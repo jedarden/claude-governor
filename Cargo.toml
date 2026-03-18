@@ -1,0 +1,49 @@
+[package]
+name = "claude-governor"
+version = "0.1.0"
+edition = "2021"
+description = "Automated capacity governor for Claude Code subscription usage"
+authors = ["Claude Governor Team"]
+
+[[bin]]
+name = "cgov"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP client with rustls (no native-tls)
+ureq = { version = "2", features = ["tls"] }
+rustls = "0.23"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Home directory
+dirs = "6"
+
+[dev-dependencies]
+# Testing
+tempfile = "3"
+mockito = "1"
+
+[profile.release]
+# Optimize for size and speed
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
