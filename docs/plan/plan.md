@@ -88,22 +88,22 @@ curl -s \
 - `five_hour.utilization` — session burst usage %
 - `five_hour.resets_at` — session reset timestamp
 
-**Token count collection (supplementary):**
+**Token delta collection (supplementary):**
 
-The API returns percentages only, not raw token counts. Raw token counts are available locally from `~/.ccdash/tokens.db` (SQLite) and `~/.claude/projects/**/*.jsonl`. Each polling cycle also reads the cumulative token total to pair with the percentage snapshot:
+The API returns percentages only, not raw token counts. The Token Collector (see Component 2 below) maintains a separate time-series database by tailing `~/.claude/projects/**/*.jsonl`. Each polling cycle reads the **delta** in token counts since the previous snapshot — broken down by model and token type — and pairs it with the percentage change:
 
-```bash
-# Cumulative tokens from ccdash db (fast — pre-aggregated)
-TOKENS=$(sqlite3 ~/.ccdash/tokens.db \
-    "SELECT SUM(total_input_tokens + total_output_tokens + total_cache_read_tokens)
-     FROM file_aggregates
-     WHERE earliest_timestamp >= datetime('now', '-7 days')" 2>/dev/null || echo 0)
+```
+delta_input_tokens     (priced at model input rate)
+delta_output_tokens    (priced at model output rate)
+delta_cache_read_tokens  (priced at model cache-read rate)
+delta_cache_write_tokens (priced at model cache-write rate)
 ```
 
-Pairing `(utilization_pct, cumulative_tokens, timestamp, is_peak)` in each snapshot enables:
-1. Computing tokens-per-percent-point, which should be ~2x higher during off-peak
-2. Validating the promotion is working as expected
-3. Expressing burn rate in tokens/hr (more stable than %/hr as plan tier changes)
+Pairing `(delta_pct, delta_tokens_by_type_by_model, dollar_equivalent, timestamp, is_peak)` enables:
+1. Model-specific burn rates — Sonnet and Opus consume quota at different token volumes per percent
+2. Dollar-equivalent capacity estimation — remaining % translates to estimated remaining API-equivalent dollars
+3. Promotion validation — tokens-per-percent should be ~2x during off-peak; measurable per model
+4. Stable cross-plan burn rate in $/hr regardless of plan tier changes
 
 **Polling frequency:** Every 5 minutes (vs. current 15 min). The API is lightweight (~200ms) and less prone to rate-limiting than the TUI scraper.
 
@@ -111,7 +111,106 @@ Pairing `(utilization_pct, cumulative_tokens, timestamp, is_peak)` in each snaps
 
 ---
 
-### 2. State Store
+### 2. Token Collector
+
+An **independent daemon** responsible solely for capturing model-specific token consumption with type-level granularity. It runs separately from the governor loop and can be started, stopped, and queried independently.
+
+**Source:** Tails `~/.claude/projects/**/*.jsonl` for assistant messages containing `usage` blocks. Each API response includes:
+
+```json
+{
+  "usage": {
+    "input_tokens": 3241,
+    "output_tokens": 847,
+    "cache_creation_input_tokens": 10863,
+    "cache_read_input_tokens": 6370,
+    "service_tier": "standard"
+  }
+}
+```
+
+The session filename path encodes the model used; the `model` field in the message confirms it.
+
+**Token type pricing** (USD per million tokens, Claude API public rates):
+
+```json
+{
+  "claude-sonnet-4-6": {
+    "input_per_mtok": 3.00,
+    "output_per_mtok": 15.00,
+    "cache_write_per_mtok": 3.75,
+    "cache_read_per_mtok": 0.30
+  },
+  "claude-opus-4-6": {
+    "input_per_mtok": 15.00,
+    "output_per_mtok": 75.00,
+    "cache_write_per_mtok": 18.75,
+    "cache_read_per_mtok": 1.50
+  },
+  "claude-haiku-4-5": {
+    "input_per_mtok": 0.80,
+    "output_per_mtok": 4.00,
+    "cache_write_per_mtok": 1.00,
+    "cache_read_per_mtok": 0.08
+  }
+}
+```
+
+**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. One record per collection interval per model:
+
+```json
+{
+  "ts": "2026-03-18T14:30:00Z",
+  "interval_minutes": 5,
+  "is_peak": false,
+  "workers_active": 2,
+  "model": "claude-sonnet-4-6",
+  "delta": {
+    "input_tokens": 45230,
+    "output_tokens": 8340,
+    "cache_read_tokens": 312000,
+    "cache_write_tokens": 28500
+  },
+  "dollar_equiv": {
+    "input": 0.1357,
+    "output": 0.1251,
+    "cache_read": 0.0936,
+    "cache_write": 0.1069,
+    "total": 0.4613
+  },
+  "plan_pct_delta": 0.8
+}
+```
+
+`plan_pct_delta` is filled in by the governor when it joins the token record to the concurrent API percentage snapshot. The collector records tokens; the governor annotates with the percent movement seen at the same interval.
+
+**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (written by collector alongside JSONL; JSONL is authoritative):
+
+```sql
+CREATE TABLE token_intervals (
+    ts          TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    is_peak     INTEGER NOT NULL,
+    workers     INTEGER NOT NULL,
+    in_tok      INTEGER, out_tok INTEGER,
+    cr_tok      INTEGER, cw_tok  INTEGER,
+    usd_total   REAL,
+    pct_delta   REAL
+);
+CREATE INDEX idx_ts_model ON token_intervals(ts, model);
+```
+
+**Standalone CLI:**
+```bash
+token-collector --collect      # run one collection pass, append to JSONL+DB
+token-collector --daemon       # loop every N minutes
+token-collector --query        # print recent intervals as table
+token-collector --summary      # model totals for current 7d window
+```
+
+---
+
+### 3. State Store
 
 **File:** `~/.needle/state/governor-state.json`
 
@@ -124,10 +223,47 @@ Pairing `(utilization_pct, cumulative_tokens, timestamp, is_peak)` in each snaps
     "all_models_pct": 81.0,
     "five_hour_pct": 14.0,
     "sonnet_resets_at": "2026-03-20T03:59:59Z",
-    "five_hour_resets_at": "2026-03-18T15:59:59Z",
-    "tokens_7d": 4821043,
-    "tokens_5h": 312847,
-    "tokens_source": "ccdash_db"
+    "five_hour_resets_at": "2026-03-18T15:59:59Z"
+  },
+
+  "token_deltas": {
+    "claude-sonnet-4-6": {
+      "interval_minutes": 5,
+      "input_tokens": 45230,
+      "output_tokens": 8340,
+      "cache_read_tokens": 312000,
+      "cache_write_tokens": 28500,
+      "dollar_equiv": {
+        "input": 0.1357,
+        "output": 0.1251,
+        "cache_read": 0.0936,
+        "cache_write": 0.1069,
+        "total": 0.4613
+      }
+    },
+    "claude-opus-4-6": {
+      "interval_minutes": 5,
+      "input_tokens": 3100,
+      "output_tokens": 920,
+      "cache_read_tokens": 18400,
+      "cache_write_tokens": 3200,
+      "dollar_equiv": {
+        "input": 0.0465,
+        "output": 0.0690,
+        "cache_read": 0.0276,
+        "cache_write": 0.0600,
+        "total": 0.2031
+      }
+    }
+  },
+
+  "capacity_estimate": {
+    "claude-sonnet-4-6": {
+      "remaining_pct": 28.0,
+      "dollars_per_pct_observed": 1.648,
+      "estimated_remaining_dollars": 46.1,
+      "estimated_total_plan_dollar_value": 164.8
+    }
   },
 
   "schedule": {
@@ -148,10 +284,24 @@ Pairing `(utilization_pct, cumulative_tokens, timestamp, is_peak)` in each snaps
   },
 
   "burn_rate": {
-    "observed_pct_per_worker_per_hour": 1.35,
-    "samples": 12,
-    "last_sample_at": "2026-03-18T14:15:00Z",
-    "baseline_pct_per_worker_per_hour": 1.2
+    "by_model": {
+      "claude-sonnet-4-6": {
+        "pct_per_worker_per_hour": 1.35,
+        "dollars_per_worker_per_hour": 5.54,
+        "samples": 12
+      },
+      "claude-opus-4-6": {
+        "pct_per_worker_per_hour": 3.80,
+        "dollars_per_worker_per_hour": 24.37,
+        "samples": 4
+      }
+    },
+    "tokens_per_pct_peak": 69780,
+    "tokens_per_pct_offpeak": 141350,
+    "offpeak_ratio_observed": 2.03,
+    "offpeak_ratio_expected": 2.0,
+    "promotion_validated": true,
+    "last_sample_at": "2026-03-18T14:15:00Z"
   },
 
   "alerts": []
@@ -213,55 +363,56 @@ target_workers = clamp(target_workers, min_workers, max_workers)
 
 ---
 
-### 4. Adaptive Burn Rate Estimator
+### 5. Adaptive Burn Rate Estimator
 
-**Problem:** The current `1.2% per worker per hour` constant is never validated. Percentage burn rate is also unstable — it encodes both actual consumption and plan tier (1% on a Max 20x plan represents far more tokens than 1% on a Pro plan).
+**Problem:** The current `1.2% per worker per hour` constant is both unvalidated and model-agnostic. Opus workers consume far more quota per hour than Sonnet workers. Percentage burn rate is also plan-tier-unstable (1% on Max 20x represents far more tokens than 1% on Pro). Dollar-equivalent burn rate is stable across both dimensions.
 
-**Solution:** Track burn rate in **both** percentage and tokens per worker per hour, derived from consecutive state snapshots.
+**Solution:** Track burn rate **per model** in three parallel units — %/hr, tokens/hr, and $/hr — derived from consecutive state snapshots joined to Token Collector records.
 
 ```
-# Percentage-based (used for target worker calculation against plan limit)
-pct_burn_sample = (pct_now - pct_prev) / hours_since_prev / workers_active_during_interval
+# Per model, per interval
+pct_burn_sample   = delta_pct   / elapsed_hours / workers_active
+token_burn_sample = delta_tokens / elapsed_hours / workers_active   # sum of all token types
+dollar_burn_sample = delta_usd  / elapsed_hours / workers_active
 
-# Token-based (more stable; useful for cross-plan comparison and promotion validation)
-token_burn_sample = (tokens_now - tokens_prev) / hours_since_prev / workers_active_during_interval
+# Dollar breakdown by token type (Sonnet example):
+delta_usd = (delta_input * 3.00 + delta_output * 15.00
+           + delta_cache_write * 3.75 + delta_cache_read * 0.30) / 1_000_000
 ```
 
-**Exponential moving average (EMA) to smooth noisy samples:**
+**Exponential moving average (EMA) per model:**
 ```
-new_burn_rate = alpha * latest_sample + (1 - alpha) * previous_burn_rate
-alpha = 0.2  # weight recent observations more than old
-```
-
-**Tokens-per-percent ratio (promotion validation signal):**
-```
-tokens_per_pct = token_burn_sample / pct_burn_sample
-```
-During the off-peak promotion, `tokens_per_pct` should be approximately **2x** its peak-hour value — because consuming 1% off-peak requires twice the tokens. If the ratio stays flat across peak/off-peak transitions, the promotion is not applying correctly to that limit bucket. Store peak and off-peak samples separately to compute this ratio.
-
-**Fallback:** Use baseline (`1.2%/worker/hr`) when fewer than 3 samples are available or when variance is high.
-
-**Store:** `burn_rate` block in `governor-state.json`:
-```json
-"burn_rate": {
-  "observed_pct_per_worker_per_hour": 1.35,
-  "observed_tokens_per_worker_per_hour": 94200,
-  "tokens_per_pct_peak": 69780,
-  "tokens_per_pct_offpeak": 141350,
-  "offpeak_ratio_observed": 2.03,
-  "offpeak_ratio_expected": 2.0,
-  "promotion_validated": true,
-  "samples": 12,
-  "last_sample_at": "2026-03-18T14:15:00Z",
-  "baseline_pct_per_worker_per_hour": 1.2
-}
+new_rate[model] = alpha * latest_sample[model] + (1 - alpha) * prev_rate[model]
+alpha = 0.2
 ```
 
-**Why this matters:** If actual burn rate is 1.8%/hr, the governor sets targets 50% too high and risks hitting the limit. Token-based tracking also gives a cross-promotion calibration signal — if `offpeak_ratio_observed` diverges significantly from `offpeak_ratio_expected`, the `promotions.json` multiplier needs adjustment.
+**Dollar-based remaining capacity estimate:**
+```
+dollars_per_pct[model] = ema_dollar_burn / ema_pct_burn   # $/% observed ratio
+estimated_remaining_dollars = dollars_per_pct * remaining_pct
+estimated_plan_value = dollars_per_pct * 100
+```
+This lets the governor answer: "you have approximately $X of API-equivalent value remaining," independent of plan tier. It also surfaces the effective $/month value being extracted from the subscription.
+
+**Tokens-per-percent ratio (promotion validation signal, per model):**
+```
+tokens_per_pct[model] = token_burn_sample / pct_burn_sample
+```
+Stored separately for peak vs. off-peak intervals. During the off-peak promotion, the ratio should be ~2x, because the plan limit doubles but actual token consumption does not change. If the ratio stays flat, the promotion is not applying to that model's limit bucket.
+
+**Guard conditions for sample validity:**
+- Skip if `elapsed < 2 min` (too short to be meaningful)
+- Skip if worker count changed mid-interval (burn rate can't be attributed cleanly)
+- Skip if `delta_pct == 0` and `delta_tokens > 0` (possible API rounding artifact)
+- Discard outliers > 3σ from current EMA
+
+**Fallback per model:** Use configured `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples are available.
+
+**Why model separation matters:** A fleet of 2 Sonnet + 1 Opus workers doesn't burn quota at `3 * sonnet_rate`. The Opus worker may burn 3–4x the quota per hour. A model-agnostic governor will systematically overshoot when Opus is active.
 
 ---
 
-### 5. Worker Manager
+### 6. Worker Manager
 
 #### Scale-Up
 ```bash
@@ -297,7 +448,7 @@ done
 
 ---
 
-### 6. Hysteresis
+### 7. Hysteresis
 
 **Problem:** Without hysteresis, minor fluctuations cause thrashing.
 
@@ -320,7 +471,7 @@ This prevents the current thrash pattern where 1 worker exits (idle_timeout) and
 
 ---
 
-### 7. Alert Manager
+### 8. Alert Manager
 
 Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfacing them for human review.
 
@@ -339,7 +490,7 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 
 ---
 
-### 8. Emergency Brake
+### 9. Emergency Brake
 
 If `seven_day_sonnet.utilization >= 98%`, immediately scale all workers to 0 regardless of hysteresis or idle state. Log `EMERGENCY BRAKE APPLIED`. This is the hard stop that prevents plan overages.
 
@@ -377,6 +528,33 @@ agents:
 # Promotion definitions
 promotions_file: ~/.needle/config/promotions.json
 
+# API pricing (USD per million tokens) — used for dollar-equivalent burn rate
+# Update when Anthropic changes public pricing
+pricing:
+  claude-sonnet-4-6:
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    cache_write_per_mtok: 3.75
+    cache_read_per_mtok: 0.30
+  claude-opus-4-6:
+    input_per_mtok: 15.00
+    output_per_mtok: 75.00
+    cache_write_per_mtok: 18.75
+    cache_read_per_mtok: 1.50
+  claude-haiku-4-5:
+    input_per_mtok: 0.80
+    output_per_mtok: 4.00
+    cache_write_per_mtok: 1.00
+    cache_read_per_mtok: 0.08
+
+# Token collector
+token_collector:
+  enabled: true
+  interval: 120              # seconds between collection passes
+  jsonl_file: ~/.needle/state/token-history.jsonl
+  db_file: ~/.needle/state/token-history.db
+  source_glob: ~/.claude/projects/**/*.jsonl
+
 # Alert thresholds
 alerts:
   capacity_warning_pct: 90
@@ -409,6 +587,35 @@ alerts:
 3. Test: Run every minute for 30 minutes, verify output matches TUI `/status` values.
 
 **Deliverable:** `scripts/poll-usage.sh` — standalone, can be used by other scripts.
+
+---
+
+### Phase 1b: Token Collector (Independent Data Capture)
+
+**Goal:** Independently capture model-specific, token-type-specific consumption data. Runs as a separate daemon; the governor reads from its output but does not depend on it being active to function.
+
+1. Write `scripts/token-collector.py`:
+   - Walks `~/.claude/projects/**/*.jsonl` to find unprocessed lines (tracks cursor per file in `~/.needle/state/collector-cursors.json`)
+   - Parses each assistant message's `usage` block: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`
+   - Extracts `model` from the message or infers from session path
+   - Accumulates deltas per model per collection interval
+   - Computes dollar equivalent for each token type using pricing from `governor.yaml`
+   - Appends one JSONL record per model per interval to `token-history.jsonl`
+   - Mirrors to `token-history.db` SQLite for fast queries
+   - Exposes `--query` and `--summary` modes for inspection
+
+2. Write cursor tracking (`collector-cursors.json`):
+   - Stores `{filepath: byte_offset}` so restarts resume where they left off without re-scanning
+   - New files detected via glob on each pass
+
+3. `plan_pct_delta` annotation: on each governor poll cycle, join the most recent token collector record to the concurrent API percent snapshot to fill in `plan_pct_delta`. This is the only field the collector cannot populate itself.
+
+4. Test independently:
+   - Verify dollar computation against known API pricing
+   - Verify delta (not cumulative) — run twice, confirm second pass only counts new messages
+   - Verify correct model attribution when multiple models active in same session
+
+**Deliverable:** `scripts/token-collector.py` — fully standalone, can be queried without the governor running.
 
 ---
 
@@ -452,20 +659,29 @@ alerts:
 
 ### Phase 3: Adaptive Burn Rate Estimator
 
-**Goal:** Empirically calibrate the per-worker burn rate.
+**Goal:** Empirically calibrate per-model burn rates in %/hr, tokens/hr, and $/hr.
 
-1. Extend state store to track `burn_rate` block with EMA.
+1. Extend state store with `burn_rate.by_model` block, `token_deltas`, and `capacity_estimate` as specified in the State Store schema.
 
 2. Write `scripts/burn-rate.py`:
-   - Reads current and previous state snapshots
-   - Computes sample: `(pct_now - pct_prev) / elapsed_hours / avg_workers`
-   - Updates EMA: `new = alpha * sample + (1 - alpha) * prev`
-   - Guards: skip sample if elapsed < 2 min or worker count changed mid-interval
-   - Falls back to baseline if samples < 3
+   - Joins Token Collector records to API percent snapshots over matching intervals
+   - Computes per-model samples: `pct_burn`, `token_burn`, `dollar_burn` (all per worker per hour)
+   - Applies EMA per model with `alpha = 0.2`
+   - Stores separate `tokens_per_pct_peak` and `tokens_per_pct_offpeak` for promotion validation
+   - Computes `dollars_per_pct[model]` → `capacity_estimate` block
+   - Guard conditions: skip short intervals, changed worker counts, zero-delta API responses
+   - Falls back to `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples
 
-3. Add `workers_active` to state snapshot so burn rate can be correctly attributed.
+3. Add `workers_active` and `workers_by_model` to each governor state snapshot so burn rate can be attributed to the correct model mix.
 
-**Deliverable:** `scripts/burn-rate.py` + updated state schema
+4. Dollar-based capacity estimate — updated each cycle:
+   ```
+   dollars_per_pct = ema_dollar_burn_per_worker_hr / ema_pct_burn_per_worker_hr
+   remaining_dollars = dollars_per_pct * remaining_pct
+   ```
+   Log this alongside the percentage: "72% used, ~$46 API-equivalent remaining."
+
+**Deliverable:** `scripts/burn-rate.py` + updated state schema + capacity estimate output
 
 ---
 
@@ -562,15 +778,17 @@ claude-governor/
 ├── scripts/
 │   ├── governor.sh           # Main daemon (Phase 4)
 │   ├── poll-usage.sh         # Direct API usage poller (Phase 1)
+│   ├── token-collector.py    # Independent token delta collector (Phase 1b)
 │   ├── worker-manager.sh     # Scale-up/down logic (Phase 4)
 │   ├── alerts.sh             # Alert creation (Phase 5)
 │   ├── schedule.py           # Peak/off-peak calculator (Phase 2)
-│   └── burn-rate.py          # Adaptive burn rate EMA (Phase 3)
+│   └── burn-rate.py          # Model-specific burn rate EMA (Phase 3)
 ├── config/
-│   ├── governor.yaml         # Main configuration
+│   ├── governor.yaml         # Main configuration (incl. pricing table)
 │   └── promotions.json       # Promotion window definitions
 ├── systemd/
-│   └── governor.service      # Systemd user service unit
+│   ├── governor.service      # Systemd user service — governor daemon
+│   └── token-collector.service  # Systemd user service — token collector daemon
 ├── install.sh                # Installation helper
 ├── docs/
 │   ├── research/
@@ -582,6 +800,16 @@ claude-governor/
 └── README.md
 ```
 
+**Runtime state files** (written to `~/.needle/state/`):
+
+| File | Written by | Purpose |
+|---|---|---|
+| `governor-state.json` | governor | Current scaling state, burn rates, capacity estimate |
+| `governor-state.prev.json` | governor | Previous cycle snapshot for delta calculation |
+| `token-history.jsonl` | token-collector | Append-only per-interval token delta records |
+| `token-history.db` | token-collector | SQLite mirror for fast queries |
+| `collector-cursors.json` | token-collector | File byte offsets to avoid re-processing |
+
 ---
 
 ## Key Improvements Over Existing Governor
@@ -590,8 +818,11 @@ claude-governor/
 |---|---|---|
 | **Usage source** | TUI screen-scraper (~10s, fragile) | Direct API call (~200ms, reliable) |
 | **Off-peak math** | `effective_hours` computed but not used | Fully integrated into target calculation |
-| **Burn rate** | Hardcoded `1.2%/worker/hr` | Adaptive EMA in both %/hr and tokens/hr |
+| **Burn rate** | Hardcoded `1.2%/worker/hr`, model-agnostic | Per-model EMA in %/hr, tokens/hr, and $/hr |
+| **Token tracking** | None | Per-model delta by type: input/output/cache-read/cache-write |
+| **Dollar equivalent** | None | $/hr burn and estimated remaining API-equivalent value |
 | **Promotion validation** | Assumed correct | Cross-validated against observed tokens-per-percent ratio |
+| **Capacity estimate** | % remaining only | % + estimated $ remaining based on observed $/% ratio |
 | **Scale-down** | `tmux kill-session` (forceful) | Graceful SIGINT to idle workers only |
 | **Hysteresis** | None — thrashes every cycle | ±1 worker dead band |
 | **Workspace** | Hard-coded `kalshi-trading` | Auto-discovered by needle run |
@@ -616,3 +847,9 @@ claude-governor/
 5. **Promotion end date:** After March 28, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly.
 
 6. **Multiple accounts / credential rotation:** The poller assumes a single `~/.claude/.credentials.json`. If multiple accounts are used, parameterize the credentials path.
+
+7. **Token collector lag:** The collector reads JSONL files that may be flushed with a short delay after each API call. For burn rate samples, use intervals ≥ 2 minutes to ensure all requests in the window have been written. The `pct_delta` annotation from the API snapshot is the authoritative signal; token deltas enrich it.
+
+8. **Pricing staleness:** The `pricing` block in `governor.yaml` must be manually updated when Anthropic changes API rates. Dollar-equivalent figures become misleading if rates drift. Log the pricing version and date so stale configs are detectable.
+
+9. **Model attribution in multi-model sessions:** A single Claude Code session can make calls to multiple models (e.g., a tool-call routing to Haiku while the main conversation uses Sonnet). Token records must be attributed per-model from the `model` field in each response, not inferred from the session path alone.
