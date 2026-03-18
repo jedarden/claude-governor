@@ -2,7 +2,11 @@
 
 ## Overview
 
-Claude Governor is an automated capacity governor that monitors Claude Code subscription usage in real time and dynamically scales the number of active AI worker instances (initially Claude Code Sonnet via NEEDLE) to maximize utilization of the available plan without exceeding limits.
+Claude Governor is an automated capacity governor that monitors Claude Code subscription usage in real time and predicts whether running worker processes will be stopped by hitting a usage window limit before that window resets. When the forecast shows workers will exhaust a window early, the governor scales down the fleet to a safe level; when capacity remains, it allows or adds workers.
+
+The primary output of the entire measurement pipeline is a per-window **exhaustion prediction**: given the current fleet burn rate, will the `five_hour`, `seven_day`, or `seven_day_sonnet` window reach 100% before its reset time? If yes for any window, workers will be forcibly stopped by the platform. The governor exists to detect and prevent that outcome.
+
+All token-level measurement — input, output, cache reads, cache writes, dollar equivalents, per-instance granularity, and promotion-period tracking — exists as inputs to make that exhaustion prediction as accurate as possible.
 
 The system replaces the current `capacity-governor.sh` (screen-scraping, stateless, incomplete off-peak logic) with a reliable, accurate, and extensible daemon.
 
@@ -10,13 +14,14 @@ The system replaces the current `capacity-governor.sh` (screen-scraping, statele
 
 ## Goals
 
-1. **Maximize quota utilization** — consume as close to 100% of the weekly allocation as possible before reset, without going over.
-2. **Respect promotion windows** — treat off-peak hours as 2x capacity and run more workers accordingly.
-3. **Graceful operation** — never kill workers mid-task; only scale down idle workers.
-4. **Accurate measurement** — replace the fragile TUI scraper with direct API calls.
-5. **Adaptive burn rate** — learn actual per-worker consumption empirically rather than using a hardcoded constant.
-6. **Extensibility** — support multiple configured systems beyond Sonnet (Opus, pay-per-token providers, etc.) via a plugin architecture.
-7. **Observability** — structured state files, human-readable logs, and alerting beads when action is needed.
+1. **Predict worker cutoff** — for each usage window (`five_hour`, `seven_day`, `seven_day_sonnet`), forecast whether the fleet will exhaust the window before reset (`exh_hrs < hrs_left`). This is the primary output that drives all scaling decisions.
+2. **Prevent premature exhaustion** — scale down to `safe_worker_count` when any window is on track to exhaust early; hold or scale up when headroom exists.
+3. **Respect promotion windows** — account for off-peak 2x capacity when forecasting exhaustion; during off-peak hours the effective remaining capacity is doubled, so more workers can safely run.
+4. **Graceful operation** — never kill workers mid-task; only scale down idle workers.
+5. **Accurate measurement** — replace the fragile TUI scraper with direct API calls; capture token-type granularity to produce accurate dollar-equivalent burn rates per model.
+6. **Adaptive burn rate** — learn actual per-worker consumption empirically (p75 EMA) rather than using a hardcoded constant, so exhaustion predictions improve over time.
+7. **Extensibility** — support multiple configured systems beyond Sonnet (Opus, pay-per-token providers, etc.) via a plugin architecture.
+8. **Observability** — structured state files, human-readable logs, and alerting beads when cutoff risk is imminent.
 
 ---
 
@@ -205,12 +210,20 @@ The column set is fixed at startup from the pricing config — all configured mo
 
 #### Record Type `w` — Window Forecast Row
 
-**Three lines per interval** (one per window), written last. Self-contained for capacity forecast queries.
+**Three lines per interval** (one per window), written last. These are the **primary output** of the entire measurement pipeline: they answer "will workers be stopped before this window resets?"
+
+Key fields:
+- `exh_hrs` — hours until window exhausts at current fleet burn rate (`remain / fleet_pct_hr`)
+- `hrs_left` — hours until window resets
+- `cutoff_risk` — `1` if `exh_hrs < hrs_left` (workers **will** be stopped before reset at current rate)
+- `margin_hrs` — `hrs_left - exh_hrs`; positive = safe headroom, negative = fleet exceeds sustainable rate
+- `bind` — `1` if this is the most constrained window (smallest `margin_hrs` across all windows)
+- `safe_w` — max worker count where `exh_hrs >= hrs_left` (only present on binding window)
 
 ```
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":63.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":8.03,"bind":0,"safe_w":null,"pk":0}
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day","snap":72.6,"reset":"2026-03-20T03:00:00Z","delta":0.54,"remain":27.4,"hrs_left":37.5,"fleet_pct_hr":6.48,"exh_hrs":4.23,"bind":0,"safe_w":null,"pk":0}
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":36.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":4.06,"bind":1,"safe_w":2,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":63.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":8.03,"cutoff_risk":0,"margin_hrs":6.53,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day","snap":72.6,"reset":"2026-03-20T03:00:00Z","delta":0.54,"remain":27.4,"hrs_left":37.5,"fleet_pct_hr":6.48,"exh_hrs":4.23,"cutoff_risk":1,"margin_hrs":-33.27,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":36.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":4.06,"cutoff_risk":1,"margin_hrs":-33.44,"bind":1,"safe_w":2,"pk":0}
 ```
 
 ---
@@ -261,14 +274,18 @@ CREATE INDEX f_t0    ON f(t0);
 CREATE INDEX f_pk_t0 ON f(pk, t0);  -- fast peak vs off-peak queries
 
 -- Type "w": one row per window per interval
+-- Primary output: cutoff_risk=1 means workers will be stopped before this window resets
 CREATE TABLE w (
     ts TEXT, t0 TEXT, t1 TEXT, win TEXT,
     snap REAL, reset TEXT, delta REAL,
     remain REAL, hrs_left REAL,
     fleet_pct_hr REAL, exh_hrs REAL,
+    cutoff_risk INTEGER,  -- 1 if exh_hrs < hrs_left (workers will be stopped)
+    margin_hrs REAL,      -- hrs_left - exh_hrs; negative means over-budget
     bind INTEGER, safe_w INTEGER, pk INTEGER
 );
-CREATE INDEX w_win_t0 ON w(win, t0);
+CREATE INDEX w_win_t0        ON w(win, t0);
+CREATE INDEX w_cutoff_risk   ON w(cutoff_risk, t0);  -- fast query: "when were we at risk?"
 
 -- Cross-instance comparison: all sessions side by side for a given interval
 CREATE VIEW instance_compare AS
@@ -331,12 +348,16 @@ token-collector --rebuild-db          # reconstruct SQLite from JSONL
   },
 
   "capacity_forecast": {
+    // PRIMARY OUTPUT: per-window cutoff prediction.
+    // cutoff_risk=true means workers will be stopped before this window resets
+    // at the current fleet burn rate. margin_hrs < 0 means already in cutoff territory.
     "five_hour": {
       "remaining_pct":              63.6,
       "hours_remaining":            1.50,
       "fleet_pct_per_hour":         7.92,
       "predicted_exhaustion_hours": 8.03,
-      "will_exhaust_before_reset":  false,
+      "cutoff_risk":                false,  // exh_hrs (8.03) > hrs_left (1.50) → safe
+      "margin_hrs":                 6.53,   // hrs_left - exh_hrs (positive = safe)
       "binding":                    false
     },
     "seven_day": {
@@ -344,7 +365,8 @@ token-collector --rebuild-db          # reconstruct SQLite from JSONL
       "hours_remaining":            37.5,
       "fleet_pct_per_hour":         6.48,
       "predicted_exhaustion_hours": 4.23,
-      "will_exhaust_before_reset":  true,
+      "cutoff_risk":                true,   // exh_hrs (4.23) < hrs_left (37.5) → will exhaust
+      "margin_hrs":                 -33.27, // negative = workers WILL be stopped
       "binding":                    false
     },
     "seven_day_sonnet": {
@@ -352,11 +374,12 @@ token-collector --rebuild-db          # reconstruct SQLite from JSONL
       "hours_remaining":            37.5,
       "fleet_pct_per_hour":         9.00,
       "predicted_exhaustion_hours": 4.06,
-      "will_exhaust_before_reset":  true,
+      "cutoff_risk":                true,   // exh_hrs (4.06) < hrs_left (37.5) → will exhaust
+      "margin_hrs":                 -33.44, // BINDING: most constrained window
       "binding":                    true,
-      "safe_worker_count":          2
+      "safe_worker_count":          2       // max workers where exh_hrs >= hrs_left
     },
-    "binding_window":      "seven_day_sonnet",
+    "binding_window":      "seven_day_sonnet",  // window with smallest margin_hrs
     "dollars_per_pct_7d_s": 1.648,
     "estimated_remaining_dollars": 46.1
   },
@@ -526,16 +549,21 @@ hours_remaining[W] = (resets_at[W] - now).total_seconds() / 3600
 
 fleet_pct_per_hour[W]         = ema_pct_per_hour[model][W] * workers_active
 predicted_exhaustion_hours[W] = remaining_pct[W] / fleet_pct_per_hour[W]
-will_exhaust_before_reset[W]  = predicted_exhaustion_hours[W] < hours_remaining[W]
 
-# Safe worker count: max workers before exhaustion, using conservative rate
+# PRIMARY CUTOFF PREDICTION — the core question the governor answers:
+cutoff_risk[W]  = predicted_exhaustion_hours[W] < hours_remaining[W]
+margin_hrs[W]   = hours_remaining[W] - predicted_exhaustion_hours[W]
+# margin_hrs > 0: safe (workers will idle before hitting limit)
+# margin_hrs < 0: at risk (workers WILL be stopped before window resets)
+
+# Safe worker count: max workers where margin_hrs[W] >= 0, using conservative rate
 safe_worker_count[W] = floor(remaining_pct[W] / hours_remaining[W] / p75_rate_per_worker)
 
-# Binding window: whichever will exhaust first
-binding_window = argmin(predicted_exhaustion_hours[W] for W in windows)
+# Binding window: the most constrained window (smallest / most negative margin_hrs)
+binding_window = argmin(margin_hrs[W] for W in windows)
 ```
 
-The governor's `compute_target_workers()` uses `safe_worker_count[binding_window]` as its ceiling, replacing the previous single-window formula. When the 5h and 7d windows give contradictory limits, the more constraining one (lower `safe_worker_count`) wins.
+The governor's `compute_target_workers()` uses `safe_worker_count[binding_window]` as its ceiling. Any window where `cutoff_risk=True` immediately triggers a scale-down toward `safe_worker_count`. When the 5h and 7d windows give contradictory ceilings, the lower (more conservative) `safe_worker_count` wins.
 
 #### Dollar-Based Remaining Capacity
 
@@ -633,12 +661,11 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 
 | Condition | Alert Type | Action |
 |---|---|---|
-| `sonnet_pct >= 90` and `hours_remaining > 12` | `capacity_warning` | Create HUMAN bead: "Sonnet at 90% with 12h+ until reset — pace workers down" |
-| `sonnet_pct >= 95` | `capacity_critical` | Reduce `SONNET_MAX` to 1; create HUMAN bead |
-| `five_hour_pct >= 90` | `session_warning` | Log warning; no worker change |
-| `five_hour_pct >= 100` | `session_exhausted` | Scale to 0 workers until session resets |
-| `burn_rate_sample > baseline * 2` | `burn_rate_spike` | Log anomaly; increase polling rate |
-| Reset in < 2h and `sonnet_pct < 50` | `underutilization` | Scale to SONNET_MAX to consume remaining budget |
+| Any window `cutoff_risk=1` with `margin_hrs < -2` | `cutoff_imminent` | Create HUMAN bead: "Window `{win}` will exhaust in `{exh_hrs:.1f}h`, resets in `{hrs_left:.1f}h` — workers will be stopped" |
+| `seven_day_sonnet.cutoff_risk=1` (any margin) | `sonnet_cutoff_risk` | Scale to `safe_worker_count`; log prediction |
+| `five_hour.cutoff_risk=1` | `session_cutoff_risk` | Scale to `safe_worker_count` for session window; log prediction |
+| `burn_rate_sample > baseline * 2` | `burn_rate_spike` | Log anomaly; increase polling rate to recalibrate faster |
+| All windows `margin_hrs > hrs_left * 0.5` | `underutilization` | Scale up toward max_workers; headroom is ample |
 
 **Deduplication:** Each alert type is only created once per governor cycle (store last-alerted timestamp per type in state file).
 
@@ -646,7 +673,7 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 
 ### 9. Emergency Brake
 
-If `seven_day_sonnet.utilization >= 98%`, immediately scale all workers to 0 regardless of hysteresis or idle state. Log `EMERGENCY BRAKE APPLIED`. This is the hard stop that prevents plan overages.
+If any window `utilization >= 98%`, immediately scale all workers to 0 regardless of hysteresis or idle state. Log `EMERGENCY BRAKE APPLIED — {win} at {pct}%`. This is the hard stop that guarantees workers are not running when the limit is about to be hit. It fires regardless of whether `cutoff_risk` was predicted — it acts on observed utilization, not forecasts.
 
 ---
 
