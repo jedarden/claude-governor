@@ -156,58 +156,184 @@ The session filename path encodes the model used; the `model` field in the messa
 }
 ```
 
-**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. One record per collection interval per model:
+**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Two record types written per collection pass:
+
+#### Record Type 1: Per-Instance Delta
+
+One record per active worker session per collection interval. This is the atomic unit of measurement — it preserves per-instance attribution so burn rates and variance can be computed across the fleet.
 
 ```json
 {
+  "record_type": "instance_delta",
   "ts": "2026-03-18T14:30:00Z",
-  "interval_minutes": 5,
-  "is_peak": false,
-  "workers_active": 2,
+  "interval_start": "2026-03-18T14:25:00Z",
+  "interval_end": "2026-03-18T14:30:00Z",
+  "worker_session": "needle-claude-anthropic-sonnet-alpha",
+  "claude_session_id": "ad5b2e01-7f3c-4d9a-b812-3e9f1a2b4c5d",
   "model": "claude-sonnet-4-6",
+  "is_peak": false,
   "delta": {
-    "input_tokens": 45230,
-    "output_tokens": 8340,
-    "cache_read_tokens": 312000,
-    "cache_write_5m_tokens": 12000,
-    "cache_write_1h_tokens": 16500
+    "input_tokens": 15410,
+    "output_tokens": 2830,
+    "cache_read_tokens": 104200,
+    "cache_write_5m_tokens": 4100,
+    "cache_write_1h_tokens": 5500
   },
   "dollar_equiv": {
-    "input": 0.1357,
-    "output": 0.1251,
-    "cache_read": 0.0936,
-    "cache_write_5m": 0.0450,
-    "cache_write_1h": 0.0990,
-    "total": 0.4984
+    "input": 0.0462,
+    "output": 0.0425,
+    "cache_read": 0.0313,
+    "cache_write_5m": 0.0154,
+    "cache_write_1h": 0.0330,
+    "total": 0.1684
   },
-  "plan_pct_delta": 0.8
+  "window_pct_deltas": {
+    "five_hour": null,
+    "seven_day": null,
+    "seven_day_sonnet": null
+  }
 }
 ```
 
-`plan_pct_delta` is filled in by the governor when it joins the token record to the concurrent API percentage snapshot. The collector records tokens; the governor annotates with the percent movement seen at the same interval.
+`window_pct_deltas` are `null` at write time. The governor annotates them during its poll cycle by apportioning the observed API percentage movement across the concurrent instance records in proportion to their dollar_equiv totals. Per-instance records from the same interval are joined by `interval_start`/`interval_end`.
 
-**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (written by collector alongside JSONL; JSONL is authoritative):
+#### Record Type 2: Fleet Aggregate
+
+One record per collection interval, written after all instance records for that interval. Aggregates across all active workers and includes fleet-level statistics needed for capacity forecasting.
+
+```json
+{
+  "record_type": "fleet_aggregate",
+  "ts": "2026-03-18T14:30:00Z",
+  "interval_start": "2026-03-18T14:25:00Z",
+  "interval_end": "2026-03-18T14:30:00Z",
+  "is_peak": false,
+  "by_model": {
+    "claude-sonnet-4-6": {
+      "worker_sessions": [
+        "needle-claude-anthropic-sonnet-alpha",
+        "needle-claude-anthropic-sonnet-bravo"
+      ],
+      "workers_active": 2,
+      "delta": {
+        "input_tokens": 29840,
+        "output_tokens": 5510,
+        "cache_read_tokens": 198300,
+        "cache_write_5m_tokens": 7900,
+        "cache_write_1h_tokens": 10400
+      },
+      "dollar_equiv": { "total": 0.3201 },
+      "per_worker_stats": {
+        "dollar_per_hour_mean": 1.921,
+        "dollar_per_hour_stddev": 0.312,
+        "dollar_per_hour_p75": 2.147,
+        "dollar_per_hour_min": 1.609,
+        "dollar_per_hour_max": 2.233
+      }
+    }
+  },
+  "window_snapshots": {
+    "five_hour":        { "utilization": 36.4, "resets_at": "2026-03-18T15:59:59Z" },
+    "seven_day":        { "utilization": 72.6, "resets_at": "2026-03-20T03:00:00Z" },
+    "seven_day_sonnet": { "utilization": 63.5, "resets_at": "2026-03-20T03:59:59Z" }
+  },
+  "window_pct_deltas": {
+    "five_hour":        0.66,
+    "seven_day":        0.54,
+    "seven_day_sonnet": 0.75
+  },
+  "capacity_forecast": {
+    "five_hour": {
+      "remaining_pct":              63.6,
+      "hours_remaining":            1.50,
+      "fleet_pct_per_hour":         7.92,
+      "predicted_exhaustion_hours": 8.03,
+      "will_exhaust_before_reset":  false,
+      "binding":                    false
+    },
+    "seven_day_sonnet": {
+      "remaining_pct":              36.5,
+      "hours_remaining":            37.5,
+      "fleet_pct_per_hour":         9.00,
+      "predicted_exhaustion_hours": 4.06,
+      "will_exhaust_before_reset":  true,
+      "binding":                    true,
+      "safe_worker_count":          2
+    }
+  },
+  "binding_window": "seven_day_sonnet"
+}
+```
+
+`binding_window` names the most constraining window — the one the governor's target calculation must optimize against. When `five_hour` becomes binding (e.g., burst activity near a session reset), the governor temporarily scales down even if the weekly window has headroom.
+
+`safe_worker_count` is the maximum number of workers at the current per-worker burn rate (`p75` for conservatism) that will not exhaust the binding window before its reset.
+
+**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (JSONL is authoritative; DB is rebuilt from JSONL on corruption):
 
 ```sql
-CREATE TABLE token_intervals (
-    ts          TEXT NOT NULL,
-    model       TEXT NOT NULL,
-    is_peak     INTEGER NOT NULL,
-    workers     INTEGER NOT NULL,
-    in_tok      INTEGER, out_tok INTEGER,
-    cr_tok      INTEGER, cw_tok  INTEGER,
-    usd_total   REAL,
-    pct_delta   REAL
+-- Per-instance records
+CREATE TABLE instance_deltas (
+    ts              TEXT NOT NULL,
+    interval_start  TEXT NOT NULL,
+    interval_end    TEXT NOT NULL,
+    worker_session  TEXT NOT NULL,
+    claude_sess_id  TEXT,
+    model           TEXT NOT NULL,
+    is_peak         INTEGER NOT NULL,
+    in_tok          INTEGER,
+    out_tok         INTEGER,
+    cr_tok          INTEGER,
+    cw_5m_tok       INTEGER,
+    cw_1h_tok       INTEGER,
+    usd_total       REAL,
+    pct_delta_5h    REAL,    -- annotated by governor
+    pct_delta_7d    REAL,
+    pct_delta_7d_s  REAL
 );
-CREATE INDEX idx_ts_model ON token_intervals(ts, model);
+CREATE INDEX idx_inst_ts       ON instance_deltas(ts);
+CREATE INDEX idx_inst_session  ON instance_deltas(worker_session, ts);
+CREATE INDEX idx_inst_model    ON instance_deltas(model, ts);
+
+-- Fleet aggregate records
+CREATE TABLE fleet_aggregates (
+    ts              TEXT NOT NULL PRIMARY KEY,
+    interval_start  TEXT NOT NULL,
+    interval_end    TEXT NOT NULL,
+    is_peak         INTEGER NOT NULL,
+    workers_json    TEXT,          -- JSON: {"claude-sonnet-4-6": 2, ...}
+    usd_total       REAL,
+    pct_delta_5h    REAL,
+    pct_delta_7d    REAL,
+    pct_delta_7d_s  REAL,
+    snap_5h_pct     REAL,
+    snap_7d_pct     REAL,
+    snap_7d_s_pct   REAL,
+    binding_window  TEXT,
+    safe_workers    INTEGER,
+    forecast_json   TEXT           -- full capacity_forecast block as JSON
+);
+
+-- Per-worker burn rate view (derived, not stored)
+CREATE VIEW worker_burn_rates AS
+SELECT
+    worker_session,
+    model,
+    AVG(usd_total / ((julianday(interval_end) - julianday(interval_start)) * 24)) AS usd_per_hour,
+    COUNT(*) AS sample_count
+FROM instance_deltas
+WHERE pct_delta_5h IS NOT NULL
+GROUP BY worker_session, model;
 ```
 
 **Standalone CLI:**
 ```bash
-token-collector --collect      # run one collection pass, append to JSONL+DB
-token-collector --daemon       # loop every N minutes
-token-collector --query        # print recent intervals as table
-token-collector --summary      # model totals for current 7d window
+token-collector --collect           # run one collection pass
+token-collector --daemon            # loop every N minutes
+token-collector --query [--window N]  # recent fleet aggregates (default: last 12)
+token-collector --workers           # per-worker burn rate summary
+token-collector --forecast          # current capacity forecast for all windows
+token-collector --rebuild-db        # reconstruct SQLite from JSONL
 ```
 
 ---
@@ -228,48 +354,56 @@ token-collector --summary      # model totals for current 7d window
     "five_hour_resets_at": "2026-03-18T15:59:59Z"
   },
 
-  "token_deltas": {
-    "claude-sonnet-4-6": {
-      "interval_minutes": 5,
-      "input_tokens": 45230,
-      "output_tokens": 8340,
-      "cache_read_tokens": 312000,
-      "cache_write_5m_tokens": 12000,
-      "cache_write_1h_tokens": 16500,
-      "dollar_equiv": {
-        "input": 0.1357,
-        "output": 0.1251,
-        "cache_read": 0.0936,
-        "cache_write_5m": 0.0450,
-        "cache_write_1h": 0.0990,
-        "total": 0.4984
+  "last_fleet_aggregate": {
+    "interval_start": "2026-03-18T14:25:00Z",
+    "interval_end":   "2026-03-18T14:30:00Z",
+    "by_model": {
+      "claude-sonnet-4-6": {
+        "workers_active": 2,
+        "dollar_equiv_total": 0.3201,
+        "per_worker_stats": {
+          "dollar_per_hour_mean": 1.921,
+          "dollar_per_hour_p75":  2.147,
+          "dollar_per_hour_stddev": 0.312
+        }
       }
     },
-    "claude-opus-4-6": {
-      "interval_minutes": 5,
-      "input_tokens": 3100,
-      "output_tokens": 920,
-      "cache_read_tokens": 18400,
-      "cache_write_5m_tokens": 800,
-      "cache_write_1h_tokens": 2400,
-      "dollar_equiv": {
-        "input": 0.0155,
-        "output": 0.0230,
-        "cache_read": 0.0092,
-        "cache_write_5m": 0.0050,
-        "cache_write_1h": 0.0240,
-        "total": 0.0767
-      }
+    "window_pct_deltas": {
+      "five_hour":        0.66,
+      "seven_day":        0.54,
+      "seven_day_sonnet": 0.75
     }
   },
 
-  "capacity_estimate": {
-    "claude-sonnet-4-6": {
-      "remaining_pct": 28.0,
-      "dollars_per_pct_observed": 1.648,
-      "estimated_remaining_dollars": 46.1,
-      "estimated_total_plan_dollar_value": 164.8
-    }
+  "capacity_forecast": {
+    "five_hour": {
+      "remaining_pct":              63.6,
+      "hours_remaining":            1.50,
+      "fleet_pct_per_hour":         7.92,
+      "predicted_exhaustion_hours": 8.03,
+      "will_exhaust_before_reset":  false,
+      "binding":                    false
+    },
+    "seven_day": {
+      "remaining_pct":              27.4,
+      "hours_remaining":            37.5,
+      "fleet_pct_per_hour":         6.48,
+      "predicted_exhaustion_hours": 4.23,
+      "will_exhaust_before_reset":  true,
+      "binding":                    false
+    },
+    "seven_day_sonnet": {
+      "remaining_pct":              36.5,
+      "hours_remaining":            37.5,
+      "fleet_pct_per_hour":         9.00,
+      "predicted_exhaustion_hours": 4.06,
+      "will_exhaust_before_reset":  true,
+      "binding":                    true,
+      "safe_worker_count":          2
+    },
+    "binding_window":      "seven_day_sonnet",
+    "dollars_per_pct_7d_s": 1.648,
+    "estimated_remaining_dollars": 46.1
   },
 
   "schedule": {
@@ -372,67 +506,108 @@ target_workers = clamp(target_workers, min_workers, max_workers)
 
 ### 5. Adaptive Burn Rate Estimator
 
-**Problem:** The current `1.2% per worker per hour` constant is both unvalidated and model-agnostic. Opus workers consume far more quota per hour than Sonnet workers. Percentage burn rate is also plan-tier-unstable (1% on Max 20x represents far more tokens than 1% on Pro). Dollar-equivalent burn rate is stable across both dimensions.
+**Problem:** The current `1.2% per worker per hour` constant is unvalidated, model-agnostic, and window-agnostic. Three independent windows (5h session, 7d all-models, 7d Sonnet) each have their own utilization curve and reset time. A single %/hr estimate cannot simultaneously optimize all three.
 
-**Solution:** Track burn rate **per model** in three parallel units — %/hr, tokens/hr, and $/hr — derived from consecutive state snapshots joined to Token Collector records.
+**Solution:** Compute burn rates **per model, per window** using per-instance delta records from the Token Collector. Variance across instances drives conservative planning.
+
+#### Per-Instance Burn Rate (from `instance_deltas`)
 
 ```
-# Per model, per interval
-pct_burn_sample    = delta_pct    / elapsed_hours / workers_active
-token_burn_sample  = delta_tokens / elapsed_hours / workers_active   # sum of all token types
-dollar_burn_sample = delta_usd    / elapsed_hours / workers_active
+# For each instance_delta record with annotated window_pct_deltas:
+dollar_burn[session][window] = dollar_equiv.total / elapsed_hours
+pct_burn[session][window]    = window_pct_deltas[window] / elapsed_hours
+```
 
-# Dollar breakdown by token type — must split cache writes into 5m and 1h tiers
-# Source fields: usage.cache_creation.ephemeral_5m_input_tokens
-#                usage.cache_creation.ephemeral_1h_input_tokens
-# (Sonnet 4.6 example — prices: $3/$15/$3.75/$6/$0.30 per MTok)
-delta_usd = (delta_input         * 3.00
-           + delta_output        * 15.00
-           + delta_cache_w_5m    * 3.75   # 1.25x input
-           + delta_cache_w_1h    * 6.00   # 2.0x input
-           + delta_cache_read    * 0.30   # 0.1x input
+Dollar breakdown by token type (Sonnet 4.6, with corrected pricing):
+```
+delta_usd = (input       * 3.00
+           + output      * 15.00
+           + cw_5m       * 3.75   # 1.25x input; ephemeral_5m_input_tokens
+           + cw_1h       * 6.00   # 2.0x input;  ephemeral_1h_input_tokens
+           + cache_read  * 0.30   # 0.1x input
            ) / 1_000_000
 
-# Opus 4.6 example — NOTE: $5/$25, not $15/$75 (those are Opus 4.1/4 legacy rates)
-delta_usd = (delta_input         * 5.00
-           + delta_output        * 25.00
-           + delta_cache_w_5m    * 6.25
-           + delta_cache_w_1h    * 10.00
-           + delta_cache_read    * 0.50
+# Opus 4.6 — $5/$25/MTok (NOT $15/$75 — those are legacy Opus 4.1/4 rates)
+delta_usd = (input       * 5.00
+           + output      * 25.00
+           + cw_5m       * 6.25
+           + cw_1h       * 10.00
+           + cache_read  * 0.50
            ) / 1_000_000
 ```
 
-**Exponential moving average (EMA) per model:**
+#### Fleet-Level Burn Rate and Variance
+
+Aggregate instance records for the same interval to get fleet-level statistics:
+
 ```
-new_rate[model] = alpha * latest_sample[model] + (1 - alpha) * prev_rate[model]
-alpha = 0.2
+# Fleet burn rate for window W at time T, N workers active:
+fleet_pct_per_hour[W] = sum(pct_burn[session][W] for all sessions) / elapsed_hours
+
+# Per-worker distribution (used for safe_worker_count):
+rates = [dollar_burn[s] for s in sessions]
+mean     = avg(rates)
+stddev   = stdev(rates)
+p75      = percentile(rates, 75)
+
+# Conservative estimate for capacity planning:
+conservative_rate_per_worker = p75  # 75th percentile, not mean
 ```
 
-**Dollar-based remaining capacity estimate:**
+High `stddev` signals task heterogeneity — some workers handling large documents, others doing light edits. Using `p75` rather than `mean` ensures the capacity forecast doesn't underestimate risk when variance is high.
+
+#### Per-Window EMA and Capacity Forecast
+
+Maintain a separate EMA per (model, window) pair:
+
 ```
-dollars_per_pct[model] = ema_dollar_burn / ema_pct_burn   # $/% observed ratio
-estimated_remaining_dollars = dollars_per_pct * remaining_pct
-estimated_plan_value = dollars_per_pct * 100
+# EMA update after each fleet_aggregate interval:
+ema_pct_per_hour[model][window] = α * fleet_pct_per_hour[window] + (1-α) * prev_ema
+α = 0.2
+
+# Capacity forecast per window:
+remaining_pct[W]   = 100 - snapshot_utilization[W]
+hours_remaining[W] = (resets_at[W] - now).total_seconds() / 3600
+
+fleet_pct_per_hour[W]         = ema_pct_per_hour[model][W] * workers_active
+predicted_exhaustion_hours[W] = remaining_pct[W] / fleet_pct_per_hour[W]
+will_exhaust_before_reset[W]  = predicted_exhaustion_hours[W] < hours_remaining[W]
+
+# Safe worker count: max workers before exhaustion, using conservative rate
+safe_worker_count[W] = floor(remaining_pct[W] / hours_remaining[W] / p75_rate_per_worker)
+
+# Binding window: whichever will exhaust first
+binding_window = argmin(predicted_exhaustion_hours[W] for W in windows)
 ```
-This lets the governor answer: "you have approximately $X of API-equivalent value remaining," independent of plan tier. It also surfaces the effective $/month value being extracted from the subscription.
 
-**Tokens-per-percent ratio (promotion validation signal, per model):**
+The governor's `compute_target_workers()` uses `safe_worker_count[binding_window]` as its ceiling, replacing the previous single-window formula. When the 5h and 7d windows give contradictory limits, the more constraining one (lower `safe_worker_count`) wins.
+
+#### Dollar-Based Remaining Capacity
+
 ```
-tokens_per_pct[model] = token_burn_sample / pct_burn_sample
+dollars_per_pct[W] = ema_dollar_per_hour / ema_pct_per_hour[W]
+estimated_remaining_dollars[W] = dollars_per_pct[W] * remaining_pct[W]
 ```
-Stored separately for peak vs. off-peak intervals. During the off-peak promotion, the ratio should be ~2x, because the plan limit doubles but actual token consumption does not change. If the ratio stays flat, the promotion is not applying to that model's limit bucket.
 
-**Guard conditions for sample validity:**
-- Skip if `elapsed < 2 min` (too short to be meaningful)
-- Skip if worker count changed mid-interval (burn rate can't be attributed cleanly)
-- Skip if `delta_pct == 0` and `delta_tokens > 0` (possible API rounding artifact)
-- Discard outliers > 3σ from current EMA
+This is window-specific because different models weight the all-models vs. Sonnet-only windows differently.
 
-**Fallback per model:** Use configured `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples are available.
+#### Promotion Validation Signal (per window)
 
-**Why model separation matters:** A fleet of 2 Sonnet + 1 Opus workers doesn't burn quota at `3 * sonnet_rate`. The Opus worker may burn 3–4x the plan-percent per hour (heavier context, longer turns). In dollar terms, Opus 4.6 is ~1.67× Sonnet 4.6 (not 5×, as the legacy Opus 4.1 pricing implied). A model-agnostic governor will systematically overshoot on plan-percent when Opus is active.
+```
+tokens_per_pct[model][window] = token_burn_sample / pct_burn_sample
+```
 
-**Claude Code cache behavior note:** Claude Code makes heavy use of 1-hour prompt caching for system prompts, file contexts, and conversation history. In practice, `cache_read_tokens` typically dominate token counts but cost only 0.1× input price. This means raw token counts are a poor proxy for dollar cost — dollar-equivalent burn rate is more representative. The split between `cache_write_5m` and `cache_write_1h` is significant: 1h writes cost 2× input vs 1.25× for 5m writes.
+Stored separately for peak vs. off-peak intervals per window. The 5h and 7d windows may validate differently if the promotion applies asymmetrically across them.
+
+#### Guard Conditions
+
+- Skip if `elapsed < 2 min` — too short to be meaningful
+- Skip if worker count changed mid-interval — can't cleanly attribute
+- Skip if `delta_pct[W] == 0` across all windows but tokens > 0 — API rounding artifact
+- Discard samples > 3σ from current EMA per window
+- When a window resets mid-interval, discard that interval's pct_delta for that window only (it spans two separate quota periods)
+
+**Claude Code cache behavior note:** Cache reads dominate token counts (cheap, 0.1× input) while 1h cache writes are the most expensive token type per unit (2.0× input). Dollar-equivalent burn rate is the most accurate single measure of plan consumption rate, more so than raw token count or even pct/hr alone.
 
 ---
 
@@ -662,12 +837,16 @@ alerts:
    - Stores `{filepath: byte_offset}` so restarts resume where they left off without re-scanning
    - New files detected via glob on each pass
 
-3. `plan_pct_delta` annotation: on each governor poll cycle, join the most recent token collector record to the concurrent API percent snapshot to fill in `plan_pct_delta`. This is the only field the collector cannot populate itself.
+3. `window_pct_deltas` annotation: on each governor poll cycle, the governor joins the interval's instance records to the concurrent API percentage snapshots to fill in `pct_delta_5h`, `pct_delta_7d`, `pct_delta_7d_s`. Apportionment across instances uses each instance's `dollar_equiv.total` as the weight (heavier-spending workers are attributed proportionally more of the observed percentage movement). This is the only field the collector cannot self-populate.
 
-4. Test independently:
-   - Verify dollar computation against known API pricing
+4. Write one `fleet_aggregate` record per interval after all `instance_delta` records, containing aggregated stats, `per_worker_stats` (mean/p75/stddev), `window_snapshots` from the API, and the full `capacity_forecast` block.
+
+5. Test independently:
+   - Verify dollar computation against known API pricing (unit test each token type and model)
    - Verify delta (not cumulative) — run twice, confirm second pass only counts new messages
    - Verify correct model attribution when multiple models active in same session
+   - Verify per-worker variance calculation with synthetic data (3 workers, divergent rates)
+   - Verify `binding_window` selection when 5h is more constraining than 7d
 
 **Deliverable:** `scripts/token-collector.py` — fully standalone, can be queried without the governor running.
 
@@ -715,27 +894,30 @@ alerts:
 
 **Goal:** Empirically calibrate per-model burn rates in %/hr, tokens/hr, and $/hr.
 
-1. Extend state store with `burn_rate.by_model` block, `token_deltas`, and `capacity_estimate` as specified in the State Store schema.
+1. Extend state store with `burn_rate.by_model`, `last_fleet_aggregate`, and `capacity_forecast` as specified in the State Store schema.
 
 2. Write `scripts/burn-rate.py`:
-   - Joins Token Collector records to API percent snapshots over matching intervals
-   - Computes per-model samples: `pct_burn`, `token_burn`, `dollar_burn` (all per worker per hour)
-   - Applies EMA per model with `alpha = 0.2`
-   - Stores separate `tokens_per_pct_peak` and `tokens_per_pct_offpeak` for promotion validation
-   - Computes `dollars_per_pct[model]` → `capacity_estimate` block
-   - Guard conditions: skip short intervals, changed worker counts, zero-delta API responses
-   - Falls back to `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples
+   - Reads `instance_delta` records from `token-history.db` for the most recent complete interval
+   - Computes per-instance `dollar_burn` and `pct_burn` per window from annotated `window_pct_deltas`
+   - Computes fleet-level `per_worker_stats` (mean, p75, stddev) across active sessions
+   - Maintains per-(model, window) EMA with `alpha = 0.2`
+   - Generates `capacity_forecast` per window: `fleet_pct_per_hour`, `predicted_exhaustion_hours`, `will_exhaust_before_reset`, `safe_worker_count`
+   - Identifies `binding_window` — the window that will exhaust soonest
+   - Stores separate peak/off-peak `tokens_per_pct` per window for promotion validation
+   - Guard conditions: skip short intervals, changed worker counts, window resets mid-interval, zero-delta API responses
+   - Falls back to `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples per window
 
-3. Add `workers_active` and `workers_by_model` to each governor state snapshot so burn rate can be attributed to the correct model mix.
+3. Update `compute_target_workers()` in governor to use `safe_worker_count[binding_window]` as the ceiling rather than the single-window formula.
 
-4. Dollar-based capacity estimate — updated each cycle:
+4. Log per-window capacity forecast each cycle:
    ```
-   dollars_per_pct = ema_dollar_burn_per_worker_hr / ema_pct_burn_per_worker_hr
-   remaining_dollars = dollars_per_pct * remaining_pct
+   [governor] 5h: 63.6% remaining, resets in 1.5h — OK (exhausts in 8h at current rate)
+   [governor] 7d: 27.4% remaining, resets in 37.5h — OK (not binding)
+   [governor] 7d-sonnet: 36.5% remaining, resets in 37.5h — BINDING (exhausts in 4.1h at 2 workers)
+   [governor] → target: 2 workers (safe_worker_count from binding window)
    ```
-   Log this alongside the percentage: "72% used, ~$46 API-equivalent remaining."
 
-**Deliverable:** `scripts/burn-rate.py` + updated state schema + capacity estimate output
+**Deliverable:** `scripts/burn-rate.py` + updated state schema + per-window capacity forecast
 
 ---
 
@@ -873,10 +1055,12 @@ claude-governor/
 | **Usage source** | TUI screen-scraper (~10s, fragile) | Direct API call (~200ms, reliable) |
 | **Off-peak math** | `effective_hours` computed but not used | Fully integrated into target calculation |
 | **Burn rate** | Hardcoded `1.2%/worker/hr`, model-agnostic | Per-model EMA in %/hr, tokens/hr, and $/hr |
-| **Token tracking** | None | Per-model delta by type: input/output/cache-read/cache-write |
-| **Dollar equivalent** | None | $/hr burn and estimated remaining API-equivalent value |
-| **Promotion validation** | Assumed correct | Cross-validated against observed tokens-per-percent ratio |
-| **Capacity estimate** | % remaining only | % + estimated $ remaining based on observed $/% ratio |
+| **Token tracking** | None | Per-instance delta by type: input/output/cache-read/cw-5m/cw-1h |
+| **Dollar equivalent** | None | $/hr burn and estimated remaining API-equivalent value per window |
+| **Promotion validation** | Assumed correct | Cross-validated per window against observed tokens-per-percent ratio |
+| **Capacity estimate** | % remaining only | Per-window forecast: exhaustion time, safe worker count, binding window |
+| **Cross-instance comparison** | None | Per-worker variance (mean/p75/stddev) drives conservative planning |
+| **Multi-window optimization** | Single window | All three windows tracked independently; binding window governs target |
 | **Scale-down** | `tmux kill-session` (forceful) | Graceful SIGINT to idle workers only |
 | **Hysteresis** | None — thrashes every cycle | ±1 worker dead band |
 | **Workspace** | Hard-coded `kalshi-trading` | Auto-discovered by needle run |
