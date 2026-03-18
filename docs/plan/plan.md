@@ -33,28 +33,39 @@ The system replaces the current `capacity-governor.sh` (screen-scraping, statele
 │                                                         │
 │  ┌──────────────┐    ┌─────────────────┐               │
 │  │  Usage Poller │    │  State Store    │               │
-│  │  (API-based) │───▶│  (JSON files)   │               │
-│  └──────────────┘    └────────┬────────┘               │
-│                               │                         │
-│  ┌──────────────┐    ┌────────▼────────┐               │
-│  │  Scheduler   │◀───│  Rate Estimator │               │
-│  │  (off-peak   │    │  (adaptive burn │               │
-│  │   aware)     │    │   rate model)   │               │
-│  └──────┬───────┘    └─────────────────┘               │
-│         │                                               │
-│  ┌──────▼───────────────────────────────────┐          │
-│  │            Worker Manager                 │          │
-│  │  ┌──────────────┐  ┌──────────────────┐  │          │
-│  │  │  Scale Up    │  │  Scale Down      │  │          │
-│  │  │  (needle run)│  │  (graceful only) │  │          │
-│  │  └──────────────┘  └──────────────────┘  │          │
-│  └───────────────────────────────────────────┘          │
-│                                                         │
-│  ┌──────────────────────────────────────────┐           │
-│  │            Alert Manager                  │           │
-│  │  (creates HUMAN-type beads near limits)   │           │
-│  └──────────────────────────────────────────┘           │
+│  │  (API-based) │───▶│  (JSON files)   │◀──────────┐   │
+│  └──────────────┘    └────────┬────────┘            │   │
+│                               │                      │   │
+│  ┌──────────────┐    ┌────────▼────────┐            │   │
+│  │  Scheduler   │◀───│  Rate Estimator │            │   │
+│  │  (off-peak   │    │  (adaptive burn │            │   │
+│  │   aware)     │    │   rate model)   │            │   │
+│  └──────┬───────┘    └─────────────────┘            │   │
+│         │                                            │   │
+│  ┌──────▼───────────────────────────────────┐       │   │
+│  │            Worker Manager                 │       │   │
+│  │  ┌──────────────┐  ┌──────────────────┐  │       │   │
+│  │  │  Scale Up    │  │  Scale Down      │  │       │   │
+│  │  │  (needle run)│  │  (graceful only) │  │       │   │
+│  │  └──────────────┘  └──────────────────┘  │       │   │
+│  └───────────────────────────────────────────┘       │   │
+│                                                      │   │
+│  ┌──────────────────────────────────────────┐        │   │
+│  │            Alert Manager                  │        │   │
+│  │  (creates HUMAN-type beads near limits)   │        │   │
+│  └──────────────────────────────────────────┘        │   │
+│                                                      │   │
+│  ┌────────────────────────────────────────────────┐  │   │
+│  │   Token Collector (independent daemon)          │──┘   │
+│  │   tails ~/.claude/projects/**/*.jsonl           │      │
+│  └────────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────┘
+                          │ reads state
+              ┌───────────▼───────────┐
+              │      cgov CLI         │
+              │  humans: status TUI   │
+              │  robots: --json/exit  │
+              └───────────────────────┘
 ```
 
 ---
@@ -700,6 +711,40 @@ If any window `utilization >= 98%`, immediately scale all workers to 0 regardles
 
 ---
 
+### 10. CLI Output Layer (`cgov`)
+
+A single `cgov` entry point provides both human and machine interfaces to all governor state. It reads `governor-state.json` and the token-history DB directly — it does not need the daemon running to show current data.
+
+**Dual-mode design:** every subcommand detects whether stdout is a TTY:
+- TTY → colorized human-readable table
+- non-TTY or `--json` → raw JSON to stdout, errors to stderr
+
+**Exit codes carry semantic meaning** so scripts can branch without parsing JSON:
+- `0` = all windows safe
+- `1` = general error / daemon not running
+- `2` = cutoff risk active (one or more windows)
+- `3` = emergency brake engaged
+
+**`cgov status` human output:**
+```
+Claude Governor — 2026-03-18 14:30 ET
+──────────────────────────────────────────────────────
+Window          Used    Ceiling  Remain  Resets    Risk
+five_hour        36%      85%     49%    in 1h30   OK
+seven_day        73%      90%     17%    in 37h    ⚠ CUTOFF (2.7h at current rate)
+seven_day_sonnet 64%      90%     26%    in 37h    ⚠ CUTOFF (2.9h) ← BINDING
+
+Workers:  2 active  (target: 2 · safe ceiling: 2)
+Burn:     $2.15/hr  (p75 per worker)
+Peak:     no  (promo 2x active, off-peak until 08:00 ET)
+──────────────────────────────────────────────────────
+Last cycle: 14s ago  |  Next: in 4m46s
+```
+
+**Daemon management via `cgov`:** `cgov enable/disable/start/stop/restart` abstract over systemd user services (Linux) and tmux sessions (fallback), so callers never need to know the underlying mechanism.
+
+---
+
 ## Configuration File
 
 `~/.needle/config/governor.yaml`:
@@ -996,35 +1041,175 @@ alerts:
 
 ---
 
-### Phase 6: Packaging and Deployment
+### Phase 6: CLI, Packaging, and Deployment
 
-**Goal:** Make the governor easy to install and run as a persistent daemon.
+**Goal:** Ship a single `cgov` CLI entry point that works for both humans and scripts, with a one-command install that persists across reboots.
 
-1. Write `install.sh`:
-   - Copies scripts to `~/.needle/bin/`
-   - Writes default `governor.yaml` if not present
-   - Creates systemd user service OR launchd plist (cross-platform)
-   - Optionally migrates from existing `capacity-governor.sh`
+#### 6.1 — `cgov` CLI Entry Point
 
-2. Write `governor.service` (systemd user unit):
-   ```ini
-   [Unit]
-   Description=Claude Governor — quota-aware worker scaler
-   After=network.target
+A thin Bash wrapper at `~/.local/bin/cgov` that dispatches to the underlying scripts. Every subcommand supports `--json` for machine-readable output.
 
-   [Service]
-   Type=simple
-   ExecStart=%h/.needle/bin/governor.sh --loop
-   Restart=on-failure
-   RestartSec=60
+**Subcommand surface:**
 
-   [Install]
-   WantedBy=default.target
+```
+cgov status [--json] [--watch]             # Windows, workers, burn rate, cutoff risk
+cgov forecast [--json]                     # Window forecast only (latest w records)
+cgov workers [--json]                      # Worker count, targets, heartbeat status
+cgov scale <N> [--dry-run]                 # Manually override target worker count
+cgov start                                 # Start the governor daemon
+cgov stop                                  # Stop the governor daemon (graceful)
+cgov restart                               # Restart daemon
+cgov enable                                # Install + enable systemd service (survives reboot)
+cgov disable                               # Disable systemd service
+cgov logs [--follow] [--lines N]           # Tail governor log
+cgov token-history [--json] [--last N] [--window W]  # Query w records
+cgov config [--edit]                       # Print active config; --edit opens $EDITOR
+cgov version                               # Print version and component status
+```
+
+**Human output (`cgov status`):**
+
+```
+Claude Governor — 2026-03-18 14:30 ET
+──────────────────────────────────────────────────────
+Window          Used    Ceiling  Remain  Resets    Risk
+five_hour        36%      85%     49%    in 1h30   OK
+seven_day        73%      90%     17%    in 37h    ⚠ CUTOFF (2.7h at current rate)
+seven_day_sonnet 64%      90%     26%    in 37h    ⚠ CUTOFF (2.9h) ← BINDING
+
+Workers:  2 active  (target: 2 · safe ceiling: 2)
+Burn:     $2.15/hr  (p75 per worker)
+Peak:     no  (promo 2x active, off-peak until 08:00 ET)
+──────────────────────────────────────────────────────
+Last cycle: 14s ago  |  Next: in 4m46s
+```
+
+- Color coding: green = OK, yellow = approaching ceiling, red = cutoff risk
+- Falls back to plain ASCII when `NO_COLOR` is set or stdout is not a TTY
+- `--watch` clears terminal and re-renders on a 30s interval
+
+**Robot output (`cgov status --json`):**
+
+Emits the full `governor-state.json` to stdout. Exit codes signal actionable states without requiring JSON parsing:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | All windows safe |
+| `1` | General error (daemon not running, parse failure) |
+| `2` | Cutoff risk active on one or more windows |
+| `3` | Emergency brake engaged (a window ≥ 98%) |
+
+```bash
+# Branch on exit code without parsing JSON:
+cgov status --json > state.json
+case $? in
+  2) echo "Cutoff risk — pausing new submissions" ;;
+  3) echo "Emergency brake — halt all workers" ;;
+esac
+```
+
+**Non-TTY auto-detection:** When stdout is not a TTY and `--json` is omitted, `cgov status` emits JSON automatically — assumes pipeline. Human formatting only when writing to a terminal.
+
+#### 6.2 — Daemon Management
+
+Two modes, selected at install time based on what's available:
+
+**Mode A: systemd user service (Linux default)**
+
+```ini
+# ~/.config/systemd/user/claude-governor.service
+[Unit]
+Description=Claude Governor — quota-aware worker scaler
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cgov _daemon
+Restart=on-failure
+RestartSec=60
+StandardOutput=append:%h/.needle/logs/governor.log
+StandardError=append:%h/.needle/logs/governor.log
+
+[Install]
+WantedBy=default.target
+```
+
+```ini
+# ~/.config/systemd/user/claude-token-collector.service
+[Unit]
+Description=Claude Governor — token collector
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cgov _token-collector
+Restart=on-failure
+RestartSec=30
+```
+
+```bash
+cgov enable   # installs units → daemon-reload → enable + start both
+cgov disable  # stop + disable both units
+cgov start    # start daemon (must already be enabled, or use enable)
+cgov stop     # graceful stop — governor finishes current cycle before exiting
+```
+
+**Mode B: tmux sessions (fallback — no systemd or macOS)**
+
+```bash
+# cgov start (tmux fallback path)
+tmux new-session -d -s "claude-governor" "cgov _daemon"
+tmux new-session -d -s "claude-token-collector" "cgov _token-collector"
+```
+
+`cgov start` auto-detects whether a systemd user session is available and picks the appropriate mode. The chosen mode is written to `governor.yaml` as `daemon_mode: systemd|tmux`. `cgov stop` uses the same detection to know how to stop it.
+
+`cgov logs --follow` works regardless of mode — it tails the log file directly, not the service journal.
+
+#### 6.3 — Install Script
+
+**One-liner install:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh | bash
+```
+
+**Or from clone:**
+```bash
+git clone https://github.com/jedarden/claude-governor
+cd claude-governor && ./install.sh
+```
+
+`install.sh` steps:
+1. Check prerequisites: `bash ≥4`, `python3` (stdlib only), `curl`, `jq`; warn if `needle` / `br` absent but do not abort
+2. Copy `scripts/` → `~/.local/share/claude-governor/`
+3. Copy default configs → `~/.needle/config/` (skip existing files — never clobber user config)
+4. Write `~/.local/bin/cgov` dispatcher
+5. Create `~/.needle/logs/` and `~/.needle/state/` if absent
+6. Detect systemd availability; install units if present, print tmux fallback note otherwise
+7. Print quickstart message:
    ```
+   Installed cgov v0.1.0
+     cgov enable    → start daemon (survives reboot)
+     cgov start     → start now, this session only
+     cgov status    → check state
+   Config: ~/.needle/config/governor.yaml
+   ```
+8. Migration note: if `capacity-governor.sh` is detected, print the key config differences; do not modify or replace the old script
 
-3. Write `README.md` with quickstart, configuration guide, and troubleshooting.
+**Upgrade:**
+```bash
+cd claude-governor && git pull && ./install.sh --upgrade
+```
+`--upgrade` overwrites scripts and units but never touches config files.
 
-**Deliverable:** Installable package with systemd service
+**Uninstall:**
+```bash
+cgov disable
+./install.sh --uninstall
+```
+Removes `~/.local/bin/cgov`, `~/.local/share/claude-governor/`, systemd units. Does **not** touch `~/.needle/state/` (collected data) or `~/.needle/config/governor.yaml` (configuration).
+
+**Deliverable:** `install.sh`, `bin/cgov` dispatcher, systemd unit files, `README.md` quickstart
 
 ---
 
@@ -1032,8 +1217,10 @@ alerts:
 
 ```
 claude-governor/
+├── bin/
+│   └── cgov                  # CLI entry point / dispatcher (Phase 6)
 ├── scripts/
-│   ├── governor.sh           # Main daemon (Phase 4)
+│   ├── governor.sh           # Main daemon loop (Phase 4) — invoked via cgov _daemon
 │   ├── poll-usage.sh         # Direct API usage poller (Phase 1)
 │   ├── token-collector.py    # Independent token delta collector (Phase 1b)
 │   ├── worker-manager.sh     # Scale-up/down logic (Phase 4)
@@ -1044,9 +1231,9 @@ claude-governor/
 │   ├── governor.yaml         # Main configuration (incl. pricing table)
 │   └── promotions.json       # Promotion window definitions
 ├── systemd/
-│   ├── governor.service      # Systemd user service — governor daemon
-│   └── token-collector.service  # Systemd user service — token collector daemon
-├── install.sh                # Installation helper
+│   ├── claude-governor.service       # Systemd user service — governor daemon
+│   └── claude-token-collector.service  # Systemd user service — token collector
+├── install.sh                # Install / upgrade / uninstall helper
 ├── docs/
 │   ├── research/
 │   │   ├── usage-tracking.md
