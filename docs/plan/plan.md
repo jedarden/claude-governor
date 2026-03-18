@@ -169,14 +169,16 @@ The session filename path encodes the model used; the `model` field in the messa
     "input_tokens": 45230,
     "output_tokens": 8340,
     "cache_read_tokens": 312000,
-    "cache_write_tokens": 28500
+    "cache_write_5m_tokens": 12000,
+    "cache_write_1h_tokens": 16500
   },
   "dollar_equiv": {
     "input": 0.1357,
     "output": 0.1251,
     "cache_read": 0.0936,
-    "cache_write": 0.1069,
-    "total": 0.4613
+    "cache_write_5m": 0.0450,
+    "cache_write_1h": 0.0990,
+    "total": 0.4984
   },
   "plan_pct_delta": 0.8
 }
@@ -232,13 +234,15 @@ token-collector --summary      # model totals for current 7d window
       "input_tokens": 45230,
       "output_tokens": 8340,
       "cache_read_tokens": 312000,
-      "cache_write_tokens": 28500,
+      "cache_write_5m_tokens": 12000,
+      "cache_write_1h_tokens": 16500,
       "dollar_equiv": {
         "input": 0.1357,
         "output": 0.1251,
         "cache_read": 0.0936,
-        "cache_write": 0.1069,
-        "total": 0.4613
+        "cache_write_5m": 0.0450,
+        "cache_write_1h": 0.0990,
+        "total": 0.4984
       }
     },
     "claude-opus-4-6": {
@@ -246,13 +250,15 @@ token-collector --summary      # model totals for current 7d window
       "input_tokens": 3100,
       "output_tokens": 920,
       "cache_read_tokens": 18400,
-      "cache_write_tokens": 3200,
+      "cache_write_5m_tokens": 800,
+      "cache_write_1h_tokens": 2400,
       "dollar_equiv": {
-        "input": 0.0465,
-        "output": 0.0690,
-        "cache_read": 0.0276,
-        "cache_write": 0.0600,
-        "total": 0.2031
+        "input": 0.0155,
+        "output": 0.0230,
+        "cache_read": 0.0092,
+        "cache_write_5m": 0.0050,
+        "cache_write_1h": 0.0240,
+        "total": 0.0767
       }
     }
   },
@@ -292,8 +298,9 @@ token-collector --summary      # model totals for current 7d window
       },
       "claude-opus-4-6": {
         "pct_per_worker_per_hour": 3.80,
-        "dollars_per_worker_per_hour": 24.37,
+        "dollars_per_worker_per_hour": 9.21,
         "samples": 4
+        // NOTE: Opus 4.6 is $5/$25/MTok (not $15/$75) — dollar rate ~1.7x Sonnet, not 4-5x
       }
     },
     "tokens_per_pct_peak": 69780,
@@ -371,13 +378,28 @@ target_workers = clamp(target_workers, min_workers, max_workers)
 
 ```
 # Per model, per interval
-pct_burn_sample   = delta_pct   / elapsed_hours / workers_active
-token_burn_sample = delta_tokens / elapsed_hours / workers_active   # sum of all token types
-dollar_burn_sample = delta_usd  / elapsed_hours / workers_active
+pct_burn_sample    = delta_pct    / elapsed_hours / workers_active
+token_burn_sample  = delta_tokens / elapsed_hours / workers_active   # sum of all token types
+dollar_burn_sample = delta_usd    / elapsed_hours / workers_active
 
-# Dollar breakdown by token type (Sonnet example):
-delta_usd = (delta_input * 3.00 + delta_output * 15.00
-           + delta_cache_write * 3.75 + delta_cache_read * 0.30) / 1_000_000
+# Dollar breakdown by token type — must split cache writes into 5m and 1h tiers
+# Source fields: usage.cache_creation.ephemeral_5m_input_tokens
+#                usage.cache_creation.ephemeral_1h_input_tokens
+# (Sonnet 4.6 example — prices: $3/$15/$3.75/$6/$0.30 per MTok)
+delta_usd = (delta_input         * 3.00
+           + delta_output        * 15.00
+           + delta_cache_w_5m    * 3.75   # 1.25x input
+           + delta_cache_w_1h    * 6.00   # 2.0x input
+           + delta_cache_read    * 0.30   # 0.1x input
+           ) / 1_000_000
+
+# Opus 4.6 example — NOTE: $5/$25, not $15/$75 (those are Opus 4.1/4 legacy rates)
+delta_usd = (delta_input         * 5.00
+           + delta_output        * 25.00
+           + delta_cache_w_5m    * 6.25
+           + delta_cache_w_1h    * 10.00
+           + delta_cache_read    * 0.50
+           ) / 1_000_000
 ```
 
 **Exponential moving average (EMA) per model:**
@@ -408,7 +430,9 @@ Stored separately for peak vs. off-peak intervals. During the off-peak promotion
 
 **Fallback per model:** Use configured `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples are available.
 
-**Why model separation matters:** A fleet of 2 Sonnet + 1 Opus workers doesn't burn quota at `3 * sonnet_rate`. The Opus worker may burn 3–4x the quota per hour. A model-agnostic governor will systematically overshoot when Opus is active.
+**Why model separation matters:** A fleet of 2 Sonnet + 1 Opus workers doesn't burn quota at `3 * sonnet_rate`. The Opus worker may burn 3–4x the plan-percent per hour (heavier context, longer turns). In dollar terms, Opus 4.6 is ~1.67× Sonnet 4.6 (not 5×, as the legacy Opus 4.1 pricing implied). A model-agnostic governor will systematically overshoot on plan-percent when Opus is active.
+
+**Claude Code cache behavior note:** Claude Code makes heavy use of 1-hour prompt caching for system prompts, file contexts, and conversation history. In practice, `cache_read_tokens` typically dominate token counts but cost only 0.1× input price. This means raw token counts are a poor proxy for dollar cost — dollar-equivalent burn rate is more representative. The split between `cache_write_5m` and `cache_write_1h` is significant: 1h writes cost 2× input vs 1.25× for 5m writes.
 
 ---
 
@@ -529,22 +553,46 @@ agents:
 promotions_file: ~/.needle/config/promotions.json
 
 # API pricing (USD per million tokens) — used for dollar-equivalent burn rate
-# Update when Anthropic changes public pricing
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
+# Update when Anthropic changes public pricing.
+# NOTE: Two cache write tiers exist (5-minute TTL and 1-hour TTL) with different rates.
+# The API response's usage.cache_creation sub-object distinguishes them.
 pricing:
   claude-sonnet-4-6:
     input_per_mtok: 3.00
     output_per_mtok: 15.00
-    cache_write_per_mtok: 3.75
+    cache_write_5m_per_mtok: 3.75   # 1.25x input
+    cache_write_1h_per_mtok: 6.00   # 2.0x input
+    cache_read_per_mtok: 0.30       # 0.1x input
+  claude-sonnet-4-5:
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    cache_write_5m_per_mtok: 3.75
+    cache_write_1h_per_mtok: 6.00
     cache_read_per_mtok: 0.30
-  claude-opus-4-6:
-    input_per_mtok: 15.00
-    output_per_mtok: 75.00
-    cache_write_per_mtok: 18.75
-    cache_read_per_mtok: 1.50
-  claude-haiku-4-5:
+  claude-opus-4-6:                  # NOTE: Opus 4.6 is $5/$25, NOT $15/$75
+    input_per_mtok: 5.00            # Opus 4.1/4 were $15/$75 — those are legacy models
+    output_per_mtok: 25.00
+    cache_write_5m_per_mtok: 6.25
+    cache_write_1h_per_mtok: 10.00
+    cache_read_per_mtok: 0.50
+  claude-opus-4-5:
+    input_per_mtok: 5.00
+    output_per_mtok: 25.00
+    cache_write_5m_per_mtok: 6.25
+    cache_write_1h_per_mtok: 10.00
+    cache_read_per_mtok: 0.50
+  claude-haiku-4-5:                 # NOTE: Haiku 4.5 is $1/$5, not $0.80/$4 (those are Haiku 3.5)
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+    cache_write_5m_per_mtok: 1.25
+    cache_write_1h_per_mtok: 2.00
+    cache_read_per_mtok: 0.10
+  claude-haiku-3-5:
     input_per_mtok: 0.80
     output_per_mtok: 4.00
-    cache_write_per_mtok: 1.00
+    cache_write_5m_per_mtok: 1.00
+    cache_write_1h_per_mtok: 1.60
     cache_read_per_mtok: 0.08
 
 # Token collector
@@ -596,7 +644,13 @@ alerts:
 
 1. Write `scripts/token-collector.py`:
    - Walks `~/.claude/projects/**/*.jsonl` to find unprocessed lines (tracks cursor per file in `~/.needle/state/collector-cursors.json`)
-   - Parses each assistant message's `usage` block: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`
+   - Parses each assistant message's `usage` block — must read the nested `cache_creation` sub-object to split writes by tier:
+     - `usage.input_tokens` — fresh input
+     - `usage.output_tokens` — output
+     - `usage.cache_read_input_tokens` — cache hits (0.1× input rate)
+     - `usage.cache_creation.ephemeral_5m_input_tokens` — 5-min writes (1.25× input rate)
+     - `usage.cache_creation.ephemeral_1h_input_tokens` — 1-hour writes (2.0× input rate)
+     - Falls back to `usage.cache_creation_input_tokens` as 5m when sub-object absent
    - Extracts `model` from the message or infers from session path
    - Accumulates deltas per model per collection interval
    - Computes dollar equivalent for each token type using pricing from `governor.yaml`
@@ -850,6 +904,8 @@ claude-governor/
 
 7. **Token collector lag:** The collector reads JSONL files that may be flushed with a short delay after each API call. For burn rate samples, use intervals ≥ 2 minutes to ensure all requests in the window have been written. The `pct_delta` annotation from the API snapshot is the authoritative signal; token deltas enrich it.
 
-8. **Pricing staleness:** The `pricing` block in `governor.yaml` must be manually updated when Anthropic changes API rates. Dollar-equivalent figures become misleading if rates drift. Log the pricing version and date so stale configs are detectable.
+8. **Pricing staleness and model generation confusion:** The `pricing` block in `governor.yaml` must be manually updated when Anthropic changes API rates. Critically, Opus 4.6/4.5 pricing ($5/$25) is dramatically different from Opus 4.1/4 ($15/$75) — a stale config using the wrong generation will produce 3× dollar-equivalent errors. Log the pricing source URL and snapshot date in `governor.yaml`. When a new model version is detected in token records but not found in the pricing config, log a warning and fall back to the nearest known model's pricing rather than silently using wrong rates.
+
+9. **Single vs. two-tier cache write fallback:** Not all API responses include the `cache_creation` sub-object (it may be absent in older response formats or certain service tiers). When absent, attribute all `cache_creation_input_tokens` to the 5-minute tier (1.25× rate) as the conservative fallback — this slightly underestimates cost rather than overestimating.
 
 9. **Model attribution in multi-model sessions:** A single Claude Code session can make calls to multiple models (e.g., a tool-call routing to Haiku while the main conversation uses Sonnet). Token records must be attributed per-model from the `model` field in each response, not inferred from the session path alone.
