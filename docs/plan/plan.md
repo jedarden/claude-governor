@@ -88,6 +88,23 @@ curl -s \
 - `five_hour.utilization` — session burst usage %
 - `five_hour.resets_at` — session reset timestamp
 
+**Token count collection (supplementary):**
+
+The API returns percentages only, not raw token counts. Raw token counts are available locally from `~/.ccdash/tokens.db` (SQLite) and `~/.claude/projects/**/*.jsonl`. Each polling cycle also reads the cumulative token total to pair with the percentage snapshot:
+
+```bash
+# Cumulative tokens from ccdash db (fast — pre-aggregated)
+TOKENS=$(sqlite3 ~/.ccdash/tokens.db \
+    "SELECT SUM(total_input_tokens + total_output_tokens + total_cache_read_tokens)
+     FROM file_aggregates
+     WHERE earliest_timestamp >= datetime('now', '-7 days')" 2>/dev/null || echo 0)
+```
+
+Pairing `(utilization_pct, cumulative_tokens, timestamp, is_peak)` in each snapshot enables:
+1. Computing tokens-per-percent-point, which should be ~2x higher during off-peak
+2. Validating the promotion is working as expected
+3. Expressing burn rate in tokens/hr (more stable than %/hr as plan tier changes)
+
 **Polling frequency:** Every 5 minutes (vs. current 15 min). The API is lightweight (~200ms) and less prone to rate-limiting than the TUI scraper.
 
 **Token refresh:** When `expiresAt - now < 5 minutes`, POST to `https://platform.claude.com/v1/oauth/token` with the refresh token. Update `~/.claude/.credentials.json` in place.
@@ -107,7 +124,10 @@ curl -s \
     "all_models_pct": 81.0,
     "five_hour_pct": 14.0,
     "sonnet_resets_at": "2026-03-20T03:59:59Z",
-    "five_hour_resets_at": "2026-03-18T15:59:59Z"
+    "five_hour_resets_at": "2026-03-18T15:59:59Z",
+    "tokens_7d": 4821043,
+    "tokens_5h": 312847,
+    "tokens_source": "ccdash_db"
   },
 
   "schedule": {
@@ -195,12 +215,16 @@ target_workers = clamp(target_workers, min_workers, max_workers)
 
 ### 4. Adaptive Burn Rate Estimator
 
-**Problem:** The current `1.2% per worker per hour` constant is never validated.
+**Problem:** The current `1.2% per worker per hour` constant is never validated. Percentage burn rate is also unstable — it encodes both actual consumption and plan tier (1% on a Max 20x plan represents far more tokens than 1% on a Pro plan).
 
-**Solution:** Measure empirical burn rate from consecutive state snapshots.
+**Solution:** Track burn rate in **both** percentage and tokens per worker per hour, derived from consecutive state snapshots.
 
 ```
-burn_rate_sample = (pct_now - pct_prev) / hours_since_prev / workers_active_during_interval
+# Percentage-based (used for target worker calculation against plan limit)
+pct_burn_sample = (pct_now - pct_prev) / hours_since_prev / workers_active_during_interval
+
+# Token-based (more stable; useful for cross-plan comparison and promotion validation)
+token_burn_sample = (tokens_now - tokens_prev) / hours_since_prev / workers_active_during_interval
 ```
 
 **Exponential moving average (EMA) to smooth noisy samples:**
@@ -209,11 +233,31 @@ new_burn_rate = alpha * latest_sample + (1 - alpha) * previous_burn_rate
 alpha = 0.2  # weight recent observations more than old
 ```
 
+**Tokens-per-percent ratio (promotion validation signal):**
+```
+tokens_per_pct = token_burn_sample / pct_burn_sample
+```
+During the off-peak promotion, `tokens_per_pct` should be approximately **2x** its peak-hour value — because consuming 1% off-peak requires twice the tokens. If the ratio stays flat across peak/off-peak transitions, the promotion is not applying correctly to that limit bucket. Store peak and off-peak samples separately to compute this ratio.
+
 **Fallback:** Use baseline (`1.2%/worker/hr`) when fewer than 3 samples are available or when variance is high.
 
-**Store:** `burn_rate` block in `governor-state.json`
+**Store:** `burn_rate` block in `governor-state.json`:
+```json
+"burn_rate": {
+  "observed_pct_per_worker_per_hour": 1.35,
+  "observed_tokens_per_worker_per_hour": 94200,
+  "tokens_per_pct_peak": 69780,
+  "tokens_per_pct_offpeak": 141350,
+  "offpeak_ratio_observed": 2.03,
+  "offpeak_ratio_expected": 2.0,
+  "promotion_validated": true,
+  "samples": 12,
+  "last_sample_at": "2026-03-18T14:15:00Z",
+  "baseline_pct_per_worker_per_hour": 1.2
+}
+```
 
-**Why this matters:** If actual burn rate is 1.8%/hr (e.g., heavy context workloads), the governor would set targets 50% too high and risk hitting the limit. If it's 0.8%/hr (lightweight tasks), it would under-provision.
+**Why this matters:** If actual burn rate is 1.8%/hr, the governor sets targets 50% too high and risks hitting the limit. Token-based tracking also gives a cross-promotion calibration signal — if `offpeak_ratio_observed` diverges significantly from `offpeak_ratio_expected`, the `promotions.json` multiplier needs adjustment.
 
 ---
 
@@ -386,7 +430,23 @@ alerts:
    - Past-promo-end returns 1x
    - Effective hours: 40h reset with 30h off-peak should be > 40
 
-**Deliverable:** `scripts/schedule.py` + `config/promotions.json`
+4. **Promotion validation against measured consumption:**
+
+   The `offpeak_multiplier: 2.0` in `promotions.json` is taken from the official announcement — it needs to be confirmed against observed data before the governor trusts it for scheduling.
+
+   **Validation approach:** Once the poller has accumulated ≥5 peak-hour samples and ≥5 off-peak samples with the same worker count, compute:
+   ```
+   observed_ratio = median(tokens_per_pct_offpeak_samples) / median(tokens_per_pct_peak_samples)
+   ```
+   - If `observed_ratio` is within 10% of `offpeak_multiplier` (e.g., 1.8–2.2 for a declared 2.0): **validated**, log confirmation.
+   - If `observed_ratio < 1.2`: promotion may not be applying — log warning, fall back to 1x multiplier until re-validated.
+   - If `observed_ratio > 2.5`: unexpected — log anomaly, use observed ratio instead of declared.
+
+   Write validation result to `burn_rate.promotion_validated` in state file. The scheduler reads this flag: if `false`, it uses `offpeak_multiplier: 1.0` (conservative) rather than the declared 2.0.
+
+   This guards against: the promotion ending early, the multiplier applying to some limit buckets but not others, or a future promotion with a different multiplier being misconfigured.
+
+**Deliverable:** `scripts/schedule.py` + `config/promotions.json` + promotion validation logic in burn-rate estimator
 
 ---
 
@@ -530,7 +590,8 @@ claude-governor/
 |---|---|---|
 | **Usage source** | TUI screen-scraper (~10s, fragile) | Direct API call (~200ms, reliable) |
 | **Off-peak math** | `effective_hours` computed but not used | Fully integrated into target calculation |
-| **Burn rate** | Hardcoded `1.2%/worker/hr` | Adaptive EMA from observed data |
+| **Burn rate** | Hardcoded `1.2%/worker/hr` | Adaptive EMA in both %/hr and tokens/hr |
+| **Promotion validation** | Assumed correct | Cross-validated against observed tokens-per-percent ratio |
 | **Scale-down** | `tmux kill-session` (forceful) | Graceful SIGINT to idle workers only |
 | **Hysteresis** | None — thrashes every cycle | ±1 worker dead band |
 | **Workspace** | Hard-coded `kalshi-trading` | Auto-discovered by needle run |
