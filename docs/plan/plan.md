@@ -160,39 +160,45 @@ The session filename path encodes the model used; the `model` field in the messa
 
 Token-type column suffixes used throughout:
 
-| Suffix | Meaning | Pricing basis |
-|---|---|---|
-| `-input` | Fresh input tokens | base input rate |
-| `-output` | Output tokens | output rate |
-| `-r-cache` | Cache reads (hits) | 0.1× input |
-| `-w-cache-5m` | Cache writes, 5-min TTL | 1.25× input |
-| `-w-cache-1h` | Cache writes, 1-hour TTL | 2.0× input |
+| Suffix | Meaning | Pricing basis | Notes |
+|---|---|---|---|
+| `-input` | Fresh input tokens | base input rate | |
+| `-output` | Output tokens | output rate | |
+| `-r-cache` | Cache reads (hits) | 0.1× input | |
+| `-w-cache` | Cache writes | 1.25× input | Standard API always uses `{"type":"ephemeral"}` = 5-min TTL |
+| `-w-cache-1h` | Cache writes, 1-hour TTL | 2.0× input | Bedrock only (`ENABLE_PROMPT_CACHING_1H_BEDROCK`); near-zero on standard API |
+
+Claude Code hardcodes `cache_control: {"type": "ephemeral"}` for all cache writes on the standard Anthropic API. The `{"ttl": "1h"}` variant is conditionally added only on Bedrock. In practice, `-w-cache-1h` columns will be zero for standard API usage and are retained in the schema solely for Bedrock compatibility. The dollar model for standard deployments is effectively four types: `input`, `output`, `r-cache`, `w-cache`.
 
 Each token-type column appears in two variants: `-n` (token count) and `-usd` (dollar cost).
 
 #### Record Type `i` — Instance Wide Row
 
-**One line per session per interval.** All five token types appear as columns on the same row — width is `(5 tok_types × 2 variants) + metadata + total + percentages`. Since each session runs one model, tok_type columns are not model-prefixed; the `model` field carries the model identity.
+**One line per session per interval.** All token types appear as columns on the same row. Since each session runs one model, tok_type columns are not model-prefixed; the `model` field carries the model identity.
+
+Time fields for promotion detection: `hr_et` (0–23, hour in US Eastern time at `t0`) and `dow` (0=Mon … 6=Sun). Together with `pk` these allow grouping intervals by peak/off-peak without parsing timestamps, and computing the `usd_per_pct` ratio across time-of-day buckets to validate whether the 2× promotion is being applied.
 
 ```
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","pk":0,"input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-5m-n":4100,"w-cache-5m-usd":0.0154,"w-cache-1h-n":5500,"w-cache-1h-usd":0.0330,"total-usd":0.1684,"p5h":null,"p7d":null,"p7ds":null}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","pk":0,"hr_et":10,"dow":2,"input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-n":4100,"w-cache-usd":0.0154,"w-cache-1h-n":0,"w-cache-1h-usd":0,"total-usd":0.1621,"p5h":null,"p7d":null,"p7ds":null}
 ```
 
 Two workers in the same interval produce two `i` lines, directly comparable column-for-column:
 
 ```
-{"r":"i",...,"sess":"...alpha","model":"claude-sonnet-4-6","input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-5m-n":4100,"w-cache-5m-usd":0.0154,"w-cache-1h-n":5500,"w-cache-1h-usd":0.0330,"total-usd":0.1684,"p5h":null,"p7d":null,"p7ds":null}
-{"r":"i",...,"sess":"...bravo","model":"claude-sonnet-4-6","input-n":14430,"input-usd":0.0433,"output-n":2680,"output-usd":0.0402,"r-cache-n":94100,"r-cache-usd":0.0282,"w-cache-5m-n":3800,"w-cache-5m-usd":0.0143,"w-cache-1h-n":4900,"w-cache-1h-usd":0.0294,"total-usd":0.1554,"p5h":null,"p7d":null,"p7ds":null}
+{"r":"i",...,"sess":"...alpha","hr_et":10,"dow":2,"pk":0,"input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-n":4100,"w-cache-usd":0.0154,"w-cache-1h-n":0,"w-cache-1h-usd":0,"total-usd":0.1621,"p5h":null,"p7d":null,"p7ds":null}
+{"r":"i",...,"sess":"...bravo","hr_et":10,"dow":2,"pk":0,"input-n":14430,"input-usd":0.0433,"output-n":2680,"output-usd":0.0402,"r-cache-n":94100,"r-cache-usd":0.0282,"w-cache-n":3800,"w-cache-usd":0.0143,"w-cache-1h-n":0,"w-cache-1h-usd":0,"total-usd":0.1260,"p5h":null,"p7d":null,"p7ds":null}
 ```
 
 `p5h`, `p7d`, `p7ds` are `null` at write time. The governor annotates them in the SQLite mirror by apportioning each window's observed percentage delta across concurrent sessions, weighted by `total-usd`.
 
 #### Record Type `f` — Fleet Wide Row
 
-**One line per interval.** All models × all token types appear as columns, prefixed by model name: `[model]-[tok_type]-n` and `[model]-[tok_type]-usd`. Zero-filled for models with no activity in the interval. Ends with fleet-level totals, per-worker variance stats, and percentage deltas.
+**One line per interval.** All models × all token types appear as columns, prefixed by model name. Zero-filled for models with no activity. Ends with fleet totals, per-worker variance, percentage deltas, and `usd-per-pct` ratios for promotion validation.
+
+`hr_et` and `dow` appear here too, matching the `i` records, so peak/off-peak grouping is possible on either table without a join. `usd-per-pct-7ds` is the key promotion signal: divide `total-usd` by `p7ds` to get the dollar cost of 1% of the Sonnet weekly window. During active off-peak promotion this ratio should be ~2× its peak value, because the same dollar spend moves the percentage half as much.
 
 ```
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","pk":0,"workers":2,"claude-sonnet-4-6-input-n":29840,"claude-sonnet-4-6-input-usd":0.0924,"claude-sonnet-4-6-output-n":5510,"claude-sonnet-4-6-output-usd":0.0828,"claude-sonnet-4-6-r-cache-n":198300,"claude-sonnet-4-6-r-cache-usd":0.0595,"claude-sonnet-4-6-w-cache-5m-n":7900,"claude-sonnet-4-6-w-cache-5m-usd":0.0296,"claude-sonnet-4-6-w-cache-1h-n":10400,"claude-sonnet-4-6-w-cache-1h-usd":0.0624,"claude-opus-4-6-input-n":0,"claude-opus-4-6-input-usd":0,"claude-opus-4-6-output-n":0,"claude-opus-4-6-output-usd":0,"claude-opus-4-6-r-cache-n":0,"claude-opus-4-6-r-cache-usd":0,"claude-opus-4-6-w-cache-5m-n":0,"claude-opus-4-6-w-cache-5m-usd":0,"claude-opus-4-6-w-cache-1h-n":0,"claude-opus-4-6-w-cache-1h-usd":0,"total-usd":0.3201,"p75-usd-hr":2.147,"std-usd-hr":0.312,"p5h":0.66,"p7d":0.54,"p7ds":0.75}
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","pk":0,"hr_et":10,"dow":2,"workers":2,"claude-sonnet-4-6-input-n":29840,"claude-sonnet-4-6-input-usd":0.0924,"claude-sonnet-4-6-output-n":5510,"claude-sonnet-4-6-output-usd":0.0828,"claude-sonnet-4-6-r-cache-n":198300,"claude-sonnet-4-6-r-cache-usd":0.0595,"claude-sonnet-4-6-w-cache-n":7900,"claude-sonnet-4-6-w-cache-usd":0.0296,"claude-sonnet-4-6-w-cache-1h-n":0,"claude-sonnet-4-6-w-cache-1h-usd":0,"claude-opus-4-6-input-n":0,"claude-opus-4-6-input-usd":0,"claude-opus-4-6-output-n":0,"claude-opus-4-6-output-usd":0,"claude-opus-4-6-r-cache-n":0,"claude-opus-4-6-r-cache-usd":0,"claude-opus-4-6-w-cache-n":0,"claude-opus-4-6-w-cache-usd":0,"claude-opus-4-6-w-cache-1h-n":0,"claude-opus-4-6-w-cache-1h-usd":0,"total-usd":0.2643,"p75-usd-hr":2.147,"std-usd-hr":0.312,"p5h":0.66,"p7d":0.54,"p7ds":0.75,"usd-per-pct-7ds":0.3524}
 ```
 
 The column set is fixed at startup from the pricing config — all configured models appear in every `f` row, zero-filled when inactive. This keeps the schema stable and rows directly comparable across time.
@@ -214,37 +220,45 @@ The column set is fixed at startup from the pricing config — all configured mo
 ```sql
 -- Type "i": one row per session per interval
 CREATE TABLE i (
-    ts TEXT, t0 TEXT, t1 TEXT, sess TEXT, sid TEXT, model TEXT, pk INTEGER,
-    "input-n" INTEGER,     "input-usd" REAL,
-    "output-n" INTEGER,    "output-usd" REAL,
-    "r-cache-n" INTEGER,   "r-cache-usd" REAL,
-    "w-cache-5m-n" INTEGER,"w-cache-5m-usd" REAL,
-    "w-cache-1h-n" INTEGER,"w-cache-1h-usd" REAL,
+    ts TEXT, t0 TEXT, t1 TEXT, sess TEXT, sid TEXT, model TEXT,
+    pk INTEGER,       -- 1 = peak hours (8-14 ET weekdays), 0 = off-peak
+    hr_et INTEGER,    -- hour of day in US Eastern (0-23) at t0
+    dow INTEGER,      -- day of week at t0 (0=Mon … 6=Sun)
+    "input-n" INTEGER,    "input-usd" REAL,
+    "output-n" INTEGER,   "output-usd" REAL,
+    "r-cache-n" INTEGER,  "r-cache-usd" REAL,
+    "w-cache-n" INTEGER,  "w-cache-usd" REAL,    -- 5-min TTL; standard API only
+    "w-cache-1h-n" INTEGER,"w-cache-1h-usd" REAL, -- Bedrock only; near-zero on standard API
     "total-usd" REAL,
     p5h REAL, p7d REAL, p7ds REAL   -- null until governor annotates
 );
-CREATE INDEX i_t0_sess ON i(t0, sess);
+CREATE INDEX i_t0_sess  ON i(t0, sess);
 CREATE INDEX i_model_t0 ON i(model, t0);
+CREATE INDEX i_pk_t0    ON i(pk, t0);  -- fast peak vs off-peak queries
 
 -- Type "f": one wide row per interval; columns generated from pricing config
 -- Example with claude-sonnet-4-6 and claude-opus-4-6 configured:
 CREATE TABLE f (
-    ts TEXT, t0 TEXT, t1 TEXT, pk INTEGER, workers INTEGER,
-    "claude-sonnet-4-6-input-n" INTEGER,      "claude-sonnet-4-6-input-usd" REAL,
-    "claude-sonnet-4-6-output-n" INTEGER,     "claude-sonnet-4-6-output-usd" REAL,
-    "claude-sonnet-4-6-r-cache-n" INTEGER,    "claude-sonnet-4-6-r-cache-usd" REAL,
-    "claude-sonnet-4-6-w-cache-5m-n" INTEGER, "claude-sonnet-4-6-w-cache-5m-usd" REAL,
-    "claude-sonnet-4-6-w-cache-1h-n" INTEGER, "claude-sonnet-4-6-w-cache-1h-usd" REAL,
-    "claude-opus-4-6-input-n" INTEGER,        "claude-opus-4-6-input-usd" REAL,
-    "claude-opus-4-6-output-n" INTEGER,       "claude-opus-4-6-output-usd" REAL,
-    "claude-opus-4-6-r-cache-n" INTEGER,      "claude-opus-4-6-r-cache-usd" REAL,
-    "claude-opus-4-6-w-cache-5m-n" INTEGER,   "claude-opus-4-6-w-cache-5m-usd" REAL,
-    "claude-opus-4-6-w-cache-1h-n" INTEGER,   "claude-opus-4-6-w-cache-1h-usd" REAL,
+    ts TEXT, t0 TEXT, t1 TEXT,
+    pk INTEGER, hr_et INTEGER, dow INTEGER,
+    workers INTEGER,
+    "claude-sonnet-4-6-input-n" INTEGER,     "claude-sonnet-4-6-input-usd" REAL,
+    "claude-sonnet-4-6-output-n" INTEGER,    "claude-sonnet-4-6-output-usd" REAL,
+    "claude-sonnet-4-6-r-cache-n" INTEGER,   "claude-sonnet-4-6-r-cache-usd" REAL,
+    "claude-sonnet-4-6-w-cache-n" INTEGER,   "claude-sonnet-4-6-w-cache-usd" REAL,
+    "claude-sonnet-4-6-w-cache-1h-n" INTEGER,"claude-sonnet-4-6-w-cache-1h-usd" REAL,
+    "claude-opus-4-6-input-n" INTEGER,       "claude-opus-4-6-input-usd" REAL,
+    "claude-opus-4-6-output-n" INTEGER,      "claude-opus-4-6-output-usd" REAL,
+    "claude-opus-4-6-r-cache-n" INTEGER,     "claude-opus-4-6-r-cache-usd" REAL,
+    "claude-opus-4-6-w-cache-n" INTEGER,     "claude-opus-4-6-w-cache-usd" REAL,
+    "claude-opus-4-6-w-cache-1h-n" INTEGER,  "claude-opus-4-6-w-cache-1h-usd" REAL,
     "total-usd" REAL,
     "p75-usd-hr" REAL, "std-usd-hr" REAL,
-    p5h REAL, p7d REAL, p7ds REAL
+    p5h REAL, p7d REAL, p7ds REAL,
+    "usd-per-pct-7ds" REAL   -- promotion signal: should be ~2x higher when pk=0 during promo
 );
-CREATE INDEX f_t0 ON f(t0);
+CREATE INDEX f_t0    ON f(t0);
+CREATE INDEX f_pk_t0 ON f(pk, t0);  -- fast peak vs off-peak queries
 
 -- Type "w": one row per window per interval
 CREATE TABLE w (
@@ -258,12 +272,24 @@ CREATE INDEX w_win_t0 ON w(win, t0);
 
 -- Cross-instance comparison: all sessions side by side for a given interval
 CREATE VIEW instance_compare AS
-SELECT t0, sess, model,
+SELECT t0, hr_et, dow, pk, sess, model,
     "total-usd", "input-usd", "output-usd",
-    "r-cache-usd", "w-cache-5m-usd", "w-cache-1h-usd",
+    "r-cache-usd", "w-cache-usd", "w-cache-1h-usd",
     "total-usd" / ((julianday(t1)-julianday(t0))*24) AS usd_per_hour,
-    p7ds
+    p7ds,
+    CASE WHEN p7ds > 0 THEN "total-usd" / p7ds END AS usd_per_pct_7ds
 FROM i ORDER BY t0 DESC, "total-usd" DESC;
+
+-- Promotion validation: compare usd_per_pct_7ds across peak vs off-peak
+-- If 2x promotion is applying: AVG(usd_per_pct_7ds) WHERE pk=0 ≈ 2× WHERE pk=1
+CREATE VIEW promo_check AS
+SELECT pk, hr_et,
+    AVG("usd-per-pct-7ds") AS avg_usd_per_pct,
+    COUNT(*)               AS samples
+FROM f
+WHERE p7ds > 0 AND "usd-per-pct-7ds" IS NOT NULL
+GROUP BY pk, hr_et
+ORDER BY hr_et;
 ```
 
 **Standalone CLI:**
