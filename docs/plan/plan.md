@@ -156,184 +156,135 @@ The session filename path encodes the model used; the `model` field in the messa
 }
 ```
 
-**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Two record types written per collection pass:
+**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Every line is a single flat JSON object — no nested fields. Three record types, identified by `"r"`:
 
-#### Record Type 1: Per-Instance Delta
+#### Line Structure
 
-One record per active worker session per collection interval. This is the atomic unit of measurement — it preserves per-instance attribution so burn rates and variance can be computed across the fleet.
+Each line encodes exactly one measurement in the form `[model]-[tok_type]-[tokens]-[usd]-[pct]`. The `tok_type` field takes one of five values:
 
-```json
-{
-  "record_type": "instance_delta",
-  "ts": "2026-03-18T14:30:00Z",
-  "interval_start": "2026-03-18T14:25:00Z",
-  "interval_end": "2026-03-18T14:30:00Z",
-  "worker_session": "needle-claude-anthropic-sonnet-alpha",
-  "claude_session_id": "ad5b2e01-7f3c-4d9a-b812-3e9f1a2b4c5d",
-  "model": "claude-sonnet-4-6",
-  "is_peak": false,
-  "delta": {
-    "input_tokens": 15410,
-    "output_tokens": 2830,
-    "cache_read_tokens": 104200,
-    "cache_write_5m_tokens": 4100,
-    "cache_write_1h_tokens": 5500
-  },
-  "dollar_equiv": {
-    "input": 0.0462,
-    "output": 0.0425,
-    "cache_read": 0.0313,
-    "cache_write_5m": 0.0154,
-    "cache_write_1h": 0.0330,
-    "total": 0.1684
-  },
-  "window_pct_deltas": {
-    "five_hour": null,
-    "seven_day": null,
-    "seven_day_sonnet": null
-  }
-}
+| Value | Meaning | Pricing basis |
+|---|---|---|
+| `input` | Fresh input tokens | base input rate |
+| `output` | Output tokens | output rate |
+| `r-cache` | Cache reads (hits) | 0.1× input |
+| `w-cache-5m` | Cache writes, 5-min TTL | 1.25× input |
+| `w-cache-1h` | Cache writes, 1-hour TTL | 2.0× input |
+
+#### Record Type `i` — Instance Token-Type Delta
+
+One line per **(session × model × tok\_type)** per interval. Five lines per active worker (one per tok_type), all sharing the same `t0`/`t1`. The percentage fields (`p5h`, `p7d`, `p7ds`) are `null` at write time and annotated by the governor on its next poll cycle.
+
+```
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"input","n":15410,"usd":0.0462,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"output","n":2830,"usd":0.0425,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"r-cache","n":104200,"usd":0.0313,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"w-cache-5m","n":4100,"usd":0.0154,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"w-cache-1h","n":5500,"usd":0.0330,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
 ```
 
-`window_pct_deltas` are `null` at write time. The governor annotates them during its poll cycle by apportioning the observed API percentage movement across the concurrent instance records in proportion to their dollar_equiv totals. Per-instance records from the same interval are joined by `interval_start`/`interval_end`.
+After governor annotation, the percentage fields are filled in on the existing rows in the SQLite mirror (JSONL is append-only — annotated values live only in the DB):
 
-#### Record Type 2: Fleet Aggregate
-
-One record per collection interval, written after all instance records for that interval. Aggregates across all active workers and includes fleet-level statistics needed for capacity forecasting.
-
-```json
-{
-  "record_type": "fleet_aggregate",
-  "ts": "2026-03-18T14:30:00Z",
-  "interval_start": "2026-03-18T14:25:00Z",
-  "interval_end": "2026-03-18T14:30:00Z",
-  "is_peak": false,
-  "by_model": {
-    "claude-sonnet-4-6": {
-      "worker_sessions": [
-        "needle-claude-anthropic-sonnet-alpha",
-        "needle-claude-anthropic-sonnet-bravo"
-      ],
-      "workers_active": 2,
-      "delta": {
-        "input_tokens": 29840,
-        "output_tokens": 5510,
-        "cache_read_tokens": 198300,
-        "cache_write_5m_tokens": 7900,
-        "cache_write_1h_tokens": 10400
-      },
-      "dollar_equiv": { "total": 0.3201 },
-      "per_worker_stats": {
-        "dollar_per_hour_mean": 1.921,
-        "dollar_per_hour_stddev": 0.312,
-        "dollar_per_hour_p75": 2.147,
-        "dollar_per_hour_min": 1.609,
-        "dollar_per_hour_max": 2.233
-      }
-    }
-  },
-  "window_snapshots": {
-    "five_hour":        { "utilization": 36.4, "resets_at": "2026-03-18T15:59:59Z" },
-    "seven_day":        { "utilization": 72.6, "resets_at": "2026-03-20T03:00:00Z" },
-    "seven_day_sonnet": { "utilization": 63.5, "resets_at": "2026-03-20T03:59:59Z" }
-  },
-  "window_pct_deltas": {
-    "five_hour":        0.66,
-    "seven_day":        0.54,
-    "seven_day_sonnet": 0.75
-  },
-  "capacity_forecast": {
-    "five_hour": {
-      "remaining_pct":              63.6,
-      "hours_remaining":            1.50,
-      "fleet_pct_per_hour":         7.92,
-      "predicted_exhaustion_hours": 8.03,
-      "will_exhaust_before_reset":  false,
-      "binding":                    false
-    },
-    "seven_day_sonnet": {
-      "remaining_pct":              36.5,
-      "hours_remaining":            37.5,
-      "fleet_pct_per_hour":         9.00,
-      "predicted_exhaustion_hours": 4.06,
-      "will_exhaust_before_reset":  true,
-      "binding":                    true,
-      "safe_worker_count":          2
-    }
-  },
-  "binding_window": "seven_day_sonnet"
-}
+```
+{"r":"i",...,"tok":"input","n":15410,"usd":0.0462,"p5h":0.055,"p7d":0.044,"p7ds":0.062,"pk":0}
 ```
 
-`binding_window` names the most constraining window — the one the governor's target calculation must optimize against. When `five_hour` becomes binding (e.g., burst activity near a session reset), the governor temporarily scales down even if the weekly window has headroom.
+`p5h`, `p7d`, `p7ds` are each this instance's apportioned share of the observed window delta for that interval, weighted by `usd` across all concurrent sessions.
 
-`safe_worker_count` is the maximum number of workers at the current per-worker burn rate (`p75` for conservatism) that will not exhaust the binding window before its reset.
+#### Record Type `f` — Fleet Token-Type Aggregate
 
-**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (JSONL is authoritative; DB is rebuilt from JSONL on corruption):
+One line per **(model × tok\_type)** per interval, written after all `i` records for that interval. Enables direct comparison of token-type consumption across the full fleet and tracks per-worker variance.
+
+```
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"input","n":29840,"usd":0.0924,"workers":2,"mean_usd_hr":0.554,"p75_usd_hr":0.619,"std_usd_hr":0.093,"p5h":0.110,"p7d":0.088,"p7ds":0.124,"pk":0}
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"output","n":5510,"usd":0.0828,"workers":2,"mean_usd_hr":0.497,"p75_usd_hr":0.558,"std_usd_hr":0.086,"p5h":0.099,"p7d":0.079,"p7ds":0.111,"pk":0}
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"r-cache","n":198300,"usd":0.0595,"workers":2,"mean_usd_hr":0.357,"p75_usd_hr":0.401,"std_usd_hr":0.061,"p5h":0.071,"p7d":0.057,"p7ds":0.080,"pk":0}
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"w-cache-5m","n":7900,"usd":0.0296,"workers":2,"mean_usd_hr":0.178,"p75_usd_hr":0.199,"std_usd_hr":0.030,"p5h":0.035,"p7d":0.028,"p7ds":0.040,"pk":0}
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"w-cache-1h","n":10400,"usd":0.0624,"workers":2,"mean_usd_hr":0.374,"p75_usd_hr":0.421,"std_usd_hr":0.064,"p5h":0.075,"p7d":0.059,"p7ds":0.084,"pk":0}
+```
+
+`mean_usd_hr`/`p75_usd_hr`/`std_usd_hr` are computed per-tok-type across the active worker sessions, enabling fine-grained comparison of which token type is driving variance (e.g., high stddev on `w-cache-1h` means workers differ significantly in how much long-lived context they establish).
+
+#### Record Type `w` — Window Capacity Forecast
+
+One line per window per interval, written last. Self-contained — contains everything needed to reconstruct the capacity forecast without joining other tables.
+
+```
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":63.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":8.03,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day","snap":72.6,"reset":"2026-03-20T03:00:00Z","delta":0.54,"remain":27.4,"hrs_left":37.5,"fleet_pct_hr":6.48,"exh_hrs":4.23,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":36.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":4.06,"bind":1,"safe_w":2,"pk":0}
+```
+
+`bind:1` marks the binding window. `safe_w` is null for non-binding windows.
+
+---
+
+**Why flat single-line records?**
+
+- Any window or instance can be filtered with a single `grep`/`jq` without parsing nested objects
+- Token types are directly comparable across sessions: `jq 'select(.r=="f" and .tok=="w-cache-1h")'`
+- Burn rate for a specific worker across time: `jq 'select(.r=="i" and .sess=="...alpha" and .tok=="output")'`
+- All inputs this week: `jq 'select(.r=="f" and .tok=="input") | .n' | paste -sd+ | bc`
+- The `[model]-[tok]-[n]-[usd]-[p7ds]` tuple is directly readable on each line without unpacking
+
+---
+
+**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (JSONL is authoritative; DB rebuilt from JSONL on corruption). Schema mirrors the three record types exactly — one table per type:
 
 ```sql
--- Per-instance records
-CREATE TABLE instance_deltas (
-    ts              TEXT NOT NULL,
-    interval_start  TEXT NOT NULL,
-    interval_end    TEXT NOT NULL,
-    worker_session  TEXT NOT NULL,
-    claude_sess_id  TEXT,
-    model           TEXT NOT NULL,
-    is_peak         INTEGER NOT NULL,
-    in_tok          INTEGER,
-    out_tok         INTEGER,
-    cr_tok          INTEGER,
-    cw_5m_tok       INTEGER,
-    cw_1h_tok       INTEGER,
-    usd_total       REAL,
-    pct_delta_5h    REAL,    -- annotated by governor
-    pct_delta_7d    REAL,
-    pct_delta_7d_s  REAL
+-- Type "i": instance token-type deltas
+CREATE TABLE i (
+    ts    TEXT, t0 TEXT, t1 TEXT,
+    sess  TEXT, sid TEXT,
+    model TEXT, tok TEXT,
+    n     INTEGER, usd REAL,
+    p5h   REAL, p7d REAL, p7ds REAL,   -- null until governor annotates
+    pk    INTEGER
 );
-CREATE INDEX idx_inst_ts       ON instance_deltas(ts);
-CREATE INDEX idx_inst_session  ON instance_deltas(worker_session, ts);
-CREATE INDEX idx_inst_model    ON instance_deltas(model, ts);
+CREATE INDEX i_sess_tok ON i(sess, tok, t0);
+CREATE INDEX i_model_tok ON i(model, tok, t0);
 
--- Fleet aggregate records
-CREATE TABLE fleet_aggregates (
-    ts              TEXT NOT NULL PRIMARY KEY,
-    interval_start  TEXT NOT NULL,
-    interval_end    TEXT NOT NULL,
-    is_peak         INTEGER NOT NULL,
-    workers_json    TEXT,          -- JSON: {"claude-sonnet-4-6": 2, ...}
-    usd_total       REAL,
-    pct_delta_5h    REAL,
-    pct_delta_7d    REAL,
-    pct_delta_7d_s  REAL,
-    snap_5h_pct     REAL,
-    snap_7d_pct     REAL,
-    snap_7d_s_pct   REAL,
-    binding_window  TEXT,
-    safe_workers    INTEGER,
-    forecast_json   TEXT           -- full capacity_forecast block as JSON
+-- Type "f": fleet token-type aggregates
+CREATE TABLE f (
+    ts    TEXT, t0 TEXT, t1 TEXT,
+    model TEXT, tok TEXT,
+    n     INTEGER, usd REAL, workers INTEGER,
+    mean_usd_hr REAL, p75_usd_hr REAL, std_usd_hr REAL,
+    p5h   REAL, p7d REAL, p7ds REAL,
+    pk    INTEGER
 );
+CREATE INDEX f_model_tok ON f(model, tok, t0);
 
--- Per-worker burn rate view (derived, not stored)
-CREATE VIEW worker_burn_rates AS
-SELECT
-    worker_session,
-    model,
-    AVG(usd_total / ((julianday(interval_end) - julianday(interval_start)) * 24)) AS usd_per_hour,
-    COUNT(*) AS sample_count
-FROM instance_deltas
-WHERE pct_delta_5h IS NOT NULL
-GROUP BY worker_session, model;
+-- Type "w": window capacity forecasts
+CREATE TABLE w (
+    ts    TEXT, t0 TEXT, t1 TEXT,
+    win   TEXT,
+    snap  REAL, reset TEXT, delta REAL,
+    remain REAL, hrs_left REAL,
+    fleet_pct_hr REAL, exh_hrs REAL,
+    bind  INTEGER, safe_w INTEGER,
+    pk    INTEGER
+);
+CREATE INDEX w_win ON w(win, t0);
+
+-- Cross-instance burn rate comparison view
+CREATE VIEW worker_rates AS
+SELECT sess, model, tok,
+    SUM(n) AS total_tokens,
+    SUM(usd) AS total_usd,
+    SUM(usd) / SUM((julianday(t1)-julianday(t0))*24) AS usd_per_hour,
+    COUNT(*) AS samples
+FROM i WHERE p7ds IS NOT NULL
+GROUP BY sess, model, tok;
 ```
 
 **Standalone CLI:**
 ```bash
-token-collector --collect           # run one collection pass
-token-collector --daemon            # loop every N minutes
-token-collector --query [--window N]  # recent fleet aggregates (default: last 12)
-token-collector --workers           # per-worker burn rate summary
-token-collector --forecast          # current capacity forecast for all windows
-token-collector --rebuild-db        # reconstruct SQLite from JSONL
+token-collector --collect             # one collection pass; write i+f+w records
+token-collector --daemon              # loop every N minutes
+token-collector --query [--last N]    # recent w records (window forecasts)
+token-collector --workers [--tok TOK] # worker_rates view, optionally filtered by tok_type
+token-collector --compare-instances   # side-by-side usd_per_hour across active sessions
+token-collector --rebuild-db          # reconstruct SQLite from JSONL
 ```
 
 ---
@@ -355,24 +306,13 @@ token-collector --rebuild-db        # reconstruct SQLite from JSONL
   },
 
   "last_fleet_aggregate": {
-    "interval_start": "2026-03-18T14:25:00Z",
-    "interval_end":   "2026-03-18T14:30:00Z",
-    "by_model": {
-      "claude-sonnet-4-6": {
-        "workers_active": 2,
-        "dollar_equiv_total": 0.3201,
-        "per_worker_stats": {
-          "dollar_per_hour_mean": 1.921,
-          "dollar_per_hour_p75":  2.147,
-          "dollar_per_hour_stddev": 0.312
-        }
-      }
-    },
-    "window_pct_deltas": {
-      "five_hour":        0.66,
-      "seven_day":        0.54,
-      "seven_day_sonnet": 0.75
-    }
+    "t0": "2026-03-18T14:25:00Z",
+    "t1": "2026-03-18T14:30:00Z",
+    "sonnet_workers": 2,
+    "sonnet_usd_total": 0.3201,
+    "sonnet_p75_usd_hr": 2.147,
+    "sonnet_std_usd_hr": 0.312,
+    "window_pct_deltas": { "five_hour": 0.66, "seven_day": 0.54, "seven_day_sonnet": 0.75 }
   },
 
   "capacity_forecast": {
@@ -842,11 +782,12 @@ alerts:
 4. Write one `fleet_aggregate` record per interval after all `instance_delta` records, containing aggregated stats, `per_worker_stats` (mean/p75/stddev), `window_snapshots` from the API, and the full `capacity_forecast` block.
 
 5. Test independently:
-   - Verify dollar computation against known API pricing (unit test each token type and model)
-   - Verify delta (not cumulative) — run twice, confirm second pass only counts new messages
+   - Verify dollar computation against known API pricing (unit test each tok_type × model)
+   - Verify delta (not cumulative) — run twice, confirm second pass emits zero-n records
    - Verify correct model attribution when multiple models active in same session
-   - Verify per-worker variance calculation with synthetic data (3 workers, divergent rates)
-   - Verify `binding_window` selection when 5h is more constraining than 7d
+   - Verify `f` record variance stats with synthetic data: 3 sessions, divergent `usd` values
+   - Verify `w` record `bind` and `safe_w` selection when 5h is more constraining than 7d
+   - Verify grep/jq queryability: `jq 'select(.r=="i" and .tok=="w-cache-1h")'` returns only those lines
 
 **Deliverable:** `scripts/token-collector.py` — fully standalone, can be queried without the governor running.
 
