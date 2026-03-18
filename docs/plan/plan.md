@@ -22,6 +22,10 @@ The system replaces the current `capacity-governor.sh` (screen-scraping, statele
 6. **Adaptive burn rate** — learn actual per-worker consumption empirically (p75 EMA) rather than using a hardcoded constant, so exhaustion predictions improve over time.
 7. **Extensibility** — support multiple configured systems beyond Sonnet (Opus, pay-per-token providers, etc.) via a plugin architecture.
 8. **Observability** — structured state files, human-readable logs, and alerting beads when cutoff risk is imminent.
+9. **Zero runtime dependencies** — ships as a single statically-linked Rust binary (`cgov`). No interpreter, no shared libraries, no package manager. Copy the binary to any Linux amd64 machine and it runs. Build dependencies (Rust crates) are compiled into the binary: `ureq` + `rustls` (HTTPS), `serde` + `serde_json` + `serde_yaml` (serialization), `rusqlite` with `bundled` (SQLite compiled in), `clap` (CLI), `chrono` (datetime).
+10. **Worker-system agnostic** — the governor does not hardcode NEEDLE or any specific worker launcher. Each agent config specifies a `launch_cmd` (shell command to start a worker), `session_pattern` (tmux glob to find running workers), and `heartbeat_dir` (directory of JSON status files). Any system that writes heartbeat files and runs in tmux sessions can be governed.
+
+**Note on code examples:** Pseudocode throughout this document uses Python-like syntax for readability. The implementation is Rust.
 
 ---
 
@@ -78,23 +82,22 @@ The system replaces the current `capacity-governor.sh` (screen-scraping, statele
 
 **Source:** Direct HTTP call to `https://api.anthropic.com/api/oauth/usage`
 
-```bash
+```
 # Read OAuth token from credentials file
-ACCESS_TOKEN=$(jq -r '.claudeAiOauth.accessToken' ~/.claude/.credentials.json)
-EXPIRES_AT=$(jq -r '.claudeAiOauth.expiresAt' ~/.claude/.credentials.json)
+creds = read_json("~/.claude/.credentials.json")
+access_token = creds.claudeAiOauth.accessToken
+expires_at = creds.claudeAiOauth.expiresAt
 
 # Refresh if within 5 minutes of expiry
-NOW_MS=$(($(date +%s) * 1000))
-if (( NOW_MS + 300000 >= EXPIRES_AT )); then
-    refresh_token
-fi
+if now_ms() + 300000 >= expires_at:
+    access_token = refresh_token(creds)
 
-# Fetch usage
-curl -s \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    -H "anthropic-beta: oauth-2025-04-20" \
-    -H "User-Agent: claude-code/2.1.78" \
-    "https://api.anthropic.com/api/oauth/usage"
+# Fetch usage via HTTPS
+usage = https_get_json("https://api.anthropic.com/api/oauth/usage", headers={
+    "Authorization": "Bearer {access_token}",
+    "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": "claude-code/2.1.78",
+})
 ```
 
 **Output fields consumed:**
@@ -125,6 +128,12 @@ Pairing `(delta_pct, delta_tokens_by_type_by_model, dollar_equivalent, timestamp
 
 **Token refresh:** When `expiresAt - now < 5 minutes`, POST to `https://platform.claude.com/v1/oauth/token` with the refresh token. Update `~/.claude/.credentials.json` in place.
 
+**Token refresh failure handling:** If the refresh POST fails:
+1. Retry once after 5 seconds
+2. If retry fails, use last-known usage data for this cycle — log `[poller] WARN: token refresh failed, using stale data (age: Xs)`
+3. If refresh fails for 3 consecutive cycles (~15 minutes), create a HUMAN-type alert bead: `"OAuth token refresh failing — run: claude login"`
+4. Never crash the governor loop on auth failure — stale data is always preferable to no governor
+
 ---
 
 ### 2. Token Collector
@@ -154,25 +163,29 @@ The session filename path encodes the model used; the `model` field in the messa
   "claude-sonnet-4-6": {
     "input_per_mtok": 3.00,
     "output_per_mtok": 15.00,
-    "cache_write_per_mtok": 3.75,
+    "cache_write_5m_per_mtok": 3.75,
     "cache_read_per_mtok": 0.30
   },
   "claude-opus-4-6": {
-    "input_per_mtok": 15.00,
-    "output_per_mtok": 75.00,
-    "cache_write_per_mtok": 18.75,
-    "cache_read_per_mtok": 1.50
+    "input_per_mtok": 5.00,
+    "output_per_mtok": 25.00,
+    "cache_write_5m_per_mtok": 6.25,
+    "cache_read_per_mtok": 0.50
   },
   "claude-haiku-4-5": {
-    "input_per_mtok": 0.80,
-    "output_per_mtok": 4.00,
-    "cache_write_per_mtok": 1.00,
-    "cache_read_per_mtok": 0.08
+    "input_per_mtok": 1.00,
+    "output_per_mtok": 5.00,
+    "cache_write_5m_per_mtok": 1.25,
+    "cache_read_per_mtok": 0.10
   }
 }
 ```
 
+Cache write rates shown above are the 5-minute TTL tier (standard API). The 1-hour TTL tier (Bedrock only, 2.0× input) is documented in the Configuration File section.
+
 **Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Every line is a single flat JSON object. Three record types per collection pass, identified by `"r"`. Records `i` and `f` are wide: every token-type measurement appears as a column on the same row, not as separate rows.
+
+**Naming convention:** JSONL records use compact field names for storage efficiency (`safe_w`, `fleet_pct_hr`, `exh_hrs`). The governor state file (`governor-state.json`) and prose use readable equivalents (`safe_worker_count`, `fleet_pct_per_hour`, `predicted_exhaustion_hours`). Both refer to the same values; the mapping is unambiguous from context.
 
 Token-type column suffixes used throughout:
 
@@ -325,14 +338,14 @@ GROUP BY pk, hr_et
 ORDER BY hr_et;
 ```
 
-**Standalone CLI:**
-```bash
-token-collector --collect             # one collection pass; write i+f+w lines
-token-collector --daemon              # loop every N minutes
-token-collector --query [--last N]    # recent w rows (window forecasts)
-token-collector --compare [--at TS]   # instance_compare view for latest (or given) interval
-token-collector --fleet [--last N]    # recent f rows showing all model×tok_type columns
-token-collector --rebuild-db          # reconstruct SQLite from JSONL
+**Standalone CLI subcommands** (all built into `cgov` binary):
+```
+cgov collect                          # one collection pass; write i+f+w lines
+cgov collect --daemon                 # loop every N minutes
+cgov token-history [--last N]         # recent w rows (window forecasts)
+cgov token-history --compare [--at TS]  # instance_compare view for given interval
+cgov token-history --fleet [--last N]   # recent f rows showing all model×tok_type columns
+cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 ```
 
 ---
@@ -454,9 +467,9 @@ token-collector --rebuild-db          # reconstruct SQLite from JSONL
 
 ---
 
-### 3. Promotion and Schedule Awareness
+### 4. Promotion and Schedule Awareness
 
-**Peak window:** 08:00–14:00 US Eastern Time (weekdays only)
+**Peak window:** `[08:00, 14:00)` US Eastern Time (weekdays only) — half-open interval. 08:00:00 is the first peak second; 13:59:59 is the last. 14:00:00 is off-peak. All boundary comparisons use `>=` for start and `<` for end.
 **Off-peak:** Everything else (all weekends, weekday evenings/nights)
 
 **Promotion detection:**
@@ -515,10 +528,10 @@ target_workers = clamp(target_workers, min_workers, max_workers)
 
 **Solution:** Compute burn rates **per model, per window** using per-instance delta records from the Token Collector. Variance across instances drives conservative planning.
 
-#### Per-Instance Burn Rate (from `instance_deltas`)
+#### Per-Instance Burn Rate (from `i` records)
 
 ```
-# For each instance_delta record with annotated window_pct_deltas:
+# For each i record with annotated window_pct_deltas:
 dollar_burn[session][window] = dollar_equiv.total / elapsed_hours
 pct_burn[session][window]    = window_pct_deltas[window] / elapsed_hours
 ```
@@ -566,7 +579,7 @@ High `stddev` signals task heterogeneity — some workers handling large documen
 Maintain a separate EMA per (model, window) pair:
 
 ```
-# EMA update after each fleet_aggregate interval:
+# EMA update after each f (fleet) interval:
 ema_pct_per_hour[model][window] = α * fleet_pct_per_hour[window] + (1-α) * prev_ema
 α = 0.2
 
@@ -622,7 +635,19 @@ Stored separately for peak vs. off-peak intervals per window. The 5h and 7d wind
 - Skip if worker count changed mid-interval — can't cleanly attribute
 - Skip if `delta_pct[W] == 0` across all windows but tokens > 0 — API rounding artifact
 - Discard samples > 3σ from current EMA per window
-- When a window resets mid-interval, discard that interval's pct_delta for that window only (it spans two separate quota periods)
+- When a window resets mid-interval, discard that interval's pct_delta for that window only (it spans two separate quota periods). **Reset detection:** a window has reset when `current_utilization < previous_utilization - 1.0` for that window (the 1.0% margin absorbs API rounding noise)
+
+**Token collector offline — graceful degradation:**
+
+The governor must function when the Token Collector is not running, using a three-tier fallback based on data staleness:
+
+| Collector data age | Behavior |
+|---|---|
+| < 10 minutes | Use normally — collector may be between cycles |
+| 10–30 minutes | Use last EMA values; log `[governor] WARN: collector data stale ({age}s)` |
+| > 30 minutes | Fall back to `baseline_burn_rate` from `governor.yaml`; create HUMAN alert bead: `"Token collector offline — burn rate using baseline fallback"` |
+
+In fallback mode, dollar-equivalent burn rates and cache efficiency metrics are unavailable. The governor continues scaling using percentage-based burn rate only. When the collector resumes, the governor returns to EMA-based rates within one interval.
 
 **Claude Code cache behavior note:** Cache reads dominate token counts (cheap, 0.1× input) while 1h cache writes are the most expensive token type per unit (2.0× input). Dollar-equivalent burn rate is the most accurate single measure of plan consumption rate, more so than raw token count or even pct/hr alone.
 
@@ -631,36 +656,91 @@ Stored separately for peak vs. off-peak intervals per window. The 5h and 7d wind
 ### 6. Worker Manager
 
 #### Scale-Up
-```bash
-for i in $(seq 1 $((target - current))); do
-    # Auto-discover workspace with largest bead backlog
-    needle run --agent="$AGENT" --force
-done
 ```
-- Remove the hard-coded `--workspace` arg — let NEEDLE auto-discover the richest workspace
-- One launch per loop tick (not batch) to avoid tmux session naming collisions
+for _ in range(target - current):
+    shell_exec(agent.launch_cmd)   # configured per agent in governor.yaml
+    sleep(1)                        # stagger to avoid tmux naming collisions
+```
+
+**Separation of concerns — capacity vs. orchestration:**
+
+The governor manages **how many** workers run. The worker system (NEEDLE, or any alternative) manages **what** workers do. These are deliberately separate:
+
+| Responsibility | Governor (`cgov`) | Worker system (`needle`) |
+|---|---|---|
+| Decide worker count | Yes — exhaustion prediction, scaling | No |
+| Launch a worker | Executes `launch_cmd` via shell | Handles all setup (tmux session, workspace discovery, bead claiming, prompt construction, agent dispatch) |
+| Monitor worker state | Reads heartbeat JSON files | Writes heartbeat JSON files |
+| Stop a worker | Sends SIGINT / kills tmux session | Receives signal, exits cleanly |
+| Claim and process beads | No | Yes |
+| Build prompts | No | Yes |
+| Invoke Claude CLI | No | Yes |
+
+**Call chain for `launch_cmd: "needle run --agent=claude-anthropic-sonnet --force"`:**
+
+```
+cgov (Rust binary)
+ └─ sh -c "needle run --agent=claude-anthropic-sonnet --force"
+     └─ needle (bash) — validates agent, auto-discovers workspace, generates session name
+         └─ tmux new-session -d -s "needle-claude-anthropic-sonnet-alpha" "needle _run_worker ..."
+             └─ needle _run_worker — infinite loop:
+                 ├─ claim bead from br
+                 ├─ build prompt (3-tier project context, type-specific instructions)
+                 ├─ render agent invoke template
+                 ├─ execute claude CLI with prompt
+                 ├─ process result (commit, close bead, or quarantine)
+                 ├─ emit heartbeat to ~/.needle/state/heartbeats/{session}.json
+                 └─ loop
+```
+
+The governor's `launch_cmd` returns immediately after the tmux session is created — it does not block on worker execution. The governor detects the new worker on its next cycle via the heartbeat file.
+
+**Why not absorb NEEDLE into cgov?** NEEDLE is a 44K-line worker orchestration system with bead lifecycle management, multi-agent prompt templating, stream parsing, watchdog recovery, and hook execution. Rewriting this in Rust would be massive scope creep with no capacity-management benefit. The shell-out interface is the correct boundary: `cgov` decides "launch one worker," NEEDLE handles everything else.
+
+**Custom worker systems:** Any system that (a) can be launched with a shell command, (b) runs in a tmux session matching `session_pattern`, and (c) writes heartbeat JSON to `heartbeat_dir` is compatible with the governor. The heartbeat format is specified in the Heartbeat File Format section below.
 
 #### Scale-Down (Graceful Only)
-```bash
-# Find idle workers (status == "idle" in heartbeat files)
-idle_sessions=$(find ~/.needle/state/heartbeats/ -name "needle-${AGENT}-*.json" \
-    -exec jq -r 'select(.status == "idle") | .session' {} \;)
+```
+# Find idle workers from heartbeat files (path from agent.heartbeat_dir)
+idle_sessions = []
+for hb_path in glob(agent.heartbeat_dir / agent.session_pattern + ".json"):
+    heartbeat = read_json(hb_path)
+    if heartbeat.status == "idle":
+        idle_sessions.push(heartbeat.session)
 
-# Sort by launch order (reverse NATO = most recent first)
-# Only kill workers not attached to a human terminal
-for session in $idle_sessions; do
-    attached=$(tmux display-message -t "$session" -p '#{session_attached}' 2>/dev/null)
-    [[ "$attached" -gt 0 ]] && continue  # skip if human is watching
-    tmux send-keys -t "$session" "C-c" 2>/dev/null  # graceful SIGINT
-    sleep 2
-    # Force kill if still alive after 10 seconds
-    tmux kill-session -t "$session" 2>/dev/null
-    ((killed++))
-    [[ $killed -ge $((current - target)) ]] && break
-done
+# Kill idle, unattached workers (most recent first)
+killed = 0
+for session in idle_sessions.reversed():
+    attached = tmux("display-message", session, "#{session_attached}")
+    if attached > 0:
+        continue  # human is watching
+    tmux("send-keys", session, "C-c")   # graceful SIGINT
+    sleep(2)
+    tmux("kill-session", session)        # force after timeout
+    killed += 1
+    if killed >= current - target:
+        break
 ```
 
 **Key principle:** Never kill an `executing` worker. Only kill `idle` workers. If no idle workers are available but current > target, wait until the next cycle.
+
+**Heartbeat file format:**
+
+NEEDLE workers write heartbeat files to `~/.needle/state/heartbeats/{session}.json` every 30 seconds:
+
+```json
+{
+  "session": "needle-claude-anthropic-sonnet-alpha",
+  "agent": "claude-anthropic-sonnet",
+  "status": "idle",
+  "bead_id": null,
+  "workspace": "/home/coding/kalshi-trading",
+  "updated_at": "2026-03-18T14:29:45Z",
+  "launched_at": "2026-03-18T12:00:00Z"
+}
+```
+
+`status` values: `idle` (between beads, safe to kill), `executing` (working on a bead, never kill), `starting` (launched but not yet claimed a bead, treat as executing). Heartbeat files older than 60 seconds are treated as stale — the worker may have crashed without cleanup. Stale heartbeats are verified against `tmux list-sessions` before any action is taken; if the tmux session no longer exists, the heartbeat file is removed.
 
 ---
 
@@ -701,7 +781,7 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 | `burn_rate_sample > baseline * 2` | `burn_rate_spike` | Log anomaly; increase polling rate to recalibrate faster |
 | All windows `margin_hrs > hrs_left * 0.5` | `underutilization` | Scale up toward max_workers; headroom is ample |
 
-**Deduplication:** Each alert type is only created once per governor cycle (store last-alerted timestamp per type in state file).
+**Deduplication:** Per-type cooldown of 1 hour (configurable via `alerts.cooldown_minutes`). When an alert fires, the same alert type is suppressed for the cooldown period even if the condition persists. If the condition clears and then re-triggers after the cooldown expires, a new alert is created. Cooldown timestamps are stored per-type in the state file under `alerts.last_fired`.
 
 ---
 
@@ -745,6 +825,481 @@ Last cycle: 14s ago  |  Next: in 4m46s
 
 ---
 
+### 11. Trajectory Simulator (`cgov simulate`)
+
+**Purpose:** Project future capacity utilization under configurable worker scenarios, accounting for all promotion boundaries and window resets.
+
+**Usage:**
+```bash
+cgov simulate --workers 4 --hours 12           # 4 workers for 12 hours
+cgov simulate --workers "4:6h,2:6h" --hours 12 # 4 for 6h, then 2 for 6h
+cgov simulate --hours 24 --json                 # current worker count, JSON output
+```
+
+**Algorithm:** Walk forward from `now` in 1-minute steps, applying:
+- Current per-model EMA burn rate (from `governor-state.json`)
+- Promotion multiplier transitions from `promotions.json` (e.g., 2x→1x at 08:00 ET)
+- Window resets (utilization drops to 0 when `resets_at` is crossed)
+- Configured `target_utilization` ceilings per window
+
+At each step, compute per-window utilization, remaining headroom, and whether the ceiling would be breached. Output is a trajectory at configurable resolution (default: 15-minute intervals).
+
+**Human output:**
+```
+Simulating: 4 workers for 12h starting 2026-03-18 14:30 ET
+Using burn rate: 4.5 %/hr/worker (p75 EMA, seven_day_sonnet)
+
+Time         5h%   7d%   7ds%   Promo   Workers   Event
+14:30        36    73    64     2x      4
+15:00        40    74    67     2x      4
+...
+17:30        62    79    82     2x      4
+18:00        ──    80    85     2x      4         ← 5h resets
+18:30         4    81    88     2x      4
+19:00         8    82    ██ 91  2x      4         ← 7ds CEILING BREACH at 18:47
+```
+
+**JSON output:** Array of `{"t": "...", "five_hour": 36.2, "seven_day": 73.1, "seven_day_sonnet": 64.0, "promo": 2.0, "workers": 4, "events": []}` objects. Includes a `breach` object identifying the first window/time that exceeds its ceiling, or `null` if all windows stay safe.
+
+The simulator is read-only — it reads current state but makes no changes.
+
+---
+
+### 12. Prediction Accuracy Self-Calibration
+
+**Purpose:** Track how accurate past exhaustion predictions were, score them, and auto-tune governor parameters to improve over time.
+
+**Mechanism:** After each window reset, compare the prediction made at the *start* of that window period against actual outcome:
+
+```
+prediction_error = actual_final_pct - predicted_final_pct
+# negative = conservative (left capacity on table), positive = aggressive (cut it too close)
+```
+
+**Scoring:** Each prediction scored to `~/.needle/state/prediction-accuracy.jsonl`:
+
+```json
+{"ts":"2026-03-20T04:00:00Z","win":"seven_day_sonnet","pred_pct":87.2,"actual_pct":82.1,"error":-5.1,"pred_exh":false,"actual_exh":false,"correct":true,"workers_avg":2.8}
+```
+
+**Auto-tuning rules** (activated after ≥10 scored predictions per window):
+
+| Signal | Adjustment | Rationale |
+|---|---|---|
+| Median error < -5 (conservative) | Increase `burn_rate_alpha` +0.02, widen `hysteresis_band` +0.5 | Leaving capacity on the table |
+| Median error > +5 (aggressive) | Decrease `burn_rate_alpha` -0.02, tighten `hysteresis_band` -0.5 | Cutting it too close |
+| Stddev > 10 (unpredictable) | Lower `target_utilization` -0.02 | Need larger safety buffer |
+
+Adjustments are clamped to prevent runaway drift: `alpha ∈ [0.05, 0.5]`, `hysteresis ∈ [0, 3]`, `target_util ∈ [0.70, 0.98]`.
+
+**State:** `burn_rate.calibration` in `governor-state.json`:
+
+```json
+{
+  "calibration": {
+    "predictions_scored": 24,
+    "median_error_7ds": -3.2,
+    "auto_tuned_alpha": 0.22,
+    "auto_tuned_hysteresis": 1.0,
+    "last_tuned_at": "2026-03-20T04:00:00Z"
+  }
+}
+```
+
+Auto-tuning is opt-in via `calibration.auto_calibrate: true` in `governor.yaml`. When disabled, accuracy is still tracked and reported via `cgov status` but parameters are not modified.
+
+---
+
+### 13. Promotion Boundary Pre-Scaling
+
+**Purpose:** Anticipate upcoming promotion multiplier transitions and begin scaling changes *before* the boundary hits, preventing the burst of over-consumption when effective burn rate changes abruptly.
+
+**Problem:** At 08:00 ET on a weekday during the March 2026 promotion, the multiplier drops from 2x to 1x. If the governor is running 5 workers at an effective burn rate sustainable only at 2x, the burn rate against quota effectively doubles instantly. By the time the next governor cycle detects this (up to 5 minutes later), significant quota has been consumed at the higher effective rate.
+
+**Mechanism:** The schedule calculator gains a `next_transition()` function:
+
+```python
+def next_transition(promotions) -> (datetime, old_multiplier, new_multiplier):
+    """Return the next upcoming multiplier change."""
+    # e.g., (2026-03-19T08:00:00-04:00, 2.0, 1.0)
+```
+
+The governor loop checks: if a transition is within `pre_scale_minutes` (default: 30), compute the target worker count using the *post-transition* multiplier. If the post-transition target is lower than current workers, begin scaling down immediately — one worker per cycle:
+
+```python
+transition_in = next_transition() - now
+if transition_in < pre_scale_minutes:
+    post_target = compute_target_workers(multiplier=new_multiplier)
+    if post_target < current_workers:
+        effective_target = max(post_target, current_workers - 1)
+```
+
+Pre-scaling is **conservative-only**: it scales down before losing a multiplier bonus, but does **not** scale up before gaining one. Never speculate on cheaper capacity that hasn't started yet.
+
+**Logging:** `[governor] PRE-SCALE: off-peak→peak in 22min — scaling 4→3 (post-transition safe: 2)`
+
+---
+
+### 14. End-of-Window Capacity Sprint
+
+**Purpose:** Capture throughput from capacity that would otherwise expire unused at window reset.
+
+**Problem:** If the `five_hour` window is at 55% with 45 minutes to reset, 30% of headroom (to the 85% ceiling) will evaporate at reset. Those tokens are already paid for — not using them is waste.
+
+**Trigger conditions** (all must be true):
+- Window resets in ≤ `sprint.horizon_minutes` (default: 90)
+- Remaining headroom > `sprint.min_headroom_pct` (default: 15%)
+- Bead backlog exists (workers have work to do)
+- No other window is at `cutoff_risk`
+
+**Behavior:** Temporarily raise `max_workers` by `sprint.max_workers_boost` (default: 3) for the affected agent. The sprint flag is set in state so `cgov status` shows the reason. Sprint ends when the window resets or headroom drops below 5%.
+
+```python
+if sprint_eligible(window):
+    effective_max = min(
+        max_workers + sprint_max_workers_boost,
+        safe_worker_count_other_windows  # never violate other windows
+    )
+    target = min(compute_target(), effective_max)
+    state.sprint_active = True
+    state.sprint_window = window.name
+```
+
+**Guard:** Sprint never violates other windows. `effective_max` is capped at the minimum `safe_worker_count` across non-sprinting windows. Additionally, sprint is inhibited when the forecast confidence cone (Component 21) is wide (`cone_ratio > 2.0`) — high prediction uncertainty makes aggressive scaling dangerous. Sprint is also disabled while safe mode (Component 20) is active.
+
+**Status output during sprint:**
+```
+Workers:  5 active  (target: 5 · normal max: 3 · SPRINT on five_hour, resets in 0h42m)
+```
+
+**Most useful for:** The `five_hour` window, which resets frequently and often has significant unused headroom.
+
+---
+
+### 15. Worker Capacity Awareness
+
+**Purpose:** Give workers visibility into the fleet's capacity state so they can adapt their behavior to budget constraints.
+
+Workers are Claude Code instances that can run shell commands. The approach: `cgov status --json` is the data source, and NEEDLE injects a capacity summary into the worker's operating context at launch.
+
+**Mechanism — Prompt Injection via NEEDLE:**
+
+When NEEDLE launches a worker, it runs `cgov status --json` and injects a capacity summary block into the worker's CLAUDE.md:
+
+```markdown
+## Fleet Capacity (auto-injected by governor)
+
+- Binding window: seven_day_sonnet — 26% headroom, resets in 37h
+- Capacity pressure: HIGH (cutoff risk active)
+- Recommendation: prefer lighter approaches, minimize unnecessary exploration,
+  use Haiku subagents where possible, avoid speculative multi-file reads
+```
+
+Three pressure levels drive the recommendation:
+- **LOW** (`margin_hrs > hrs_left * 0.5`): no constraints — work normally
+- **MEDIUM** (`margin_hrs > 0` but < `hrs_left * 0.5`): be efficient but don't compromise quality
+- **HIGH** (`cutoff_risk` active): actively conserve — prefer Haiku subagents, skip optional steps
+
+**Active Checking:** Workers can run `cgov status --json` mid-task. The exit code (0=safe, 2=cutoff_risk, 3=emergency) enables simple conditionals in hooks:
+
+```bash
+# Claude Code hook (pre-tool):
+cgov status --json > /dev/null 2>&1
+[ $? -eq 3 ] && echo "Emergency brake — pausing" && exit 1
+```
+
+**NEEDLE integration:** Capacity injection happens in NEEDLE's worker launch function. If `cgov` is not installed or the daemon is not running, the block is omitted — non-breaking enhancement.
+
+---
+
+### 16. Decision Narration & Audit Log (`cgov explain`)
+
+**Purpose:** Make every scaling decision transparent and auditable with a plain-English explanation and persistent decision log.
+
+**Decision log:** `~/.needle/state/governor-decisions.jsonl`, one line per governor cycle that resulted in a scaling action or notable state change:
+
+```json
+{"ts":"2026-03-18T14:30:00Z","action":"scale_down","from":3,"to":2,"reason":"seven_day_sonnet binding at 72.3% with 24.1h to reset. 3 workers exhaust ceiling in 5.9h; 2 workers extend to 8.8h.","trigger":"cutoff_risk","binding_window":"seven_day_sonnet","margin_before":-18.2,"margin_after":8.8}
+```
+
+**Notable state changes that generate entries:**
+- Scale up or down (with full reasoning)
+- Cutoff risk transitions (safe→risk, risk→safe)
+- Sprint activation/deactivation
+- Pre-scale activation
+- Emergency brake engagement/release
+- Promotion multiplier transitions
+- Prediction accuracy scores (on window reset)
+
+**`cgov explain` output:**
+
+```
+Latest decision — 2026-03-18 14:30 ET
+
+Action:  scale_down 3 → 2 workers
+Reason:  seven_day_sonnet binding at 72.3% with 24.1h to reset.
+         At p75 burn of 4.5%/hr/worker, 3 workers exhaust the 90%
+         ceiling in 5.9h. Reducing to 2 extends exhaustion to 8.8h.
+Trigger: cutoff_risk on seven_day_sonnet
+```
+
+`cgov explain --last 5` shows the 5 most recent decisions. `cgov explain --json` emits raw JSONL records.
+
+**Implementation:** A template-based text generator in `src/narrator.rs` that takes the governor state diff (before/after) and produces the explanation. Templates cover each action type. No LLM — pure string formatting from structured data.
+
+---
+
+### 17. Cross-Window Capacity Optimization
+
+**Purpose:** Optimize worker count across all three windows simultaneously, weighting by reset horizon, rather than governing solely to the binding window.
+
+**Problem:** The binding-window approach is overly conservative when a short-horizon window is the constraint. If `five_hour` is binding at 72% with 45 minutes to reset, the governor scales down — even though the 5h window regenerates in 45 minutes while `seven_day` windows have ample room. The "cost" of consuming 5h capacity is low (regenerates soon); the "cost" of consuming 7d_sonnet capacity is high (gone for days).
+
+**Marginal window cost:**
+
+```python
+def window_cost(window):
+    """Higher cost = more scarce capacity to consume."""
+    if window.remaining_pct <= 0:
+        return float('inf')
+    scarcity = (1.0 / window.remaining_pct) * window.hrs_left
+    return scarcity
+```
+
+A window with 30% remaining and 2h to reset: cost = 0.067. Same 30% with 36h to reset: cost = 1.2 — 18× more expensive. This correctly captures that short-horizon capacity is cheap.
+
+**Optimized target:**
+
+```python
+def composite_risk(N, windows, burn_rate):
+    """Total risk score for running N workers."""
+    risk = 0
+    for w in windows:
+        exhaust_hrs = w.remaining_pct / (burn_rate * N)
+        if exhaust_hrs < w.hrs_left:
+            risk += window_cost(w) * (w.hrs_left - exhaust_hrs)
+    return risk
+
+# Max N where composite_risk is acceptable
+optimal = max(N for N in range(max_workers + 1)
+              if composite_risk(N, windows, burn_rate) < cost_threshold)
+```
+
+`cost_threshold` defaults to `0.0` (never breach any window — equivalent to current binding-window behavior). Setting it positive allows breaching cheap (short-horizon) windows when long-horizon windows have ample room.
+
+**Interaction with sprint:** Cross-window optimization and sprint are complementary. Sprint captures end-of-window surplus by adding workers temporarily; cross-window optimization allows running more workers *persistently* by recognizing that short-horizon breaches are low-cost.
+
+**State schema when enabled:** When `cross_window.enabled` is true:
+- `binding_window` — still populated (the window with smallest `margin_hrs`) for display and logging
+- `safe_worker_count` — computed by the composite risk function rather than the binding-window-only formula
+- `cross_window_optimal` — new field: the worker count where `composite_risk < cost_threshold`
+- When `cross_window.enabled` is false or safe mode is active, `safe_worker_count` reverts to the strict binding-window formula and `cross_window_optimal` is `null`
+
+---
+
+### 18. Cache Efficiency Monitor
+
+**Purpose:** Track per-worker and per-workspace cache hit ratios to identify inefficient capacity consumption.
+
+**Metric:**
+
+```
+cache_efficiency = cache_read_tokens / (cache_read_tokens + input_tokens)
+```
+
+When both `cache_read_tokens` and `input_tokens` are zero for an interval (worker produced only output or was idle), `cache_eff` is `null` — the metric is undefined and excluded from aggregation and alerting. This avoids division-by-zero and prevents idle intervals from skewing statistics.
+
+Cache reads cost 0.1× input rate (30× cheaper). A worker with 90% cache efficiency burns ~3× less quota per useful token than one with 50% efficiency. This is the single largest lever on burn rate the governor doesn't currently observe.
+
+**Tracking:** The Token Collector adds `cache_eff` to each `i` record and `fleet_cache_eff` + `cache_eff_p25` to `f` records.
+
+**SQLite view:**
+
+```sql
+CREATE VIEW workspace_cache_eff AS
+SELECT
+    sess,
+    AVG("cache_eff") AS avg_eff,
+    MIN("cache_eff") AS min_eff,
+    COUNT(*) AS samples
+FROM i
+WHERE t0 > datetime('now', '-24 hours')
+GROUP BY sess
+ORDER BY avg_eff ASC;
+```
+
+**Alerting:** When a worker's cache efficiency drops below `cache_efficiency.warn_threshold` (default: 0.60) for `consecutive_intervals` (default: 3) consecutive intervals:
+
+```
+[governor] CACHE: needle-claude-anthropic-sonnet-bravo efficiency 0.43 (fleet avg 0.84)
+```
+
+**`cgov status` integration:**
+
+```
+Burn:     $2.15/hr  (p75 per worker)  ·  Cache: 84% (fleet avg)
+```
+
+**Common causes of low cache efficiency:**
+- Worker recently restarted (cold cache) — expected, transient
+- Workspace has many small files (poor cache locality) — structural
+- Context exceeded 200k tokens and was compressed — causes cache invalidation burst
+
+The governor does not automatically act on cache efficiency (causes are too varied), but surfacing the metric makes the operator aware of a key cost driver.
+
+---
+
+### 19. System Health Diagnostic (`cgov doctor`)
+
+**Purpose:** Validate the entire governor stack in one command with specific remediation steps.
+
+**Checks:**
+
+| Check | Pass | Warn | Fail |
+|---|---|---|---|
+| OAuth credentials | Valid, >1h to expiry | <30min to expiry | Expired or missing |
+| API reachability | 200 OK in <2s | Slow (>2s) | Unreachable or auth error |
+| Token collector | Running, cursors advancing | Cursors stale >10min | Not running |
+| Burn rate samples | ≥5 per window | 3–4 samples | <3 (using baseline fallback) |
+| Pricing config | All detected models have entries | — | Unknown model in token records |
+| Model generation | Rates match known generation | — | Opus 4.6 priced at $15/$75 (legacy) |
+| Promotion dates | Active or future promo configured | Expires in <48h | Expired, still in config |
+| SQLite integrity | `PRAGMA integrity_check` passes | — | Corruption detected |
+| JSONL/DB sync | Row counts within 1% | Diverge >1% | DB missing or empty |
+| Daemon status | Running, last cycle <2× interval | Last cycle >2× interval | Not running |
+| Log file | Exists, <100MB | >100MB | Missing or not writable |
+| Prediction accuracy | Median error <5% | 5–10% | >10% or insufficient data |
+
+**Output:**
+
+```
+cgov doctor — 2026-03-18 14:30 ET
+──────────────────────────────────────────
+✓ OAuth credentials     valid, expires in 3h12m
+✓ API reachability      200 OK (142ms)
+✓ Token collector       running, cursors current
+✓ Burn rate samples     12 samples (seven_day_sonnet)
+✓ Pricing config        all models matched
+✓ Model generation      rates consistent
+⚠ Promotion dates       expires in 10 days
+✓ SQLite integrity      OK
+✓ JSONL/DB sync         4,201 / 4,198 rows (99.9%)
+✓ Daemon status         running, last cycle 42s ago
+✓ Log file              12.4 MB
+✓ Prediction accuracy   median error -2.1% (24 scored)
+──────────────────────────────────────────
+11 passed · 1 warning · 0 failed
+```
+
+**Exit codes:** `0` = all pass (warnings OK), `1` = any fail.
+
+**Remediation hints:** Each failing check includes a specific fix command:
+- Credentials expired → `"Run: claude login"`
+- SQLite corrupt → `"Run: cgov token-history --rebuild-db"`
+- Pricing mismatch → `"Update pricing in ~/.needle/config/governor.yaml"`
+- Collector not running → `"Run: cgov start"`
+
+---
+
+### 20. Safe Mode
+
+**Purpose:** When prediction accuracy degrades beyond a threshold, the governor automatically enters a conservative fallback mode rather than continuing to make confident-but-wrong scaling decisions.
+
+**Trigger:** The calibrator (Component 12) tracks prediction accuracy over scored window resets. Safe mode activates when:
+- Median prediction error > `safe_mode.enter_median_error` (default: 10.0%), OR
+- Prediction error stddev > `safe_mode.enter_stddev` (default: 15.0%)
+
+**Effects while active:**
+- `target_utilization` reduced by `safe_mode.util_reduction` (default: 0.10) — e.g., 0.90 → 0.80
+- `hysteresis_band` widened by `safe_mode.hysteresis_boost` (default: 1) — less reactive
+- Sprint (Component 14) disabled — no aggressive end-of-window scaling
+- Cross-window optimization (Component 17) disabled — fall back to strict binding-window behavior
+- Logging: `[governor] SAFE MODE ENTERED — prediction accuracy degraded (median error 14.2%, stddev 18.1%)`
+
+**Exit conditions** (all must be true):
+- Median error drops below `safe_mode.exit_median_error` (default: 7.0%)
+- Stddev drops below `safe_mode.exit_stddev` (default: 12.0%)
+- At least 3 new predictions scored since safe mode was entered
+
+Uses hysteresis between entry and exit thresholds to prevent toggling. Logging: `[governor] SAFE MODE EXITED — prediction accuracy recovered (median error 4.8%, stddev 9.2%)`
+
+**State:** `safe_mode` in `governor-state.json`:
+
+```json
+{
+  "safe_mode": {
+    "active": true,
+    "entered_at": "2026-03-19T10:00:00Z",
+    "trigger": "median_error",
+    "median_error_at_entry": 14.2,
+    "predictions_since_entry": 1
+  }
+}
+```
+
+**`cgov status` integration:**
+```
+Workers:  2 active  (target: 2 · safe ceiling: 2)  ⚠ SAFE MODE (prediction accuracy degraded)
+```
+
+**Interaction with calibrator:** Safe mode and auto-tuning (Component 12) are complementary. Auto-tuning gradually adjusts parameters to improve accuracy; safe mode is the immediate defensive response when accuracy is too poor for tuning alone to fix. Safe mode buys time for the auto-tuner to converge.
+
+**Interaction with sprint (Component 14):** If safe mode activates while a sprint is running, the sprint terminates at the end of the current governor cycle. Sprint cannot be re-entered while safe mode is active.
+
+**Interaction with confidence cone (Component 21):** While safe mode is active, the governor always acts on the p75 (worst-case) estimate regardless of cone width. This is the most conservative posture.
+
+**Manual override:** `cgov scale N` overrides the safe-mode-adjusted target for one cycle but logs `[governor] WARN: manual scale override during safe mode`. Safe mode remains active and will reassert its target on the next cycle unless overridden again.
+
+**`predictions_since_entry` semantics:** Incremented once per window reset event (regardless of how many windows reset at the same time). Three distinct reset events must occur before safe mode can exit, ensuring enough fresh data to judge whether accuracy has genuinely recovered.
+
+---
+
+### 21. Forecast Confidence Cone
+
+**Purpose:** Replace single-point exhaustion predictions with range estimates that convey prediction certainty, using per-worker variance data already collected.
+
+**Mechanism:** The per-worker variance data in `f` records (`p75-usd-hr`, `std-usd-hr`) feeds three prediction scenarios per window:
+
+```python
+# Per-worker burn rate distribution from recent fleet aggregates:
+rate_p25 = ema_rate - 0.675 * stddev   # optimistic (25th percentile)
+rate_p50 = ema_rate                     # expected (median)
+rate_p75 = ema_rate + 0.675 * stddev   # conservative (75th percentile)
+
+# Per-window exhaustion prediction cone:
+exh_hrs_p25 = remaining_pct / (rate_p25 * workers)  # best case (slow burn)
+exh_hrs_p50 = remaining_pct / (rate_p50 * workers)  # expected
+exh_hrs_p75 = remaining_pct / (rate_p75 * workers)  # worst case (fast burn)
+```
+
+**Decision logic uses the cone width:**
+- **Narrow cone** (p75/p25 ratio < 1.5): high confidence — act on p50 (expected case)
+- **Wide cone** (p75/p25 ratio > 2.0): uncertain — act on p75 (worst case), which is more conservative
+- **Between**: blend linearly between p50 and p75 as the action threshold
+
+This means the governor is automatically more conservative when workload is heterogeneous (high variance) and more aggressive when workload is uniform (low variance), without any explicit configuration.
+
+**Extended `w` record fields:**
+
+```json
+{"r":"w",...,"exh_hrs":2.94,"exh_hrs_p25":3.81,"exh_hrs_p50":2.94,"exh_hrs_p75":2.02,"cone_ratio":1.89,...}
+```
+
+**`cgov status` integration:**
+
+```
+Window          Used    Ceiling  Remain  Resets    Risk
+seven_day_sonnet 64%      90%     26%    in 37h    ⚠ CUTOFF 2.0–3.8h ← BINDING
+```
+
+The range `2.0–3.8h` replaces the single `2.9h`, immediately communicating uncertainty to the operator.
+
+**`cgov simulate` integration:** The simulator outputs three trajectory lines (best/expected/worst) instead of one, showing the cone diverge over time. Useful for seeing when a decision that looks safe in the expected case is risky in the worst case.
+
+**Interaction with safe mode:** When safe mode is active (Component 20), the governor always uses p75 regardless of cone width — maximum conservatism during periods of known unreliability.
+
+---
+
 ## Configuration File
 
 `~/.needle/config/governor.yaml`:
@@ -754,6 +1309,9 @@ Last cycle: 14s ago  |  Next: in 4m46s
 loop_interval: 300          # seconds between cycles (5 minutes)
 hysteresis_band: 1          # workers deviation before acting
 log_file: ~/.needle/logs/governor.log
+log_level: INFO             # DEBUG, INFO, WARN, ERROR
+log_max_bytes: 104857600    # 100 MB — rotate when exceeded
+log_backup_count: 3         # keep 3 rotated log files (.1, .2, .3)
 state_file: ~/.needle/state/governor-state.json
 
 # Target utilization — governs how much of each window the fleet is allowed to consume.
@@ -779,15 +1337,28 @@ agents:
     max_workers: 5
     baseline_burn_rate: 1.2    # % per worker per hour (initial estimate)
     burn_rate_alpha: 0.2       # EMA smoothing factor
-    workspace: ""              # empty = auto-discover
-    launch_args: "--force"
+    launch_cmd: "needle run --agent=claude-anthropic-sonnet --force"
+    session_pattern: "needle-claude-anthropic-sonnet-*"  # tmux session glob
+    heartbeat_dir: ~/.needle/state/heartbeats            # JSON heartbeat files
 
   claude-anthropic-opus:
     enabled: false             # not managed by default
     min_workers: 0
     max_workers: 2
     baseline_burn_rate: 4.0    # Opus consumes ~3-4x more quota than Sonnet
-    workspace: ""
+    launch_cmd: "needle run --agent=claude-anthropic-opus --force"
+    session_pattern: "needle-claude-anthropic-opus-*"
+    heartbeat_dir: ~/.needle/state/heartbeats
+
+# Multi-agent orchestration:
+# All agents share the same usage windows (five_hour, seven_day, seven_day_sonnet).
+# Each agent has independent min/max/target worker counts and burn rate EMA.
+# The governor's capacity forecast aggregates burn across all active agents:
+#   fleet_pct_per_hour = sum(ema_rate[agent] * workers[agent] for agent in enabled_agents)
+# When scaling down under cutoff_risk, the governor reduces the agent with the
+# highest per-worker dollar cost first (Opus before Sonnet before Haiku).
+# When scaling up, the governor adds workers to the agent with the lowest
+# per-worker cost that has capacity (current < max_workers).
 
 # Promotion definitions
 promotions_file: ~/.needle/config/promotions.json
@@ -850,6 +1421,57 @@ alerts:
   emergency_brake_pct: 98
   underutilization_threshold_pct: 50
   underutilization_hours_remaining: 2
+  cooldown_minutes: 60        # suppress duplicate alerts for this period
+
+# Promotion validation
+promotion_validation:
+  tolerance_pct: 10           # observed ratio must be within ±10% of declared multiplier
+  min_samples: 5              # minimum peak + off-peak samples before validating
+  fallback_multiplier: 1.0    # use this when validation fails (conservative)
+
+# Trajectory simulator
+simulator:
+  default_resolution_minutes: 15  # output interval granularity
+  max_horizon_hours: 168          # maximum simulation window (1 week)
+
+# Prediction accuracy self-calibration
+calibration:
+  auto_calibrate: true            # auto-tune parameters based on prediction accuracy
+  min_predictions_to_tune: 10     # minimum scored predictions before tuning activates
+  alpha_range: [0.05, 0.5]        # clamp range for auto-tuned EMA alpha
+  hysteresis_range: [0, 3]        # clamp range for auto-tuned hysteresis band
+  target_util_range: [0.70, 0.98] # clamp range for auto-tuned target utilization
+
+# Promotion boundary pre-scaling
+pre_scale_minutes: 30             # look-ahead for multiplier transitions (0 = disabled)
+
+# End-of-window capacity sprint
+sprint:
+  enabled: true
+  horizon_minutes: 90             # how close to reset before sprint activates
+  min_headroom_pct: 15            # minimum remaining headroom to trigger sprint
+  max_workers_boost: 3            # workers added to max_workers during sprint
+
+# Cross-window capacity optimization
+cross_window:
+  enabled: true                   # composite risk scoring vs binding-window-only
+  cost_threshold: 0.0             # 0 = strict (never breach); >0 = allow cheap-window breach
+
+# Cache efficiency monitoring
+cache_efficiency:
+  enabled: true
+  warn_threshold: 0.60            # warn when worker cache efficiency drops below this
+  consecutive_intervals: 3        # consecutive intervals below threshold before warning
+
+# Safe mode — automatic conservatism when predictions degrade
+safe_mode:
+  enabled: true
+  enter_median_error: 10.0        # enter safe mode when median prediction error exceeds this %
+  enter_stddev: 15.0              # or when prediction error stddev exceeds this %
+  exit_median_error: 7.0          # exit when median error drops below this %
+  exit_stddev: 12.0               # and stddev drops below this %
+  util_reduction: 0.10            # reduce target_utilization by this amount in safe mode
+  hysteresis_boost: 1             # widen hysteresis_band by this in safe mode
 ```
 
 ---
@@ -860,21 +1482,16 @@ alerts:
 
 **Goal:** Replace `claude-status.sh` with reliable direct API polling.
 
-1. Write `scripts/poll-usage.sh`:
+1. Implement `src/poller.rs`:
    - Reads `~/.claude/.credentials.json` for OAuth token
-   - Checks token expiry; refreshes if needed
-   - Calls `/api/oauth/usage`
-   - Outputs JSON to stdout
-   - Handles errors (rate-limit, network, invalid token)
+   - Checks token expiry; refreshes via HTTPS (ureq + rustls) if needed
+   - Calls `/api/oauth/usage` via HTTPS
+   - Parses response, computes `hours_remaining` from `resets_at`
+   - Handles errors (network, invalid token, refresh failure with 3-cycle escalation)
 
-2. Write `scripts/parse-usage.py` (or inline Python):
-   - Parses API response
-   - Computes `hours_remaining` from `resets_at`
-   - Outputs structured fields for governor consumption
+2. Test: Run `cgov poll` every minute for 30 minutes, verify output matches TUI `/status` values.
 
-3. Test: Run every minute for 30 minutes, verify output matches TUI `/status` values.
-
-**Deliverable:** `scripts/poll-usage.sh` — standalone, can be used by other scripts.
+**Deliverable:** `cgov poll` subcommand — standalone, usable without the daemon running.
 
 ---
 
@@ -882,7 +1499,7 @@ alerts:
 
 **Goal:** Independently capture model-specific, token-type-specific consumption data. Runs as a separate daemon; the governor reads from its output but does not depend on it being active to function.
 
-1. Write `scripts/token-collector.py`:
+1. Implement `src/collector.rs`:
    - Walks `~/.claude/projects/**/*.jsonl` to find unprocessed lines (tracks cursor per file in `~/.needle/state/collector-cursors.json`)
    - Parses each assistant message's `usage` block — must read the nested `cache_creation` sub-object to split writes by tier:
      - `usage.input_tokens` — fresh input
@@ -901,10 +1518,11 @@ alerts:
 2. Write cursor tracking (`collector-cursors.json`):
    - Stores `{filepath: byte_offset}` so restarts resume where they left off without re-scanning
    - New files detected via glob on each pass
+   - **Shrinkage guard:** Before seeking, compare current file size to stored offset. If file is smaller (log rotation replaced it), reset that file's cursor to 0 and re-scan from the beginning. Log `[collector] cursor reset for {filepath} (file shrunk: {stored} → {actual} bytes)`
 
 3. `window_pct_deltas` annotation: on each governor poll cycle, the governor joins the interval's instance records to the concurrent API percentage snapshots to fill in `pct_delta_5h`, `pct_delta_7d`, `pct_delta_7d_s`. Apportionment across instances uses each instance's `dollar_equiv.total` as the weight (heavier-spending workers are attributed proportionally more of the observed percentage movement). This is the only field the collector cannot self-populate.
 
-4. Write one `fleet_aggregate` record per interval after all `instance_delta` records, containing aggregated stats, `per_worker_stats` (mean/p75/stddev), `window_snapshots` from the API, and the full `capacity_forecast` block.
+4. Write one `f` (fleet) record per interval after all `i` (instance) records, containing aggregated stats, `per_worker_stats` (mean/p75/stddev), `window_snapshots` from the API, and the full `capacity_forecast` block.
 
 5. Test independently:
    - Verify dollar computation against known API pricing (unit test each tok_type × model)
@@ -912,9 +1530,9 @@ alerts:
    - Verify correct model attribution when multiple models active in same session
    - Verify `f` record variance stats with synthetic data: 3 sessions, divergent `usd` values
    - Verify `w` record `bind` and `safe_w` selection when 5h is more constraining than 7d
-   - Verify grep/jq queryability: `jq 'select(.r=="i" and .tok=="w-cache-1h")'` returns only those lines
+   - Verify Python queryability: `python3 -c "import json,sys;[print(l,end='') for l in open('token-history.jsonl') if json.loads(l).get('r')=='i' and json.loads(l).get('w-cache-1h-n',0)>0]"` returns only records with 1-hour cache write activity
 
-**Deliverable:** `scripts/token-collector.py` — fully standalone, can be queried without the governor running.
+**Deliverable:** `cgov collect` subcommand — fully standalone, can be queried without the daemon running.
 
 ---
 
@@ -922,7 +1540,7 @@ alerts:
 
 **Goal:** Accurate effective-hours calculation with off-peak awareness.
 
-1. Write `scripts/schedule.py`:
+1. Implement `src/schedule.rs`:
    - `is_peak_now()` → bool
    - `current_multiplier()` → float (1.0 or 2.0 during promo)
    - `effective_hours_remaining(reset_time)` → float
@@ -952,7 +1570,7 @@ alerts:
 
    This guards against: the promotion ending early, the multiplier applying to some limit buckets but not others, or a future promotion with a different multiplier being misconfigured.
 
-**Deliverable:** `scripts/schedule.py` + `config/promotions.json` + promotion validation logic in burn-rate estimator
+**Deliverable:** `src/schedule.rs` + `config/promotions.json` + promotion validation logic in burn_rate module
 
 ---
 
@@ -962,8 +1580,8 @@ alerts:
 
 1. Extend state store with `burn_rate.by_model`, `last_fleet_aggregate`, and `capacity_forecast` as specified in the State Store schema.
 
-2. Write `scripts/burn-rate.py`:
-   - Reads `instance_delta` records from `token-history.db` for the most recent complete interval
+2. Implement `src/burn_rate.rs`:
+   - Reads `i` (instance) records from `token-history.db` for the most recent complete interval
    - Computes per-instance `dollar_burn` and `pct_burn` per window from annotated `window_pct_deltas`
    - Computes fleet-level `per_worker_stats` (mean, p75, stddev) across active sessions
    - Maintains per-(model, window) EMA with `alpha = 0.2`
@@ -971,7 +1589,7 @@ alerts:
    - Identifies `binding_window` — the window that will exhaust soonest
    - Stores separate peak/off-peak `tokens_per_pct` per window for promotion validation
    - Guard conditions: skip short intervals, changed worker counts, window resets mid-interval, zero-delta API responses
-   - Falls back to `baseline_pct_per_worker_per_hour` from `governor.yaml` until 3 valid samples per window
+   - Falls back to `baseline_burn_rate` from `governor.yaml` until 3 valid samples exist **per window** (each window independently transitions from baseline to EMA as it accumulates samples; a window with 2 samples uses baseline even if another window has 10)
 
 3. Update `compute_target_workers()` in governor to use `safe_worker_count[binding_window]` as the ceiling rather than the single-window formula.
 
@@ -983,7 +1601,7 @@ alerts:
    [governor] → target: 2 workers (safe_worker_count from binding window)
    ```
 
-**Deliverable:** `scripts/burn-rate.py` + updated state schema + per-window capacity forecast
+**Deliverable:** `src/burn_rate.rs` + updated state schema + per-window capacity forecast
 
 ---
 
@@ -991,19 +1609,18 @@ alerts:
 
 **Goal:** Replace `capacity-governor.sh` with the full governor.
 
-1. Write `scripts/governor.sh` (main daemon):
-   ```
-   while true; do
-       usage=$(poll_usage)
-       schedule=$(compute_schedule)
-       burn_rate=$(compute_burn_rate)
-       target=$(compute_target_workers usage schedule burn_rate)
-       current=$(count_workers)
-       apply_scaling current target
-       check_alerts usage schedule
-       write_state
-       sleep $LOOP_INTERVAL
-   done
+1. Implement `src/governor.rs` (main daemon):
+   ```python
+   while True:
+       usage = poll_usage()
+       schedule = compute_schedule()
+       burn_rate = compute_burn_rate()
+       target = compute_target_workers(usage, schedule, burn_rate)
+       current = count_workers()
+       apply_scaling(current, target)
+       check_alerts(usage, schedule)
+       write_state()
+       time.sleep(LOOP_INTERVAL)
    ```
 
 2. Implement `compute_target_workers()` using corrected formula with effective hours.
@@ -1012,14 +1629,14 @@ alerts:
 
 4. Implement emergency brake (>= 98% → scale to 0).
 
-5. Write `scripts/worker-manager.sh`:
-   - `scale_up(n)`: call `needle run` n times
-   - `scale_down_graceful(n)`: find idle workers, send SIGINT, fall back to kill after timeout
-   - `count_workers()`: use `needle list` + heartbeat status
+5. Implement `src/worker.rs`:
+   - `scale_up(n)`: execute `agent.launch_cmd` n times (one per tick) via shell
+   - `scale_down_graceful(n)`: read heartbeat JSON files from `agent.heartbeat_dir`, find idle workers, send SIGINT via tmux, fall back to kill after timeout
+   - `count_workers()`: read heartbeat files + verify against `tmux list-sessions`
 
 6. `--dry-run` mode: compute and log everything but do not modify workers.
 
-**Deliverable:** `scripts/governor.sh` — replaces `capacity-governor.sh`
+**Deliverable:** `cgov daemon` subcommand — replaces `capacity-governor.sh`
 
 ---
 
@@ -1027,17 +1644,17 @@ alerts:
 
 **Goal:** Surfacing important state transitions to human attention.
 
-1. Write `scripts/alerts.sh`:
+1. Implement `src/alerts.rs`:
    - Check each alert condition against thresholds
-   - Check if alert already fired this period (dedup by state file timestamp)
-   - Create HUMAN-type NEEDLE bead via `br create --type human`
+   - Check if alert already fired this period (dedup by cooldown in state file)
+   - Create HUMAN-type bead via configured alert command (default: `br create --type human "..."`)
    - Log alert to `governor.log`
 
-2. Add `last_alerted` per-type tracking to state file.
+2. Add `last_fired` per-type tracking to state file.
 
-3. Add "underutilization sprint" logic: if < 50% used and < 2h to reset, boost to SONNET_MAX.
+3. Add "underutilization sprint" logic: if < 50% used and < 2h to reset, boost to max_workers.
 
-**Deliverable:** `scripts/alerts.sh`
+**Deliverable:** `src/alerts.rs` module
 
 ---
 
@@ -1047,7 +1664,7 @@ alerts:
 
 #### 6.1 — `cgov` CLI Entry Point
 
-A thin Bash wrapper at `~/.local/bin/cgov` that dispatches to the underlying scripts. Every subcommand supports `--json` for machine-readable output.
+A single static binary at `~/.local/bin/cgov` that implements all subcommands directly. Every subcommand supports `--json` for machine-readable output.
 
 **Subcommand surface:**
 
@@ -1065,6 +1682,9 @@ cgov logs [--follow] [--lines N]           # Tail governor log
 cgov token-history [--json] [--last N] [--window W]  # Query w records
 cgov config [--edit]                       # Print active config; --edit opens $EDITOR
 cgov version                               # Print version and component status
+cgov simulate [--workers N|SCHEDULE] [--hours H] [--json]  # Project capacity trajectory
+cgov explain [--json] [--last N]                            # Scaling decision reasoning
+cgov doctor [--json]                                        # System health diagnostic
 ```
 
 **Human output (`cgov status`):**
@@ -1168,48 +1788,130 @@ tmux new-session -d -s "claude-token-collector" "cgov _token-collector"
 
 #### 6.3 — Install Script
 
-**One-liner install:**
+**Pre-built binary (recommended):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh | bash
+curl -fsSL https://github.com/jedarden/claude-governor/releases/latest/download/cgov-linux-amd64 \
+    -o ~/.local/bin/cgov && chmod +x ~/.local/bin/cgov
+cgov init   # writes default config + systemd units
 ```
 
-**Or from clone:**
+**Or build from source:**
 ```bash
 git clone https://github.com/jedarden/claude-governor
-cd claude-governor && ./install.sh
+cd claude-governor && cargo build --release
+cp target/release/cgov ~/.local/bin/
+cgov init
 ```
 
-`install.sh` steps:
-1. Check prerequisites: `bash ≥4`, `python3` (stdlib only), `curl`, `jq`; warn if `needle` / `br` absent but do not abort
-2. Copy `scripts/` → `~/.local/share/claude-governor/`
-3. Copy default configs → `~/.needle/config/` (skip existing files — never clobber user config)
-4. Write `~/.local/bin/cgov` dispatcher
-5. Create `~/.needle/logs/` and `~/.needle/state/` if absent
-6. Detect systemd availability; install units if present, print tmux fallback note otherwise
-7. Print quickstart message:
+**`cgov init` steps:**
+1. No prerequisites to check — `cgov` is a static binary with everything compiled in. Warn if `tmux` absent (needed for worker management)
+2. Copy default configs → `~/.needle/config/` (skip existing files — never clobber user config)
+3. Create `~/.needle/logs/` and `~/.needle/state/` if absent
+4. Detect systemd availability; install units if present, print tmux fallback note otherwise
+5. Print quickstart message:
    ```
-   Installed cgov v0.1.0
+   cgov v0.1.0 initialized
      cgov enable    → start daemon (survives reboot)
      cgov start     → start now, this session only
      cgov status    → check state
    Config: ~/.needle/config/governor.yaml
    ```
-8. Migration note: if `capacity-governor.sh` is detected, print the key config differences; do not modify or replace the old script
+6. Migration note: if `capacity-governor.sh` is detected, print the key config differences
 
 **Upgrade:**
 ```bash
-cd claude-governor && git pull && ./install.sh --upgrade
+curl -fsSL https://github.com/jedarden/claude-governor/releases/latest/download/cgov-linux-amd64 \
+    -o ~/.local/bin/cgov && chmod +x ~/.local/bin/cgov
 ```
-`--upgrade` overwrites scripts and units but never touches config files.
+Binary replacement is atomic — config files are never touched.
 
 **Uninstall:**
 ```bash
 cgov disable
-./install.sh --uninstall
+rm ~/.local/bin/cgov
 ```
-Removes `~/.local/bin/cgov`, `~/.local/share/claude-governor/`, systemd units. Does **not** touch `~/.needle/state/` (collected data) or `~/.needle/config/governor.yaml` (configuration).
+Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (collected data) or `~/.needle/config/governor.yaml` (configuration).
 
-**Deliverable:** `install.sh`, `bin/cgov` dispatcher, systemd unit files, `README.md` quickstart
+**Deliverable:** `cgov` binary, systemd unit files, `README.md` quickstart
+
+---
+
+### Phase 7: Advanced Capacity Intelligence
+
+**Goal:** Add predictive, self-tuning, and diagnostic capabilities that make the governor increasingly accurate and transparent over time.
+
+1. Implement `src/simulator.rs` (Component 11):
+   - Reads current state + burn rates + promotions config
+   - Walks forward in 1-minute steps with configurable worker schedule
+   - Outputs trajectory as JSON array or ASCII table
+   - Handles window resets (utilization drops to 0) and promotion transitions mid-simulation
+   - Test: simulate 24h with known burn rate, verify window reset handling and promotion transitions
+
+2. Implement `src/calibrator.rs` (Component 12):
+   - Hooks into window reset events to score past predictions vs actual outcomes
+   - Maintains `prediction-accuracy.jsonl` time series
+   - Auto-tunes alpha, hysteresis, target_utilization within clamped ranges
+   - Test: feed synthetic prediction/actual pairs, verify tuning direction and clamp enforcement
+
+3. Add pre-scaling logic to `src/schedule.rs` (Component 13):
+   - `next_transition()` returns upcoming multiplier change time and magnitude
+   - Governor loop pre-scales down when transition is within `pre_scale_minutes`
+   - Conservative-only: pre-scale down before losing bonus, never pre-scale up
+   - Test: mock clock at 07:35 ET during promo, verify scale-down triggers before 08:00
+
+4. Add sprint logic to `src/worker.rs` (Component 14):
+   - Sprint eligibility check per window (headroom, time-to-reset, backlog, cross-window safety)
+   - Temporary max_workers override with other-window guard
+   - Sprint flag in state with auto-expiry at window reset
+   - Test: verify sprint does not activate when a non-sprinting window has cutoff_risk
+
+5. Add capacity injection to NEEDLE worker launch (Component 15):
+   - Run `cgov status --json` at launch, format summary into pressure-level block
+   - Inject into worker's CLAUDE.md under `## Fleet Capacity`
+   - Three levels: LOW / MEDIUM / HIGH with behavioral guidance
+   - Graceful degradation: omit block silently when cgov not installed
+   - Test: verify injection content at each pressure level; verify omission when cgov absent
+
+6. Implement `src/narrator.rs` (Component 16):
+   - Template-based decision explanation generator (no LLM — pure string formatting)
+   - Append to `governor-decisions.jsonl` on every scaling action or state transition
+   - `cgov explain` reads and formats recent entries
+   - Test: verify narration covers scale_up, scale_down, sprint, pre_scale, emergency_brake
+
+7. Add cross-window optimization to `src/burn_rate.rs` (Component 17):
+   - `window_cost()` and `composite_risk()` functions
+   - Replace binding-window ceiling with composite-risk optimal worker count when enabled
+   - Configurable `cost_threshold` (default 0.0 = strict, equivalent to binding-window behavior)
+   - Test: 5h near-reset with 7d ample — optimizer should allow more workers than binding approach
+
+8. Add cache efficiency tracking to `src/collector.rs` (Component 18):
+   - Compute `cache_eff` per instance interval, add to `i` records
+   - Add `fleet_cache_eff` and `cache_eff_p25` to `f` records
+   - Create `workspace_cache_eff` view in SQLite
+   - Warn on sustained low efficiency (below threshold for N consecutive intervals)
+   - Test: synthetic token records with known cache ratios, verify metric and alert logic
+
+9. Implement `src/doctor.rs` (Component 19):
+   - 12 health checks with pass/warn/fail thresholds
+   - Structured JSON output (`--json`) + human-readable table (TTY)
+   - Specific remediation commands per failure type
+   - Test: break each check condition, verify detection and remediation text
+
+10. Add safe mode logic to `src/governor.rs` (Component 20):
+    - Check calibrator's prediction accuracy on each cycle
+    - Enter safe mode when thresholds exceeded: reduce target_util, widen hysteresis, disable sprint + cross-window
+    - Exit when accuracy recovers with hysteresis between entry/exit thresholds
+    - Write `safe_mode` block to state; surface in `cgov status`
+    - Test: feed poor-accuracy prediction history, verify entry; feed good accuracy, verify exit with minimum-scored-since-entry guard
+
+11. Add confidence cone to `src/burn_rate.rs` and `w` records (Component 21):
+    - Compute `exh_hrs_p25`, `exh_hrs_p50`, `exh_hrs_p75` per window using per-worker stddev
+    - Compute `cone_ratio` = p75/p25; use to modulate scaling aggressiveness
+    - Narrow cone → act on p50; wide cone → act on p75; blend between
+    - Extend `w` record and `cgov status` / `cgov simulate` output with range display
+    - Test: synthetic fleet data with low vs high stddev, verify cone width affects which percentile governs decisions
+
+**Deliverable:** `src/simulator.rs`, `src/calibrator.rs`, `src/narrator.rs`, `src/doctor.rs` + extensions to existing modules
 
 ---
 
@@ -1217,23 +1919,28 @@ Removes `~/.local/bin/cgov`, `~/.local/share/claude-governor/`, systemd units. D
 
 ```
 claude-governor/
-├── bin/
-│   └── cgov                  # CLI entry point / dispatcher (Phase 6)
-├── scripts/
-│   ├── governor.sh           # Main daemon loop (Phase 4) — invoked via cgov _daemon
-│   ├── poll-usage.sh         # Direct API usage poller (Phase 1)
-│   ├── token-collector.py    # Independent token delta collector (Phase 1b)
-│   ├── worker-manager.sh     # Scale-up/down logic (Phase 4)
-│   ├── alerts.sh             # Alert creation (Phase 5)
-│   ├── schedule.py           # Peak/off-peak calculator (Phase 2)
-│   └── burn-rate.py          # Model-specific burn rate EMA (Phase 3)
+├── Cargo.toml                # Rust project manifest
+├── src/
+│   ├── main.rs               # CLI entry point + subcommand dispatch
+│   ├── poller.rs             # Usage API poller (Phase 1) — ureq + rustls
+│   ├── collector.rs          # Token collector (Phase 1b)
+│   ├── governor.rs           # Main daemon loop (Phase 4)
+│   ├── worker.rs             # Worker manager — launch/stop via configured commands (Phase 4)
+│   ├── alerts.rs             # Alert creation (Phase 5)
+│   ├── schedule.rs           # Peak/off-peak calculator (Phase 2)
+│   ├── burn_rate.rs          # Model-specific burn rate EMA (Phase 3)
+│   ├── simulator.rs          # Trajectory projection (Phase 7)
+│   ├── calibrator.rs         # Prediction accuracy self-tuning (Phase 7)
+│   ├── narrator.rs           # Decision explanation generator (Phase 7)
+│   ├── doctor.rs             # Health diagnostic (Phase 7)
+│   └── state.rs              # State store — JSON read/write + rusqlite
 ├── config/
 │   ├── governor.yaml         # Main configuration (incl. pricing table)
 │   └── promotions.json       # Promotion window definitions
 ├── systemd/
 │   ├── claude-governor.service       # Systemd user service — governor daemon
 │   └── claude-token-collector.service  # Systemd user service — token collector
-├── install.sh                # Install / upgrade / uninstall helper
+├── install.sh                # Download binary + write default config
 ├── docs/
 │   ├── research/
 │   │   ├── usage-tracking.md
@@ -1244,6 +1951,8 @@ claude-governor/
 └── README.md
 ```
 
+**Build output:** `cargo build --release` produces a single statically-linked binary `target/release/cgov` (~5–10 MB). This is the only artifact that needs to be deployed.
+
 **Runtime state files** (written to `~/.needle/state/`):
 
 | File | Written by | Purpose |
@@ -1253,6 +1962,9 @@ claude-governor/
 | `token-history.jsonl` | token-collector | Append-only per-interval token delta records |
 | `token-history.db` | token-collector | SQLite mirror for fast queries |
 | `collector-cursors.json` | token-collector | File byte offsets to avoid re-processing |
+| `prediction-accuracy.jsonl` | calibrator | Scored prediction vs actual for self-tuning |
+| `governor-decisions.jsonl` | narrator | Plain-English scaling decision audit log |
+| `heartbeats/{session}.json` | NEEDLE workers | Per-worker status (idle/executing), refreshed every 30s |
 
 ---
 
