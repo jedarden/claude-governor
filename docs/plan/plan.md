@@ -213,17 +213,20 @@ The column set is fixed at startup from the pricing config — all configured mo
 **Three lines per interval** (one per window), written last. These are the **primary output** of the entire measurement pipeline: they answer "will workers be stopped before this window resets?"
 
 Key fields:
-- `exh_hrs` — hours until window exhausts at current fleet burn rate (`remain / fleet_pct_hr`)
+- `ceil` — configured target ceiling for this window (e.g. `90.0` when `target_utilization=0.90`)
+- `snap` — raw platform utilization % at time of snapshot
+- `remain` — headroom to `ceil`, not to 100% (`ceil - snap`); this is the usable budget
+- `exh_hrs` — hours until `ceil` is reached at current fleet burn rate (`remain / fleet_pct_hr`)
 - `hrs_left` — hours until window resets
-- `cutoff_risk` — `1` if `exh_hrs < hrs_left` (workers **will** be stopped before reset at current rate)
-- `margin_hrs` — `hrs_left - exh_hrs`; positive = safe headroom, negative = fleet exceeds sustainable rate
-- `bind` — `1` if this is the most constrained window (smallest `margin_hrs` across all windows)
+- `cutoff_risk` — `1` if `exh_hrs < hrs_left` (fleet will hit the ceiling before window resets)
+- `margin_hrs` — `hrs_left - exh_hrs`; positive = safe, negative = will exceed ceiling
+- `bind` — `1` if this is the most constrained window (smallest `margin_hrs`)
 - `safe_w` — max worker count where `exh_hrs >= hrs_left` (only present on binding window)
 
 ```
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":63.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":8.03,"cutoff_risk":0,"margin_hrs":6.53,"bind":0,"safe_w":null,"pk":0}
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day","snap":72.6,"reset":"2026-03-20T03:00:00Z","delta":0.54,"remain":27.4,"hrs_left":37.5,"fleet_pct_hr":6.48,"exh_hrs":4.23,"cutoff_risk":1,"margin_hrs":-33.27,"bind":0,"safe_w":null,"pk":0}
-{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":36.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":4.06,"cutoff_risk":1,"margin_hrs":-33.44,"bind":1,"safe_w":2,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","ceil":85.0,"snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":48.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":6.14,"cutoff_risk":0,"margin_hrs":4.64,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day","ceil":90.0,"snap":72.6,"reset":"2026-03-20T03:00:00Z","delta":0.54,"remain":17.4,"hrs_left":37.5,"fleet_pct_hr":6.48,"exh_hrs":2.69,"cutoff_risk":1,"margin_hrs":-34.81,"bind":0,"safe_w":null,"pk":0}
+{"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","ceil":90.0,"snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":26.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":2.94,"cutoff_risk":1,"margin_hrs":-34.56,"bind":1,"safe_w":2,"pk":0}
 ```
 
 ---
@@ -274,14 +277,16 @@ CREATE INDEX f_t0    ON f(t0);
 CREATE INDEX f_pk_t0 ON f(pk, t0);  -- fast peak vs off-peak queries
 
 -- Type "w": one row per window per interval
--- Primary output: cutoff_risk=1 means workers will be stopped before this window resets
+-- Primary output: cutoff_risk=1 means the fleet will hit the target ceiling before this window resets
 CREATE TABLE w (
     ts TEXT, t0 TEXT, t1 TEXT, win TEXT,
+    ceil REAL,            -- configured target ceiling (e.g. 90.0); stored per-record so history reflects config at the time
     snap REAL, reset TEXT, delta REAL,
-    remain REAL, hrs_left REAL,
+    remain REAL,          -- ceil - snap (headroom to target ceiling, not to 100%)
+    hrs_left REAL,
     fleet_pct_hr REAL, exh_hrs REAL,
-    cutoff_risk INTEGER,  -- 1 if exh_hrs < hrs_left (workers will be stopped)
-    margin_hrs REAL,      -- hrs_left - exh_hrs; negative means over-budget
+    cutoff_risk INTEGER,  -- 1 if exh_hrs < hrs_left (fleet will hit ceiling before reset)
+    margin_hrs REAL,      -- hrs_left - exh_hrs; negative means over-budget relative to target
     bind INTEGER, safe_w INTEGER, pk INTEGER
 );
 CREATE INDEX w_win_t0        ON w(win, t0);
@@ -349,37 +354,44 @@ token-collector --rebuild-db          # reconstruct SQLite from JSONL
 
   "capacity_forecast": {
     // PRIMARY OUTPUT: per-window cutoff prediction.
-    // cutoff_risk=true means workers will be stopped before this window resets
-    // at the current fleet burn rate. margin_hrs < 0 means already in cutoff territory.
+    // cutoff_risk=true means the fleet will hit the target ceiling before this window resets.
+    // target_ceiling = target_utilization * 100 (e.g. 90.0 when target_utilization=0.90).
+    // remaining_pct = target_ceiling - current_utilization (headroom to ceiling, not to 100%).
     "five_hour": {
-      "remaining_pct":              63.6,
+      "target_ceiling":             85.0,   // target_utilization=0.85 for session window
+      "current_utilization":        36.4,
+      "remaining_pct":              48.6,   // 85.0 - 36.4
       "hours_remaining":            1.50,
       "fleet_pct_per_hour":         7.92,
-      "predicted_exhaustion_hours": 8.03,
-      "cutoff_risk":                false,  // exh_hrs (8.03) > hrs_left (1.50) → safe
-      "margin_hrs":                 6.53,   // hrs_left - exh_hrs (positive = safe)
+      "predicted_exhaustion_hours": 6.14,
+      "cutoff_risk":                false,  // exh_hrs (6.14) > hrs_left (1.50) → safe
+      "margin_hrs":                 4.64,
       "binding":                    false
     },
     "seven_day": {
-      "remaining_pct":              27.4,
+      "target_ceiling":             90.0,
+      "current_utilization":        72.6,
+      "remaining_pct":              17.4,   // 90.0 - 72.6
       "hours_remaining":            37.5,
       "fleet_pct_per_hour":         6.48,
-      "predicted_exhaustion_hours": 4.23,
-      "cutoff_risk":                true,   // exh_hrs (4.23) < hrs_left (37.5) → will exhaust
-      "margin_hrs":                 -33.27, // negative = workers WILL be stopped
+      "predicted_exhaustion_hours": 2.69,
+      "cutoff_risk":                true,   // exh_hrs (2.69) < hrs_left (37.5) → will exceed target
+      "margin_hrs":                 -34.81,
       "binding":                    false
     },
     "seven_day_sonnet": {
-      "remaining_pct":              36.5,
+      "target_ceiling":             90.0,
+      "current_utilization":        63.5,
+      "remaining_pct":              26.5,   // 90.0 - 63.5
       "hours_remaining":            37.5,
       "fleet_pct_per_hour":         9.00,
-      "predicted_exhaustion_hours": 4.06,
-      "cutoff_risk":                true,   // exh_hrs (4.06) < hrs_left (37.5) → will exhaust
-      "margin_hrs":                 -33.44, // BINDING: most constrained window
+      "predicted_exhaustion_hours": 2.94,
+      "cutoff_risk":                true,   // exh_hrs (2.94) < hrs_left (37.5) → will exceed target
+      "margin_hrs":                 -34.56, // BINDING: most constrained window
       "binding":                    true,
       "safe_worker_count":          2       // max workers where exh_hrs >= hrs_left
     },
-    "binding_window":      "seven_day_sonnet",  // window with smallest margin_hrs
+    "binding_window":      "seven_day_sonnet",
     "dollars_per_pct_7d_s": 1.648,
     "estimated_remaining_dollars": 46.1
   },
@@ -472,7 +484,11 @@ def effective_hours_remaining(reset_time, promotions):
 
 **Target rate calculation (corrected from existing governor):**
 ```
-remaining_capacity = 100 - sonnet_pct
+# target_utilization caps effective consumption; default 1.0 = use everything
+target_ceiling  = target_utilization * 100      # e.g. 90.0 when target_utilization=0.90
+remaining_capacity = target_ceiling - sonnet_pct
+remaining_capacity = max(0, remaining_capacity)  # clamp if already past target
+
 # effective_hours accounts for 2x off-peak windows
 target_rate_per_effective_hour = remaining_capacity / effective_hours_remaining
 target_rate_per_raw_hour = target_rate_per_effective_hour * current_multiplier
@@ -544,17 +560,24 @@ ema_pct_per_hour[model][window] = α * fleet_pct_per_hour[window] + (1-α) * pre
 α = 0.2
 
 # Capacity forecast per window:
-remaining_pct[W]   = 100 - snapshot_utilization[W]
+# target_utilization is configured per-window (default 1.0 = 100%).
+# E.g. target_utilization=0.90 treats the window as exhausted at 90%,
+# leaving a 10% reserve that workers will never consume.
+target_ceiling[W]  = target_utilization[W] * 100         # e.g. 90.0
+effective_used[W]  = min(snapshot_utilization[W], target_ceiling[W])
+remaining_pct[W]   = target_ceiling[W] - effective_used[W]  # headroom to target, not to 100%
 hours_remaining[W] = (resets_at[W] - now).total_seconds() / 3600
 
 fleet_pct_per_hour[W]         = ema_pct_per_hour[model][W] * workers_active
 predicted_exhaustion_hours[W] = remaining_pct[W] / fleet_pct_per_hour[W]
 
 # PRIMARY CUTOFF PREDICTION — the core question the governor answers:
+# With target_utilization < 1.0, "cutoff" means hitting the configured ceiling,
+# not the hard platform limit. This gives a configurable safety reserve.
 cutoff_risk[W]  = predicted_exhaustion_hours[W] < hours_remaining[W]
 margin_hrs[W]   = hours_remaining[W] - predicted_exhaustion_hours[W]
-# margin_hrs > 0: safe (workers will idle before hitting limit)
-# margin_hrs < 0: at risk (workers WILL be stopped before window resets)
+# margin_hrs > 0: safe (workers will idle before hitting target ceiling)
+# margin_hrs < 0: at risk (workers WILL exceed the target ceiling before window resets)
 
 # Safe worker count: max workers where margin_hrs[W] >= 0, using conservative rate
 safe_worker_count[W] = floor(remaining_pct[W] / hours_remaining[W] / p75_rate_per_worker)
@@ -687,6 +710,21 @@ loop_interval: 300          # seconds between cycles (5 minutes)
 hysteresis_band: 1          # workers deviation before acting
 log_file: ~/.needle/logs/governor.log
 state_file: ~/.needle/state/governor-state.json
+
+# Target utilization — governs how much of each window the fleet is allowed to consume.
+# 1.0 = use all available capacity; 0.9 = reserve 10%; 0.8 = reserve 20%.
+# Applies to the remaining headroom calculation: remaining = (target * 100) - current_pct
+# Can be overridden per-window under `windows:` below.
+target_utilization: 0.90    # default: reserve 10% across all windows
+
+# Per-window overrides (optional — inherit target_utilization if absent)
+windows:
+  five_hour:
+    target_utilization: 0.85  # session window: tighter reserve to avoid mid-task cutoff
+  seven_day:
+    target_utilization: 0.90
+  seven_day_sonnet:
+    target_utilization: 0.90
 
 # Managed agents
 agents:
