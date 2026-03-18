@@ -156,57 +156,50 @@ The session filename path encodes the model used; the `model` field in the messa
 }
 ```
 
-**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Every line is a single flat JSON object — no nested fields. Three record types, identified by `"r"`:
+**Output — append-only JSONL** at `~/.needle/state/token-history.jsonl`. Every line is a single flat JSON object. Three record types per collection pass, identified by `"r"`. Records `i` and `f` are wide: every token-type measurement appears as a column on the same row, not as separate rows.
 
-#### Line Structure
+Token-type column suffixes used throughout:
 
-Each line encodes exactly one measurement in the form `[model]-[tok_type]-[tokens]-[usd]-[pct]`. The `tok_type` field takes one of five values:
-
-| Value | Meaning | Pricing basis |
+| Suffix | Meaning | Pricing basis |
 |---|---|---|
-| `input` | Fresh input tokens | base input rate |
-| `output` | Output tokens | output rate |
-| `r-cache` | Cache reads (hits) | 0.1× input |
-| `w-cache-5m` | Cache writes, 5-min TTL | 1.25× input |
-| `w-cache-1h` | Cache writes, 1-hour TTL | 2.0× input |
+| `-input` | Fresh input tokens | base input rate |
+| `-output` | Output tokens | output rate |
+| `-r-cache` | Cache reads (hits) | 0.1× input |
+| `-w-cache-5m` | Cache writes, 5-min TTL | 1.25× input |
+| `-w-cache-1h` | Cache writes, 1-hour TTL | 2.0× input |
 
-#### Record Type `i` — Instance Token-Type Delta
+Each token-type column appears in two variants: `-n` (token count) and `-usd` (dollar cost).
 
-One line per **(session × model × tok\_type)** per interval. Five lines per active worker (one per tok_type), all sharing the same `t0`/`t1`. The percentage fields (`p5h`, `p7d`, `p7ds`) are `null` at write time and annotated by the governor on its next poll cycle.
+#### Record Type `i` — Instance Wide Row
 
-```
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"input","n":15410,"usd":0.0462,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"output","n":2830,"usd":0.0425,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"r-cache","n":104200,"usd":0.0313,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"w-cache-5m","n":4100,"usd":0.0154,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
-{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","tok":"w-cache-1h","n":5500,"usd":0.0330,"p5h":null,"p7d":null,"p7ds":null,"pk":0}
-```
-
-After governor annotation, the percentage fields are filled in on the existing rows in the SQLite mirror (JSONL is append-only — annotated values live only in the DB):
+**One line per session per interval.** All five token types appear as columns on the same row — width is `(5 tok_types × 2 variants) + metadata + total + percentages`. Since each session runs one model, tok_type columns are not model-prefixed; the `model` field carries the model identity.
 
 ```
-{"r":"i",...,"tok":"input","n":15410,"usd":0.0462,"p5h":0.055,"p7d":0.044,"p7ds":0.062,"pk":0}
+{"r":"i","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","sess":"needle-claude-anthropic-sonnet-alpha","sid":"ad5b2e01","model":"claude-sonnet-4-6","pk":0,"input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-5m-n":4100,"w-cache-5m-usd":0.0154,"w-cache-1h-n":5500,"w-cache-1h-usd":0.0330,"total-usd":0.1684,"p5h":null,"p7d":null,"p7ds":null}
 ```
 
-`p5h`, `p7d`, `p7ds` are each this instance's apportioned share of the observed window delta for that interval, weighted by `usd` across all concurrent sessions.
-
-#### Record Type `f` — Fleet Token-Type Aggregate
-
-One line per **(model × tok\_type)** per interval, written after all `i` records for that interval. Enables direct comparison of token-type consumption across the full fleet and tracks per-worker variance.
+Two workers in the same interval produce two `i` lines, directly comparable column-for-column:
 
 ```
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"input","n":29840,"usd":0.0924,"workers":2,"mean_usd_hr":0.554,"p75_usd_hr":0.619,"std_usd_hr":0.093,"p5h":0.110,"p7d":0.088,"p7ds":0.124,"pk":0}
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"output","n":5510,"usd":0.0828,"workers":2,"mean_usd_hr":0.497,"p75_usd_hr":0.558,"std_usd_hr":0.086,"p5h":0.099,"p7d":0.079,"p7ds":0.111,"pk":0}
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"r-cache","n":198300,"usd":0.0595,"workers":2,"mean_usd_hr":0.357,"p75_usd_hr":0.401,"std_usd_hr":0.061,"p5h":0.071,"p7d":0.057,"p7ds":0.080,"pk":0}
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"w-cache-5m","n":7900,"usd":0.0296,"workers":2,"mean_usd_hr":0.178,"p75_usd_hr":0.199,"std_usd_hr":0.030,"p5h":0.035,"p7d":0.028,"p7ds":0.040,"pk":0}
-{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","model":"claude-sonnet-4-6","tok":"w-cache-1h","n":10400,"usd":0.0624,"workers":2,"mean_usd_hr":0.374,"p75_usd_hr":0.421,"std_usd_hr":0.064,"p5h":0.075,"p7d":0.059,"p7ds":0.084,"pk":0}
+{"r":"i",...,"sess":"...alpha","model":"claude-sonnet-4-6","input-n":15410,"input-usd":0.0462,"output-n":2830,"output-usd":0.0425,"r-cache-n":104200,"r-cache-usd":0.0313,"w-cache-5m-n":4100,"w-cache-5m-usd":0.0154,"w-cache-1h-n":5500,"w-cache-1h-usd":0.0330,"total-usd":0.1684,"p5h":null,"p7d":null,"p7ds":null}
+{"r":"i",...,"sess":"...bravo","model":"claude-sonnet-4-6","input-n":14430,"input-usd":0.0433,"output-n":2680,"output-usd":0.0402,"r-cache-n":94100,"r-cache-usd":0.0282,"w-cache-5m-n":3800,"w-cache-5m-usd":0.0143,"w-cache-1h-n":4900,"w-cache-1h-usd":0.0294,"total-usd":0.1554,"p5h":null,"p7d":null,"p7ds":null}
 ```
 
-`mean_usd_hr`/`p75_usd_hr`/`std_usd_hr` are computed per-tok-type across the active worker sessions, enabling fine-grained comparison of which token type is driving variance (e.g., high stddev on `w-cache-1h` means workers differ significantly in how much long-lived context they establish).
+`p5h`, `p7d`, `p7ds` are `null` at write time. The governor annotates them in the SQLite mirror by apportioning each window's observed percentage delta across concurrent sessions, weighted by `total-usd`.
 
-#### Record Type `w` — Window Capacity Forecast
+#### Record Type `f` — Fleet Wide Row
 
-One line per window per interval, written last. Self-contained — contains everything needed to reconstruct the capacity forecast without joining other tables.
+**One line per interval.** All models × all token types appear as columns, prefixed by model name: `[model]-[tok_type]-n` and `[model]-[tok_type]-usd`. Zero-filled for models with no activity in the interval. Ends with fleet-level totals, per-worker variance stats, and percentage deltas.
+
+```
+{"r":"f","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","pk":0,"workers":2,"claude-sonnet-4-6-input-n":29840,"claude-sonnet-4-6-input-usd":0.0924,"claude-sonnet-4-6-output-n":5510,"claude-sonnet-4-6-output-usd":0.0828,"claude-sonnet-4-6-r-cache-n":198300,"claude-sonnet-4-6-r-cache-usd":0.0595,"claude-sonnet-4-6-w-cache-5m-n":7900,"claude-sonnet-4-6-w-cache-5m-usd":0.0296,"claude-sonnet-4-6-w-cache-1h-n":10400,"claude-sonnet-4-6-w-cache-1h-usd":0.0624,"claude-opus-4-6-input-n":0,"claude-opus-4-6-input-usd":0,"claude-opus-4-6-output-n":0,"claude-opus-4-6-output-usd":0,"claude-opus-4-6-r-cache-n":0,"claude-opus-4-6-r-cache-usd":0,"claude-opus-4-6-w-cache-5m-n":0,"claude-opus-4-6-w-cache-5m-usd":0,"claude-opus-4-6-w-cache-1h-n":0,"claude-opus-4-6-w-cache-1h-usd":0,"total-usd":0.3201,"p75-usd-hr":2.147,"std-usd-hr":0.312,"p5h":0.66,"p7d":0.54,"p7ds":0.75}
+```
+
+The column set is fixed at startup from the pricing config — all configured models appear in every `f` row, zero-filled when inactive. This keeps the schema stable and rows directly comparable across time.
+
+#### Record Type `w` — Window Forecast Row
+
+**Three lines per interval** (one per window), written last. Self-contained for capacity forecast queries.
 
 ```
 {"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"five_hour","snap":36.4,"reset":"2026-03-18T15:59:59Z","delta":0.66,"remain":63.6,"hrs_left":1.50,"fleet_pct_hr":7.92,"exh_hrs":8.03,"bind":0,"safe_w":null,"pk":0}
@@ -214,76 +207,72 @@ One line per window per interval, written last. Self-contained — contains ever
 {"r":"w","ts":"2026-03-18T14:30:00Z","t0":"2026-03-18T14:25:00Z","t1":"2026-03-18T14:30:00Z","win":"seven_day_sonnet","snap":63.5,"reset":"2026-03-20T03:59:59Z","delta":0.75,"remain":36.5,"hrs_left":37.5,"fleet_pct_hr":9.00,"exh_hrs":4.06,"bind":1,"safe_w":2,"pk":0}
 ```
 
-`bind:1` marks the binding window. `safe_w` is null for non-binding windows.
-
 ---
 
-**Why flat single-line records?**
-
-- Any window or instance can be filtered with a single `grep`/`jq` without parsing nested objects
-- Token types are directly comparable across sessions: `jq 'select(.r=="f" and .tok=="w-cache-1h")'`
-- Burn rate for a specific worker across time: `jq 'select(.r=="i" and .sess=="...alpha" and .tok=="output")'`
-- All inputs this week: `jq 'select(.r=="f" and .tok=="input") | .n' | paste -sd+ | bc`
-- The `[model]-[tok]-[n]-[usd]-[p7ds]` tuple is directly readable on each line without unpacking
-
----
-
-**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (JSONL is authoritative; DB rebuilt from JSONL on corruption). Schema mirrors the three record types exactly — one table per type:
+**Fast-query SQLite mirror** at `~/.needle/state/token-history.db` (JSONL is authoritative; DB rebuilt on corruption). Table schemas are wide to match the records:
 
 ```sql
--- Type "i": instance token-type deltas
+-- Type "i": one row per session per interval
 CREATE TABLE i (
-    ts    TEXT, t0 TEXT, t1 TEXT,
-    sess  TEXT, sid TEXT,
-    model TEXT, tok TEXT,
-    n     INTEGER, usd REAL,
-    p5h   REAL, p7d REAL, p7ds REAL,   -- null until governor annotates
-    pk    INTEGER
+    ts TEXT, t0 TEXT, t1 TEXT, sess TEXT, sid TEXT, model TEXT, pk INTEGER,
+    "input-n" INTEGER,     "input-usd" REAL,
+    "output-n" INTEGER,    "output-usd" REAL,
+    "r-cache-n" INTEGER,   "r-cache-usd" REAL,
+    "w-cache-5m-n" INTEGER,"w-cache-5m-usd" REAL,
+    "w-cache-1h-n" INTEGER,"w-cache-1h-usd" REAL,
+    "total-usd" REAL,
+    p5h REAL, p7d REAL, p7ds REAL   -- null until governor annotates
 );
-CREATE INDEX i_sess_tok ON i(sess, tok, t0);
-CREATE INDEX i_model_tok ON i(model, tok, t0);
+CREATE INDEX i_t0_sess ON i(t0, sess);
+CREATE INDEX i_model_t0 ON i(model, t0);
 
--- Type "f": fleet token-type aggregates
+-- Type "f": one wide row per interval; columns generated from pricing config
+-- Example with claude-sonnet-4-6 and claude-opus-4-6 configured:
 CREATE TABLE f (
-    ts    TEXT, t0 TEXT, t1 TEXT,
-    model TEXT, tok TEXT,
-    n     INTEGER, usd REAL, workers INTEGER,
-    mean_usd_hr REAL, p75_usd_hr REAL, std_usd_hr REAL,
-    p5h   REAL, p7d REAL, p7ds REAL,
-    pk    INTEGER
+    ts TEXT, t0 TEXT, t1 TEXT, pk INTEGER, workers INTEGER,
+    "claude-sonnet-4-6-input-n" INTEGER,      "claude-sonnet-4-6-input-usd" REAL,
+    "claude-sonnet-4-6-output-n" INTEGER,     "claude-sonnet-4-6-output-usd" REAL,
+    "claude-sonnet-4-6-r-cache-n" INTEGER,    "claude-sonnet-4-6-r-cache-usd" REAL,
+    "claude-sonnet-4-6-w-cache-5m-n" INTEGER, "claude-sonnet-4-6-w-cache-5m-usd" REAL,
+    "claude-sonnet-4-6-w-cache-1h-n" INTEGER, "claude-sonnet-4-6-w-cache-1h-usd" REAL,
+    "claude-opus-4-6-input-n" INTEGER,        "claude-opus-4-6-input-usd" REAL,
+    "claude-opus-4-6-output-n" INTEGER,       "claude-opus-4-6-output-usd" REAL,
+    "claude-opus-4-6-r-cache-n" INTEGER,      "claude-opus-4-6-r-cache-usd" REAL,
+    "claude-opus-4-6-w-cache-5m-n" INTEGER,   "claude-opus-4-6-w-cache-5m-usd" REAL,
+    "claude-opus-4-6-w-cache-1h-n" INTEGER,   "claude-opus-4-6-w-cache-1h-usd" REAL,
+    "total-usd" REAL,
+    "p75-usd-hr" REAL, "std-usd-hr" REAL,
+    p5h REAL, p7d REAL, p7ds REAL
 );
-CREATE INDEX f_model_tok ON f(model, tok, t0);
+CREATE INDEX f_t0 ON f(t0);
 
--- Type "w": window capacity forecasts
+-- Type "w": one row per window per interval
 CREATE TABLE w (
-    ts    TEXT, t0 TEXT, t1 TEXT,
-    win   TEXT,
-    snap  REAL, reset TEXT, delta REAL,
+    ts TEXT, t0 TEXT, t1 TEXT, win TEXT,
+    snap REAL, reset TEXT, delta REAL,
     remain REAL, hrs_left REAL,
     fleet_pct_hr REAL, exh_hrs REAL,
-    bind  INTEGER, safe_w INTEGER,
-    pk    INTEGER
+    bind INTEGER, safe_w INTEGER, pk INTEGER
 );
-CREATE INDEX w_win ON w(win, t0);
+CREATE INDEX w_win_t0 ON w(win, t0);
 
--- Cross-instance burn rate comparison view
-CREATE VIEW worker_rates AS
-SELECT sess, model, tok,
-    SUM(n) AS total_tokens,
-    SUM(usd) AS total_usd,
-    SUM(usd) / SUM((julianday(t1)-julianday(t0))*24) AS usd_per_hour,
-    COUNT(*) AS samples
-FROM i WHERE p7ds IS NOT NULL
-GROUP BY sess, model, tok;
+-- Cross-instance comparison: all sessions side by side for a given interval
+CREATE VIEW instance_compare AS
+SELECT t0, sess, model,
+    "total-usd", "input-usd", "output-usd",
+    "r-cache-usd", "w-cache-5m-usd", "w-cache-1h-usd",
+    "total-usd" / ((julianday(t1)-julianday(t0))*24) AS usd_per_hour,
+    p7ds
+FROM i ORDER BY t0 DESC, "total-usd" DESC;
 ```
 
 **Standalone CLI:**
 ```bash
-token-collector --collect             # one collection pass; write i+f+w records
+token-collector --collect             # one collection pass; write i+f+w lines
 token-collector --daemon              # loop every N minutes
-token-collector --query [--last N]    # recent w records (window forecasts)
-token-collector --workers [--tok TOK] # worker_rates view, optionally filtered by tok_type
-token-collector --compare-instances   # side-by-side usd_per_hour across active sessions
+token-collector --query [--last N]    # recent w rows (window forecasts)
+token-collector --compare [--at TS]   # instance_compare view for latest (or given) interval
+token-collector --fleet [--last N]    # recent f rows showing all model×tok_type columns
 token-collector --rebuild-db          # reconstruct SQLite from JSONL
 ```
 
