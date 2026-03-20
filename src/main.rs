@@ -13,6 +13,10 @@ use log::LevelFilter;
 mod poller;
 use poller::{Poller, UsageData};
 
+mod config;
+mod collector;
+mod pricing;
+
 #[derive(Parser)]
 #[command(name = "cgov")]
 #[command(about = "Claude Governor - automated capacity governor for Claude Code", long_about = None)]

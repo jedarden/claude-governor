@@ -1,0 +1,64 @@
+# Claude Governor Configuration
+#
+# This file contains pricing data for Claude models.
+# Prices are in USD per million tokens (MTok).
+#
+# Source: https://docs.anthropic.com/en/docs/about-claude/models
+
+pricing:
+  models:
+    # Claude Sonnet 4.6 (claude-sonnet-4-20250514)
+    # Input: $3.00/MTok, Output: $15.00/MTok
+    claude-sonnet-4-20250514:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    # Claude Opus 4.6 (claude-opus-4-20250514)
+    # Input: $5.00/MTok, Output: $25.00/MTok
+    claude-opus-4-20250514:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_write_5m_per_mtok: 6.25
+      cache_write_1h_per_mtok: 10.0
+      cache_read_per_mtok: 0.50
+
+    # Claude Haiku 4.5 (claude-haiku-4-20241022)
+    # Input: $1.00/MTok, Output: $5.00/MTok
+    claude-haiku-4-20241022:
+      input_per_mtok: 1.0
+      output_per_mtok: 5.0
+      cache_write_5m_per_mtok: 1.25
+      cache_write_1h_per_mtok: 2.0
+      cache_read_per_mtok: 0.10
+
+    # Legacy model IDs (for backward compatibility)
+    claude-opus-4-20250211:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_write_5m_per_mtok: 6.25
+      cache_write_1h_per_mtok: 10.0
+      cache_read_per_mtok: 0.50
+
+    claude-sonnet-4-20250211:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    claude-sonnet-4-20240529:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    claude-opus-4-20240229:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_write_5m_per_mtok: 6.25
+      cache_write_1h_per_mtok: 10.0
+      cache_read_per_mtok: 0.50
