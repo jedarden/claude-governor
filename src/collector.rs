@@ -204,6 +204,90 @@ impl CursorStore {
     }
 }
 
+/// Extract model identifier from a message JSON object
+///
+/// Primary: reads `model` field from the message JSON object.
+/// Fallback: returns "unknown" if the field is missing or null.
+pub fn extract_model(message_json: serde_json::Value) -> String {
+    message_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Extract session ID from a JSONL file path
+///
+/// Returns the filename stem (without .jsonl extension).
+/// Example: `/home/user/.claude/projects/foo/abc123.jsonl` -> `abc123`
+pub fn extract_session_id(jsonl_path: &Path) -> String {
+    jsonl_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Infer model from path hints
+///
+/// Checks if the path contains model name hints (e.g., directory with "sonnet" or "opus").
+/// Returns None for generic paths without model hints.
+pub fn infer_model_from_path(jsonl_path: &Path) -> Option<String> {
+    let path_str = jsonl_path.to_string_lossy().to_lowercase();
+
+    // Check for common model identifiers in path
+    if path_str.contains("opus") {
+        // Could refine to specific opus version if path contains version info
+        Some("claude-opus".to_string())
+    } else if path_str.contains("sonnet") {
+        Some("claude-sonnet".to_string())
+    } else if path_str.contains("haiku") {
+        Some("claude-haiku".to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse a usage block from a JSONL line into a UsageRecord
+///
+/// Extracts token counts, model, and session from the JSON structure.
+pub fn parse_usage_block(line: &JsonlLine, jsonl_path: &Path) -> Option<UsageRecord> {
+    // Only process assistant messages with usage data
+    let message = line.message.as_ref()?;
+    let usage = message.usage.as_ref()?;
+
+    // Extract model: prefer message-level model, fallback to path inference, then "unknown"
+    let model = message.model.clone().unwrap_or_else(|| {
+        infer_model_from_path(jsonl_path).unwrap_or_else(|| "unknown".to_string())
+    });
+
+    // Extract session ID from file path
+    let session = extract_session_id(jsonl_path);
+
+    // Extract cache write tokens with 5m/1h breakdown
+    let (cache_write_5m, cache_write_1h) = match &usage.cache_creation {
+        Some(cc) => (
+            cc.ephemeral_5m_input_tokens.unwrap_or(0),
+            cc.ephemeral_1h_input_tokens.unwrap_or(0),
+        ),
+        None => {
+            // Legacy format: cache_creation_input_tokens without breakdown
+            // Treat all as 5m (conservative assumption)
+            (usage.cache_creation_input_tokens.unwrap_or(0), 0)
+        }
+    };
+
+    Some(UsageRecord {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        cache_write_5m_tokens: cache_write_5m,
+        cache_write_1h_tokens: cache_write_1h,
+        model,
+        session,
+    })
+}
+
 /// Read new lines from a JSONL file since the last cursor position
 ///
 /// Seeks to the stored byte offset and reads all content to EOF.
@@ -406,6 +490,147 @@ mod tests {
         let files = discover_jsonl_files(temp_dir.path());
 
         assert!(files.is_empty());
+    }
+
+    mod model {
+        use super::*;
+
+        #[test]
+        fn extract_model_returns_model_field() {
+            let json = serde_json::json!({"model": "claude-sonnet-4-20250514"});
+            assert_eq!(extract_model(json), "claude-sonnet-4-20250514");
+        }
+
+        #[test]
+        fn extract_model_returns_unknown_when_missing() {
+            let json = serde_json::json!({"other_field": "value"});
+            assert_eq!(extract_model(json), "unknown");
+        }
+
+        #[test]
+        fn extract_model_returns_unknown_when_null() {
+            let json = serde_json::json!({"model": null});
+            assert_eq!(extract_model(json), "unknown");
+        }
+
+        #[test]
+        fn extract_session_id_returns_stem() {
+            let path = Path::new("/home/user/.claude/projects/foo/abc123.jsonl");
+            assert_eq!(extract_session_id(path), "abc123");
+        }
+
+        #[test]
+        fn extract_session_id_handles_nested_path() {
+            let path = Path::new("/deeply/nested/path/session-xyz-789.jsonl");
+            assert_eq!(extract_session_id(path), "session-xyz-789");
+        }
+
+        #[test]
+        fn extract_session_id_returns_unknown_for_no_stem() {
+            // Path with no filename component
+            let path = Path::new("/");
+            assert_eq!(extract_session_id(path), "unknown");
+        }
+
+        #[test]
+        fn infer_model_from_path_returns_none_for_generic() {
+            let path = Path::new("/home/user/.claude/projects/foo/session.jsonl");
+            assert!(infer_model_from_path(path).is_none());
+        }
+
+        #[test]
+        fn infer_model_from_path_detects_sonnet() {
+            let path = Path::new("/home/user/sessions/sonnet/test.jsonl");
+            assert_eq!(infer_model_from_path(path), Some("claude-sonnet".to_string()));
+        }
+
+        #[test]
+        fn infer_model_from_path_detects_opus() {
+            let path = Path::new("/home/user/opus-sessions/test.jsonl");
+            assert_eq!(infer_model_from_path(path), Some("claude-opus".to_string()));
+        }
+
+        #[test]
+        fn infer_model_from_path_detects_haiku() {
+            let path = Path::new("/home/user/haiku/test.jsonl");
+            assert_eq!(infer_model_from_path(path), Some("claude-haiku".to_string()));
+        }
+
+        #[test]
+        fn infer_model_from_path_is_case_insensitive() {
+            let path = Path::new("/home/user/SONNET/test.jsonl");
+            assert_eq!(infer_model_from_path(path), Some("claude-sonnet".to_string()));
+        }
+
+        #[test]
+        fn parse_usage_block_extracts_all_fields() {
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":60,"ephemeral_1h_input_tokens":40}}}}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+            let path = Path::new("/sessions/test-session.jsonl");
+
+            let record = parse_usage_block(&line, path).unwrap();
+
+            assert_eq!(record.input_tokens, 1000);
+            assert_eq!(record.output_tokens, 500);
+            assert_eq!(record.cache_read_tokens, 50);
+            assert_eq!(record.cache_write_5m_tokens, 60);
+            assert_eq!(record.cache_write_1h_tokens, 40);
+            assert_eq!(record.model, "claude-sonnet-4-20250514");
+            assert_eq!(record.session, "test-session");
+        }
+
+        #[test]
+        fn parse_usage_block_uses_path_inference_when_no_model() {
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+            let path = Path::new("/sessions/sonnet/test.jsonl");
+
+            let record = parse_usage_block(&line, path).unwrap();
+
+            assert_eq!(record.model, "claude-sonnet");
+        }
+
+        #[test]
+        fn parse_usage_block_returns_unknown_when_no_model_hints() {
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+            let path = Path::new("/sessions/test.jsonl");
+
+            let record = parse_usage_block(&line, path).unwrap();
+
+            assert_eq!(record.model, "unknown");
+        }
+
+        #[test]
+        fn parse_usage_block_returns_none_for_non_message() {
+            let json = r#"{"type":"other"}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+            let path = Path::new("/sessions/test.jsonl");
+
+            assert!(parse_usage_block(&line, path).is_none());
+        }
+
+        #[test]
+        fn multi_model_session_produces_different_records() {
+            let path = Path::new("/sessions/multi-session.jsonl");
+
+            // First line with Sonnet
+            let json1 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}}}"#;
+            let line1: JsonlLine = serde_json::from_str(json1).unwrap();
+            let record1 = parse_usage_block(&line1, path).unwrap();
+
+            // Second line with Opus
+            let json2 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-opus-4-20250514","usage":{"input_tokens":2000,"output_tokens":800}}}"#;
+            let line2: JsonlLine = serde_json::from_str(json2).unwrap();
+            let record2 = parse_usage_block(&line2, path).unwrap();
+
+            // Same session, different models
+            assert_eq!(record1.session, "multi-session");
+            assert_eq!(record2.session, "multi-session");
+            assert_eq!(record1.model, "claude-sonnet-4-20250514");
+            assert_eq!(record2.model, "claude-opus-4-20250514");
+            assert_ne!(record1.model, record2.model);
+        }
     }
 
     mod read_new {
