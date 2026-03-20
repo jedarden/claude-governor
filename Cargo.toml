@@ -5,6 +5,10 @@ edition = "2021"
 description = "Automated capacity governor for Claude Code subscription usage"
 authors = ["Claude Governor Team"]
 
+[lib]
+name = "claude_governor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cgov"
 path = "src/main.rs"
@@ -35,6 +39,12 @@ env_logger = "0.11"
 
 # Home directory
 dirs = "6"
+
+# File discovery
+glob = "0.3"
+
+# SQLite (bundled = compiled in, no system lib needed)
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 # Testing

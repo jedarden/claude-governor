@@ -365,12 +365,18 @@ mod tests {
         // Should find all 3 JSONL files
         assert_eq!(files.len(), 3);
 
-        // Should be sorted
+        // Should be sorted by full path
+        let sorted = files.windows(2).all(|w| w[0] <= w[1]);
+        assert!(sorted, "Files should be sorted by path");
+
+        // Verify all expected files are present
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["level1.jsonl", "level2.jsonl", "root.jsonl"]);
+        assert!(names.contains(&"root.jsonl".to_string()));
+        assert!(names.contains(&"level1.jsonl".to_string()));
+        assert!(names.contains(&"level2.jsonl".to_string()));
     }
 
     #[test]
