@@ -22,15 +22,17 @@ use log::LevelFilter;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use claude_governor::capacity_summary::generate_capacity_summary;
+use claude_governor::collector;
 use claude_governor::poller::{Poller, UsageData};
 use claude_governor::schedule;
 use claude_governor::simulator::{self, SimConfig};
-use claude_governor::state::{self, GovernorState, WorkerState};
+use claude_governor::state::{self, GovernorState};
 use claude_governor::config::GovernorConfig;
+use claude_governor::db;
 
 /// Default state file path
 fn default_state_path() -> PathBuf {
@@ -140,6 +142,44 @@ enum Commands {
         /// Output resolution in minutes
         #[arg(short = 'r', long, default_value = "15")]
         resolution: i64,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run one token collection pass (or start daemon)
+    Collect {
+        /// Run in continuous daemon mode
+        #[arg(long)]
+        daemon: bool,
+
+        /// Collection interval in seconds (daemon mode, default: 120)
+        #[arg(short, long, default_value = "120")]
+        interval: u64,
+    },
+
+    /// Query token history from SQLite mirror
+    TokenHistory {
+        /// Show last N window records
+        #[arg(long)]
+        last: Option<usize>,
+
+        /// Show instance comparison view
+        #[arg(long)]
+        compare: bool,
+
+        /// Show last N fleet records
+        #[arg(long, name = "fleet")]
+        fleet: bool,
+
+        /// Rebuild SQLite from JSONL source
+        #[arg(long)]
+        rebuild_db: bool,
+
+        /// Number of records for --last and --fleet (default: 10)
+        #[arg(short = 'n', long, default_value = "10")]
+        count: usize,
 
         /// Output in JSON format
         #[arg(long)]
@@ -553,6 +593,104 @@ fn run_simulate_command(workers: &str, hours: f64, resolution: i64, json: bool) 
     Ok(())
 }
 
+fn run_token_history_command(
+    last: Option<usize>,
+    compare: bool,
+    fleet: bool,
+    rebuild_db: bool,
+    count: usize,
+    json: bool,
+) -> Result<()> {
+    let history_path = collector::default_history_path();
+    let db_path = collector::default_db_path();
+
+    // Handle --rebuild-db
+    if rebuild_db {
+        let n = db::rebuild_from_jsonl(&history_path, &db_path)?;
+        println!("Rebuilt SQLite from JSONL: {} records", n);
+        return Ok(());
+    }
+
+    let conn = db::open_db(&db_path)?;
+    db::create_schema(&conn)?;
+
+    // Handle --compare
+    if compare {
+        let results = db::query_instance_compare(&conn, count)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            println!("{:<30} {:<30} {:>10} {:>10} {:>10}", "session", "model", "total_usd", "usd/hr", "usd/%7ds");
+            println!("{}", "-".repeat(95));
+            for r in &results {
+                let usd_pct = match r.get("usd_per_pct_7ds") {
+                    Some(v) if !v.is_null() => format!("{:>10.4}", v.as_f64().unwrap_or(0.0)),
+                    _ => "       N/A".to_string(),
+                };
+                println!(
+                    "{:<30} {:<30} {:>10.4} {:>10.4} {}",
+                    r["sess"].as_str().unwrap_or("?"),
+                    r["model"].as_str().unwrap_or("?"),
+                    r["total_usd"].as_f64().unwrap_or(0.0),
+                    r["usd_per_hour"].as_f64().unwrap_or(0.0),
+                    usd_pct,
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle --fleet
+    if fleet {
+        let results = db::query_last_fleets(&conn, count)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            for r in &results {
+                let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+                let workers = r.get("workers").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = r.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let p75 = r.get("p75-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let std = r.get("std-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                println!(
+                    "{} | workers={} total=${:.4} p75=${:.2}/hr std=${:.2}/hr",
+                    ts, workers, total, p75, std,
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle --last (default)
+    let n = last.unwrap_or(count);
+    let results = db::query_last_windows(&conn, n)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        for r in &results {
+            let win = r.get("win").and_then(|v| v.as_str()).unwrap_or("?");
+            let snap = r.get("snap").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let remain = r.get("remain").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let exh = r.get("exh_hrs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cutoff = r.get("cutoff_risk").and_then(|v| v.as_u64()).unwrap_or(0);
+            let bind = r.get("bind").and_then(|v| v.as_u64()).unwrap_or(0);
+            let safe_w = r.get("safe_w").and_then(|v| v.as_u64());
+            let binding = if bind == 1 { " [BINDING]" } else { "" };
+            let cutoff_str = if cutoff == 1 { " CUTOFF_RISK" } else { "" };
+            let safe_str = match safe_w {
+                Some(w) => format!(" safe_w={}", w),
+                None => String::new(),
+            };
+            println!(
+                "{}: snap={:.1}% remain={:.1}% exh={:.1}h{}{}{}",
+                win, snap, remain, exh, binding, cutoff_str, safe_str,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -605,6 +743,30 @@ fn main() -> Result<()> {
         }
         Commands::Version => {
             run_version_command()?;
+        }
+        Commands::Collect { daemon, interval } => {
+            if daemon {
+                collector::run_daemon(interval)?;
+            } else {
+                let result = collector::run_collection_pass()?;
+                println!(
+                    "Collection complete: {} lines, {} instances, {} fleet records, ${:.4} total",
+                    result.lines_processed,
+                    result.instance_records,
+                    result.fleet_records,
+                    result.total_usd,
+                );
+            }
+        }
+        Commands::TokenHistory {
+            last,
+            compare,
+            fleet,
+            rebuild_db,
+            count,
+            json,
+        } => {
+            run_token_history_command(last, compare, fleet, rebuild_db, count, json)?;
         }
     }
 

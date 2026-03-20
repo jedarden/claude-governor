@@ -47,6 +47,9 @@ glob = "0.3"
 # SQLite (bundled = compiled in, no system lib needed)
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Signal handling for daemon mode
+ctrlc = { version = "3", features = ["termination"] }
+
 [dev-dependencies]
 # Testing
 tempfile = "3"

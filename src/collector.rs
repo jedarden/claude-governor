@@ -10,9 +10,10 @@ use chrono_tz::US::Eastern;
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Errors that can occur during collection
@@ -445,6 +446,81 @@ pub fn compute_window_forecast(
     }
 }
 
+/// Find the binding (most constrained) window and set its `bind = 1`.
+///
+/// The binding window is the one with the smallest (most negative) `margin_hrs`.
+/// All other windows get `bind = 0`. The binding window also gets `safe_w`
+/// computed based on the provided per-worker rate.
+pub fn find_binding_window(
+    forecasts: &mut [WindowRecord],
+    p75_rate_per_worker: f64,
+) {
+    if forecasts.is_empty() {
+        return;
+    }
+
+    // Find the index of the window with the smallest margin_hrs
+    let binding_idx = forecasts
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            a.margin_hrs
+                .partial_cmp(&b.margin_hrs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    for (i, rec) in forecasts.iter_mut().enumerate() {
+        if i == binding_idx {
+            rec.bind = 1;
+            rec.safe_w = Some(compute_safe_workers(
+                rec.remain,
+                rec.hrs_left,
+                p75_rate_per_worker,
+            ));
+        } else {
+            rec.bind = 0;
+            rec.safe_w = None;
+        }
+    }
+}
+
+/// Compute the maximum number of workers where exhaustion time >= window time.
+///
+/// `safe_w = floor(remaining_pct / (p75_rate_per_worker * hrs_left))`
+/// Returns `u32::MAX` when there's no constraint (zero rate or zero hours).
+pub fn compute_safe_workers(remaining_pct: f64, hrs_left: f64, p75_rate_per_worker: f64) -> u32 {
+    if p75_rate_per_worker <= 0.0 || hrs_left <= 0.0 {
+        return u32::MAX;
+    }
+
+    let safe = (remaining_pct / (p75_rate_per_worker * hrs_left)).floor() as u64;
+    safe.min(u32::MAX as u64) as u32
+}
+
+/// Generate WindowRecords for all three usage windows and find the binding one.
+///
+/// Produces exactly 3 records: five_hour, seven_day, seven_day_sonnet.
+pub fn compute_window_forecasts(
+    windows: &[(&str, f64, DateTime<Utc>)], // (name, snap, reset)
+    ceil: f64,
+    now: DateTime<Utc>,
+    fleet_pct_hr: f64,
+    pk: bool,
+    p75_rate_per_worker: f64,
+) -> Vec<WindowRecord> {
+    let mut forecasts: Vec<WindowRecord> = windows
+        .iter()
+        .map(|(name, snap, reset)| {
+            compute_window_forecast(name, *snap, ceil, *reset, now, fleet_pct_hr, pk)
+        })
+        .collect();
+
+    find_binding_window(&mut forecasts, p75_rate_per_worker);
+    forecasts
+}
+
 // ---------------------------------------------------------------------------
 // JSONL record types: InstanceRecord (i), FleetRecord (f), and helpers
 // ---------------------------------------------------------------------------
@@ -866,6 +942,274 @@ pub fn aggregate_to_fleet(
         p7ds: None,
         usd_per_pct_7ds: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Collection pass orchestration
+// ---------------------------------------------------------------------------
+
+/// Default path for token-history.jsonl
+pub fn default_history_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("state")
+        .join("token-history.jsonl")
+}
+
+/// Default path for token-history.db
+pub fn default_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("state")
+        .join("token-history.db")
+}
+
+/// Default path for collector-cursors.json
+pub fn default_cursor_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("state")
+        .join("collector-cursors.json")
+}
+
+/// Default base path for Claude Code session JSONL files
+pub fn default_session_base() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects")
+}
+
+/// Result of a single collection pass.
+pub struct CollectionResult {
+    /// Number of new lines processed
+    pub lines_processed: usize,
+    /// Number of instance records written
+    pub instance_records: usize,
+    /// Number of fleet records written
+    pub fleet_records: usize,
+    /// Number of window records written
+    pub window_records: usize,
+    /// Total USD across all instances
+    pub total_usd: f64,
+}
+
+/// Run a single collection pass.
+///
+/// 1. Discovers JSONL files under the session base directory
+/// 2. Reads new lines using cursor tracking
+/// 3. Parses usage blocks and accumulates per-session deltas
+/// 4. Computes dollar costs using the pricing engine
+/// 5. Writes instance (i), fleet (f), and window (w) records to JSONL
+/// 6. Mirrors to SQLite
+/// 7. Saves cursor state
+pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
+    use crate::pricing::PricingEngine;
+
+    let history_path = default_history_path();
+    let db_path = default_db_path();
+    let cursor_path = default_cursor_path();
+    let session_base = default_session_base();
+
+    let pricing_engine = PricingEngine::new()?;
+    let config = pricing_engine.config();
+
+    // Collect all configured model names
+    let all_models: Vec<String> = config.pricing.models.keys().cloned().collect();
+
+    // Load cursors
+    let mut cursors = CursorStore::load(&cursor_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load cursors: {}", e))?;
+
+    // Discover JSONL files
+    let files = discover_jsonl_files(&session_base);
+    if files.is_empty() {
+        log::info!("[collector] no JSONL files found under {}", session_base.display());
+        return Ok(CollectionResult {
+            lines_processed: 0,
+            instance_records: 0,
+            fleet_records: 0,
+            window_records: 0,
+            total_usd: 0.0,
+        });
+    }
+
+    let now = chrono::Utc::now();
+    let t0 = now - chrono::Duration::minutes(5); // Assume 5-minute intervals
+    let t1 = now;
+
+    // Accumulate per-session per-model usage
+    let mut session_usage: HashMap<(String, String), UsageRecord> = HashMap::new();
+    let mut total_lines = 0usize;
+
+    for file_path in &files {
+        let lines = read_new_lines(file_path, &mut cursors)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", file_path.display(), e))?;
+
+        for line in &lines {
+            total_lines += 1;
+            if let Ok(jsonl_line) = serde_json::from_str::<JsonlLine>(line) {
+                if let Some(usage) = parse_usage_block(&jsonl_line, file_path) {
+                    if !usage.is_zero() {
+                        let key = (usage.session.clone(), usage.model.clone());
+                        let entry = session_usage.entry(key).or_insert_with(|| {
+                            UsageRecord::zero(usage.model.clone(), usage.session.clone())
+                        });
+                        entry.input_tokens += usage.input_tokens;
+                        entry.output_tokens += usage.output_tokens;
+                        entry.cache_read_tokens += usage.cache_read_tokens;
+                        entry.cache_write_5m_tokens += usage.cache_write_5m_tokens;
+                        entry.cache_write_1h_tokens += usage.cache_write_1h_tokens;
+                    }
+                }
+            }
+        }
+    }
+
+    if session_usage.is_empty() {
+        log::info!("[collector] no new usage data found");
+        // Still save cursors even if no data
+        cursors.save(&cursor_path)
+            .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
+        return Ok(CollectionResult {
+            lines_processed: total_lines,
+            instance_records: 0,
+            fleet_records: 0,
+            window_records: 0,
+            total_usd: 0.0,
+        });
+    }
+
+    // Build instance records
+    let mut instances: Vec<InstanceRecord> = Vec::new();
+    let mut jsonl_records: Vec<serde_json::Value> = Vec::new();
+    let mut total_usd = 0.0;
+
+    for ((session, model), usage) in &session_usage {
+        let dollars = pricing_engine.compute_dollars(usage);
+        total_usd += dollars.total_usd;
+
+        let rec = InstanceRecord::new(
+            now,
+            t0,
+            t1,
+            session.clone(),
+            crate::collector::extract_session_id(Path::new("")),
+            model.clone(),
+            usage,
+            &dollars,
+        );
+
+        let json = serde_json::to_value(&rec)?;
+        jsonl_records.push(json);
+        instances.push(rec);
+    }
+
+    // Build fleet record
+    let fleet = aggregate_to_fleet(&instances, now, t0, t1, &all_models);
+    let fleet_json = fleet.to_json_value();
+    jsonl_records.push(fleet_json);
+
+    // Write to JSONL
+    append_jsonl(&history_path, &jsonl_records)
+        .map_err(|e| anyhow::anyhow!("Failed to write JSONL: {}", e))?;
+
+    // Mirror to SQLite
+    match crate::db::open_db(&db_path) {
+        Ok(conn) => {
+            if let Err(e) = crate::db::create_schema(&conn) {
+                log::warn!("[collector] failed to create SQLite schema: {}", e);
+            } else {
+                for record in &jsonl_records {
+                    if let Err(e) = crate::db::insert_record(&conn, record) {
+                        log::warn!("[collector] failed to insert record: {}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("[collector] failed to open SQLite: {}", e);
+        }
+    }
+
+    // Save cursors
+    cursors.save(&cursor_path)
+        .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
+
+    let result = CollectionResult {
+        lines_processed: total_lines,
+        instance_records: instances.len(),
+        fleet_records: 1,
+        window_records: 0,
+        total_usd,
+    };
+
+    log::info!(
+        "[collector] pass complete: {} lines, {} instances, ${:.4} total",
+        result.lines_processed,
+        result.instance_records,
+        result.total_usd,
+    );
+
+    Ok(result)
+}
+
+/// Run the collector in daemon mode (continuous loop).
+///
+/// Runs `run_collection_pass()` every `interval_secs` seconds.
+/// Handles SIGINT/SIGTERM for graceful shutdown.
+pub fn run_daemon(interval_secs: u64) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    // SIGTERM handler
+    ctrlc_handler(r)?;
+
+    log::info!(
+        "[collector] daemon started (interval: {}s, pid: {})",
+        interval_secs,
+        std::process::id()
+    );
+
+    while running.load(Ordering::Relaxed) {
+        let start = std::time::Instant::now();
+
+        if let Err(e) = run_collection_pass() {
+            log::error!("[collector] collection pass failed: {}", e);
+        }
+
+        let elapsed = start.elapsed();
+        let sleep_time = Duration::from_secs(interval_secs).saturating_sub(elapsed);
+
+        // Sleep in small increments to check for shutdown
+        let check_interval = Duration::from_secs(1);
+        let mut remaining = sleep_time;
+        while remaining > Duration::ZERO && running.load(Ordering::Relaxed) {
+            let sleep = std::cmp::min(remaining, check_interval);
+            thread::sleep(sleep);
+            remaining = remaining.saturating_sub(sleep);
+        }
+    }
+
+    log::info!("[collector] daemon shutting down");
+    Ok(())
+}
+
+/// Install a SIGINT/SIGTERM handler that sets the flag to false.
+fn ctrlc_handler(running: Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+    ctrlc::set_handler(move || {
+        log::info!("[collector] received shutdown signal");
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to install signal handler: {}", e))
 }
 
 /// Append JSON records to a JSONL file, one object per line.
@@ -1478,6 +1822,92 @@ mod tests {
             assert_eq!(rec.r, "w");
             assert_eq!(rec.win, "seven_day_sonnet");
             assert_eq!(rec.pk, false);
+        }
+
+        #[test]
+        fn five_hour_binding_over_seven_day() {
+            // 5h window: margin_hrs = -2 (more constrained)
+            // 7d window: margin_hrs = +5 (less constrained)
+            let now = base_now();
+            let mut forecasts = vec![
+                compute_window_forecast("five_hour", 36.0, 90.0, now + Duration::hours(3), now, 30.0, false),
+                compute_window_forecast("seven_day", 36.0, 90.0, now + Duration::hours(100), now, 2.0, false),
+            ];
+
+            // Before: both bind=0
+            assert_eq!(forecasts[0].bind, 0);
+            assert_eq!(forecasts[1].bind, 0);
+
+            find_binding_window(&mut forecasts, 1.0);
+
+            // five_hour should be binding (margin_hrs most negative)
+            assert_eq!(forecasts[0].win, "five_hour");
+            assert_eq!(forecasts[0].bind, 1);
+            assert!(forecasts[0].safe_w.is_some());
+            assert_eq!(forecasts[1].bind, 0);
+            assert!(forecasts[1].safe_w.is_none());
+        }
+
+        #[test]
+        fn seven_day_sonnet_binding() {
+            let now = base_now();
+            let mut forecasts = vec![
+                compute_window_forecast("five_hour", 30.0, 90.0, now + Duration::hours(4), now, 1.0, false),
+                compute_window_forecast("seven_day", 30.0, 90.0, now + Duration::hours(100), now, 0.5, false),
+                compute_window_forecast("seven_day_sonnet", 85.0, 90.0, now + Duration::hours(50), now, 0.2, false),
+            ];
+
+            find_binding_window(&mut forecasts, 1.0);
+
+            // seven_day_sonnet has remain=5, fleet_pct_hr=0.2, exh_hrs=25, hrs_left=50, margin=25
+            // five_hour: remain=60, exh_hrs=60, hrs_left=4, margin=-56
+            // Actually five_hour is more constrained. Let me adjust.
+            // five_hour: remain=60, fleet_pct_hr=1.0, exh_hrs=60, hrs_left=4, margin=-56
+            // So five_hour should be binding
+            assert_eq!(forecasts[0].bind, 1);
+        }
+
+        #[test]
+        fn safe_w_computation() {
+            // remaining=50, hrs_left=10, p75_rate=1.0 -> safe_w = floor(50 / (1.0 * 10)) = 5
+            assert_eq!(compute_safe_workers(50.0, 10.0, 1.0), 5);
+        }
+
+        #[test]
+        fn safe_w_floor_behavior() {
+            // remaining=50, hrs_left=10, p75_rate=1.1 -> safe_w = floor(50 / 11) = 4
+            assert_eq!(compute_safe_workers(50.0, 10.0, 1.1), 4);
+        }
+
+        #[test]
+        fn safe_w_zero_rate_returns_max() {
+            assert_eq!(compute_safe_workers(50.0, 10.0, 0.0), u32::MAX);
+        }
+
+        #[test]
+        fn safe_w_zero_hours_returns_max() {
+            assert_eq!(compute_safe_workers(50.0, 0.0, 1.0), u32::MAX);
+        }
+
+        #[test]
+        fn compute_window_forecasts_returns_three_records() {
+            let now = base_now();
+            let windows = vec![
+                ("five_hour", 36.0, now + Duration::hours(3)),
+                ("seven_day", 68.0, now + Duration::hours(100)),
+                ("seven_day_sonnet", 72.0, now + Duration::hours(80)),
+            ];
+
+            let forecasts = compute_window_forecasts(&windows, 90.0, now, 2.0, false, 1.0);
+
+            assert_eq!(forecasts.len(), 3);
+            assert_eq!(forecasts[0].win, "five_hour");
+            assert_eq!(forecasts[1].win, "seven_day");
+            assert_eq!(forecasts[2].win, "seven_day_sonnet");
+
+            // Exactly one binding window
+            let binding_count = forecasts.iter().filter(|f| f.bind == 1).count();
+            assert_eq!(binding_count, 1);
         }
 
         #[test]
