@@ -10,12 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::LevelFilter;
 
-mod poller;
-use poller::{Poller, UsageData};
-
-mod config;
-mod collector;
-mod pricing;
+use claude_governor::poller::{Poller, UsageData};
 
 #[derive(Parser)]
 #[command(name = "cgov")]

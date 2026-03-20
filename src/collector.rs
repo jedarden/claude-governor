@@ -5,6 +5,7 @@
 //! - Parsing usage blocks from assistant messages
 //! - Tracking per-model token usage by type
 
+use chrono::{DateTime, Utc};
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -326,6 +327,121 @@ pub fn read_new_lines(path: &Path, cursor: &mut CursorStore) -> Result<Vec<Strin
     cursor.set_offset(path.to_path_buf(), new_offset);
 
     Ok(lines)
+}
+
+/// Forecast record for a single usage window
+///
+/// Captures the current snapshot, ceiling, and projected exhaustion metrics
+/// for one of the three Claude Code usage windows (5h, 7d, 7d-sonnet).
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowRecord {
+    /// Record type discriminator (always "w" for window)
+    #[serde(rename = "r")]
+    pub r: String,
+
+    /// Timestamp of this record
+    #[serde(rename = "ts")]
+    pub ts: DateTime<Utc>,
+
+    /// Window name: "five_hour", "seven_day", "seven_day_sonnet"
+    #[serde(rename = "win")]
+    pub win: String,
+
+    /// Peak flag
+    #[serde(rename = "pk")]
+    pub pk: bool,
+
+    /// Target ceiling from config (e.g. 90.0)
+    #[serde(rename = "ceil")]
+    pub ceil: f64,
+
+    /// Raw platform utilization %
+    #[serde(rename = "snap")]
+    pub snap: f64,
+
+    /// Window reset time
+    #[serde(rename = "reset")]
+    pub reset: DateTime<Utc>,
+
+    /// Pct change this interval (set externally when comparing to previous snapshot)
+    #[serde(rename = "delta")]
+    pub delta: f64,
+
+    /// Remaining budget: ceil - snap (NOT 100 - snap)
+    #[serde(rename = "remain")]
+    pub remain: f64,
+
+    /// Hours until window resets
+    #[serde(rename = "hrs_left")]
+    pub hrs_left: f64,
+
+    /// Fleet burn rate as pct/hr
+    #[serde(rename = "fleet_pct_hr")]
+    pub fleet_pct_hr: f64,
+
+    /// Hours until exhaustion: remain / fleet_pct_hr
+    #[serde(rename = "exh_hrs")]
+    pub exh_hrs: f64,
+
+    /// 1 if exh_hrs < hrs_left (will exhaust before window resets)
+    #[serde(rename = "cutoff_risk")]
+    pub cutoff_risk: u8,
+
+    /// Margin hours: hrs_left - exh_hrs (can be negative)
+    #[serde(rename = "margin_hrs")]
+    pub margin_hrs: f64,
+
+    /// 1 if this is the most constrained (binding) window
+    #[serde(rename = "bind")]
+    pub bind: u8,
+
+    /// Safe window in hours (only set on binding window)
+    #[serde(rename = "safe_w", skip_serializing_if = "Option::is_none")]
+    pub safe_w: Option<u32>,
+}
+
+/// Compute a window forecast from current snapshot data
+///
+/// Derives all forecast fields (remain, hrs_left, exh_hrs, cutoff_risk, margin_hrs)
+/// from the raw inputs. The `bind` and `safe_w` fields are left at defaults (0/None)
+/// and are set later by `find_binding_window`.
+pub fn compute_window_forecast(
+    win: &str,
+    snap: f64,
+    ceil: f64,
+    reset: DateTime<Utc>,
+    now: DateTime<Utc>,
+    fleet_pct_hr: f64,
+    pk: bool,
+) -> WindowRecord {
+    let remain = ceil - snap;
+    let hrs_left = (reset - now).num_seconds() as f64 / 3600.0;
+    let exh_hrs = if fleet_pct_hr > 0.0 {
+        remain / fleet_pct_hr
+    } else {
+        f64::INFINITY
+    };
+    let cutoff_risk = if exh_hrs < hrs_left { 1 } else { 0 };
+    let margin_hrs = hrs_left - exh_hrs;
+
+    WindowRecord {
+        r: "w".to_string(),
+        ts: now,
+        win: win.to_string(),
+        pk,
+        ceil,
+        snap,
+        reset,
+        delta: 0.0,
+        remain,
+        hrs_left,
+        fleet_pct_hr,
+        exh_hrs,
+        cutoff_risk,
+        margin_hrs,
+        bind: 0,
+        safe_w: None,
+    }
 }
 
 #[cfg(test)]
@@ -782,6 +898,157 @@ mod tests {
 
             assert_eq!(lines.len(), 3);
             assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        }
+    }
+
+    mod window_forecast {
+        use super::*;
+        use chrono::{Duration, Utc};
+
+        fn base_now() -> DateTime<Utc> {
+            "2026-03-20T10:00:00Z".parse().unwrap()
+        }
+
+        fn reset_5h_from(now: DateTime<Utc>) -> DateTime<Utc> {
+            now + Duration::hours(3)
+        }
+
+        #[test]
+        fn remain_is_ceil_minus_snap() {
+            // ceil=90, snap=36 -> remain=54 (NOT 64)
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
+
+            assert_eq!(rec.remain, 54.0);
+            assert_eq!(rec.ceil, 90.0);
+            assert_eq!(rec.snap, 36.0);
+        }
+
+        #[test]
+        fn hrs_left_computed_from_reset_minus_now() {
+            let now = base_now();
+            let reset = now + Duration::hours(3) + Duration::minutes(30);
+            let rec = compute_window_forecast("five_hour", 50.0, 90.0, reset, now, 2.0, false);
+
+            // 3.5 hours
+            let expected = 3.5;
+            assert!(
+                (rec.hrs_left - expected).abs() < 1e-9,
+                "expected hrs_left={}, got {}",
+                expected,
+                rec.hrs_left
+            );
+        }
+
+        #[test]
+        fn exh_hrs_is_remain_divided_by_fleet_pct_hr() {
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            // remain = 90 - 36 = 54, fleet_pct_hr = 2.0
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
+
+            assert_eq!(rec.exh_hrs, 27.0); // 54 / 2
+        }
+
+        #[test]
+        fn cutoff_risk_1_when_exh_less_than_hrs_left() {
+            let now = base_now();
+            let reset = now + Duration::hours(3);
+            // remain=54, fleet_pct_hr=30 -> exh_hrs=1.8 < 3.0
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 30.0, false);
+
+            assert_eq!(rec.cutoff_risk, 1);
+        }
+
+        #[test]
+        fn cutoff_risk_0_when_exh_greater_than_hrs_left() {
+            let now = base_now();
+            let reset = now + Duration::hours(3);
+            // remain=54, fleet_pct_hr=2.0 -> exh_hrs=27 > 3.0
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
+
+            assert_eq!(rec.cutoff_risk, 0);
+        }
+
+        #[test]
+        fn margin_hrs_can_be_negative() {
+            let now = base_now();
+            let reset = now + Duration::hours(3);
+            // remain=54, fleet_pct_hr=30 -> exh_hrs=1.8, margin=3.0-1.8=1.2
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 30.0, false);
+
+            assert!(
+                (rec.margin_hrs - 1.2).abs() < 1e-9,
+                "expected margin_hrs=1.2, got {}",
+                rec.margin_hrs
+            );
+
+            // Now with a burn rate that makes exh_hrs > hrs_left -> negative margin
+            let rec2 =
+                compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
+            // exh_hrs=27, margin=3-27=-24
+            assert!(
+                (rec2.margin_hrs - (-24.0)).abs() < 1e-9,
+                "expected margin_hrs=-24.0, got {}",
+                rec2.margin_hrs
+            );
+        }
+
+        #[test]
+        fn zero_fleet_pct_hr_gives_infinity_exh() {
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            let rec = compute_window_forecast("five_hour", 50.0, 90.0, reset, now, 0.0, false);
+
+            assert!(rec.exh_hrs.is_infinite());
+            assert_eq!(rec.cutoff_risk, 0); // infinity is not < hrs_left
+        }
+
+        #[test]
+        fn bind_and_safe_w_default() {
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            let rec = compute_window_forecast("seven_day", 70.0, 90.0, reset, now, 1.0, true);
+
+            assert_eq!(rec.bind, 0);
+            assert!(rec.safe_w.is_none());
+        }
+
+        #[test]
+        fn record_type_and_window_name() {
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            let rec = compute_window_forecast("seven_day_sonnet", 80.0, 90.0, reset, now, 1.0, false);
+
+            assert_eq!(rec.r, "w");
+            assert_eq!(rec.win, "seven_day_sonnet");
+            assert_eq!(rec.pk, false);
+        }
+
+        #[test]
+        fn serialization_uses_correct_field_names() {
+            let now = base_now();
+            let reset = reset_5h_from(now);
+            let rec = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, true);
+
+            let json = serde_json::to_value(&rec).unwrap();
+            let obj = json.as_object().unwrap();
+
+            assert_eq!(obj.get("r").unwrap().as_str().unwrap(), "w");
+            assert_eq!(obj.get("win").unwrap().as_str().unwrap(), "five_hour");
+            assert!(obj.get("pk").unwrap().as_bool().unwrap());
+            assert_eq!(obj.get("ceil").unwrap().as_f64().unwrap(), 90.0);
+            assert_eq!(obj.get("snap").unwrap().as_f64().unwrap(), 36.0);
+            assert_eq!(obj.get("remain").unwrap().as_f64().unwrap(), 54.0);
+            assert_eq!(obj.get("hrs_left").unwrap().as_f64().unwrap(), 3.0);
+            assert_eq!(obj.get("fleet_pct_hr").unwrap().as_f64().unwrap(), 2.0);
+            assert_eq!(obj.get("exh_hrs").unwrap().as_f64().unwrap(), 27.0);
+            assert_eq!(obj.get("cutoff_risk").unwrap().as_u64().unwrap(), 0);
+            assert_eq!(obj.get("margin_hrs").unwrap().as_f64().unwrap(), -24.0);
+            assert_eq!(obj.get("bind").unwrap().as_u64().unwrap(), 0);
+            // safe_w is None and should be omitted from serialization
+            assert!(!obj.contains_key("safe_w"));
         }
     }
 }
