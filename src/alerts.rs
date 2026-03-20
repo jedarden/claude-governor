@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::config::SprintConfig;
 use crate::state::{AlertCooldown, CapacityForecast, GovernorState};
 
 /// Alert severity levels
@@ -77,6 +78,121 @@ pub struct AlertCondition {
 
 /// Default cooldown duration in minutes
 pub const DEFAULT_COOLDOWN_MINUTES: i64 = 60;
+
+/// Sprint trigger event - indicates a sprint should be initiated
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SprintTrigger {
+    /// The worker pool/agent that should sprint
+    pub worker_id: String,
+    /// The window triggering the sprint
+    pub window: String,
+    /// Current utilization percentage
+    pub utilization_pct: f64,
+    /// Hours remaining until window reset
+    pub hours_remaining: f64,
+    /// Target worker count for sprint (max_workers)
+    pub target_workers: u32,
+    /// Reason for the sprint
+    pub reason: String,
+    /// Timestamp when sprint was triggered
+    pub triggered_at: DateTime<Utc>,
+}
+
+/// Check if an underutilization sprint should be triggered (auto-selects best worker)
+///
+/// Sprint triggers when:
+/// - Utilization < threshold (default 50%) AND
+/// - Hours remaining < limit (default 2 hours) AND
+/// - No other window has cutoff_risk (safety check)
+///
+/// Automatically selects the worker with the most headroom (max - current).
+/// Returns Some(SprintTrigger) if sprint should be triggered, None otherwise.
+pub fn check_underutilization_sprint(
+    state: &crate::state::GovernorState,
+    config: &crate::config::SprintConfig,
+) -> Option<SprintTrigger> {
+    let now = Utc::now();
+
+    // Find worker with most headroom (max - current)
+    let best_worker = state
+        .workers
+        .iter()
+        .filter(|(_, w)| w.current < w.max) // Only workers not already at max
+        .max_by_key(|(_, w)| w.max - w.current)?;
+
+    let worker_id = best_worker.0.as_str();
+    let max_workers = best_worker.1.max;
+
+    check_underutilization_sprint_for_worker(state, config, worker_id, max_workers, now)
+}
+
+/// Check if an underutilization sprint should be triggered for a specific worker
+///
+/// Sprint triggers when:
+/// - Utilization < threshold (default 50%) AND
+/// - Hours remaining < limit (default 2 hours) AND
+/// - No other window has cutoff_risk (safety check)
+///
+/// Returns Some(SprintTrigger) if sprint should be triggered, None otherwise.
+pub fn check_underutilization_sprint_for_worker(
+    state: &crate::state::GovernorState,
+    config: &crate::config::SprintConfig,
+    worker_id: &str,
+    max_workers: u32,
+    now: DateTime<Utc>,
+) -> Option<SprintTrigger> {
+    let forecast = &state.capacity_forecast;
+
+    // Safety check: don't sprint if any window has cutoff_risk
+    let windows = [
+        ("five_hour", &forecast.five_hour),
+        ("seven_day", &forecast.seven_day),
+        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+    ];
+
+    // Check for cutoff_risk in any window - safety check
+    let any_cutoff_risk = windows.iter().any(|(_, win)| win.cutoff_risk);
+    if any_cutoff_risk {
+        log::debug!(
+            "Sprint inhibited: another window has cutoff_risk"
+        );
+        return None;
+    }
+
+    // Find windows that meet sprint criteria
+    for (name, win) in windows {
+        let utilization = win.current_utilization;
+        let hours_remaining = win.hours_remaining;
+
+        // Check if this window meets sprint criteria
+        if utilization < config.underutilization_threshold_pct
+            && hours_remaining > 0.0
+            && hours_remaining < config.underutilization_hours_remaining
+        {
+            let trigger = SprintTrigger {
+                worker_id: worker_id.to_string(),
+                window: name.to_string(),
+                utilization_pct: utilization,
+                hours_remaining,
+                target_workers: max_workers,
+                reason: format!(
+                    "Underutilization sprint: {:.1}% used, {:.1}h to reset",
+                    utilization, hours_remaining
+                ),
+                triggered_at: now,
+            };
+
+            log::info!(
+                "Sprint triggered for worker {}: {} at {:.1}%, {:.1}h to reset -> boosting to {} workers",
+                worker_id, name, utilization, hours_remaining, max_workers
+            );
+
+            return Some(trigger);
+        }
+    }
+
+    None
+}
 
 /// Check if an alert should be fired based on cooldown
 ///
@@ -284,9 +400,10 @@ fn check_underutilization(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::state::{
         BurnRateState, CapacityForecast, FleetAggregate, GovernorState, ScheduleState,
-        SafeModeState, UsageState, WindowForecast,
+        SafeModeState, UsageState, WorkerState, WindowForecast,
     };
     use chrono::{Duration, Utc};
 
@@ -684,5 +801,267 @@ mod tests {
 
         let recorded = cooldown.get_last_fired(&AlertType::CutoffImminent.to_string());
         assert_eq!(recorded, Some(now));
+    }
+
+    // --- Sprint trigger tests ---
+
+    fn default_sprint_config() -> SprintConfig {
+        SprintConfig::default()
+    }
+
+    fn make_window_with_util(
+        util: f64,
+        hrs_left: f64,
+        cutoff_risk: bool,
+    ) -> WindowForecast {
+        WindowForecast {
+            target_ceiling: 90.0,
+            current_utilization: util,
+            remaining_pct: 90.0 - util,
+            hours_remaining: hrs_left,
+            fleet_pct_per_hour: 5.0,
+            predicted_exhaustion_hours: if hrs_left > 0.0 { (90.0 - util) / 5.0 } else { 0.0 },
+            cutoff_risk,
+            margin_hrs: hrs_left - (90.0 - util) / 5.0,
+            binding: false,
+            safe_worker_count: None,
+        }
+    }
+
+    fn make_state_with_workers(
+        forecast: CapacityForecast,
+        workers: HashMap<String, WorkerState>,
+    ) -> GovernorState {
+        let mut state = make_state_with_forecast(forecast);
+        state.workers = workers;
+        state
+    }
+
+    #[test]
+    fn sprint_triggers_when_underutilized_and_close_to_reset() {
+        // 45% used, 1.5h to reset -> sprint triggers
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(trigger.is_some(), "Sprint should trigger at 45% with 1.5h to reset");
+
+        let t = trigger.unwrap();
+        assert_eq!(t.worker_id, "sonnet");
+        assert_eq!(t.target_workers, 5);
+        assert_eq!(t.window, "five_hour");
+    }
+
+    #[test]
+    fn sprint_does_not_trigger_above_threshold() {
+        // 55% used, 1.5h to reset -> no sprint (above 50% threshold)
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(55.0, 1.5, false),
+            seven_day: make_window_with_util(55.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(55.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(
+            trigger.is_none(),
+            "Sprint should NOT trigger at 55% (above threshold)"
+        );
+    }
+
+    #[test]
+    fn sprint_does_not_trigger_too_far_from_reset() {
+        // 45% used, 3h to reset -> no sprint (too far from reset)
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 3.0, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(
+            trigger.is_none(),
+            "Sprint should NOT trigger at 3h remaining (above 2h threshold)"
+        );
+    }
+
+    #[test]
+    fn sprint_inhibited_when_other_window_has_cutoff_risk() {
+        // five_hour underutilized and close to reset, but seven_day has cutoff_risk
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(80.0, 10.0, true), // cutoff_risk!
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(
+            trigger.is_none(),
+            "Sprint should NOT trigger when another window has cutoff_risk"
+        );
+    }
+
+    #[test]
+    fn sprint_boosts_to_max_workers() {
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 8 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config).unwrap();
+        assert_eq!(
+            trigger.target_workers, 8,
+            "Sprint should boost to max_workers (8)"
+        );
+    }
+
+    #[test]
+    fn sprint_no_trigger_when_all_workers_at_max() {
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 5, target: 5, min: 1, max: 5 }, // already at max
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(
+            trigger.is_none(),
+            "Sprint should NOT trigger when all workers already at max"
+        );
+    }
+
+    #[test]
+    fn sprint_reason_contains_window_and_utilization() {
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config).unwrap();
+        assert!(trigger.reason.contains("five_hour"));
+        assert!(trigger.reason.contains("45"));
+        assert!(trigger.reason.contains("1.5"));
+        assert!(trigger.reason.contains("sonnet"));
+        assert!(trigger.reason.contains("Underutilization sprint"));
+    }
+
+    #[test]
+    fn sprint_picks_worker_with_most_headroom() {
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 3, target: 3, min: 1, max: 5 }, // headroom: 2
+        );
+        workers.insert(
+            "opus".to_string(),
+            WorkerState { current: 1, target: 1, min: 1, max: 10 }, // headroom: 9
+        );
+
+        let state = make_state_with_workers(forecast, workers);
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config).unwrap();
+        assert_eq!(
+            trigger.worker_id, "opus",
+            "Sprint should pick worker with most headroom"
+        );
+        assert_eq!(trigger.target_workers, 10);
     }
 }

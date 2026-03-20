@@ -4,10 +4,14 @@
 
 pub mod alerts;
 pub mod burn_rate;
+pub mod capacity_summary;
 pub mod collector;
 pub mod config;
 pub mod db;
 pub mod governor;
+pub mod narrator;
 pub mod poller;
 pub mod pricing;
+pub mod schedule;
+pub mod simulator;
 pub mod state;

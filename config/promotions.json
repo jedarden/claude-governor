@@ -1,0 +1,11 @@
+[
+  {
+    "name": "March 2026 Off-Peak Promotion",
+    "start_date": "2026-03-01",
+    "end_date": "2026-04-01",
+    "peak_start_hour_et": 8,
+    "peak_end_hour_et": 14,
+    "offpeak_multiplier": 2.0,
+    "applies_to": ["seven_day", "seven_day_sonnet"]
+  }
+]
