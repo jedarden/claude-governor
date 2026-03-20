@@ -5,12 +5,13 @@
 //! - Parsing usage blocks from assistant messages
 //! - Tracking per-model token usage by type
 
-use chrono::{DateTime, Utc};
+use chrono::{Datelike, DateTime, Timelike, Utc};
+use chrono_tz::US::Eastern;
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -442,6 +443,459 @@ pub fn compute_window_forecast(
         bind: 0,
         safe_w: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSONL record types: InstanceRecord (i), FleetRecord (f), and helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `t` falls within peak hours: 8 AM–2 PM ET, weekdays only.
+///
+/// Peak window aligns with `promotions.json` (`peak_start_hour_et=8`, `peak_end_hour_et=14`).
+pub fn is_peak(t: DateTime<Utc>) -> bool {
+    let et = t.with_timezone(&Eastern);
+    let weekday = et.weekday().num_days_from_monday(); // 0=Mon … 6=Sun
+    let hour = et.hour();
+    weekday < 5 && hour >= 8 && hour < 14
+}
+
+/// Returns the hour (0–23) in US Eastern time at timestamp `t`.
+pub fn hr_et(t: DateTime<Utc>) -> u8 {
+    t.with_timezone(&Eastern).hour() as u8
+}
+
+/// Returns the day-of-week in US Eastern time at timestamp `t` (0=Mon … 6=Sun).
+pub fn dow(t: DateTime<Utc>) -> u8 {
+    t.with_timezone(&Eastern)
+        .weekday()
+        .num_days_from_monday() as u8
+}
+
+/// Instance-level JSONL record — type `"i"`, one row per session per collection interval.
+///
+/// All token types appear as columns on the same row. Since each session runs
+/// one model, columns are not model-prefixed; the `model` field carries the identity.
+/// `p5h`, `p7d`, `p7ds` are `null` at write time; the governor annotates them later.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceRecord {
+    /// Record type discriminator (always `"i"`)
+    #[serde(rename = "r")]
+    pub r: String,
+
+    /// Timestamp when this record was written
+    #[serde(rename = "ts")]
+    pub ts: DateTime<Utc>,
+
+    /// Interval start time
+    #[serde(rename = "t0")]
+    pub t0: DateTime<Utc>,
+
+    /// Interval end time
+    #[serde(rename = "t1")]
+    pub t1: DateTime<Utc>,
+
+    /// Worker session name (e.g., tmux session name)
+    #[serde(rename = "sess")]
+    pub sess: String,
+
+    /// Session ID (short hash / stem from the JSONL file path)
+    #[serde(rename = "sid")]
+    pub sid: String,
+
+    /// Model identifier (e.g., `"claude-sonnet-4-20250514"`)
+    #[serde(rename = "model")]
+    pub model: String,
+
+    /// Peak flag: 1 = peak hours (8–14 ET weekdays), 0 = off-peak
+    #[serde(rename = "pk")]
+    pub pk: u8,
+
+    /// Hour of day in US Eastern time at `t0` (0–23)
+    #[serde(rename = "hr_et")]
+    pub hr_et: u8,
+
+    /// Day of week in US Eastern time at `t0` (0=Mon … 6=Sun)
+    #[serde(rename = "dow")]
+    pub dow: u8,
+
+    /// Input token count
+    #[serde(rename = "input-n")]
+    pub input_n: u64,
+
+    /// Input token cost (USD)
+    #[serde(rename = "input-usd")]
+    pub input_usd: f64,
+
+    /// Output token count
+    #[serde(rename = "output-n")]
+    pub output_n: u64,
+
+    /// Output token cost (USD)
+    #[serde(rename = "output-usd")]
+    pub output_usd: f64,
+
+    /// Cache read token count
+    #[serde(rename = "r-cache-n")]
+    pub r_cache_n: u64,
+
+    /// Cache read cost (USD)
+    #[serde(rename = "r-cache-usd")]
+    pub r_cache_usd: f64,
+
+    /// Cache write (5-minute TTL) token count
+    #[serde(rename = "w-cache-n")]
+    pub w_cache_n: u64,
+
+    /// Cache write (5-minute TTL) cost (USD)
+    #[serde(rename = "w-cache-usd")]
+    pub w_cache_usd: f64,
+
+    /// Cache write (1-hour TTL) token count — Bedrock only; near-zero on standard API
+    #[serde(rename = "w-cache-1h-n")]
+    pub w_cache_1h_n: u64,
+
+    /// Cache write (1-hour TTL) cost (USD)
+    #[serde(rename = "w-cache-1h-usd")]
+    pub w_cache_1h_usd: f64,
+
+    /// Total cost (USD) for this interval
+    #[serde(rename = "total-usd")]
+    pub total_usd: f64,
+
+    /// 5-hour window utilization % delta — `null` until governor annotates
+    #[serde(rename = "p5h", skip_serializing_if = "Option::is_none")]
+    pub p5h: Option<f64>,
+
+    /// 7-day window utilization % delta — `null` until governor annotates
+    #[serde(rename = "p7d", skip_serializing_if = "Option::is_none")]
+    pub p7d: Option<f64>,
+
+    /// 7-day Sonnet window utilization % delta — `null` until governor annotates
+    #[serde(rename = "p7ds", skip_serializing_if = "Option::is_none")]
+    pub p7ds: Option<f64>,
+}
+
+impl InstanceRecord {
+    /// Create a new InstanceRecord from a UsageRecord and DollarBreakdown.
+    pub fn new(
+        ts: DateTime<Utc>,
+        t0: DateTime<Utc>,
+        t1: DateTime<Utc>,
+        session: String,
+        sid: String,
+        model: String,
+        usage: &UsageRecord,
+        dollars: &crate::pricing::DollarBreakdown,
+    ) -> Self {
+        Self {
+            r: "i".to_string(),
+            ts,
+            t0,
+            t1,
+            sess: session,
+            sid,
+            model,
+            pk: if is_peak(t0) { 1 } else { 0 },
+            hr_et: hr_et(t0),
+            dow: dow(t0),
+            input_n: usage.input_tokens,
+            input_usd: dollars.input_usd,
+            output_n: usage.output_tokens,
+            output_usd: dollars.output_usd,
+            r_cache_n: usage.cache_read_tokens,
+            r_cache_usd: dollars.cache_read_usd,
+            w_cache_n: usage.cache_write_5m_tokens,
+            w_cache_usd: dollars.cache_write_5m_usd,
+            w_cache_1h_n: usage.cache_write_1h_tokens,
+            w_cache_1h_usd: dollars.cache_write_1h_usd,
+            total_usd: dollars.total_usd,
+            p5h: None,
+            p7d: None,
+            p7ds: None,
+        }
+    }
+}
+
+/// Summed token-type data for one model within a fleet record.
+#[derive(Debug, Clone, Default)]
+pub struct ModelTokens {
+    pub input_n: u64,
+    pub input_usd: f64,
+    pub output_n: u64,
+    pub output_usd: f64,
+    pub r_cache_n: u64,
+    pub r_cache_usd: f64,
+    pub w_cache_n: u64,
+    pub w_cache_usd: f64,
+    pub w_cache_1h_n: u64,
+    pub w_cache_1h_usd: f64,
+}
+
+/// Fleet-level JSONL record — type `"f"`, one row per collection interval.
+///
+/// Aggregates all worker instances. Per-model columns are dynamic (all configured
+/// models appear, zero-filled when inactive). Use [`FleetRecord::to_json_value`] to
+/// serialize to a flat JSON object.
+#[derive(Debug, Clone)]
+pub struct FleetRecord {
+    /// Timestamp when this record was written
+    pub ts: DateTime<Utc>,
+
+    /// Interval start time
+    pub t0: DateTime<Utc>,
+
+    /// Interval end time
+    pub t1: DateTime<Utc>,
+
+    /// Peak flag: 1 = peak hours (8–14 ET weekdays), 0 = off-peak
+    pub pk: u8,
+
+    /// Hour of day in US Eastern time at `t0` (0–23)
+    pub hr_et: u8,
+
+    /// Day of week in US Eastern time at `t0` (0=Mon … 6=Sun)
+    pub dow: u8,
+
+    /// Number of active workers this interval
+    pub workers: usize,
+
+    /// Per-model token data in config order.
+    /// Every configured model is present, zero-filled when inactive.
+    pub model_data: Vec<(String, ModelTokens)>,
+
+    /// Total fleet cost (USD) for this interval
+    pub total_usd: f64,
+
+    /// 75th-percentile per-worker USD/hr (nearest-rank method)
+    pub p75_usd_hr: f64,
+
+    /// Population standard deviation of per-worker USD/hr
+    pub std_usd_hr: f64,
+
+    /// 5-hour window utilization % delta — `null` until governor annotates
+    pub p5h: Option<f64>,
+
+    /// 7-day window utilization % delta — `null` until governor annotates
+    pub p7d: Option<f64>,
+
+    /// 7-day Sonnet window utilization % delta — `null` until governor annotates
+    pub p7ds: Option<f64>,
+
+    /// USD cost per 1 % of the Sonnet 7-day window — promotion-validation signal.
+    /// `null` when `p7ds` is null.
+    pub usd_per_pct_7ds: Option<f64>,
+}
+
+/// Token-type suffixes used in fleet record column names, in schema order.
+const TOK_SUFFIXES: &[(&str, bool)] = &[
+    ("input-n", false),
+    ("input-usd", true),
+    ("output-n", false),
+    ("output-usd", true),
+    ("r-cache-n", false),
+    ("r-cache-usd", true),
+    ("w-cache-n", false),
+    ("w-cache-usd", true),
+    ("w-cache-1h-n", false),
+    ("w-cache-1h-usd", true),
+];
+
+impl FleetRecord {
+    /// Serialize to a flat `serde_json::Value` object with all per-model columns.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        use serde_json::{Map, Number, Value};
+
+        let mut map = Map::new();
+
+        // Fixed header fields
+        map.insert("r".into(), Value::String("f".into()));
+        map.insert("ts".into(), Value::String(self.ts.to_rfc3339()));
+        map.insert("t0".into(), Value::String(self.t0.to_rfc3339()));
+        map.insert("t1".into(), Value::String(self.t1.to_rfc3339()));
+        map.insert("pk".into(), Value::Number(self.pk.into()));
+        map.insert("hr_et".into(), Value::Number(self.hr_et.into()));
+        map.insert("dow".into(), Value::Number(self.dow.into()));
+        map.insert("workers".into(), Value::Number(self.workers.into()));
+
+        // Per-model columns
+        for (model, tok) in &self.model_data {
+            let raw: [f64; 10] = [
+                tok.input_n as f64,
+                tok.input_usd,
+                tok.output_n as f64,
+                tok.output_usd,
+                tok.r_cache_n as f64,
+                tok.r_cache_usd,
+                tok.w_cache_n as f64,
+                tok.w_cache_usd,
+                tok.w_cache_1h_n as f64,
+                tok.w_cache_1h_usd,
+            ];
+            for (i, (suffix, is_float)) in TOK_SUFFIXES.iter().enumerate() {
+                let key = format!("{}-{}", model, suffix);
+                let val = if *is_float {
+                    Number::from_f64(raw[i])
+                        .map(Value::Number)
+                        .unwrap_or(Value::Number(0.into()))
+                } else {
+                    Value::Number((raw[i] as u64).into())
+                };
+                map.insert(key, val);
+            }
+        }
+
+        // Fleet totals
+        let insert_f64 = |m: &mut Map<String, Value>, k: &str, v: f64| {
+            m.insert(
+                k.into(),
+                Number::from_f64(v)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Number(0.into())),
+            );
+        };
+        insert_f64(&mut map, "total-usd", self.total_usd);
+        insert_f64(&mut map, "p75-usd-hr", self.p75_usd_hr);
+        insert_f64(&mut map, "std-usd-hr", self.std_usd_hr);
+
+        // Window snapshots (null until annotated)
+        let opt_val = |v: Option<f64>| {
+            v.and_then(Number::from_f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
+        };
+        map.insert("p5h".into(), opt_val(self.p5h));
+        map.insert("p7d".into(), opt_val(self.p7d));
+        map.insert("p7ds".into(), opt_val(self.p7ds));
+        map.insert("usd-per-pct-7ds".into(), opt_val(self.usd_per_pct_7ds));
+
+        Value::Object(map)
+    }
+}
+
+/// Aggregate a slice of instance records into a single fleet record.
+///
+/// * Sums token counts and costs per model across all instances.
+/// * Zero-fills models from `all_models` that had no activity.
+/// * Computes `p75_usd_hr` (nearest-rank) and `std_usd_hr` (population) over
+///   per-worker USD/hr values derived from the interval duration `t1 − t0`.
+/// * Window snapshot fields are left `None` — the governor annotates them later.
+pub fn aggregate_to_fleet(
+    instances: &[InstanceRecord],
+    ts: DateTime<Utc>,
+    t0: DateTime<Utc>,
+    t1: DateTime<Utc>,
+    all_models: &[String],
+) -> FleetRecord {
+    // Initialise per-model accumulators to zero for every configured model
+    let mut model_map: HashMap<String, ModelTokens> = all_models
+        .iter()
+        .map(|m| (m.clone(), ModelTokens::default()))
+        .collect();
+
+    // Sum token data from all instances
+    for inst in instances {
+        let entry = model_map.entry(inst.model.clone()).or_default();
+        entry.input_n += inst.input_n;
+        entry.input_usd += inst.input_usd;
+        entry.output_n += inst.output_n;
+        entry.output_usd += inst.output_usd;
+        entry.r_cache_n += inst.r_cache_n;
+        entry.r_cache_usd += inst.r_cache_usd;
+        entry.w_cache_n += inst.w_cache_n;
+        entry.w_cache_usd += inst.w_cache_usd;
+        entry.w_cache_1h_n += inst.w_cache_1h_n;
+        entry.w_cache_1h_usd += inst.w_cache_1h_usd;
+    }
+
+    let total_usd: f64 = instances.iter().map(|i| i.total_usd).sum();
+
+    // Per-worker variance stats
+    let elapsed_hours = (t1 - t0).num_seconds() as f64 / 3600.0;
+    let (p75_usd_hr, std_usd_hr) = if instances.is_empty() || elapsed_hours <= 0.0 {
+        (0.0, 0.0)
+    } else {
+        let mut rates: Vec<f64> = instances
+            .iter()
+            .map(|i| i.total_usd / elapsed_hours)
+            .collect();
+
+        let n = rates.len();
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Nearest-rank p75: index = ceil(n * 0.75) - 1, clamped to [0, n-1]
+        let p75_idx = ((n as f64 * 0.75).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        let p75 = rates[p75_idx];
+
+        // Population standard deviation
+        let mean = rates.iter().sum::<f64>() / n as f64;
+        let variance = rates.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        let std = variance.sqrt();
+
+        (p75, std)
+    };
+
+    // Build ordered model_data list preserving config order; include any
+    // extra models from instances that weren't in all_models at the end.
+    let mut model_data: Vec<(String, ModelTokens)> = all_models
+        .iter()
+        .map(|m| (m.clone(), model_map.remove(m).unwrap_or_default()))
+        .collect();
+    // Append any instance models not in all_models (e.g., unknown model)
+    for (m, tok) in model_map {
+        model_data.push((m, tok));
+    }
+
+    let pk = if is_peak(t0) { 1 } else { 0 };
+
+    FleetRecord {
+        ts,
+        t0,
+        t1,
+        pk,
+        hr_et: hr_et(t0),
+        dow: dow(t0),
+        workers: instances.len(),
+        model_data,
+        total_usd,
+        p75_usd_hr,
+        std_usd_hr,
+        p5h: None,
+        p7d: None,
+        p7ds: None,
+        usd_per_pct_7ds: None,
+    }
+}
+
+/// Append JSON records to a JSONL file, one object per line.
+///
+/// Creates the file (and parent directories) if they don't exist.
+/// All records are serialised into a single buffer and written with one
+/// `write_all` call to prevent partial-line writes.
+pub fn append_jsonl(path: &Path, records: &[serde_json::Value]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    // Build complete content first — prevents partial-line writes on failure
+    let mut buf = String::new();
+    for record in records {
+        buf.push_str(&serde_json::to_string(record)?);
+        buf.push('\n');
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(buf.as_bytes())?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1049,6 +1503,423 @@ mod tests {
             assert_eq!(obj.get("bind").unwrap().as_u64().unwrap(), 0);
             // safe_w is None and should be omitted from serialization
             assert!(!obj.contains_key("safe_w"));
+        }
+    }
+
+    // --- Instance record tests (bead docs-lfz) ---
+
+    mod instance {
+        use super::*;
+        use chrono::{Duration, Utc};
+
+        fn ts(s: &str) -> DateTime<Utc> {
+            s.parse().unwrap()
+        }
+
+        fn make_instance(
+            sess: &str,
+            model: &str,
+            input_n: u64,
+            output_n: u64,
+            r_cache_n: u64,
+            w_cache_n: u64,
+            w_cache_1h_n: u64,
+            total_usd: f64,
+            t0: DateTime<Utc>,
+        ) -> InstanceRecord {
+            InstanceRecord {
+                r: "i".to_string(),
+                ts: t0 + Duration::minutes(5),
+                t0,
+                t1: t0 + Duration::minutes(5),
+                sess: sess.to_string(),
+                sid: sess.to_string(),
+                model: model.to_string(),
+                pk: if is_peak(t0) { 1 } else { 0 },
+                hr_et: hr_et(t0),
+                dow: dow(t0),
+                input_n,
+                input_usd: input_n as f64 * 0.003,
+                output_n,
+                output_usd: output_n as f64 * 0.015,
+                r_cache_n,
+                r_cache_usd: r_cache_n as f64 * 0.0003,
+                w_cache_n,
+                w_cache_usd: w_cache_n as f64 * 0.00375,
+                w_cache_1h_n,
+                w_cache_1h_usd: w_cache_1h_n as f64 * 0.006,
+                total_usd,
+                p5h: None,
+                p7d: None,
+                p7ds: None,
+            }
+        }
+
+        #[test]
+        fn serialization_has_correct_field_names() {
+            // March 18 2026 is a Wednesday; 14:00 UTC = 10:00 ET (EDT, UTC-4)
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let rec = make_instance("sess-1", "claude-sonnet-4-20250514", 1000, 500, 200, 100, 50, 0.05, t0);
+
+            let json = serde_json::to_value(&rec).unwrap();
+            let obj = json.as_object().unwrap();
+
+            assert_eq!(obj.get("r").unwrap().as_str().unwrap(), "i");
+            assert_eq!(obj.get("sess").unwrap().as_str().unwrap(), "sess-1");
+            assert_eq!(obj.get("sid").unwrap().as_str().unwrap(), "sess-1");
+            assert_eq!(obj.get("model").unwrap().as_str().unwrap(), "claude-sonnet-4-20250514");
+            assert_eq!(obj.get("pk").unwrap().as_u64().unwrap(), 1);
+            assert_eq!(obj.get("hr_et").unwrap().as_u64().unwrap(), 10);
+            assert_eq!(obj.get("dow").unwrap().as_u64().unwrap(), 2); // Wed
+            assert_eq!(obj.get("input-n").unwrap().as_u64().unwrap(), 1000);
+            assert_eq!(obj.get("output-n").unwrap().as_u64().unwrap(), 500);
+            assert_eq!(obj.get("r-cache-n").unwrap().as_u64().unwrap(), 200);
+            assert_eq!(obj.get("w-cache-n").unwrap().as_u64().unwrap(), 100);
+            assert_eq!(obj.get("w-cache-1h-n").unwrap().as_u64().unwrap(), 50);
+            assert!((obj.get("total-usd").unwrap().as_f64().unwrap() - 0.05).abs() < 1e-9);
+
+            // Window fields are None → should be omitted from serialization
+            assert!(!obj.contains_key("p5h"));
+            assert!(!obj.contains_key("p7d"));
+            assert!(!obj.contains_key("p7ds"));
+        }
+
+        #[test]
+        fn new_from_usage_and_dollars() {
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let usage = UsageRecord {
+                input_tokens: 1000,
+                output_tokens: 500,
+                cache_read_tokens: 200,
+                cache_write_5m_tokens: 100,
+                cache_write_1h_tokens: 50,
+                model: "claude-sonnet-4-20250514".to_string(),
+                session: "test-session".to_string(),
+            };
+            let dollars = crate::pricing::DollarBreakdown {
+                input_usd: 3.0,
+                output_usd: 7.5,
+                cache_read_usd: 0.06,
+                cache_write_5m_usd: 0.375,
+                cache_write_1h_usd: 0.3,
+                total_usd: 11.235,
+            };
+
+            let rec = InstanceRecord::new(
+                t0 + Duration::minutes(5),
+                t0,
+                t0 + Duration::minutes(5),
+                "test-session".to_string(),
+                "sid-abc".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+                &usage,
+                &dollars,
+            );
+
+            assert_eq!(rec.r, "i");
+            assert_eq!(rec.input_n, 1000);
+            assert_eq!(rec.output_n, 500);
+            assert_eq!(rec.total_usd, 11.235);
+            assert_eq!(rec.pk, 1); // 10am ET Wednesday = peak
+        }
+    }
+
+    // --- Fleet record tests (bead docs-lfz) ---
+
+    mod fleet {
+        use super::*;
+        use chrono::{Duration, Utc};
+
+        fn ts(s: &str) -> DateTime<Utc> {
+            s.parse().unwrap()
+        }
+
+        fn make_instance(
+            sess: &str,
+            model: &str,
+            input_n: u64,
+            total_usd: f64,
+            t0: DateTime<Utc>,
+        ) -> InstanceRecord {
+            InstanceRecord {
+                r: "i".to_string(),
+                ts: t0 + Duration::minutes(5),
+                t0,
+                t1: t0 + Duration::minutes(5),
+                sess: sess.to_string(),
+                sid: sess.to_string(),
+                model: model.to_string(),
+                pk: if is_peak(t0) { 1 } else { 0 },
+                hr_et: hr_et(t0),
+                dow: dow(t0),
+                input_n,
+                input_usd: input_n as f64 * 0.003,
+                output_n: input_n / 2,
+                output_usd: (input_n / 2) as f64 * 0.015,
+                r_cache_n: 0,
+                r_cache_usd: 0.0,
+                w_cache_n: 0,
+                w_cache_usd: 0.0,
+                w_cache_1h_n: 0,
+                w_cache_1h_usd: 0.0,
+                total_usd,
+                p5h: None,
+                p7d: None,
+                p7ds: None,
+            }
+        }
+
+        #[test]
+        fn aggregation_sums_two_instances() {
+            let t0 = ts("2026-03-18T14:00:00Z"); // Wed 10am ET, peak
+            let t1 = t0 + Duration::minutes(5);
+            let all_models = vec!["claude-sonnet-4-20250514".to_string()];
+
+            let inst1 = make_instance("worker-a", "claude-sonnet-4-20250514", 1000, 0.05, t0);
+            let inst2 = make_instance("worker-b", "claude-sonnet-4-20250514", 2000, 0.10, t0);
+
+            let fleet = aggregate_to_fleet(
+                &[inst1, inst2],
+                t1,
+                t0,
+                t1,
+                &all_models,
+            );
+
+            assert_eq!(fleet.workers, 2);
+            assert_eq!(fleet.pk, 1);
+            assert!((fleet.total_usd - 0.15).abs() < 1e-9);
+
+            // Per-model columns should sum
+            let sonnet_tok = fleet.model_data.iter().find(|(m, _)| m == "claude-sonnet-4-20250514").unwrap();
+            assert_eq!(sonnet_tok.1.input_n, 3000); // 1000 + 2000
+        }
+
+        #[test]
+        fn p75_and_stddev_with_three_instances() {
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let t1 = t0 + Duration::hours(1); // 1 hour interval
+            let all_models = vec!["claude-sonnet-4-20250514".to_string()];
+
+            // USD/hr: 1.0, 2.0, 3.0
+            let inst1 = make_instance("a", "claude-sonnet-4-20250514", 100, 1.0, t0);
+            let inst2 = make_instance("b", "claude-sonnet-4-20250514", 100, 2.0, t0);
+            let inst3 = make_instance("c", "claude-sonnet-4-20250514", 100, 3.0, t0);
+
+            let fleet = aggregate_to_fleet(
+                &[inst1, inst2, inst3],
+                t1,
+                t0,
+                t1,
+                &all_models,
+            );
+
+            // p75 nearest-rank: n=3, ceil(3*0.75)-1 = ceil(2.25)-1 = 3-1 = 2 → rates[2] = 3.0
+            assert_eq!(fleet.p75_usd_hr, 3.0);
+
+            // stddev: mean=2.0, var=((1-2)^2+(2-2)^2+(3-2)^2)/3 = 2/3, std=0.8165...
+            let expected_std = (2.0_f64 / 3.0).sqrt();
+            assert!(
+                (fleet.std_usd_hr - expected_std).abs() < 1e-9,
+                "expected stddev={}, got {}",
+                expected_std,
+                fleet.std_usd_hr
+            );
+        }
+
+        #[test]
+        fn zero_activity_models_zero_filled() {
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let t1 = t0 + Duration::minutes(5);
+            let all_models = vec![
+                "claude-sonnet-4-20250514".to_string(),
+                "claude-opus-4-20250514".to_string(),
+                "claude-haiku-4-5-20251001".to_string(),
+            ];
+
+            // Only sonnet has activity
+            let inst = make_instance("a", "claude-sonnet-4-20250514", 500, 0.02, t0);
+
+            let fleet = aggregate_to_fleet(&[inst], t1, t0, t1, &all_models);
+
+            assert_eq!(fleet.model_data.len(), 3);
+
+            let json = fleet.to_json_value();
+            let obj = json.as_object().unwrap();
+
+            // Opus should have zero-filled columns
+            assert_eq!(obj.get("claude-opus-4-20250514-input-n").unwrap().as_u64().unwrap(), 0);
+            assert_eq!(obj.get("claude-opus-4-20250514-input-usd").unwrap().as_f64().unwrap(), 0.0);
+            assert_eq!(obj.get("claude-opus-4-20250514-output-n").unwrap().as_u64().unwrap(), 0);
+
+            // Haiku should also be zero-filled
+            assert_eq!(obj.get("claude-haiku-4-5-20251001-input-n").unwrap().as_u64().unwrap(), 0);
+
+            // Sonnet should have actual data
+            assert_eq!(obj.get("claude-sonnet-4-20250514-input-n").unwrap().as_u64().unwrap(), 500);
+        }
+
+        #[test]
+        fn fleet_serialization_has_correct_shape() {
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let t1 = t0 + Duration::minutes(5);
+            let all_models = vec!["claude-sonnet-4-20250514".to_string()];
+
+            let inst = make_instance("a", "claude-sonnet-4-20250514", 100, 0.01, t0);
+            let fleet = aggregate_to_fleet(&[inst], t1, t0, t1, &all_models);
+
+            let json = fleet.to_json_value();
+            let obj = json.as_object().unwrap();
+
+            assert_eq!(obj.get("r").unwrap().as_str().unwrap(), "f");
+            assert_eq!(obj.get("pk").unwrap().as_u64().unwrap(), 1);
+            assert_eq!(obj.get("hr_et").unwrap().as_u64().unwrap(), 10);
+            assert_eq!(obj.get("dow").unwrap().as_u64().unwrap(), 2);
+            assert_eq!(obj.get("workers").unwrap().as_u64().unwrap(), 1);
+            assert!(obj.contains_key("total-usd"));
+            assert!(obj.contains_key("p75-usd-hr"));
+            assert!(obj.contains_key("std-usd-hr"));
+
+            // Window snapshots should be null
+            assert!(obj.get("p5h").unwrap().is_null());
+            assert!(obj.get("p7d").unwrap().is_null());
+            assert!(obj.get("p7ds").unwrap().is_null());
+            assert!(obj.get("usd-per-pct-7ds").unwrap().is_null());
+        }
+    }
+
+    // --- Peak detection tests (bead docs-lfz) ---
+
+    mod peak {
+        use super::*;
+        use chrono::{Duration, Utc};
+
+        fn ts(s: &str) -> DateTime<Utc> {
+            s.parse().unwrap()
+        }
+
+        #[test]
+        fn weekday_10am_et_is_peak() {
+            // March 18 2026 is a Wednesday; 14:00 UTC = 10:00 ET (EDT)
+            assert!(is_peak(ts("2026-03-18T14:00:00Z")));
+        }
+
+        #[test]
+        fn weekday_3pm_et_is_off_peak() {
+            // March 18 2026 is a Wednesday; 19:00 UTC = 15:00 ET (EDT) = 3pm
+            assert!(!is_peak(ts("2026-03-18T19:00:00Z")));
+        }
+
+        #[test]
+        fn weekend_10am_et_is_off_peak() {
+            // March 21 2026 is a Saturday; 14:00 UTC = 10:00 ET
+            assert!(!is_peak(ts("2026-03-21T14:00:00Z")));
+        }
+
+        #[test]
+        fn weekday_8am_et_is_peak() {
+            // March 18 2026 is a Wednesday; 12:00 UTC = 8:00 ET (EDT)
+            assert!(is_peak(ts("2026-03-18T12:00:00Z")));
+        }
+
+        #[test]
+        fn weekday_1pm_et_is_peak() {
+            // March 18 2026 is a Wednesday; 17:00 UTC = 13:00 ET (EDT) = 1pm
+            assert!(is_peak(ts("2026-03-18T17:00:00Z")));
+        }
+
+        #[test]
+        fn weekday_2pm_et_is_off_peak() {
+            // March 18 2026 is a Wednesday; 18:00 UTC = 14:00 ET (EDT) = 2pm (exclusive)
+            assert!(!is_peak(ts("2026-03-18T18:00:00Z")));
+        }
+
+        #[test]
+        fn hr_et_and_dow_correct() {
+            // March 18 2026 is a Wednesday; 14:00 UTC = 10:00 ET
+            assert_eq!(hr_et(ts("2026-03-18T14:00:00Z")), 10);
+            assert_eq!(dow(ts("2026-03-18T14:00:00Z")), 2); // Wed
+
+            // March 16 2026 is a Monday
+            assert_eq!(dow(ts("2026-03-16T14:00:00Z")), 0);
+
+            // March 22 2026 is a Sunday
+            assert_eq!(dow(ts("2026-03-22T14:00:00Z")), 6);
+        }
+    }
+
+    // --- JSONL append tests (bead docs-lfz) ---
+
+    mod jsonl_append {
+        use super::*;
+
+        #[test]
+        fn writes_valid_jsonl() {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("test.jsonl");
+
+            let records = vec![
+                serde_json::json!({"r": "i", "sess": "a", "total-usd": 0.01}),
+                serde_json::json!({"r": "i", "sess": "b", "total-usd": 0.02}),
+            ];
+
+            append_jsonl(&path, &records).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 2);
+
+            // Each line is valid JSON
+            for line in &lines {
+                let _: serde_json::Value = serde_json::from_str(line).unwrap();
+            }
+        }
+
+        #[test]
+        fn append_to_existing_file() {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("test.jsonl");
+
+            // Write first record
+            let records1 = vec![serde_json::json!({"r": "i", "sess": "a"})];
+            append_jsonl(&path, &records1).unwrap();
+
+            // Append second record
+            let records2 = vec![serde_json::json!({"r": "i", "sess": "b"})];
+            append_jsonl(&path, &records2).unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 2);
+
+            // First record preserved
+            let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(first["sess"], "a");
+
+            // Second record appended
+            let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(second["sess"], "b");
+        }
+
+        #[test]
+        fn empty_records_writes_nothing() {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("test.jsonl");
+
+            append_jsonl(&path, &[]).unwrap();
+
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn creates_parent_directories() {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("nested").join("dir").join("test.jsonl");
+
+            let records = vec![serde_json::json!({"r": "i"})];
+            append_jsonl(&path, &records).unwrap();
+
+            assert!(path.exists());
         }
     }
 }
