@@ -5,7 +5,28 @@
 //! - Parsing usage blocks from assistant messages
 //! - Tracking per-model token usage by type
 
-use serde::Deserialize;
+use glob::glob;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Errors that can occur during collection
+#[derive(Debug, Error)]
+pub enum CollectorError {
+    #[error("Glob pattern error: {0}")]
+    GlobPattern(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type Result<T> = std::result::Result<T, CollectorError>;
 
 /// Usage record extracted from a Claude Code JSONL assistant message
 ///
@@ -100,9 +121,134 @@ pub struct JsonlLine {
     pub message: Option<AssistantMessage>,
 }
 
+/// Discover all JSONL files under a base directory
+///
+/// Walks `base/**/*.jsonl` using glob and returns a sorted list of paths.
+pub fn discover_jsonl_files(base: &Path) -> Vec<PathBuf> {
+    let pattern = base
+        .join("**")
+        .join("*.jsonl")
+        .to_string_lossy()
+        .into_owned();
+
+    let paths = match glob(&pattern) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Invalid glob pattern '{}': {}", pattern, e);
+            return Vec::new();
+        }
+    };
+
+    let mut files: Vec<PathBuf> = paths.filter_map(|entry| entry.ok()).collect();
+    files.sort();
+    files
+}
+
+/// Persistent store for file read cursors
+///
+/// Tracks the byte offset for each JSONL file to enable incremental reading.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CursorStore {
+    cursors: HashMap<PathBuf, u64>,
+}
+
+impl CursorStore {
+    /// Load cursor store from a JSON file
+    ///
+    /// Returns an empty CursorStore if the file doesn't exist.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let store: Self = serde_json::from_reader(reader)?;
+        Ok(store)
+    }
+
+    /// Save cursor store to a JSON file atomically
+    ///
+    /// Writes to a .tmp file first, then renames to the final path.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp_path = path.with_extension("tmp");
+
+        // Write to temp file
+        {
+            let file = fs::File::create(&tmp_path)?;
+            let writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(writer, self)?;
+        }
+
+        // Atomic rename
+        fs::rename(&tmp_path, path)?;
+
+        Ok(())
+    }
+
+    /// Get the stored offset for a file
+    ///
+    /// Returns 0 if the file is not in the store.
+    pub fn get_offset(&self, file: &Path) -> u64 {
+        self.cursors.get(file).copied().unwrap_or(0)
+    }
+
+    /// Set the offset for a file
+    pub fn set_offset(&mut self, file: PathBuf, offset: u64) {
+        self.cursors.insert(file, offset);
+    }
+}
+
+/// Read new lines from a JSONL file since the last cursor position
+///
+/// Seeks to the stored byte offset and reads all content to EOF.
+/// If the file has shrunk (log rotation), resets the cursor to 0 and logs a warning.
+pub fn read_new_lines(path: &Path, cursor: &mut CursorStore) -> Result<Vec<String>> {
+    let stored_offset = cursor.get_offset(path);
+    let mut file = fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    let start_offset = if file_size < stored_offset {
+        log::warn!(
+            "[collector] cursor reset for {} (file shrunk: {} -> {} bytes)",
+            path.display(),
+            stored_offset,
+            file_size
+        );
+        0
+    } else {
+        stored_offset
+    };
+
+    if start_offset > 0 {
+        file.seek(SeekFrom::Start(start_offset))?;
+    }
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+
+    let lines: Vec<String> = content
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+
+    let new_offset = start_offset + content.len() as u64;
+    cursor.set_offset(path.to_path_buf(), new_offset);
+
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_usage_record_zero() {
@@ -145,5 +291,266 @@ mod tests {
         let cache_creation = usage.cache_creation.unwrap();
         assert_eq!(cache_creation.ephemeral_5m_input_tokens, Some(50));
         assert_eq!(cache_creation.ephemeral_1h_input_tokens, Some(50));
+    }
+
+    // Cursor tests
+
+    #[test]
+    fn cursor_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("cursors.json");
+
+        // Create and populate cursor store
+        let mut store = CursorStore::default();
+        store.set_offset(PathBuf::from("/path/to/file1.jsonl"), 1000);
+        store.set_offset(PathBuf::from("/path/to/file2.jsonl"), 2500);
+        store.set_offset(PathBuf::from("/path/to/nested/file3.jsonl"), 500);
+
+        // Save
+        store.save(&cursor_path).unwrap();
+
+        // Verify no .tmp file remains
+        assert!(!cursor_path.with_extension("tmp").exists());
+
+        // Load back
+        let loaded = CursorStore::load(&cursor_path).unwrap();
+
+        // Verify all offsets match
+        assert_eq!(loaded.get_offset(Path::new("/path/to/file1.jsonl")), 1000);
+        assert_eq!(loaded.get_offset(Path::new("/path/to/file2.jsonl")), 2500);
+        assert_eq!(
+            loaded.get_offset(Path::new("/path/to/nested/file3.jsonl")),
+            500
+        );
+    }
+
+    #[test]
+    fn cursor_load_nonexistent_returns_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("nonexistent.json");
+
+        // Should not error, return empty store
+        let store = CursorStore::load(&cursor_path).unwrap();
+
+        // Any file should return offset 0
+        assert_eq!(store.get_offset(Path::new("/any/file.jsonl")), 0);
+    }
+
+    #[test]
+    fn cursor_get_offset_unknown_returns_zero() {
+        let mut store = CursorStore::default();
+        store.set_offset(PathBuf::from("/known/file.jsonl"), 100);
+
+        // Unknown file returns 0
+        assert_eq!(store.get_offset(Path::new("/unknown/file.jsonl")), 0);
+
+        // Known file returns stored offset
+        assert_eq!(store.get_offset(Path::new("/known/file.jsonl")), 100);
+    }
+
+    #[test]
+    fn discover_jsonl_finds_nested_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create nested directory structure with JSONL files
+        let nested = temp_dir.path().join("subdir").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        fs::File::create(temp_dir.path().join("root.jsonl")).unwrap();
+        fs::File::create(temp_dir.path().join("subdir").join("level1.jsonl")).unwrap();
+        fs::File::create(nested.join("level2.jsonl")).unwrap();
+
+        let files = discover_jsonl_files(temp_dir.path());
+
+        // Should find all 3 JSONL files
+        assert_eq!(files.len(), 3);
+
+        // Should be sorted
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["level1.jsonl", "level2.jsonl", "root.jsonl"]);
+    }
+
+    #[test]
+    fn discover_jsonl_ignores_non_jsonl() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create various file types
+        fs::File::create(temp_dir.path().join("data.jsonl")).unwrap();
+        fs::File::create(temp_dir.path().join("config.json")).unwrap();
+        fs::File::create(temp_dir.path().join("readme.md")).unwrap();
+        fs::File::create(temp_dir.path().join("script.sh")).unwrap();
+
+        let files = discover_jsonl_files(temp_dir.path());
+
+        // Should only find the .jsonl file
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].file_name().unwrap().to_string_lossy(),
+            "data.jsonl"
+        );
+    }
+
+    #[test]
+    fn discover_jsonl_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let files = discover_jsonl_files(temp_dir.path());
+
+        assert!(files.is_empty());
+    }
+
+    mod read_new {
+        use super::*;
+        use std::io::Write;
+        use std::sync::{Mutex, OnceLock};
+
+        // --- test logger for capturing log::warn! output ---
+
+        static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+        struct TestLogger;
+
+        impl log::Log for TestLogger {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                let logs = TEST_LOGS.get_or_init(|| Mutex::new(Vec::new()));
+                logs.lock().unwrap().push(format!("{}", record.args()));
+            }
+            fn flush(&self) {}
+        }
+
+        static TEST_LOGGER: TestLogger = TestLogger;
+
+        fn init_logger() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::set_logger(&TEST_LOGGER).ok();
+                log::set_max_level(log::LevelFilter::Warn);
+            });
+        }
+
+        fn logs_containing(pattern: &str) -> Vec<String> {
+            TEST_LOGS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|msg| msg.contains(pattern))
+                .cloned()
+                .collect()
+        }
+
+        #[test]
+        fn initial_read_returns_all_lines() {
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("test.jsonl");
+
+            fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+            let mut cursor = CursorStore::default();
+            let lines = read_new_lines(&file_path, &mut cursor).unwrap();
+
+            assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        }
+
+        #[test]
+        fn incremental_read_cursor_advances() {
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("test.jsonl");
+
+            fs::write(&file_path, "line1\nline2\n").unwrap();
+
+            let mut cursor = CursorStore::default();
+            let lines = read_new_lines(&file_path, &mut cursor).unwrap();
+            assert_eq!(lines, vec!["line1", "line2"]);
+
+            let offset_after_first = cursor.get_offset(&file_path);
+            assert!(offset_after_first > 0);
+
+            // Append 2 more lines
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .unwrap();
+            file.write_all(b"line3\nline4\n").unwrap();
+            drop(file);
+
+            let lines2 = read_new_lines(&file_path, &mut cursor).unwrap();
+            assert_eq!(lines2, vec!["line3", "line4"]);
+
+            let offset_after_second = cursor.get_offset(&file_path);
+            assert!(offset_after_second > offset_after_first);
+        }
+
+        #[test]
+        fn shrinkage_guard_resets_cursor_and_logs() {
+            init_logger();
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("shrink.jsonl");
+
+            // Write 100 bytes and set cursor to 100
+            fs::write(&file_path, "a".repeat(100)).unwrap();
+            let mut cursor = CursorStore::default();
+            cursor.set_offset(file_path.clone(), 100);
+
+            // Truncate to 10 bytes
+            fs::write(&file_path, "bbbbbbbbbb").unwrap();
+
+            let lines = read_new_lines(&file_path, &mut cursor).unwrap();
+
+            // All 10 bytes returned as one line (no newlines)
+            assert_eq!(lines, vec!["bbbbbbbbbb"]);
+
+            // Cursor reset to new file size
+            assert_eq!(cursor.get_offset(&file_path), 10);
+
+            // Warning logged with the shrinkage details
+            let path_str = file_path.to_string_lossy().to_string();
+            let warnings = logs_containing(&path_str);
+            assert!(
+                !warnings.is_empty(),
+                "Expected shrinkage warning to be logged"
+            );
+            let warning = &warnings[0];
+            assert!(
+                warning.contains("file shrunk"),
+                "Warning should mention 'file shrunk', got: {warning}"
+            );
+            assert!(
+                warning.contains("100") && warning.contains("10"),
+                "Warning should contain old (100) and new (10) sizes, got: {warning}"
+            );
+        }
+
+        #[test]
+        fn empty_file_returns_empty_vec() {
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("empty.jsonl");
+            fs::write(&file_path, "").unwrap();
+
+            let mut cursor = CursorStore::default();
+            let lines = read_new_lines(&file_path, &mut cursor).unwrap();
+
+            assert!(lines.is_empty());
+            assert_eq!(cursor.get_offset(&file_path), 0);
+        }
+
+        #[test]
+        fn trailing_newline_no_empty_line() {
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("test.jsonl");
+            fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+            let mut cursor = CursorStore::default();
+            let lines = read_new_lines(&file_path, &mut cursor).unwrap();
+
+            assert_eq!(lines.len(), 3);
+            assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        }
     }
 }
