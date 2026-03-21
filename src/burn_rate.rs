@@ -461,6 +461,130 @@ pub fn effective_multiplier(result: &PromotionValidationResult) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-Window Composite Risk Optimization
+// ---------------------------------------------------------------------------
+
+/// Compute the cost/urgency of a single window.
+///
+/// The cost function measures how "urgent" a window is based on its margin
+/// relative to time remaining. Windows that are closer to exhaustion (lower
+/// margin) have higher cost.
+///
+/// Formula: `cost = margin_hrs / hours_remaining`
+///
+/// - Positive margin (safe): cost > 0, lower is safer
+/// - Zero margin (at limit): cost = 0
+/// - Negative margin (will exhaust): cost < 0, more negative = more urgent
+///
+/// Returns `None` if hours_remaining is 0 (cannot compute cost).
+pub fn window_cost(margin_hrs: f64, hours_remaining: f64) -> Option<f64> {
+    if hours_remaining <= 0.0 {
+        return None;
+    }
+    Some(margin_hrs / hours_remaining)
+}
+
+/// Compute the composite risk score across all windows.
+///
+/// The composite risk is a weighted average of all window costs, with the
+/// binding window receiving extra weight to ensure it remains the primary
+/// constraint.
+///
+/// Formula: `composite_risk = sum(cost_i * weight_i) / sum(weight_i)`
+///
+/// Where:
+/// - `cost_i` = window cost for window i
+/// - `weight_i` = `binding_weight` if window i is the binding window, else 1.0
+///
+/// Returns `None` if no windows have valid costs.
+pub fn composite_risk(
+    forecasts: &[crate::state::WindowForecast],
+    binding_idx: usize,
+    binding_weight: f64,
+) -> Option<f64> {
+    if forecasts.is_empty() || binding_idx >= forecasts.len() {
+        return None;
+    }
+
+    let mut weighted_sum = 0.0;
+    let mut total_weight = 0.0;
+    let mut has_valid = false;
+
+    for (i, forecast) in forecasts.iter().enumerate() {
+        let cost = window_cost(forecast.margin_hrs, forecast.hours_remaining)?;
+        let weight = if i == binding_idx { binding_weight } else { 1.0 };
+        weighted_sum += cost * weight;
+        total_weight += weight;
+        has_valid = true;
+    }
+
+    if !has_valid || total_weight == 0.0 {
+        return None;
+    }
+
+    Some(weighted_sum / total_weight)
+}
+
+/// Compute the optimal worker count using composite risk optimization.
+///
+/// When composite risk optimization is enabled and the composite cost is
+/// below the cost_threshold, this function allows scaling higher than
+/// the binding window's safe_worker_count by considering the capacity
+/// available in other windows.
+///
+/// Algorithm:
+/// 1. Find binding window's safe_worker_count (baseline)
+/// 2. For each non-binding window with ample capacity (cost > threshold):
+///    - Compute its safe_worker_count based on its own constraints
+///    - Take the maximum across all windows
+/// 3. Return the maximum, but never less than the binding window's constraint
+///
+/// Returns `None` if composite risk cannot be computed or is disabled.
+pub fn compute_composite_safe_workers(
+    forecasts: &[crate::state::WindowForecast],
+    binding_idx: usize,
+    binding_weight: f64,
+    cost_threshold: f64,
+    current_workers: u32,
+) -> Option<u32> {
+    if forecasts.is_empty() || binding_idx >= forecasts.len() {
+        return None;
+    }
+
+    // Compute composite risk
+    let risk = composite_risk(forecasts, binding_idx, binding_weight)?;
+
+    // If composite risk is above threshold, use strict binding-window behavior
+    if risk <= cost_threshold {
+        return None;
+    }
+
+    // Find the maximum safe_worker_count across all windows
+    // This allows scaling higher when non-binding windows have ample capacity
+    let mut max_safe = forecasts.get(binding_idx)
+        .and_then(|f| f.safe_worker_count)
+        .unwrap_or(0);
+
+    for (i, forecast) in forecasts.iter().enumerate() {
+        if i == binding_idx {
+            continue;
+        }
+
+        // Only consider windows with positive cost (not near exhaustion)
+        let cost = window_cost(forecast.margin_hrs, forecast.hours_remaining)?;
+        if cost <= cost_threshold {
+            continue;
+        }
+
+        if let Some(safe) = forecast.safe_worker_count {
+            max_safe = max_safe.max(safe);
+        }
+    }
+
+    Some(max_safe)
+}
+
+// ---------------------------------------------------------------------------
 // Adaptive Burn Rate Estimator
 // ---------------------------------------------------------------------------
 
