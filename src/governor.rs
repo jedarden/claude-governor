@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::log_capacity_forecast;
+use crate::collector;
 use crate::config::{AlertConfig, SprintConfig};
+use crate::db;
 use crate::poller::Poller;
 use crate::state;
 use crate::worker::{self, WorkerConfig};
@@ -719,10 +721,71 @@ pub fn run_governor_cycle(
         }
     }
 
-    // 2. Count current workers (from heartbeat files + tmux)
+    // 2. Run token collector pass to gather usage data from JSONL files
+    match collector::run_collection_pass() {
+        Ok(result) => {
+            log::info!(
+                "[governor] collector pass: {} lines, {} instances, ${:.4} total",
+                result.lines_processed,
+                result.instance_records,
+                result.total_usd,
+            );
+        }
+        Err(e) => {
+            log::warn!("[governor] collector pass failed: {}", e);
+        }
+    }
+
+    // 3. Read latest fleet record from database and update last_fleet_aggregate
+    let db_path = collector::default_db_path();
+    if let Ok(conn) = db::open_db(&db_path) {
+        if let Ok(fleet_records) = db::query_last_fleets(&conn, 1) {
+            if let Some(fleet_json) = fleet_records.first() {
+                // Extract fleet aggregate data from the JSON record
+                if let (Some(t0_str), Some(t1_str)) = (
+                    fleet_json.get("t0").and_then(|v| v.as_str()),
+                    fleet_json.get("t1").and_then(|v| v.as_str()),
+                ) {
+                    let t0: DateTime<Utc> = t0_str.parse().unwrap_or_else(|_| now);
+                    let t1: DateTime<Utc> = t1_str.parse().unwrap_or_else(|_| now);
+                    let workers = fleet_json.get("workers").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let total_usd = fleet_json.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p75_usd_hr = fleet_json.get("p75-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let std_usd_hr = fleet_json.get("std-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                    // Extract window percentage deltas
+                    let p5h = fleet_json.get("p5h").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p7d = fleet_json.get("p7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p7ds = fleet_json.get("p7ds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                    state.last_fleet_aggregate = state::FleetAggregate {
+                        t0,
+                        t1,
+                        sonnet_workers: workers,
+                        sonnet_usd_total: total_usd,
+                        sonnet_p75_usd_hr: p75_usd_hr,
+                        sonnet_std_usd_hr: std_usd_hr,
+                        window_pct_deltas: state::WindowPctDeltas {
+                            five_hour: p5h,
+                            seven_day: p7d,
+                            seven_day_sonnet: p7ds,
+                        },
+                    };
+
+                    log::debug!(
+                        "[governor] fleet aggregate: {} workers, ${:.2}/hr p75, deltas 5h={:.2}% 7d={:.2}% 7ds={:.2}%",
+                        workers, p75_usd_hr, p5h, p7d, p7ds
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. Count current workers (from heartbeat files + tmux)
     let worker_config = WorkerConfig::default();
     let worker_count = worker::count_workers(&worker_config);
     let current_total = worker_count.tmux_count as u32;
+    let _prev_total = state.workers.values().map(|w| w.current).sum::<u32>();
 
     log::info!(
         "[governor] workers: {} active ({} heartbeats, {} tmux sessions, consistent={})",
@@ -743,7 +806,154 @@ pub fn run_governor_cycle(
         ws.current = per_agent + extra;
     }
 
-    // 3. Log capacity forecast
+    // 5. Compute burn rates and update capacity forecast using fleet aggregate data
+    let elapsed_hours = if state.last_fleet_aggregate.t0 != state.last_fleet_aggregate.t1 {
+        (state.last_fleet_aggregate.t1 - state.last_fleet_aggregate.t0).num_seconds() as f64 / 3600.0
+    } else {
+        0.0
+    };
+
+    // Build current utilization map from polled usage
+    let mut current_utilization = HashMap::new();
+    current_utilization.insert("five_hour".to_string(), state.usage.five_hour_pct);
+    current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
+    current_utilization.insert("seven_day_sonnet".to_string(), state.usage.sonnet_pct);
+
+    // Build hours remaining map from poller data
+    let mut hours_remaining = HashMap::new();
+    if let Ok(reset_time) = state.usage.five_hour_resets_at.parse::<DateTime<Utc>>() {
+        hours_remaining.insert("five_hour".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+    }
+    if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
+        hours_remaining.insert("seven_day_sonnet".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+        // Approximate seven_day reset time as same as seven_day_sonnet
+        hours_remaining.insert("seven_day".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+    }
+
+    // Compute fleet_pct_per_hour directly from fleet aggregate window deltas
+    // This is the key integration: use observed burn from collector output
+    let fleet_pct_per_hour: HashMap<String, f64> = if elapsed_hours > 0.0 {
+        let deltas = &state.last_fleet_aggregate.window_pct_deltas;
+        let mut map = HashMap::new();
+        map.insert("five_hour".to_string(), deltas.five_hour / elapsed_hours);
+        map.insert("seven_day".to_string(), deltas.seven_day / elapsed_hours);
+        map.insert("seven_day_sonnet".to_string(), deltas.seven_day_sonnet / elapsed_hours);
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // Build capacity forecast for each window using fleet_pct_per_hour from collector
+    let mut five_hour_forecast = state::WindowForecast::default();
+    let mut seven_day_forecast = state::WindowForecast::default();
+    let mut seven_day_sonnet_forecast = state::WindowForecast::default();
+
+    // Compute per-worker rate for safe_worker_count calculation
+    let p75_rate_per_worker = if current_total > 0 && elapsed_hours > 0.0 {
+        state.last_fleet_aggregate.sonnet_p75_usd_hr / current_total as f64
+    } else {
+        0.0
+    };
+
+    for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
+        let util = current_utilization.get(*window).copied().unwrap_or(0.0);
+        let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
+        let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
+
+        let remaining_pct = (target_ceiling - util).max(0.0);
+        let predicted_exhaustion_hours = if fleet_pct_hr > 0.0 {
+            remaining_pct / fleet_pct_hr
+        } else {
+            f64::INFINITY
+        };
+        let cutoff_risk = predicted_exhaustion_hours < hrs_left;
+        let margin_hrs = hrs_left - predicted_exhaustion_hours;
+
+        let safe_worker_count = if p75_rate_per_worker > 0.0 && hrs_left > 0.0 && fleet_pct_hr > 0.0 {
+            let safe = (remaining_pct / (fleet_pct_hr / current_total.max(1) as f64 * hrs_left)).floor() as u64;
+            Some(safe.min(u32::MAX as u64) as u32)
+        } else {
+            None
+        };
+
+        let forecast = state::WindowForecast {
+            target_ceiling,
+            current_utilization: util,
+            remaining_pct,
+            hours_remaining: hrs_left,
+            fleet_pct_per_hour: fleet_pct_hr,
+            predicted_exhaustion_hours,
+            cutoff_risk,
+            margin_hrs,
+            binding: false,
+            safe_worker_count,
+        };
+
+        match *window {
+            "five_hour" => five_hour_forecast = forecast,
+            "seven_day" => seven_day_forecast = forecast,
+            "seven_day_sonnet" => seven_day_sonnet_forecast = forecast,
+            _ => {}
+        }
+    }
+
+    // Identify binding window (most negative margin_hrs)
+    let windows = [
+        ("five_hour", &five_hour_forecast),
+        ("seven_day", &seven_day_forecast),
+        ("seven_day_sonnet", &seven_day_sonnet_forecast),
+    ];
+
+    let binding_window = windows
+        .iter()
+        .min_by(|(_, a), (_, b)| {
+            a.margin_hrs.partial_cmp(&b.margin_hrs).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_default();
+
+    // Set binding flag
+    if binding_window == "five_hour" {
+        five_hour_forecast.binding = true;
+    } else if binding_window == "seven_day" {
+        seven_day_forecast.binding = true;
+    } else if binding_window == "seven_day_sonnet" {
+        seven_day_sonnet_forecast.binding = true;
+    }
+
+    // Update state with new capacity forecast
+    state.capacity_forecast = state::CapacityForecast {
+        five_hour: five_hour_forecast,
+        seven_day: seven_day_forecast,
+        seven_day_sonnet: seven_day_sonnet_forecast,
+        binding_window: binding_window.clone(),
+        dollars_per_pct_7d_s: 0.0,
+        estimated_remaining_dollars: 0.0,
+    };
+
+    // Update burn_rate from fleet aggregate if we have valid data
+    if elapsed_hours > 0.0 && current_total > 0 {
+        let deltas = &state.last_fleet_aggregate.window_pct_deltas;
+        let total_pct_delta = deltas.five_hour + deltas.seven_day + deltas.seven_day_sonnet;
+        let avg_pct_per_hour = total_pct_delta / (elapsed_hours * 3.0); // Average across windows
+
+        let entry = state.burn_rate.by_model.entry("claude-sonnet-4-20250514".to_string()).or_insert(state::ModelBurnRate {
+            pct_per_worker_per_hour: 0.0,
+            dollars_per_worker_per_hour: 0.0,
+            samples: 0,
+        });
+
+        // Compute per-worker rates
+        let pct_per_worker = avg_pct_per_hour / current_total as f64;
+        let usd_per_worker = state.last_fleet_aggregate.sonnet_p75_usd_hr / current_total as f64;
+
+        entry.pct_per_worker_per_hour = pct_per_worker;
+        entry.dollars_per_worker_per_hour = usd_per_worker;
+        entry.samples = entry.samples.saturating_add(1);
+        state.burn_rate.last_sample_at = Some(now);
+    }
+
+    // 6. Log capacity forecast
     log_capacity_forecast(&state.capacity_forecast);
 
     // 4. Compute target workers

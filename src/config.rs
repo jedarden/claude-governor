@@ -27,6 +27,57 @@ pub struct GovernorConfig {
     /// Alert configuration
     #[serde(default)]
     pub alerts: AlertConfig,
+
+    /// Agent configurations (worker pools that can be scaled by the governor)
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, AgentConfig>,
+}
+
+/// Per-agent configuration for worker pool scaling
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct AgentConfig {
+    /// Command to launch a new worker instance
+    /// Example: "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor"
+    pub launch_cmd: String,
+
+    /// Glob pattern for matching tmux session names
+    /// Example: "needle-claude-*"
+    pub session_pattern: String,
+
+    /// Directory containing heartbeat JSON files (supports ~ expansion)
+    /// Example: "~/.needle/state/heartbeats"
+    pub heartbeat_dir: String,
+
+    /// Minimum workers for this agent (default: 0)
+    #[serde(default)]
+    pub min_workers: u32,
+
+    /// Maximum workers for this agent (default: 8)
+    #[serde(default = "default_max_workers")]
+    pub max_workers: u32,
+}
+
+fn default_max_workers() -> u32 { 8 }
+
+impl AgentConfig {
+    /// Get the heartbeat directory with tilde (~) expanded to the home directory
+    pub fn heartbeat_dir_expanded(&self) -> PathBuf {
+        if self.heartbeat_dir.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(self.heartbeat_dir.strip_prefix('~').unwrap_or("").trim_start_matches('/'));
+            }
+        }
+        PathBuf::from(&self.heartbeat_dir)
+    }
+
+    /// Extract the session prefix from the session pattern
+    /// E.g., "needle-claude-*" -> "needle-claude"
+    pub fn session_prefix(&self) -> &str {
+        // Strip trailing wildcards to get the prefix
+        self.session_pattern
+            .trim_end_matches('*')
+            .trim_end_matches('-')
+    }
 }
 
 /// Daemon configuration
@@ -432,5 +483,113 @@ daemon:
         assert_eq!(config.daemon.max_scale_down_per_cycle, 2);
         assert_eq!(config.daemon.min_scale_interval_secs, 30);
         assert!((config.daemon.target_ceiling - 85.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_agents_config_empty() {
+        let yaml = r#"
+pricing:
+  models: {}
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn test_agents_config_parsing() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  needle-sonnet:
+    launch_cmd: "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor"
+    session_pattern: "needle-claude-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+    min_workers: 0
+    max_workers: 8
+  needle-opus:
+    launch_cmd: "needle run --agent claude-opus --workspace /home/coding/project"
+    session_pattern: "opus-*"
+    heartbeat_dir: "/var/lib/heartbeats"
+    min_workers: 1
+    max_workers: 4
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.agents.len(), 2);
+
+        let needle_sonnet = config.agents.get("needle-sonnet").unwrap();
+        assert_eq!(needle_sonnet.launch_cmd, "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor");
+        assert_eq!(needle_sonnet.session_pattern, "needle-claude-*");
+        assert_eq!(needle_sonnet.heartbeat_dir, "~/.needle/state/heartbeats");
+        assert_eq!(needle_sonnet.min_workers, 0);
+        assert_eq!(needle_sonnet.max_workers, 8);
+
+        let needle_opus = config.agents.get("needle-opus").unwrap();
+        assert_eq!(needle_opus.min_workers, 1);
+        assert_eq!(needle_opus.max_workers, 4);
+    }
+
+    #[test]
+    fn test_agent_config_defaults() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  default-agent:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("default-agent").unwrap();
+        assert_eq!(agent.min_workers, 0); // default
+        assert_eq!(agent.max_workers, 8); // default
+    }
+
+    #[test]
+    fn test_agent_config_heartbeat_dir_expansion() {
+        let agent = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "test-*".to_string(),
+            heartbeat_dir: "~/.needle/heartbeats".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+        };
+        let expanded = agent.heartbeat_dir_expanded();
+        assert!(expanded.to_string_lossy().contains(".needle"));
+        assert!(!expanded.to_string_lossy().starts_with('~'));
+
+        // Test absolute path (no expansion needed)
+        let agent_abs = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "test-*".to_string(),
+            heartbeat_dir: "/var/lib/heartbeats".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+        };
+        let expanded_abs = agent_abs.heartbeat_dir_expanded();
+        assert_eq!(expanded_abs.to_string_lossy(), "/var/lib/heartbeats");
+    }
+
+    #[test]
+    fn test_agent_config_session_prefix() {
+        let agent = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "needle-claude-*".to_string(),
+            heartbeat_dir: "/tmp".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+        };
+        assert_eq!(agent.session_prefix(), "needle-claude");
+
+        // Test pattern without trailing dash
+        let agent2 = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "worker*".to_string(),
+            heartbeat_dir: "/tmp".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+        };
+        assert_eq!(agent2.session_prefix(), "worker");
     }
 }
