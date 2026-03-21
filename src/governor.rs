@@ -21,6 +21,7 @@ use crate::collector;
 use crate::config::{AgentConfig, AlertConfig, SprintConfig};
 use crate::db;
 use crate::poller::Poller;
+use crate::schedule::{self, Promotion};
 use crate::state;
 use crate::worker::{self, WorkerConfig};
 
@@ -670,6 +671,80 @@ pub fn apply_scaling(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-scale logic
+// ---------------------------------------------------------------------------
+
+/// Compute the effective target workers accounting for an upcoming multiplier transition.
+///
+/// When a losing-bonus transition (multiplier dropping, e.g. off-peak 2x → peak 1x) is
+/// imminent within `pre_scale_minutes`, returns a pre-scale target to begin scaling down
+/// one worker per cycle toward the post-transition safe count.
+///
+/// Conservative-only: returns `None` when no losing-bonus transition is imminent,
+/// including cases where a bonus is about to be *gained* (never pre-scale up).
+///
+/// # Parameters
+/// - `now`: current time (explicit for deterministic testing)
+/// - `pre_scale_minutes`: look-ahead window; 0 disables pre-scaling
+/// - `promotions`: active promotion definitions
+/// - `reset_time`: window deadline (deadline for transition search)
+/// - `target`: current target from `compute_target_workers`
+/// - `current_total`: actual running workers right now
+pub fn compute_pre_scale_target(
+    now: DateTime<Utc>,
+    pre_scale_minutes: u64,
+    promotions: &[Promotion],
+    reset_time: DateTime<Utc>,
+    target: u32,
+    current_total: u32,
+) -> Option<u32> {
+    if pre_scale_minutes == 0 {
+        return None;
+    }
+
+    let transition = schedule::next_transition_from(now, reset_time, promotions)?;
+
+    log::debug!(
+        "[governor] next transition in {}min: {:.1}x → {:.1}x at {}",
+        transition.minutes_until,
+        transition.multiplier_before,
+        transition.multiplier_after,
+        transition.at.to_rfc3339()
+    );
+
+    // Only act when transition is within the pre-scale look-ahead window
+    if transition.minutes_until > pre_scale_minutes as i64 {
+        return None;
+    }
+
+    // Conservative: only pre-scale down when LOSING a bonus (never scale up to gain one)
+    if transition.multiplier_after >= transition.multiplier_before {
+        return None;
+    }
+
+    // Scale target proportionally to multiplier drop (e.g. 2x → 1x halves effective capacity)
+    let ratio = transition.multiplier_after / transition.multiplier_before;
+    let post_transition_target = (target as f64 * ratio).floor() as u32;
+
+    if post_transition_target >= current_total {
+        return None;
+    }
+
+    // Ramp down one worker per cycle; never overshoot below post-transition target
+    let effective_target = post_transition_target.max(current_total.saturating_sub(1));
+
+    log::info!(
+        "[governor] PRE-SCALE: off-peak→peak in {}min — scaling {}→{} (post-transition safe: {})",
+        transition.minutes_until,
+        current_total,
+        effective_target,
+        post_transition_target
+    );
+
+    Some(effective_target)
+}
+
+// ---------------------------------------------------------------------------
 // Governor daemon loop
 // ---------------------------------------------------------------------------
 
@@ -687,6 +762,8 @@ pub fn run_governor_cycle(
     target_ceiling: f64,
     alert_config: &AlertConfig,
     agents: &std::collections::HashMap<String, AgentConfig>,
+    pre_scale_minutes: u64,
+    promotions: &[Promotion],
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -987,9 +1064,25 @@ pub fn run_governor_cycle(
         target, target_ceiling
     );
 
+    // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
+    //
+    // Conservative-only: pre-scale DOWN before losing multiplier bonus,
+    // never pre-scale UP before gaining bonus.
+    let pre_scale = state
+        .usage
+        .sonnet_resets_at
+        .parse::<DateTime<Utc>>()
+        .ok()
+        .and_then(|reset_time| {
+            compute_pre_scale_target(now, pre_scale_minutes, promotions, reset_time, target, current_total)
+        });
+
+    // Use pre-scale target if set, otherwise use normal target
+    let effective_target = pre_scale.unwrap_or(target);
+
     // 5. Apply scaling decision
     let decision = apply_scaling(
-        target,
+        effective_target,
         current_total,
         hysteresis_band,
         max_up_per_cycle,
@@ -1127,6 +1220,8 @@ pub fn run_daemon(
     target_ceiling: f64,
     alert_config: &AlertConfig,
     agents: &std::collections::HashMap<String, AgentConfig>,
+    pre_scale_minutes: u64,
+    promotions: &[Promotion],
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1162,6 +1257,8 @@ pub fn run_daemon(
         target_ceiling,
         alert_config,
         agents,
+        pre_scale_minutes,
+        promotions,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -1190,6 +1287,8 @@ pub fn run_daemon(
             target_ceiling,
             alert_config,
             agents,
+            pre_scale_minutes,
+            promotions,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures
@@ -1538,5 +1637,122 @@ mod tests {
         let state = GovernorState::new();
         assert!(!state.is_sprint_active());
         assert!(state.sprint.is_none());
+    }
+
+    // --- Pre-scale tests ---
+
+    #[test]
+    fn pre_scale_triggers_before_losing_multiplier_bonus() {
+        use crate::schedule::Promotion;
+        use chrono::{Duration, TimeZone};
+
+        // Test promotion: March 15-25, 2026 with 2x off-peak
+        let promo = Promotion {
+            name: "Test Promo".to_string(),
+            start_date: "2026-03-15".to_string(),
+            end_date: "2026-03-25".to_string(),
+            peak_start_hour_et: 8,
+            peak_end_hour_et: 14,
+            offpeak_multiplier: 2.0,
+            applies_to: vec!["seven_day_sonnet".to_string()],
+        };
+        let promotions = vec![promo];
+
+        // 07:35 ET on Monday March 16, 2026 (during promo, 25 min before peak)
+        let now = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 16, 7, 35, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Deadline: 2 hours from now (well past the 08:00 transition)
+        let deadline = now + Duration::hours(2);
+
+        // Check for transition
+        let transition = schedule::next_transition_from(now, deadline, &promotions);
+        assert!(transition.is_some(), "Should detect off-peak -> peak transition");
+
+        let t = transition.unwrap();
+        assert_eq!(t.minutes_until, 25, "Transition should be 25 minutes away");
+        assert!((t.multiplier_before - 2.0).abs() < 1e-9, "Before: 2x off-peak");
+        assert!((t.multiplier_after - 1.0).abs() < 1e-9, "After: 1x peak");
+
+        // Verify this is a "losing bonus" transition (after < before)
+        assert!(t.multiplier_after < t.multiplier_before, "Should be losing bonus");
+
+        // With pre_scale_minutes = 30, this should trigger pre-scale
+        // (transition in 25 min is <= 30 min window)
+        assert!(t.minutes_until <= 30, "Should be within pre-scale window");
+    }
+
+    #[test]
+    fn pre_scale_does_not_trigger_when_outside_window() {
+        use crate::schedule::Promotion;
+        use chrono::{Duration, TimeZone};
+
+        let promo = Promotion {
+            name: "Test Promo".to_string(),
+            start_date: "2026-03-15".to_string(),
+            end_date: "2026-03-25".to_string(),
+            peak_start_hour_et: 8,
+            peak_end_hour_et: 14,
+            offpeak_multiplier: 2.0,
+            applies_to: vec!["seven_day_sonnet".to_string()],
+        };
+        let promotions = vec![promo];
+
+        // 06:00 ET on Monday March 16, 2026 (2 hours before peak)
+        let now = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 16, 6, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let deadline = now + Duration::hours(3);
+
+        let transition = schedule::next_transition_from(now, deadline, &promotions);
+        assert!(transition.is_some());
+
+        let t = transition.unwrap();
+        assert_eq!(t.minutes_until, 120, "Transition should be 2 hours away");
+
+        // With pre_scale_minutes = 30, this should NOT trigger pre-scale
+        // (transition in 120 min is > 30 min window)
+        assert!(t.minutes_until > 30, "Should be outside pre-scale window");
+    }
+
+    #[test]
+    fn pre_scale_never_triggers_for_gaining_bonus() {
+        use crate::schedule::Promotion;
+        use chrono::{Duration, TimeZone};
+
+        let promo = Promotion {
+            name: "Test Promo".to_string(),
+            start_date: "2026-03-15".to_string(),
+            end_date: "2026-03-25".to_string(),
+            peak_start_hour_et: 8,
+            peak_end_hour_et: 14,
+            offpeak_multiplier: 2.0,
+            applies_to: vec!["seven_day_sonnet".to_string()],
+        };
+        let promotions = vec![promo];
+
+        // 13:45 ET on Monday March 16, 2026 (15 min before peak ends = gaining 2x bonus)
+        let now = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 16, 13, 45, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let deadline = now + Duration::hours(1);
+
+        let transition = schedule::next_transition_from(now, deadline, &promotions);
+        assert!(transition.is_some());
+
+        let t = transition.unwrap();
+        assert!(t.multiplier_after > t.multiplier_before, "Should be gaining bonus");
+
+        // Conservative-only: even within the window, we should NOT pre-scale up
+        // The check is: if after < before (losing bonus) -> pre-scale down
+        // If after > before (gaining bonus) -> do nothing
+        assert!(t.minutes_until <= 30, "Should be within pre-scale window");
+        assert!(t.multiplier_after > t.multiplier_before, "Should NOT trigger pre-scale (gaining bonus)");
     }
 }

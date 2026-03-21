@@ -72,3 +72,8 @@ agents:
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
     max_workers: 8
+
+# Daemon configuration
+# Controls the governor's scaling behavior
+daemon:
+  pre_scale_minutes: 30             # Look-ahead for multiplier transitions (0 = disabled)

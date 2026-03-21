@@ -129,6 +129,14 @@ pub struct DaemonConfig {
     /// Daemon mode: auto, systemd, or tmux (default: auto)
     #[serde(default)]
     pub mode: DaemonMode,
+
+    /// Pre-scale look-ahead for multiplier transitions in minutes (default: 30, 0 = disabled)
+    ///
+    /// When a peak/off-peak transition is within this window, the governor
+    /// pre-emptively scales down if the post-transition multiplier is lower.
+    /// Conservative-only: pre-scales down before losing bonus, never pre-scales up.
+    #[serde(default = "default_pre_scale_minutes")]
+    pub pre_scale_minutes: u64,
 }
 
 fn default_loop_interval_secs() -> u64 { 60 }
@@ -137,6 +145,7 @@ fn default_max_scale_up_per_cycle() -> u32 { 1 }
 fn default_max_scale_down_per_cycle() -> u32 { 1 }
 fn default_min_scale_interval_secs() -> u64 { 60 }
 fn default_target_ceiling() -> f64 { 90.0 }
+fn default_pre_scale_minutes() -> u64 { 30 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -148,6 +157,7 @@ impl Default for DaemonConfig {
             min_scale_interval_secs: default_min_scale_interval_secs(),
             target_ceiling: default_target_ceiling(),
             mode: DaemonMode::Auto,
+            pre_scale_minutes: default_pre_scale_minutes(),
         }
     }
 }

@@ -1020,6 +1020,10 @@ fn run_daemon_command(
     let hysteresis_band = hysteresis.unwrap_or(daemon.hysteresis_band);
     let target_ceiling = ceiling.unwrap_or(daemon.target_ceiling);
 
+    // Load promotions from config file
+    let promo_path = default_promotions_path();
+    let promotions = schedule::load_promotions(&promo_path);
+
     let state_path = default_state_path();
 
     governor::run_daemon(
@@ -1032,6 +1036,8 @@ fn run_daemon_command(
         target_ceiling,
         &config.alerts,
         &config.agents,
+        daemon.pre_scale_minutes,
+        &promotions,
     )
 }
 

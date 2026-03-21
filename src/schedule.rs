@@ -233,6 +233,61 @@ pub fn find_next_transition(
     None
 }
 
+/// Information about an upcoming peak/off-peak transition
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    /// When the transition occurs (UTC)
+    pub at: DateTime<Utc>,
+    /// Multiplier before the transition
+    pub multiplier_before: f64,
+    /// Multiplier after the transition
+    pub multiplier_after: f64,
+    /// Minutes until the transition
+    pub minutes_until: i64,
+}
+
+/// Get the next upcoming peak/off-peak transition
+///
+/// Looks ahead from now until the given deadline (typically the window reset time).
+/// Returns `None` if no transition occurs before the deadline.
+///
+/// This is the primary API for the governor loop's pre-scaling logic.
+pub fn next_transition(
+    deadline: DateTime<Utc>,
+    promotions: &[Promotion],
+) -> Option<Transition> {
+    let now = Utc::now();
+    let (at, before, after) = find_next_transition(now, deadline, promotions)?;
+    let minutes_until = (at - now).num_minutes();
+
+    Some(Transition {
+        at,
+        multiplier_before: before,
+        multiplier_after: after,
+        minutes_until,
+    })
+}
+
+/// Get the next upcoming peak/off-peak transition from a specific start time (for testing)
+///
+/// This is the same as `next_transition` but accepts an explicit `now` parameter
+/// for deterministic testing.
+pub fn next_transition_from(
+    now: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+    promotions: &[Promotion],
+) -> Option<Transition> {
+    let (at, before, after) = find_next_transition(now, deadline, promotions)?;
+    let minutes_until = (at - now).num_minutes();
+
+    Some(Transition {
+        at,
+        multiplier_before: before,
+        multiplier_after: after,
+        minutes_until,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +560,77 @@ mod tests {
 
         let promos = load_promotions(&path);
         assert!(promos.is_empty());
+    }
+
+    // --- next_transition tests ---
+
+    #[test]
+    fn next_transition_returns_transition_info() {
+        let promos = vec![test_promo()];
+
+        // Monday March 16, 2026 at 7:00 ET (off-peak, 1 hour before peak)
+        let now = et_to_utc(2026, 3, 16, 7, 0);
+        // Deadline: 2 hours later
+        let deadline = now + Duration::hours(2);
+
+        let transition = next_transition_from(now, deadline, &promos);
+        assert!(transition.is_some());
+
+        let t = transition.unwrap();
+        // Transition should be at 08:00 ET
+        let t_et = to_eastern(t.at);
+        assert_eq!(t_et.hour(), 8);
+        assert_eq!(t_et.minute(), 0);
+        assert!((t.multiplier_before - 2.0).abs() < 1e-9);
+        assert!((t.multiplier_after - 1.0).abs() < 1e-9);
+        assert_eq!(t.minutes_until, 60); // 1 hour = 60 minutes
+    }
+
+    #[test]
+    fn next_transition_none_when_no_transition_in_window() {
+        let promos = vec![test_promo()];
+
+        // Entirely within peak hours (no transition)
+        let now = et_to_utc(2026, 3, 16, 9, 0);
+        let deadline = et_to_utc(2026, 3, 16, 11, 0);
+
+        let transition = next_transition_from(now, deadline, &promos);
+        assert!(transition.is_none());
+    }
+
+    #[test]
+    fn next_transition_detects_losing_bonus_offpeak_to_peak() {
+        let promos = vec![test_promo()];
+
+        // 07:35 ET during promo - 25 minutes before peak starts
+        let now = et_to_utc(2026, 3, 16, 7, 35);
+        // Look ahead 1 hour
+        let deadline = now + Duration::hours(1);
+
+        let transition = next_transition_from(now, deadline, &promos);
+        assert!(transition.is_some());
+
+        let t = transition.unwrap();
+        // Transition is losing the 2x bonus (off-peak -> peak)
+        assert!(t.multiplier_after < t.multiplier_before, "should be losing bonus");
+        assert_eq!(t.minutes_until, 25); // 25 minutes until 08:00
+    }
+
+    #[test]
+    fn next_transition_detects_gaining_bonus_peak_to_offpeak() {
+        let promos = vec![test_promo()];
+
+        // 13:30 ET during promo - 30 minutes before peak ends
+        let now = et_to_utc(2026, 3, 16, 13, 30);
+        // Look ahead 1 hour
+        let deadline = now + Duration::hours(1);
+
+        let transition = next_transition_from(now, deadline, &promos);
+        assert!(transition.is_some());
+
+        let t = transition.unwrap();
+        // Transition is gaining the 2x bonus (peak -> off-peak)
+        assert!(t.multiplier_after > t.multiplier_before, "should be gaining bonus");
+        assert_eq!(t.minutes_until, 30); // 30 minutes until 14:00
     }
 }
