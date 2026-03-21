@@ -241,6 +241,52 @@ impl Default for SprintConfig {
     }
 }
 
+/// Composite risk optimization configuration
+///
+/// When enabled, the governor considers all windows' risk levels together
+/// rather than just the binding window's ceiling. This allows scaling higher
+/// when one window is near reset but another has ample capacity.
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct CompositeRiskConfig {
+    /// Enable composite risk optimization (default: false)
+    ///
+    /// When false, uses strict binding-window-only ceiling.
+    /// When true, uses weighted composite risk across all windows.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Cost threshold for composite risk optimization (default: 0.0)
+    ///
+    /// - 0.0: strict binding-window behavior (only binding window constrains)
+    /// - Higher values: allow more workers when non-binding windows have ample capacity
+    ///
+    /// The cost function weights each window by (margin_hrs / hours_remaining).
+    /// A window near exhaustion (low margin) has higher cost/urgency.
+    /// Setting cost_threshold > 0 allows scaling higher when the composite
+    /// weighted cost is below the threshold.
+    #[serde(default)]
+    pub cost_threshold: f64,
+
+    /// Weight for the binding window in composite calculation (default: 2.0)
+    ///
+    /// The binding window gets extra weight to ensure it remains the primary
+    /// constraint even when considering other windows.
+    #[serde(default = "default_binding_weight")]
+    pub binding_weight: f64,
+}
+
+fn default_binding_weight() -> f64 { 2.0 }
+
+impl Default for CompositeRiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cost_threshold: 0.0,
+            binding_weight: default_binding_weight(),
+        }
+    }
+}
+
 /// Alert configuration
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct AlertConfig {
