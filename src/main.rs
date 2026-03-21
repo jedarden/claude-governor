@@ -13,6 +13,7 @@
 //! - scale: Manually set target worker count
 //! - logs: Tail governor.log
 //! - config: Print or edit active configuration
+//! - explain: Show recent governor scaling decisions
 //! - version: Print version and component status
 
 use anyhow::{Context, Result};
@@ -30,6 +31,7 @@ use claude_governor::collector;
 use claude_governor::config::GovernorConfig;
 use claude_governor::db;
 use claude_governor::governor;
+use claude_governor::narrator;
 use claude_governor::poller::{Poller, UsageData};
 use claude_governor::schedule;
 use claude_governor::simulator::{self, SimConfig};
@@ -253,6 +255,17 @@ enum Commands {
         /// Service to restart: governor, collector, or all (default: all)
         #[arg(long, default_value = "all")]
         service: String,
+    },
+
+    /// Show recent governor scaling decisions from the audit log
+    Explain {
+        /// Number of recent decisions to show (default: 5)
+        #[arg(short = 'n', long, default_value = "5")]
+        last: usize,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 
     /// Internal: Run the governor daemon (called by systemd)
@@ -655,6 +668,19 @@ fn run_version_command() -> Result<()> {
     Ok(())
 }
 
+fn run_explain_command(last: usize, json: bool) -> Result<()> {
+    let decisions = narrator::read_last_decisions(last)
+        .with_context(|| "Failed to read decision log")?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&decisions)?);
+    } else {
+        print!("{}", narrator::format_decisions_human(&decisions));
+    }
+
+    Ok(())
+}
+
 fn default_promotions_path() -> PathBuf {
     PathBuf::from("config/promotions.json")
 }
@@ -888,6 +914,9 @@ fn main() -> Result<()> {
         Commands::Restart { service } => {
             run_restart_command(&service)?;
         }
+        Commands::Explain { last, json } => {
+            run_explain_command(last, json)?;
+        }
         Commands::_Daemon {
             dry_run,
             interval,
@@ -938,6 +967,15 @@ fn run_daemon_command(
 fn systemd_user_available() -> bool {
     Command::new("systemctl")
         .args(["--user", "status"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if tmux is available
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
