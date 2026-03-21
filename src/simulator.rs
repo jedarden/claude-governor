@@ -404,8 +404,10 @@ pub fn simulate(
         // Get base burn rate (same for all windows; promo multiplier is per-window)
         let base_burn_rate = ctx.get_burn_rate(); // pct per worker per hour
 
-        // Compute display multiplier (binding/first window) for trajectory recording
-        let display_promo_multiplier = ctx.promo_multiplier_at(current_time, WINDOWS[0]);
+        // Compute display multiplier as max across all windows (shows if any promotion is active)
+        let display_promo_multiplier = WINDOWS.iter()
+            .map(|w| ctx.promo_multiplier_at(current_time, w))
+            .fold(1.0_f64, f64::max);
 
         // Track events for this step
         let mut events = Vec::new();
