@@ -841,30 +841,25 @@ fn run_token_history_command(
         return Ok(());
     }
 
-    // Handle --last (default)
+    // Handle --last (default): show recent instance records with USD costs
     let n = last.unwrap_or(count);
-    let results = db::query_last_windows(&conn, n)?;
+    let results = db::query_last_instances(&conn, n)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
-        for r in &results {
-            let win = r.get("win").and_then(|v| v.as_str()).unwrap_or("?");
-            let snap = r.get("snap").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let remain = r.get("remain").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let exh = r.get("exh_hrs").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let cutoff = r.get("cutoff_risk").and_then(|v| v.as_u64()).unwrap_or(0);
-            let bind = r.get("bind").and_then(|v| v.as_u64()).unwrap_or(0);
-            let safe_w = r.get("safe_w").and_then(|v| v.as_u64());
-            let binding = if bind == 1 { " [BINDING]" } else { "" };
-            let cutoff_str = if cutoff == 1 { " CUTOFF_RISK" } else { "" };
-            let safe_str = match safe_w {
-                Some(w) => format!(" safe_w={}", w),
-                None => String::new(),
-            };
-            println!(
-                "{}: snap={:.1}% remain={:.1}% exh={:.1}h{}{}{}",
-                win, snap, remain, exh, binding, cutoff_str, safe_str,
-            );
+        if results.is_empty() {
+            println!("No instance records found. Run `cgov collect` to populate.");
+        } else {
+            println!("{:<32} {:<30} {:>10} {:>8} {:>8}", "ts", "model", "total_usd", "in_tok", "out_tok");
+            println!("{}", "-".repeat(94));
+            for r in &results {
+                let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+                let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                let usd = r.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let in_n = r.get("input-n").and_then(|v| v.as_i64()).unwrap_or(0);
+                let out_n = r.get("output-n").and_then(|v| v.as_i64()).unwrap_or(0);
+                println!("{:<32} {:<30} {:>10.4} {:>8} {:>8}", ts, model, usd, in_n, out_n);
+            }
         }
     }
 
