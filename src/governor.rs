@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
 use crate::collector;
-use crate::config::{AgentConfig, AlertConfig, SprintConfig};
+use crate::config::{AgentConfig, AlertConfig, SprintConfig, CompositeRiskConfig};
 use crate::db;
 use crate::poller::Poller;
 use crate::schedule::{self, Promotion};
@@ -543,17 +543,22 @@ pub enum ScalingDecision {
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
+/// When composite risk optimization is enabled and the composite cost is below
+/// the threshold, allows scaling higher by considering capacity in other windows.
+///
 /// Falls back to the configured max if no valid forecast is available.
 ///
 /// Steps:
 /// 1. Check emergency brake (any window >= 98%) → return 0
 /// 2. Get binding window from capacity forecast
-/// 3. Use safe_worker_count from binding window if available
-/// 4. Apply sprint boost if active
-/// 5. Clamp to [min, max] from worker state
+/// 3. If composite risk enabled, try composite optimization
+/// 4. Otherwise use safe_worker_count from binding window if available
+/// 5. Apply sprint boost if active
+/// 6. Clamp to [min, max] from worker state
 pub fn compute_target_workers(
     state: &state::GovernorState,
     _target_ceiling: f64,
+    composite_risk_config: &CompositeRiskConfig,
 ) -> u32 {
     // Aggregate min/max across all configured agents
     let mut global_min = u32::MAX;
@@ -590,28 +595,68 @@ pub fn compute_target_workers(
         }
     }
 
-    // Get safe_worker_count from binding window
+    // Get binding window index
+    let binding_idx = match forecast.binding_window.as_str() {
+        WINDOW_FIVE_HOUR => 0,
+        WINDOW_SEVEN_DAY => 1,
+        _ => 2,
+    };
+
     let binding_forecast = match forecast.binding_window.as_str() {
         WINDOW_FIVE_HOUR => &forecast.five_hour,
         WINDOW_SEVEN_DAY => &forecast.seven_day,
         _ => &forecast.seven_day_sonnet,
     };
 
-    let target = binding_forecast
-        .safe_worker_count
-        .filter(|&w| w > 0)
-        .unwrap_or(current_total)
-        .min(global_max)
-        .max(global_min);
+    // Try composite risk optimization if enabled
+    let base_target = if composite_risk_config.enabled {
+        let all_forecasts = &[
+            forecast.five_hour.clone(),
+            forecast.seven_day.clone(),
+            forecast.seven_day_sonnet.clone(),
+        ];
+
+        match compute_composite_safe_workers(
+            all_forecasts,
+            binding_idx,
+            composite_risk_config.binding_weight,
+            composite_risk_config.cost_threshold,
+            current_total,
+        ) {
+            Some(composite_safe) => {
+                log::debug!(
+                    "[governor] composite risk optimization: binding_safe={:?}, composite_safe={}",
+                    binding_forecast.safe_worker_count,
+                    composite_safe
+                );
+                composite_safe
+            }
+            None => {
+                // Composite risk not applicable, fall back to binding window
+                binding_forecast
+                    .safe_worker_count
+                    .filter(|&w| w > 0)
+                    .unwrap_or(current_total)
+            }
+        }
+    } else {
+        binding_forecast
+            .safe_worker_count
+            .filter(|&w| w > 0)
+            .unwrap_or(current_total)
+    };
+
+    let target = base_target.min(global_max).max(global_min);
 
     log::debug!(
-        "[governor] compute_target_workers: binding={}, safe_w={:?}, current={}, target={} (min={}, max={})",
+        "[governor] compute_target_workers: binding={}, safe_w={:?}, current={}, target={} (min={}, max={}, composite={})",
         forecast.binding_window,
         binding_forecast.safe_worker_count,
         current_total,
         target,
         global_min,
         global_max,
+        composite_risk_config.enabled,
     );
 
     target
