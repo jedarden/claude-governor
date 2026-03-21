@@ -12,7 +12,7 @@
 //! - Previous state is preserved in `governor-state.prev.json` before each update.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter};
@@ -107,6 +107,16 @@ impl Default for WindowPctDeltas {
     }
 }
 
+/// Deserializes an f64 field, treating JSON null as f64::INFINITY.
+/// serde_json serializes f64::INFINITY as null (JSON has no infinity literal),
+/// so we need to round-trip null → infinity on deserialization.
+fn deserialize_f64_null_as_infinity<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<f64, D::Error> {
+    let opt: Option<f64> = Option::deserialize(d)?;
+    Ok(opt.unwrap_or(f64::INFINITY))
+}
+
 /// Per-window capacity forecast
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,8 +126,10 @@ pub struct WindowForecast {
     pub remaining_pct: f64,
     pub hours_remaining: f64,
     pub fleet_pct_per_hour: f64,
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub predicted_exhaustion_hours: f64,
     pub cutoff_risk: bool,
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub margin_hrs: f64,
     pub binding: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1156,5 +1168,35 @@ mod tests {
         assert!(parsed.is_object());
         assert!(parsed.get("usage").is_some());
         assert!(parsed.get("capacity_forecast").is_some());
+    }
+}
+
+#[cfg(test)]
+mod null_roundtrip_test {
+    use super::*;
+
+    #[test]
+    fn test_window_forecast_null_roundtrip() {
+        let json = r#"{"target_ceiling":90.0,"current_utilization":12.0,"remaining_pct":78.0,"hours_remaining":7.2,"fleet_pct_per_hour":0.0,"predicted_exhaustion_hours":null,"cutoff_risk":false,"margin_hrs":null,"binding":true}"#;
+        let wf: WindowForecast = serde_json::from_str(json).expect("should deserialize null as infinity");
+        assert!(wf.predicted_exhaustion_hours.is_infinite());
+        assert!(wf.margin_hrs.is_infinite() || wf.margin_hrs.is_sign_negative());
+    }
+
+    #[test]
+    fn test_window_forecast_roundtrip_through_serialize() {
+        // Create a forecast with infinity values (as produced when burn rate is 0)
+        let wf = WindowForecast {
+            fleet_pct_per_hour: 0.0,
+            predicted_exhaustion_hours: f64::INFINITY,
+            margin_hrs: f64::NEG_INFINITY,
+            ..WindowForecast::default()
+        };
+        // Serialize (infinity → null)
+        let json = serde_json::to_string(&wf).unwrap();
+        assert!(json.contains("null"));
+        // Deserialize back (null → infinity)
+        let wf2: WindowForecast = serde_json::from_str(&json).unwrap();
+        assert!(wf2.predicted_exhaustion_hours.is_infinite());
     }
 }
