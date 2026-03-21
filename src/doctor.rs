@@ -1174,14 +1174,11 @@ fn check_jsonl_db_sync() -> CheckResult {
     // Count DB rows
     let db_rows = match rusqlite::Connection::open(&db_path) {
         Ok(conn) => {
-            conn.query_row(
-                "SELECT SUM(cnt) FROM (SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name LIKE 'usage_%')",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .ok()
-            .flatten()
-            .unwrap_or(0)
+            // Count total rows across all three tables (i = instance, f = fleet, w = window)
+            let ci: i64 = conn.query_row("SELECT COUNT(*) FROM i", [], |r| r.get(0)).unwrap_or(0);
+            let cf: i64 = conn.query_row("SELECT COUNT(*) FROM f", [], |r| r.get(0)).unwrap_or(0);
+            let cw: i64 = conn.query_row("SELECT COUNT(*) FROM w", [], |r| r.get(0)).unwrap_or(0);
+            ci + cf + cw
         }
         Err(_) => {
             return CheckResult::fail(
