@@ -634,7 +634,7 @@ fn effective_burn_rate(
 ///
 /// Computes fleet_pct_per_hour, predicted_exhaustion_hours,
 /// will_exhaust_before_reset, and safe_worker_count.
-fn generate_window_forecast(
+pub fn generate_window_forecast(
     _window: &str,
     fleet_pct_hr: f64,
     current_utilization: f64,

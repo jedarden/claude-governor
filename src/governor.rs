@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
-use crate::burn_rate::log_capacity_forecast;
+use crate::burn_rate::{log_capacity_forecast, generate_window_forecast};
 use crate::collector;
 use crate::config::{AgentConfig, AlertConfig, SprintConfig};
 use crate::db;
@@ -887,51 +887,31 @@ pub fn run_governor_cycle(
         HashMap::new()
     };
 
-    // Build capacity forecast for each window using fleet_pct_per_hour from collector
+    // Build capacity forecast for each window using burn_rate module
     let mut five_hour_forecast = state::WindowForecast::default();
     let mut seven_day_forecast = state::WindowForecast::default();
     let mut seven_day_sonnet_forecast = state::WindowForecast::default();
-
-    // Compute per-worker rate for safe_worker_count calculation
-    let p75_rate_per_worker = if current_total > 0 && elapsed_hours > 0.0 {
-        state.last_fleet_aggregate.sonnet_p75_usd_hr / current_total as f64
-    } else {
-        0.0
-    };
 
     for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
         let util = current_utilization.get(*window).copied().unwrap_or(0.0);
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
         let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
 
-        let remaining_pct = (target_ceiling - util).max(0.0);
-        let predicted_exhaustion_hours = if fleet_pct_hr > 0.0 {
-            remaining_pct / fleet_pct_hr
+        // Per-worker pct/hr rate for safe_worker_count calculation
+        let pct_per_worker = if current_total > 0 && fleet_pct_hr > 0.0 {
+            fleet_pct_hr / current_total as f64
         } else {
-            f64::INFINITY
-        };
-        let cutoff_risk = predicted_exhaustion_hours < hrs_left;
-        let margin_hrs = hrs_left - predicted_exhaustion_hours;
-
-        let safe_worker_count = if p75_rate_per_worker > 0.0 && hrs_left > 0.0 && fleet_pct_hr > 0.0 {
-            let safe = (remaining_pct / (fleet_pct_hr / current_total.max(1) as f64 * hrs_left)).floor() as u64;
-            Some(safe.min(u32::MAX as u64) as u32)
-        } else {
-            None
+            0.0
         };
 
-        let forecast = state::WindowForecast {
+        let forecast = generate_window_forecast(
+            window,
+            fleet_pct_hr,
+            util,
             target_ceiling,
-            current_utilization: util,
-            remaining_pct,
-            hours_remaining: hrs_left,
-            fleet_pct_per_hour: fleet_pct_hr,
-            predicted_exhaustion_hours,
-            cutoff_risk,
-            margin_hrs,
-            binding: false,
-            safe_worker_count,
-        };
+            hrs_left,
+            pct_per_worker,
+        );
 
         match *window {
             "five_hour" => five_hour_forecast = forecast,
