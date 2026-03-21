@@ -638,26 +638,59 @@ fn run_config_command(edit: bool) -> Result<()> {
     }
 }
 
-/// Check if daemon is running (placeholder - would check process or socket)
-fn is_daemon_running() -> bool {
-    // Check if state file has been updated recently
+/// Check if a systemd user service is active
+fn systemd_service_is_active(service: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", service])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Get daemon status as a string with detection method
+fn daemon_status_string() -> String {
+    if systemd_user_available() && systemd_service_is_active(GOVERNOR_SERVICE) {
+        return "✓ running (systemd)".to_string();
+    }
+    if tmux_available() && tmux_session_exists(GOVERNOR_SESSION) {
+        return "✓ running (tmux)".to_string();
+    }
     let state_path = default_state_path();
     if let Ok(state) = state::load_state(&state_path) {
         let age = (Utc::now() - state.updated_at).num_seconds();
-        age < 300 // Updated within last 5 minutes
-    } else {
-        false
+        if age < 300 {
+            return format!("✓ active (state {}s old)", age);
+        }
     }
+    "✗ stopped".to_string()
 }
 
-/// Check if collector is running (placeholder - would check last fleet aggregate)
-fn is_collector_running() -> bool {
+/// Get collector status as a string with detection method
+fn collector_status_string() -> String {
+    if systemd_user_available() && systemd_service_is_active(COLLECTOR_SERVICE) {
+        return "✓ running (systemd)".to_string();
+    }
+    if tmux_available() && tmux_session_exists(COLLECTOR_SESSION) {
+        return "✓ running (tmux)".to_string();
+    }
     let state_path = default_state_path();
     if let Ok(state) = state::load_state(&state_path) {
         let age = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds();
-        age < 300 // Updated within last 5 minutes
+        if age < 300 {
+            return format!("✓ active (fleet {}s old)", age);
+        }
+    }
+    "✗ stopped".to_string()
+}
+
+/// Get the detected daemon mode as a string
+fn detected_daemon_mode_string() -> String {
+    if systemd_user_available() {
+        "systemd".to_string()
+    } else if tmux_available() {
+        "tmux".to_string()
     } else {
-        false
+        "standalone".to_string()
     }
 }
 
@@ -666,8 +699,9 @@ fn run_version_command() -> Result<()> {
     println!("Claude Governor - automated capacity governor for Claude Code");
     println!();
     println!("Component Status:");
-    println!("  Daemon:    {}", if is_daemon_running() { "✓ running" } else { "✗ stopped" });
-    println!("  Collector: {}", if is_collector_running() { "✓ running" } else { "✗ stopped" });
+    println!("  Daemon:    {}", daemon_status_string());
+    println!("  Collector: {}", collector_status_string());
+    println!("  Mode:      {}", detected_daemon_mode_string());
     println!();
     println!("Build Info:");
     println!("  Target:    {}", option_env!("TARGET").unwrap_or("unknown"));
