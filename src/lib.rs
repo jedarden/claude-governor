@@ -4,6 +4,7 @@
 
 pub mod alerts;
 pub mod burn_rate;
+pub mod calibrator;
 pub mod capacity_summary;
 pub mod collector;
 pub mod config;
@@ -15,3 +16,4 @@ pub mod pricing;
 pub mod schedule;
 pub mod simulator;
 pub mod state;
+pub mod worker;

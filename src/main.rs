@@ -27,12 +27,13 @@ use std::process::Command;
 
 use claude_governor::capacity_summary::generate_capacity_summary;
 use claude_governor::collector;
+use claude_governor::config::GovernorConfig;
+use claude_governor::db;
+use claude_governor::governor;
 use claude_governor::poller::{Poller, UsageData};
 use claude_governor::schedule;
 use claude_governor::simulator::{self, SimConfig};
 use claude_governor::state::{self, GovernorState};
-use claude_governor::config::GovernorConfig;
-use claude_governor::db;
 
 /// Default state file path
 fn default_state_path() -> PathBuf {
@@ -188,6 +189,25 @@ enum Commands {
 
     /// Print version, build info, and component status
     Version,
+
+    /// Run the governor daemon (main capacity management loop)
+    Daemon {
+        /// Show what would happen without actually scaling workers
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Loop interval in seconds (overrides config)
+        #[arg(short = 'i', long)]
+        interval: Option<u64>,
+
+        /// Hysteresis band for scaling decisions (overrides config)
+        #[arg(long)]
+        hysteresis: Option<f64>,
+
+        /// Target utilization ceiling percentage (overrides config)
+        #[arg(short = 'c', long)]
+        ceiling: Option<f64>,
+    },
 }
 
 /// Format usage data for human consumption
@@ -768,9 +788,43 @@ fn main() -> Result<()> {
         } => {
             run_token_history_command(last, compare, fleet, rebuild_db, count, json)?;
         }
+        Commands::Daemon {
+            dry_run,
+            interval,
+            hysteresis,
+            ceiling,
+        } => {
+            run_daemon_command(dry_run, interval, hysteresis, ceiling)?;
+        }
     }
 
     Ok(())
+}
+
+fn run_daemon_command(
+    dry_run: bool,
+    interval: Option<u64>,
+    hysteresis: Option<f64>,
+    ceiling: Option<f64>,
+) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let daemon = &config.daemon;
+
+    let loop_interval = interval.unwrap_or(daemon.loop_interval_secs);
+    let hysteresis_band = hysteresis.unwrap_or(daemon.hysteresis_band);
+    let target_ceiling = ceiling.unwrap_or(daemon.target_ceiling);
+
+    let state_path = default_state_path();
+
+    governor::run_daemon(
+        &state_path,
+        dry_run,
+        loop_interval,
+        hysteresis_band,
+        daemon.max_scale_up_per_cycle,
+        daemon.max_scale_down_per_cycle,
+        target_ceiling,
+    )
 }
 
 #[cfg(test)]

@@ -19,6 +19,59 @@ pub struct GovernorConfig {
     /// Underutilization sprint configuration
     #[serde(default)]
     pub sprint: SprintConfig,
+
+    /// Daemon configuration
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+}
+
+/// Daemon configuration
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct DaemonConfig {
+    /// Loop interval in seconds (default: 60)
+    #[serde(default = "default_loop_interval_secs")]
+    pub loop_interval_secs: u64,
+
+    /// Hysteresis band for scaling decisions (default: 1.0)
+    /// Scaling only occurs when target differs from current by more than this
+    #[serde(default = "default_hysteresis_band")]
+    pub hysteresis_band: f64,
+
+    /// Maximum workers to scale up per cycle (default: 1)
+    #[serde(default = "default_max_scale_up_per_cycle")]
+    pub max_scale_up_per_cycle: u32,
+
+    /// Maximum workers to scale down per cycle (default: 1)
+    #[serde(default = "default_max_scale_down_per_cycle")]
+    pub max_scale_down_per_cycle: u32,
+
+    /// Minimum time between scale operations in seconds (default: 60)
+    #[serde(default = "default_min_scale_interval_secs")]
+    pub min_scale_interval_secs: u64,
+
+    /// Target utilization ceiling percentage (default: 90.0)
+    #[serde(default = "default_target_ceiling")]
+    pub target_ceiling: f64,
+}
+
+fn default_loop_interval_secs() -> u64 { 60 }
+fn default_hysteresis_band() -> f64 { 1.0 }
+fn default_max_scale_up_per_cycle() -> u32 { 1 }
+fn default_max_scale_down_per_cycle() -> u32 { 1 }
+fn default_min_scale_interval_secs() -> u64 { 60 }
+fn default_target_ceiling() -> f64 { 90.0 }
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            loop_interval_secs: default_loop_interval_secs(),
+            hysteresis_band: default_hysteresis_band(),
+            max_scale_up_per_cycle: default_max_scale_up_per_cycle(),
+            max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
+            min_scale_interval_secs: default_min_scale_interval_secs(),
+            target_ceiling: default_target_ceiling(),
+        }
+    }
 }
 
 /// Sprint trigger configuration
@@ -289,5 +342,42 @@ sprint:
         let cloned = pricing.clone();
         assert_eq!(cloned.input_per_mtok, 3.0);
         assert_eq!(cloned.output_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn test_daemon_config_defaults() {
+        let yaml = r#"
+pricing:
+  models: {}
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.daemon.loop_interval_secs, 60);
+        assert!((config.daemon.hysteresis_band - 1.0).abs() < 1e-9);
+        assert_eq!(config.daemon.max_scale_up_per_cycle, 1);
+        assert_eq!(config.daemon.max_scale_down_per_cycle, 1);
+        assert_eq!(config.daemon.min_scale_interval_secs, 60);
+        assert!((config.daemon.target_ceiling - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_daemon_config_custom() {
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  loop_interval_secs: 120
+  hysteresis_band: 2.0
+  max_scale_up_per_cycle: 2
+  max_scale_down_per_cycle: 2
+  min_scale_interval_secs: 30
+  target_ceiling: 85.0
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.daemon.loop_interval_secs, 120);
+        assert!((config.daemon.hysteresis_band - 2.0).abs() < 1e-9);
+        assert_eq!(config.daemon.max_scale_up_per_cycle, 2);
+        assert_eq!(config.daemon.max_scale_down_per_cycle, 2);
+        assert_eq!(config.daemon.min_scale_interval_secs, 30);
+        assert!((config.daemon.target_ceiling - 85.0).abs() < 1e-9);
     }
 }

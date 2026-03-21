@@ -1,4 +1,4 @@
-//! Governor - Capacity management and emergency brake
+//! Governor - Capacity management and scaling decisions
 //!
 //! This module handles:
 //! - Emergency brake detection (98% hard stop)
@@ -6,12 +6,20 @@
 //! - End-of-window capacity sprint
 //! - Governor state management
 //! - Agent scaling decisions
+//! - Main daemon loop: poll -> schedule -> burn_rate -> target -> scale -> alert -> write_state
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::alerts::SprintTrigger;
+use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, SprintTrigger, DEFAULT_COOLDOWN_MINUTES};
+use crate::burn_rate::log_capacity_forecast;
 use crate::config::SprintConfig;
+use crate::state;
+use crate::worker::{self, WorkerConfig};
 
 /// Emergency brake threshold (98%)
 const EMERGENCY_BRAKE_THRESHOLD: f64 = 98.0;
@@ -509,6 +517,400 @@ impl Default for GovernorState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scaling decision
+// ---------------------------------------------------------------------------
+
+/// Result of a scaling decision in one cycle
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalingDecision {
+    /// No change needed (within hysteresis band or already at target)
+    NoChange,
+    /// Scale up by N workers
+    ScaleUp(u32),
+    /// Scale down by N workers (graceful)
+    ScaleDown(u32),
+    /// Emergency brake — scale all to zero
+    EmergencyBrake,
+}
+
+/// Compute the target worker count from capacity forecast and schedule state.
+///
+/// Uses the binding window's `safe_worker_count` as the primary constraint.
+/// Falls back to the configured max if no valid forecast is available.
+///
+/// Steps:
+/// 1. Check emergency brake (any window >= 98%) → return 0
+/// 2. Get binding window from capacity forecast
+/// 3. Use safe_worker_count from binding window if available
+/// 4. Apply sprint boost if active
+/// 5. Clamp to [min, max] from worker state
+pub fn compute_target_workers(
+    state: &state::GovernorState,
+    _target_ceiling: f64,
+) -> u32 {
+    // Aggregate min/max across all configured agents
+    let mut global_min = u32::MAX;
+    let mut global_max: u32 = 0;
+    let mut current_total: u32 = 0;
+
+    for ws in state.workers.values() {
+        global_min = global_min.min(ws.min);
+        global_max = global_max.max(ws.max);
+        current_total += ws.current;
+    }
+
+    // No workers configured — return 0
+    if global_min == u32::MAX {
+        return 0;
+    }
+
+    let forecast = &state.capacity_forecast;
+
+    // Check emergency brake: any window >= 98%
+    let windows = [
+        (&WINDOW_FIVE_HOUR, &forecast.five_hour),
+        (&WINDOW_SEVEN_DAY, &forecast.seven_day),
+        (&WINDOW_SEVEN_DAY_SONNET, &forecast.seven_day_sonnet),
+    ];
+
+    for (_name, win) in &windows {
+        if win.current_utilization >= EMERGENCY_BRAKE_THRESHOLD {
+            log::warn!(
+                "[governor] EMERGENCY BRAKE: {} at {:.1}% >= {:.0}%",
+                _name, win.current_utilization, EMERGENCY_BRAKE_THRESHOLD
+            );
+            return 0;
+        }
+    }
+
+    // Get safe_worker_count from binding window
+    let binding_forecast = match forecast.binding_window.as_str() {
+        WINDOW_FIVE_HOUR => &forecast.five_hour,
+        WINDOW_SEVEN_DAY => &forecast.seven_day,
+        _ => &forecast.seven_day_sonnet,
+    };
+
+    let target = binding_forecast
+        .safe_worker_count
+        .filter(|&w| w > 0)
+        .unwrap_or(current_total)
+        .min(global_max)
+        .max(global_min);
+
+    log::debug!(
+        "[governor] compute_target_workers: binding={}, safe_w={:?}, current={}, target={} (min={}, max={})",
+        forecast.binding_window,
+        binding_forecast.safe_worker_count,
+        current_total,
+        target,
+        global_min,
+        global_max,
+    );
+
+    target
+}
+
+/// Apply scaling decision with hysteresis band.
+///
+/// Returns the scaling action to take:
+/// - `NoChange` if |target - current| <= hysteresis_band
+/// - `ScaleUp(n)` if target > current + hysteresis (limited by max_scale_up_per_cycle)
+/// - `ScaleDown(n)` if target < current - hysteresis (limited by max_scale_down_per_cycle)
+///
+/// Emergency brake bypasses hysteresis entirely.
+pub fn apply_scaling(
+    target: u32,
+    current: u32,
+    hysteresis_band: f64,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+) -> ScalingDecision {
+    // Emergency brake: target is 0
+    if target == 0 && current > 0 {
+        log::warn!(
+            "[governor] EMERGENCY: scaling {} -> 0 workers",
+            current
+        );
+        return ScalingDecision::EmergencyBrake;
+    }
+
+    let delta = target as i32 - current as i32;
+    let hysteresis = hysteresis_band as i32;
+
+    if delta.abs() <= hysteresis {
+        log::debug!(
+            "[governor] hysteresis: |{} - {}| = {} <= {:.1}, no change",
+            target, current, delta.abs(), hysteresis_band
+        );
+        return ScalingDecision::NoChange;
+    }
+
+    if delta > 0 {
+        let scale = (delta as u32).min(max_up_per_cycle);
+        log::info!(
+            "[governor] scale UP: {} -> {} (+{})",
+            current, current + scale, scale
+        );
+        return ScalingDecision::ScaleUp(scale);
+    }
+
+    // delta < 0
+    let scale = (delta.abs() as u32).min(max_down_per_cycle);
+    log::info!(
+        "[governor] scale DOWN: {} -> {} (-{})",
+        current, current - scale, scale
+    );
+    ScalingDecision::ScaleDown(scale)
+}
+
+// ---------------------------------------------------------------------------
+// Governor daemon loop
+// ---------------------------------------------------------------------------
+
+/// Run one governor cycle: poll -> schedule -> burn_rate -> target -> scale -> alert -> write_state
+///
+/// This is the core loop body executed every `loop_interval` seconds.
+pub fn run_governor_cycle(
+    state_path: &Path,
+    dry_run: bool,
+    loop_interval: u64,
+    hysteresis_band: f64,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+    target_ceiling: f64,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
+
+    // 1. Load current state
+    let mut state = state::load_state(state_path)?;
+
+    // 2. Count current workers (from heartbeat files + tmux)
+    let worker_config = WorkerConfig::default();
+    let worker_count = worker::count_workers(&worker_config);
+    let current_total = worker_count.tmux_count as u32;
+
+    log::info!(
+        "[governor] workers: {} active ({} heartbeats, {} tmux sessions, consistent={})",
+        current_total,
+        worker_count.heartbeat_count,
+        worker_count.tmux_count,
+        worker_count.consistent,
+    );
+
+    // Update worker state with current count
+    // Distribute evenly across configured agents
+    let agent_count = state.workers.len().max(1);
+    let per_agent = current_total / agent_count as u32;
+    let remainder = current_total % agent_count as u32;
+
+    for (i, ws) in state.workers.values_mut().enumerate() {
+        let extra = if (i as u32) < remainder { 1 } else { 0 };
+        ws.current = per_agent + extra;
+    }
+
+    // 3. Log capacity forecast
+    log_capacity_forecast(&state.capacity_forecast);
+
+    // 4. Compute target workers
+    let target = compute_target_workers(&state, target_ceiling);
+    log::info!(
+        "[governor] target workers: {} (ceiling: {:.0}%)",
+        target, target_ceiling
+    );
+
+    // 5. Apply scaling decision
+    let decision = apply_scaling(
+        target,
+        current_total,
+        hysteresis_band,
+        max_up_per_cycle,
+        max_down_per_cycle,
+    );
+
+    // 6. Execute scaling (unless dry-run or no change)
+    match &decision {
+        ScalingDecision::NoChange => {
+            log::info!("[governor] no scaling action this cycle");
+        }
+        ScalingDecision::ScaleUp(n) => {
+            log::info!("[governor] scaling up by {} workers", n);
+            if !dry_run {
+                let launched = worker::scale_up(*n, &worker_config, false);
+                log::info!("[governor] launched {} workers", launched);
+            } else {
+                log::info!("[governor] DRY RUN: would scale up by {}", n);
+            }
+        }
+        ScalingDecision::ScaleDown(n) => {
+            log::info!("[governor] gracefully scaling down by {} workers", n);
+            if !dry_run {
+                let result = worker::scale_down_graceful(*n, &worker_config, false);
+                log::info!(
+                    "[governor] scaled down: {} graceful, {} force-killed",
+                    result.graceful,
+                    result.force_killed
+                );
+            } else {
+                log::info!("[governor] DRY RUN: would scale down by {}", n);
+            }
+        }
+        ScalingDecision::EmergencyBrake => {
+            log::warn!("[governor] EMERGENCY BRAKE: scaling all to 0");
+            if !dry_run {
+                // Kill all workers immediately
+                for session in &worker_count.sessions {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["kill-session", "-t", session])
+                        .output();
+                }
+                log::warn!(
+                    "[governor] killed {} worker sessions",
+                    worker_count.sessions.len()
+                );
+
+                // Update state
+                for ws in state.workers.values_mut() {
+                    ws.current = 0;
+                    ws.target = 0;
+                }
+                state.safe_mode.active = true;
+                state.safe_mode.trigger = Some("emergency_brake".to_string());
+                state.safe_mode.entered_at = Some(now);
+            } else {
+                log::warn!("[governor] DRY RUN: would emergency brake");
+            }
+        }
+    }
+
+    // 7. Update target in state
+    match &decision {
+        ScalingDecision::EmergencyBrake => {
+            for ws in state.workers.values_mut() {
+                ws.target = 0;
+            }
+        }
+        ScalingDecision::ScaleUp(_n) | ScalingDecision::ScaleDown(_n) => {
+            let new_total = match &decision {
+                ScalingDecision::ScaleUp(n) => current_total.saturating_add(*n),
+                ScalingDecision::ScaleDown(n) => current_total.saturating_sub(*n),
+                _ => current_total,
+            };
+            let per_agent = new_total / agent_count as u32;
+            let remainder = new_total % agent_count as u32;
+            for (i, ws) in state.workers.values_mut().enumerate() {
+                let extra = if (i as u32) < remainder { 1 } else { 0 };
+                ws.target = per_agent + extra;
+            }
+        }
+        ScalingDecision::NoChange => {}
+    }
+
+    // 8. Check alerts
+    let alert_conditions = check_alert_conditions(&state, now);
+    for alert in &alert_conditions {
+        if should_fire(
+            alert.alert_type,
+            &state.alert_cooldown,
+            now,
+            DEFAULT_COOLDOWN_MINUTES,
+        ) {
+            log::warn!("[governor] ALERT [{}]: {}", alert.alert_type, alert.message);
+            update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
+            state.alerts.push(serde_json::json!({
+                "type": alert.alert_type.to_string(),
+                "message": alert.message,
+                "severity": format!("{:?}", alert.severity),
+                "detected_at": alert.detected_at.to_rfc3339(),
+            }));
+        }
+    }
+
+    // 9. Write state
+    state.updated_at = now;
+    state::save_previous_state(&state, state_path)?;
+    state::save_state(&state, state_path)?;
+
+    log::info!(
+        "[governor] === cycle complete (decision: {:?}, next in {}s) ===",
+        decision, loop_interval
+    );
+
+    Ok(())
+}
+
+/// Run the governor daemon (infinite loop with graceful shutdown on SIGINT/SIGTERM)
+///
+/// Executes `run_governor_cycle` every `loop_interval` seconds.
+/// Sets up signal handlers for graceful shutdown via ctrlc crate.
+pub fn run_daemon(
+    state_path: &Path,
+    dry_run: bool,
+    loop_interval: u64,
+    hysteresis_band: f64,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+    target_ceiling: f64,
+) -> anyhow::Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        log::info!("[governor] received shutdown signal, draining...");
+        r.store(false, Ordering::SeqCst);
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to set signal handler: {}", e))?;
+
+    log::info!(
+        "[governor] daemon started (dry_run={}, interval={}s, hysteresis={:.1}, ceiling={:.0}%)",
+        dry_run, loop_interval, hysteresis_band, target_ceiling
+    );
+
+    // Initial cycle
+    if let Err(e) = run_governor_cycle(
+        state_path,
+        dry_run,
+        loop_interval,
+        hysteresis_band,
+        max_up_per_cycle,
+        max_down_per_cycle,
+        target_ceiling,
+    ) {
+        log::error!("[governor] initial cycle failed: {}", e);
+    }
+
+    while running.load(Ordering::SeqCst) {
+        // Sleep for loop interval, checking shutdown every second
+        for _ in 0..loop_interval {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if let Err(e) = run_governor_cycle(
+            state_path,
+            dry_run,
+            loop_interval,
+            hysteresis_band,
+            max_up_per_cycle,
+            max_down_per_cycle,
+            target_ceiling,
+        ) {
+            log::error!("[governor] cycle failed: {}", e);
+            // Continue running despite cycle failures
+        }
+    }
+
+    log::info!("[governor] daemon stopped");
+    Ok(())
 }
 
 #[cfg(test)]
