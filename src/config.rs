@@ -28,6 +28,10 @@ pub struct GovernorConfig {
     #[serde(default)]
     pub alerts: AlertConfig,
 
+    /// Composite risk optimization configuration
+    #[serde(default)]
+    pub composite_risk: CompositeRiskConfig,
+
     /// Agent configurations (worker pools that can be scaled by the governor)
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentConfig>,

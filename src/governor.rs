@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
-use crate::burn_rate::{log_capacity_forecast, generate_window_forecast};
+use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
 use crate::collector;
 use crate::config::{AgentConfig, AlertConfig, SprintConfig};
 use crate::db;
