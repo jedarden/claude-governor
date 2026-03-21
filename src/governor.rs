@@ -809,6 +809,7 @@ pub fn run_governor_cycle(
     agents: &std::collections::HashMap<String, AgentConfig>,
     pre_scale_minutes: u64,
     promotions: &[Promotion],
+    composite_risk_config: &CompositeRiskConfig,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -1103,7 +1104,7 @@ pub fn run_governor_cycle(
     log_capacity_forecast(&state.capacity_forecast);
 
     // 4. Compute target workers
-    let target = compute_target_workers(&state, target_ceiling);
+    let target = compute_target_workers(&state, target_ceiling, composite_risk_config);
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%)",
         target, target_ceiling
@@ -1267,6 +1268,7 @@ pub fn run_daemon(
     agents: &std::collections::HashMap<String, AgentConfig>,
     pre_scale_minutes: u64,
     promotions: &[Promotion],
+    composite_risk_config: &CompositeRiskConfig,
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1304,6 +1306,7 @@ pub fn run_daemon(
         agents,
         pre_scale_minutes,
         promotions,
+        composite_risk_config,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -1334,6 +1337,7 @@ pub fn run_daemon(
             agents,
             pre_scale_minutes,
             promotions,
+            composite_risk_config,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures

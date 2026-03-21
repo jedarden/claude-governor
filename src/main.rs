@@ -1038,6 +1038,7 @@ fn run_daemon_command(
         &config.agents,
         daemon.pre_scale_minutes,
         &promotions,
+        &config.composite_risk,
     )
 }
 
