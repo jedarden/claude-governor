@@ -9,6 +9,7 @@ pub mod capacity_summary;
 pub mod collector;
 pub mod config;
 pub mod db;
+pub mod doctor;
 pub mod governor;
 pub mod narrator;
 pub mod poller;

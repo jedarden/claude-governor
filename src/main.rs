@@ -30,6 +30,7 @@ use claude_governor::capacity_summary::{generate_capacity_summary, StatusExitCod
 use claude_governor::collector;
 use claude_governor::config::GovernorConfig;
 use claude_governor::db;
+use claude_governor::doctor;
 use claude_governor::governor;
 use claude_governor::narrator;
 use claude_governor::poller::{Poller, UsageData};
@@ -264,6 +265,13 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "5")]
         last: usize,
 
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run health diagnostic checks
+    Doctor {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -682,6 +690,23 @@ fn run_explain_command(last: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_doctor_command(json: bool) -> Result<()> {
+    let report = doctor::run_doctor();
+
+    if json {
+        println!("{}", doctor::format_doctor_json(&report));
+    } else {
+        print!("{}", doctor::format_doctor_human(&report));
+    }
+
+    // Exit with non-zero if any checks failed
+    if report.failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 fn default_promotions_path() -> PathBuf {
     PathBuf::from("config/promotions.json")
 }
@@ -928,6 +953,9 @@ fn main() -> Result<()> {
         }
         Commands::Explain { last, json } => {
             run_explain_command(last, json)?;
+        }
+        Commands::Doctor { json } => {
+            run_doctor_command(json)?;
         }
         Commands::_Daemon {
             dry_run,
