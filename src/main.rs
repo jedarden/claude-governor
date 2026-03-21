@@ -22,11 +22,11 @@ use clap::{Parser, Subcommand};
 use log::LevelFilter;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
 
-use claude_governor::capacity_summary::generate_capacity_summary;
+use claude_governor::capacity_summary::{generate_capacity_summary, StatusExitCode};
 use claude_governor::collector;
 use claude_governor::config::GovernorConfig;
 use claude_governor::db;
@@ -36,6 +36,7 @@ use claude_governor::poller::{Poller, UsageData};
 use claude_governor::schedule;
 use claude_governor::simulator::{self, SimConfig};
 use claude_governor::state::{self, GovernorState};
+use claude_governor::status_display::{format_status_dashboard, format_status_json};
 
 /// Default state file path
 fn default_state_path() -> PathBuf {
@@ -851,15 +852,26 @@ fn main() -> Result<()> {
         } => {
             run_simulate_command(&workers, hours, resolution, json)?;
         }
-        Commands::Status { json: _, summary } => {
+        Commands::Status { json, summary } => {
             let state_path = default_state_path();
             let state = state::load_state(&state_path)?;
-            let output = generate_capacity_summary(&state);
+            let exit_code = StatusExitCode::from_state(&state);
+
+            // --summary: NEEDLE prompt injection format
             if summary {
-                print!("{}", output);
-            } else {
-                println!("{}", output);
+                print!("{}", generate_capacity_summary(&state));
+                std::process::exit(exit_code.as_exit_code());
             }
+
+            // --json or non-TTY: raw state JSON
+            if json || !std::io::stdout().is_terminal() {
+                println!("{}", format_status_json(&state));
+                std::process::exit(exit_code.as_exit_code());
+            }
+
+            // Default: rich human-readable dashboard
+            print!("{}", format_status_dashboard(&state, chrono::Utc::now()));
+            std::process::exit(exit_code.as_exit_code());
         }
         Commands::Version => {
             run_version_command()?;

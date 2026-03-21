@@ -4,6 +4,9 @@
 //! The `generate_capacity_summary` function produces markdown suitable for injection
 //! into CLAUDE.md, giving workers visibility into fleet capacity state.
 //!
+//! The `generate_status_dashboard` function produces the rich human-readable table
+//! displayed by `cgov status`.
+//!
 //! ## Pressure Levels
 //!
 //! - **LOW**: `margin_hrs > hrs_left * 0.5` — no constraints, work normally
