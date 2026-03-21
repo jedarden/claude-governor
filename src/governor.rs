@@ -1264,7 +1264,15 @@ pub fn run_governor_cycle(
                 ws.target = per_agent + extra;
             }
         }
-        ScalingDecision::NoChange => {}
+        ScalingDecision::NoChange => {
+            // Still update target to reflect current desired state
+            let per_agent = effective_target / agent_count as u32;
+            let remainder = effective_target % agent_count as u32;
+            for (i, ws) in state.workers.values_mut().enumerate() {
+                let extra = if (i as u32) < remainder { 1 } else { 0 };
+                ws.target = per_agent + extra;
+            }
+        }
     }
 
     // 8. Check alerts and fire via configured command
