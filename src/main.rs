@@ -219,6 +219,69 @@ enum Commands {
         #[arg(long)]
         no_systemd: bool,
     },
+
+    /// Enable claude-governor services (install systemd units and start)
+    Enable {
+        /// Force overwrite existing service files
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Disable claude-governor services (stop and remove systemd units)
+    Disable {
+        /// Also remove service files
+        #[arg(long)]
+        purge: bool,
+    },
+
+    /// Start claude-governor daemon services
+    Start {
+        /// Service to start: governor, collector, or all (default: all)
+        #[arg(long, default_value = "all")]
+        service: String,
+    },
+
+    /// Stop claude-governor daemon services
+    Stop {
+        /// Service to stop: governor, collector, or all (default: all)
+        #[arg(long, default_value = "all")]
+        service: String,
+    },
+
+    /// Restart claude-governor daemon services
+    Restart {
+        /// Service to restart: governor, collector, or all (default: all)
+        #[arg(long, default_value = "all")]
+        service: String,
+    },
+
+    /// Internal: Run the governor daemon (called by systemd)
+    #[command(hide = true, name = "_daemon")]
+    _Daemon {
+        /// Show what would happen without actually scaling workers
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Loop interval in seconds (overrides config)
+        #[arg(short = 'i', long)]
+        interval: Option<u64>,
+
+        /// Hysteresis band for scaling decisions (overrides config)
+        #[arg(long)]
+        hysteresis: Option<f64>,
+
+        /// Target utilization ceiling percentage (overrides config)
+        #[arg(short = 'c', long)]
+        ceiling: Option<f64>,
+    },
+
+    /// Internal: Run the token collector daemon (called by systemd)
+    #[command(hide = true, name = "_token-collector")]
+    _TokenCollector {
+        /// Collection interval in seconds (default: 120)
+        #[arg(short, long, default_value = "120")]
+        interval: u64,
+    },
 }
 
 /// Format usage data for human consumption
@@ -810,6 +873,32 @@ fn main() -> Result<()> {
         Commands::Init { force, no_systemd } => {
             run_init_command(force, no_systemd)?;
         }
+        Commands::Enable { force } => {
+            run_enable_command(force)?;
+        }
+        Commands::Disable { purge } => {
+            run_disable_command(purge)?;
+        }
+        Commands::Start { service } => {
+            run_start_command(&service)?;
+        }
+        Commands::Stop { service } => {
+            run_stop_command(&service)?;
+        }
+        Commands::Restart { service } => {
+            run_restart_command(&service)?;
+        }
+        Commands::_Daemon {
+            dry_run,
+            interval,
+            hysteresis,
+            ceiling,
+        } => {
+            run_internal_daemon_command(dry_run, interval, hysteresis, ceiling)?;
+        }
+        Commands::_TokenCollector { interval } => {
+            run_internal_token_collector_command(interval)?;
+        }
     }
 
     Ok(())
@@ -841,6 +930,227 @@ fn run_daemon_command(
         &config.alerts,
         &config.agents,
     )
+}
+
+// --- Systemd helpers ---
+
+/// Check if systemd user sessions are available
+fn systemd_user_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "status"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Get the systemd user unit directory
+fn systemd_user_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("systemd/user"))
+}
+
+/// Run a systemctl --user command and return success/failure
+fn systemctl_user(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user"])
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to run systemctl --user {}", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("systemctl --user {} failed with exit code {:?}", args.join(" "), status.code())
+    }
+}
+
+/// Service names for the two-unit split
+const GOVERNOR_SERVICE: &str = "claude-governor.service";
+const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
+
+/// Resolve --service arg to a list of unit names
+fn resolve_service_names(service: &str) -> Vec<&'static str> {
+    match service {
+        "governor" => vec![GOVERNOR_SERVICE],
+        "collector" => vec![COLLECTOR_SERVICE],
+        _ => vec![GOVERNOR_SERVICE, COLLECTOR_SERVICE],
+    }
+}
+
+// --- Lifecycle commands ---
+
+fn run_enable_command(force: bool) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+
+    if !systemd_user_available() {
+        anyhow::bail!(
+            "systemd user sessions not available.\n\
+             Ensure systemd --user is enabled (loginctl enable-linger $USER)"
+        );
+    }
+
+    let user_dir = systemd_user_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine systemd user directory"))?;
+    if !user_dir.exists() {
+        fs::create_dir_all(&user_dir)
+            .with_context(|| format!("Failed to create {}", user_dir.display()))?;
+    }
+
+    let mut actions = Vec::new();
+
+    // Install both unit files
+    for (name, content) in [
+        (GOVERNOR_SERVICE, include_str!("../config/claude-governor.service")),
+        (COLLECTOR_SERVICE, include_str!("../config/claude-token-collector.service")),
+    ] {
+        let path = user_dir.join(name);
+        let content = content.replace("%h", home.to_str().unwrap_or("~"));
+
+        if path.exists() && !force {
+            actions.push(format!("  - {} already exists (use --force to overwrite)", name));
+        } else {
+            fs::write(&path, &content)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            actions.push(format!("  ✓ Installed {}", path.display()));
+        }
+    }
+
+    // Daemon-reload
+    systemctl_user(&["daemon-reload"])?;
+    actions.push("  ✓ Ran daemon-reload".to_string());
+
+    // Enable both services
+    systemctl_user(&["enable", GOVERNOR_SERVICE])?;
+    actions.push(format!("  ✓ Enabled {}", GOVERNOR_SERVICE));
+
+    systemctl_user(&["enable", COLLECTOR_SERVICE])?;
+    actions.push(format!("  ✓ Enabled {}", COLLECTOR_SERVICE));
+
+    // Start both services
+    systemctl_user(&["start", GOVERNOR_SERVICE])?;
+    actions.push(format!("  ✓ Started {}", GOVERNOR_SERVICE));
+
+    systemctl_user(&["start", COLLECTOR_SERVICE])?;
+    actions.push(format!("  ✓ Started {}", COLLECTOR_SERVICE));
+
+    println!("Claude Governor services enabled and started");
+    println!("============================================\n");
+    for action in &actions {
+        println!("{}", action);
+    }
+    println!("\nView logs:");
+    println!("  journalctl --user -u {} -f", GOVERNOR_SERVICE);
+    println!("  journalctl --user -u {} -f", COLLECTOR_SERVICE);
+
+    Ok(())
+}
+
+fn run_disable_command(purge: bool) -> Result<()> {
+    if !systemd_user_available() {
+        anyhow::bail!("systemd user sessions not available");
+    }
+
+    let mut actions = Vec::new();
+
+    // Stop both services (ignore errors if not running)
+    for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
+        if systemctl_user(&["is-active", svc]).is_ok() {
+            systemctl_user(&["stop", svc])?;
+            actions.push(format!("  ✓ Stopped {}", svc));
+        }
+    }
+
+    // Disable both services
+    for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
+        if systemctl_user(&["is-enabled", svc]).is_ok() {
+            systemctl_user(&["disable", svc])?;
+            actions.push(format!("  ✓ Disabled {}", svc));
+        }
+    }
+
+    // Optionally purge service files
+    if purge {
+        let user_dir = systemd_user_dir();
+        if let Some(dir) = user_dir {
+            for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
+                let path = dir.join(svc);
+                if path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("Failed to remove {}", path.display()))?;
+                    actions.push(format!("  ✓ Removed {}", path.display()));
+                }
+            }
+            systemctl_user(&["daemon-reload"])?;
+            actions.push("  ✓ Ran daemon-reload".to_string());
+        }
+    }
+
+    println!("Claude Governor services disabled{}\n", if purge { " and purged" } else { "" });
+    for action in &actions {
+        println!("{}", action);
+    }
+
+    Ok(())
+}
+
+fn run_start_command(service: &str) -> Result<()> {
+    if !systemd_user_available() {
+        anyhow::bail!("systemd user sessions not available");
+    }
+
+    let names = resolve_service_names(service);
+    for name in &names {
+        systemctl_user(&["start", name])?;
+        println!("  ✓ Started {}", name);
+    }
+
+    Ok(())
+}
+
+fn run_stop_command(service: &str) -> Result<()> {
+    if !systemd_user_available() {
+        anyhow::bail!("systemd user sessions not available");
+    }
+
+    let names = resolve_service_names(service);
+    for name in &names {
+        if systemctl_user(&["is-active", name]).is_ok() {
+            systemctl_user(&["stop", name])?;
+            println!("  ✓ Stopped {}", name);
+        } else {
+            println!("  - {} is not running", name);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_restart_command(service: &str) -> Result<()> {
+    if !systemd_user_available() {
+        anyhow::bail!("systemd user sessions not available");
+    }
+
+    let names = resolve_service_names(service);
+    for name in &names {
+        systemctl_user(&["restart", name])?;
+        println!("  ✓ Restarted {}", name);
+    }
+
+    Ok(())
+}
+
+fn run_internal_daemon_command(
+    dry_run: bool,
+    interval: Option<u64>,
+    hysteresis: Option<f64>,
+    ceiling: Option<f64>,
+) -> Result<()> {
+    // Identical to run_daemon_command — called by systemd unit file
+    run_daemon_command(dry_run, interval, hysteresis, ceiling)
+}
+
+fn run_internal_token_collector_command(interval: u64) -> Result<()> {
+    // Identical to collect --daemon — called by systemd unit file
+    collector::run_daemon(interval)
 }
 
 fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
@@ -985,9 +1295,8 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
     println!("  2. Check status:       cgov status");
     println!("  3. View forecasts:     cgov forecast");
     if systemd_installed {
-        println!("  4. Enable service:     systemctl --user enable cgov");
-        println!("  5. Start service:      systemctl --user start cgov");
-        println!("  6. View logs:          journalctl --user -u cgov -f");
+        println!("  4. Enable services:    cgov enable");
+        println!("  5. View logs:          journalctl --user -u claude-governor -f");
     } else {
         println!("  4. Run daemon:         cgov daemon");
     }
