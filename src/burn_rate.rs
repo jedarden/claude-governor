@@ -1,11 +1,28 @@
-//! Per-instance burn rate computation and promotion validation
+//! Adaptive Burn Rate Estimator
 //!
-//! Computes dollar_per_hour and pct_per_hour from token collector interval records.
-//! Each window (5h, 7d, 7d-sonnet) is computed independently with guard conditions
-//! to reject unreliable data.
+//! Empirically calibrates per-model burn rates (%/hr, tokens/hr, $/hr) using
+//! observed consumption data from the token collector.
 //!
-//! Also validates declared promotion multipliers against observed consumption data
-//! by comparing median tokens-per-pct between peak and off-peak intervals.
+//! ## Capabilities
+//!
+//! - Per-instance dollar/pct burn computation with guard conditions
+//! - Fleet-level per-worker stats (mean, p75, stddev) across active sessions
+//! - Per-(model, window) EMA with configurable alpha (default 0.2)
+//! - Capacity forecast per window: fleet_pct_per_hour, predicted_exhaustion_hours,
+//!   will_exhaust_before_reset, safe_worker_count
+//! - Binding window identification (soonest to exhaust)
+//! - Separate peak/off-peak tokens_per_pct for promotion validation
+//! - Baseline fallback until 3 valid samples per window
+//!
+//! ## Data Flow
+//!
+//! 1. Read instance (i) records from token-history.db for the most recent interval
+//! 2. Compute per-instance burn rates with guard conditions
+//! 3. Aggregate to fleet-level stats
+//! 4. Update per-(model, window) EMA estimates
+//! 5. Generate capacity forecast for each window
+//! 6. Identify binding window and safe worker count
+//! 7. Update GovernorState with burn_rate, last_fleet_aggregate, capacity_forecast
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -24,6 +41,55 @@ pub struct WindowUtilization {
 
     /// Previous interval utilization snapshot %
     pub previous_utilization: f64,
+}
+
+impl WindowUtilization {
+    /// Create a WindowUtilization from percentage delta and current/previous values
+    pub fn from_pct_delta(window: &str, pct_delta: Option<f64>, current: f64, previous: f64) -> Self {
+        Self {
+            window: window.to_string(),
+            pct_delta,
+            current_utilization: current,
+            previous_utilization: previous,
+        }
+    }
+}
+
+/// Convert a database instance record to a burn_rate InstanceRecord
+///
+/// Takes the flat db record with window percentage deltas and constructs
+/// the nested WindowUtilization structure used by the burn rate estimator.
+impl From<crate::db::DbInstanceRecord> for InstanceRecord {
+    fn from(db_rec: crate::db::DbInstanceRecord) -> Self {
+        let windows = vec![
+            WindowUtilization::from_pct_delta(
+                "five_hour",
+                db_rec.p5h,
+                db_rec.current_p5h,
+                db_rec.prev_p5h,
+            ),
+            WindowUtilization::from_pct_delta(
+                "seven_day",
+                db_rec.p7d,
+                db_rec.current_p7d,
+                db_rec.prev_p7d,
+            ),
+            WindowUtilization::from_pct_delta(
+                "seven_day_sonnet",
+                db_rec.p7ds,
+                db_rec.current_p7ds,
+                db_rec.prev_p7ds,
+            ),
+        ];
+
+        InstanceRecord {
+            session: db_rec.session,
+            model: db_rec.model,
+            total_usd: db_rec.total_usd,
+            total_tokens: db_rec.total_tokens,
+            windows,
+        }
+    }
 }
 
 /// Instance interval record (mirrors the `i` table in token-history.db)
@@ -392,6 +458,529 @@ pub fn effective_multiplier(result: &PromotionValidationResult) -> f64 {
 
     // Not validated: conservative fallback to 1x
     1.0
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Burn Rate Estimator
+// ---------------------------------------------------------------------------
+
+/// EMA smoothing factor (alpha = 0.2 per plan)
+const EMA_ALPHA: f64 = 0.2;
+
+/// Minimum valid samples per window before EMA is used instead of baseline
+const MIN_SAMPLES_FOR_EMA: u32 = 3;
+
+/// Known window names
+const WINDOWS: &[&str] = &["five_hour", "seven_day", "seven_day_sonnet"];
+
+/// Fleet-level per-worker statistics for one window
+#[derive(Debug, Clone)]
+pub struct FleetWorkerStats {
+    /// Number of active workers in this sample
+    pub worker_count: u32,
+
+    /// Mean pct_per_hour across workers
+    pub mean_pct_hr: f64,
+
+    /// 75th-percentile pct_per_hour (nearest-rank)
+    pub p75_pct_hr: f64,
+
+    /// Population standard deviation of pct_per_hour
+    pub std_pct_hr: f64,
+
+    /// Mean dollar_per_hour across workers
+    pub mean_usd_hr: f64,
+}
+
+/// Per-(model, window) EMA state
+#[derive(Debug, Clone)]
+pub struct ModelWindowEma {
+    /// Current EMA value for pct_per_worker_per_hour
+    pub ema_pct: f64,
+
+    /// Current EMA value for dollars_per_worker_per_hour
+    pub ema_usd: f64,
+
+    /// Number of valid samples accumulated
+    pub samples: u32,
+}
+
+impl Default for ModelWindowEma {
+    fn default() -> Self {
+        Self {
+            ema_pct: 0.0,
+            ema_usd: 0.0,
+            samples: 0,
+        }
+    }
+}
+
+/// Baseline burn rates from configuration (fallback before EMA is ready)
+#[derive(Debug, Clone)]
+pub struct BaselineBurnRates {
+    /// Default pct per worker per hour when no EMA is available
+    pub pct_per_worker_per_hour: f64,
+
+    /// Default dollars per worker per hour when no EMA is available
+    pub dollars_per_worker_per_hour: f64,
+}
+
+impl Default for BaselineBurnRates {
+    fn default() -> Self {
+        // Conservative defaults: ~1.5%/hr per worker, ~$5/hr per worker
+        Self {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        }
+    }
+}
+
+/// Result of the adaptive burn rate estimation pass
+#[derive(Debug, Clone)]
+pub struct BurnRateEstimate {
+    /// Per-model EMA state keyed by (model, window)
+    pub ema_state: HashMap<(String, String), ModelWindowEma>,
+
+    /// Fleet worker stats per window
+    pub fleet_stats: HashMap<String, FleetWorkerStats>,
+
+    /// Whether any window had valid data this cycle
+    pub had_valid_data: bool,
+}
+
+/// Compute fleet-level per-worker statistics for a single window
+///
+/// Takes per-instance burn rates for one window and computes aggregate stats.
+fn compute_fleet_stats(
+    _window: &str,
+    instance_rates: &[&InstanceBurnRate],
+    total_workers: u32,
+) -> FleetWorkerStats {
+    if instance_rates.is_empty() || total_workers == 0 {
+        return FleetWorkerStats {
+            worker_count: total_workers,
+            mean_pct_hr: 0.0,
+            p75_pct_hr: 0.0,
+            std_pct_hr: 0.0,
+            mean_usd_hr: 0.0,
+        };
+    }
+
+    let n = instance_rates.len();
+    let sum_pct: f64 = instance_rates.iter().map(|r| r.pct_per_hour).sum();
+    let sum_usd: f64 = instance_rates.iter().map(|r| r.dollar_per_hour).sum();
+    let mean_pct = sum_pct / n as f64;
+    let mean_usd = sum_usd / n as f64;
+
+    // Population standard deviation for pct_per_hour
+    let variance: f64 = instance_rates
+        .iter()
+        .map(|r| (r.pct_per_hour - mean_pct).powi(2))
+        .sum::<f64>()
+        / n as f64;
+    let std_pct = variance.sqrt();
+
+    // Nearest-rank p75
+    let mut sorted_pct: Vec<f64> = instance_rates.iter().map(|r| r.pct_per_hour).collect();
+    sorted_pct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p75_idx = ((n as f64 * 0.75).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    let p75_pct = sorted_pct[p75_idx];
+
+    FleetWorkerStats {
+        worker_count: total_workers,
+        mean_pct_hr: mean_pct,
+        p75_pct_hr: p75_pct,
+        std_pct_hr: std_pct,
+        mean_usd_hr: mean_usd,
+    }
+}
+
+/// Update EMA state with a new sample
+///
+/// EMA formula: `new_ema = alpha * new_value + (1 - alpha) * old_ema`
+/// On the first sample (samples == 0), the EMA is initialized directly.
+fn update_ema(ema: &mut ModelWindowEma, pct_hr: f64, usd_hr: f64) {
+    if ema.samples == 0 {
+        ema.ema_pct = pct_hr;
+        ema.ema_usd = usd_hr;
+    } else {
+        ema.ema_pct = EMA_ALPHA * pct_hr + (1.0 - EMA_ALPHA) * ema.ema_pct;
+        ema.ema_usd = EMA_ALPHA * usd_hr + (1.0 - EMA_ALPHA) * ema.ema_usd;
+    }
+    ema.samples += 1;
+}
+
+/// Get the effective burn rate for a (model, window) pair
+///
+/// Returns the EMA value if enough samples have been accumulated,
+/// otherwise falls back to the baseline.
+fn effective_burn_rate(
+    ema: &ModelWindowEma,
+    baseline: &BaselineBurnRates,
+) -> (f64, f64) {
+    if ema.samples >= MIN_SAMPLES_FOR_EMA {
+        (ema.ema_pct, ema.ema_usd)
+    } else {
+        (
+            baseline.pct_per_worker_per_hour,
+            baseline.dollars_per_worker_per_hour,
+        )
+    }
+}
+
+/// Generate a capacity forecast for a single window
+///
+/// Computes fleet_pct_per_hour, predicted_exhaustion_hours,
+/// will_exhaust_before_reset, and safe_worker_count.
+fn generate_window_forecast(
+    _window: &str,
+    fleet_pct_hr: f64,
+    current_utilization: f64,
+    target_ceiling: f64,
+    hours_remaining: f64,
+    p75_rate_per_worker: f64,
+) -> crate::state::WindowForecast {
+    let remaining_pct = (target_ceiling - current_utilization).max(0.0);
+
+    let predicted_exhaustion_hours = if fleet_pct_hr > 0.0 {
+        remaining_pct / fleet_pct_hr
+    } else {
+        f64::INFINITY
+    };
+
+    let cutoff_risk = predicted_exhaustion_hours < hours_remaining;
+    let margin_hrs = hours_remaining - predicted_exhaustion_hours;
+
+    let safe_worker_count = if p75_rate_per_worker > 0.0 && hours_remaining > 0.0 {
+        let safe = (remaining_pct / (p75_rate_per_worker * hours_remaining)).floor() as u64;
+        Some(safe.min(u32::MAX as u64) as u32)
+    } else {
+        None
+    };
+
+    crate::state::WindowForecast {
+        target_ceiling,
+        current_utilization,
+        remaining_pct,
+        hours_remaining,
+        fleet_pct_per_hour: fleet_pct_hr,
+        predicted_exhaustion_hours,
+        cutoff_risk,
+        margin_hrs,
+        binding: false,
+        safe_worker_count,
+    }
+}
+
+/// The main adaptive burn rate estimation function
+///
+/// Reads instance records, computes per-instance burn rates, aggregates to
+/// fleet stats, updates EMA state, and generates capacity forecasts.
+///
+/// Returns updated EMA state and fleet stats for persisting in GovernorState.
+pub fn estimate_burn_rates(
+    instance_records: &[InstanceRecord],
+    elapsed_hours: f64,
+    current_workers: u32,
+    prev_workers: u32,
+    ema_state: &mut HashMap<(String, String), ModelWindowEma>,
+    baseline: &BaselineBurnRates,
+    current_utilization: &HashMap<String, f64>, // window -> current %
+    target_ceiling: f64,
+    hours_remaining: &HashMap<String, f64>, // window -> hours until reset
+) -> (BurnRateEstimate, crate::state::CapacityForecast) {
+    // Guard: skip if worker count changed this interval
+    if prev_workers != 0 && prev_workers != current_workers {
+        log::debug!(
+            "[burn_rate] worker count changed ({} -> {}), skipping EMA update",
+            prev_workers,
+            current_workers
+        );
+        return (
+            BurnRateEstimate {
+                ema_state: ema_state.clone(),
+                fleet_stats: HashMap::new(),
+                had_valid_data: false,
+            },
+            crate::state::CapacityForecast::default(),
+        );
+    }
+
+    // Compute per-instance burn rates
+    let mut all_instance_rates: Vec<InstanceBurnRate> = Vec::new();
+    for record in instance_records {
+        let rates = compute_instance_burn(record, elapsed_hours);
+        all_instance_rates.extend(rates);
+    }
+
+    if all_instance_rates.is_empty() {
+        return (
+            BurnRateEstimate {
+                ema_state: ema_state.clone(),
+                fleet_stats: HashMap::new(),
+                had_valid_data: false,
+            },
+            crate::state::CapacityForecast::default(),
+        );
+    }
+
+    // Group instance rates by window
+    let mut rates_by_window: HashMap<String, Vec<&InstanceBurnRate>> = HashMap::new();
+    for rate in &all_instance_rates {
+        rates_by_window
+            .entry(rate.window.clone())
+            .or_default()
+            .push(rate);
+    }
+
+    // Compute fleet stats per window
+    let mut fleet_stats: HashMap<String, FleetWorkerStats> = HashMap::new();
+    for window in WINDOWS {
+        let rates = rates_by_window.get(*window).map(|v| v.as_slice()).unwrap_or(&[]);
+        fleet_stats.insert(
+            window.to_string(),
+            compute_fleet_stats(window, rates, current_workers),
+        );
+    }
+
+    // Update EMA state per (model, window)
+    for rate in &all_instance_rates {
+        let key = (rate.model.clone(), rate.window.clone());
+        let pct_per_worker = if current_workers > 0 {
+            rate.pct_per_hour / current_workers as f64
+        } else {
+            0.0
+        };
+        let usd_per_worker = if current_workers > 0 {
+            rate.dollar_per_hour / current_workers as f64
+        } else {
+            0.0
+        };
+
+        let ema = ema_state.entry(key).or_default();
+        update_ema(ema, pct_per_worker, usd_per_worker);
+    }
+
+    // Generate capacity forecasts
+    let mut forecasts = HashMap::new();
+    for window in WINDOWS {
+        let stats = fleet_stats.get(*window).cloned().unwrap_or_else(|| FleetWorkerStats {
+            worker_count: current_workers,
+            mean_pct_hr: 0.0,
+            p75_pct_hr: 0.0,
+            std_pct_hr: 0.0,
+            mean_usd_hr: 0.0,
+        });
+
+        // Use fleet-level mean pct/hr as the fleet burn rate
+        let fleet_pct_hr = stats.mean_pct_hr;
+
+        // Get p75 per-worker rate for safe worker computation
+        let p75_per_worker = if current_workers > 0 {
+            stats.p75_pct_hr / current_workers as f64
+        } else {
+            0.0
+        };
+
+        let util = current_utilization.get(*window).copied().unwrap_or(0.0);
+        let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
+
+        forecasts.insert(
+            window.to_string(),
+            generate_window_forecast(
+                window,
+                fleet_pct_hr,
+                util,
+                target_ceiling,
+                hrs_left,
+                p75_per_worker,
+            ),
+        );
+    }
+
+    // Identify binding window (soonest to exhaust)
+    let binding_window = WINDOWS
+        .iter()
+        .min_by(|&a, &b| {
+            let fa = forecasts.get(*a).map(|f| f.margin_hrs).unwrap_or(f64::INFINITY);
+            let fb = forecasts.get(*b).map(|f| f.margin_hrs).unwrap_or(f64::INFINITY);
+            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|w| w.to_string())
+        .unwrap_or_default();
+
+    // Set binding flag on the binding window
+    for (win, forecast) in forecasts.iter_mut() {
+        forecast.binding = *win == binding_window;
+    }
+
+    // Build CapacityForecast state
+    let capacity_forecast = crate::state::CapacityForecast {
+        five_hour: forecasts
+            .get("five_hour")
+            .cloned()
+            .unwrap_or_default(),
+        seven_day: forecasts
+            .get("seven_day")
+            .cloned()
+            .unwrap_or_default(),
+        seven_day_sonnet: forecasts
+            .get("seven_day_sonnet")
+            .cloned()
+            .unwrap_or_default(),
+        binding_window: binding_window.clone(),
+        dollars_per_pct_7d_s: 0.0, // Computed externally from fleet aggregate
+        estimated_remaining_dollars: 0.0, // Computed externally
+    };
+
+    // Log per-window capacity forecast
+    for window in WINDOWS {
+        let f = forecasts.get(*window).cloned().unwrap_or_default();
+        let binding = if f.binding { " BINDING" } else { "" };
+        let cutoff = if f.cutoff_risk { " CUTOFF_RISK" } else { "" };
+        let safe_str = f
+            .safe_worker_count
+            .map(|w| format!(" at {} workers", w))
+            .unwrap_or_default();
+
+        log::info!(
+            "[burn_rate] {}: {:.1}% remaining, resets in {:.1}h{}{} — exhausts in {:.1}h{}",
+            window,
+            f.remaining_pct,
+            f.hours_remaining,
+            binding,
+            cutoff,
+            f.predicted_exhaustion_hours,
+            safe_str,
+        );
+    }
+
+    if !binding_window.is_empty() {
+        let binding_forecast = forecasts.get(&binding_window);
+        let safe_w = binding_forecast
+            .and_then(|f| f.safe_worker_count)
+            .unwrap_or(0);
+        log::info!(
+            "[burn_rate] → target: {} workers (safe_worker_count from binding window {})",
+            safe_w,
+            binding_window,
+        );
+    }
+
+    (
+        BurnRateEstimate {
+            ema_state: ema_state.clone(),
+            fleet_stats,
+            had_valid_data: true,
+        },
+        capacity_forecast,
+    )
+}
+
+/// Build the burn_rate state block for GovernorState from EMA data
+///
+/// Converts internal EMA state to the state schema's `BurnRateState`.
+pub fn build_burn_rate_state(
+    ema_state: &HashMap<(String, String), ModelWindowEma>,
+    tokens_per_pct_peak: u64,
+    tokens_per_pct_offpeak: u64,
+    offpeak_ratio_observed: f64,
+    offpeak_ratio_expected: f64,
+    promotion_validated: bool,
+    last_sample_at: Option<DateTime<Utc>>,
+    calibration: crate::state::CalibrationState,
+) -> crate::state::BurnRateState {
+    let mut by_model: HashMap<String, crate::state::ModelBurnRate> = HashMap::new();
+
+    // Aggregate per-model: use the max samples across windows, and average rates
+    let mut model_windows: HashMap<String, Vec<&ModelWindowEma>> = HashMap::new();
+    for ((model, _window), ema) in ema_state {
+        model_windows
+            .entry(model.clone())
+            .or_default()
+            .push(ema);
+    }
+
+    for (model, emas) in &model_windows {
+        let max_samples = emas.iter().map(|e| e.samples).max().unwrap_or(0);
+        let avg_pct = if !emas.is_empty() {
+            emas.iter().map(|e| e.ema_pct).sum::<f64>() / emas.len() as f64
+        } else {
+            0.0
+        };
+        let avg_usd = if !emas.is_empty() {
+            emas.iter().map(|e| e.ema_usd).sum::<f64>() / emas.len() as f64
+        } else {
+            0.0
+        };
+
+        by_model.insert(
+            model.clone(),
+            crate::state::ModelBurnRate {
+                pct_per_worker_per_hour: avg_pct,
+                dollars_per_worker_per_hour: avg_usd,
+                samples: max_samples,
+            },
+        );
+    }
+
+    crate::state::BurnRateState {
+        by_model,
+        tokens_per_pct_peak,
+        tokens_per_pct_offpeak,
+        offpeak_ratio_observed,
+        offpeak_ratio_expected,
+        promotion_validated,
+        last_sample_at,
+        calibration,
+    }
+}
+
+/// Log per-window capacity forecast (for governor loop integration)
+pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
+    let windows = [
+        ("5h", &forecast.five_hour),
+        ("7d", &forecast.seven_day),
+        ("7d-sonnet", &forecast.seven_day_sonnet),
+    ];
+
+    for (label, f) in &windows {
+        let binding = if f.binding { " BINDING" } else { "" };
+        let cutoff = if f.cutoff_risk { " CUTOFF_RISK" } else { "" };
+        let safe_str = f
+            .safe_worker_count
+            .map(|w| format!(" at {} workers", w))
+            .unwrap_or_default();
+
+        log::info!(
+            "[governor] {}: {:.1}% remaining, resets in {:.1}h{}{} — exhausts in {:.1}h{}",
+            label,
+            f.remaining_pct,
+            f.hours_remaining,
+            binding,
+            cutoff,
+            f.predicted_exhaustion_hours,
+            safe_str,
+        );
+    }
+
+    if !forecast.binding_window.is_empty() {
+        let binding_forecast = match forecast.binding_window.as_str() {
+            "five_hour" => &forecast.five_hour,
+            "seven_day" => &forecast.seven_day,
+            _ => &forecast.seven_day_sonnet,
+        };
+        let safe_w = binding_forecast
+            .safe_worker_count
+            .unwrap_or(0);
+        log::info!(
+            "[governor] → target: {} workers (safe_worker_count from binding window {})",
+            safe_w,
+            forecast.binding_window,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1038,5 +1627,561 @@ mod tests {
         let result = validate_promotion(&samples, 2.0);
         assert!(!result.validated);
         assert!(result.reason.unwrap().contains("median peak tokens_per_pct is zero"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive Burn Rate Estimator tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create an instance record with two valid windows
+    fn multi_window_record(
+        session: &str,
+        model: &str,
+        total_usd: f64,
+        total_tokens: u64,
+        five_hour_delta: Option<f64>,
+        seven_day_delta: Option<f64>,
+        seven_ds_delta: Option<f64>,
+        five_current: f64,
+        five_prev: f64,
+        seven_current: f64,
+        seven_prev: f64,
+        seven_ds_current: f64,
+        seven_ds_prev: f64,
+    ) -> InstanceRecord {
+        InstanceRecord {
+            session: session.to_string(),
+            model: model.to_string(),
+            total_usd,
+            total_tokens,
+            windows: vec![
+                win("five_hour", five_hour_delta, five_current, five_prev),
+                win("seven_day", seven_day_delta, seven_current, seven_prev),
+                win("seven_day_sonnet", seven_ds_delta, seven_ds_current, seven_ds_prev),
+            ],
+        }
+    }
+
+    #[test]
+    fn estimate_with_two_workers_computes_fleet_stats() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        let instances = vec![
+            multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                2.0,  // $2/hr
+                500_000,
+                Some(1.0), Some(0.5), Some(0.75),
+                41.0, 40.0,  // 5h: delta=1
+                60.5, 60.0,  // 7d: delta=0.5
+                70.75, 70.0, // 7ds: delta=0.75
+            ),
+            multi_window_record(
+                "w2",
+                "claude-sonnet-4-20250514",
+                3.0,  // $3/hr
+                750_000,
+                Some(2.0), Some(1.0), Some(1.5),
+                42.0, 40.0,  // 5h: delta=2
+                61.0, 60.0,  // 7d: delta=1
+                71.5, 70.0,  // 7ds: delta=1.5
+            ),
+        ];
+
+        let elapsed = 1.0; // 1 hour
+        let current_workers = 2;
+        let prev_workers = 2;
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 42.0);
+        utilization.insert("seven_day".to_string(), 61.0);
+        utilization.insert("seven_day_sonnet".to_string(), 71.5);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 3.0);
+        hrs_left.insert("seven_day".to_string(), 37.5);
+        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+
+        let (estimate, forecast) = estimate_burn_rates(
+            &instances,
+            elapsed,
+            current_workers,
+            prev_workers,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        assert!(estimate.had_valid_data);
+
+        // Fleet stats for five_hour: 2 instances with pct_per_hour 1.0 and 2.0
+        let five_stats = estimate.fleet_stats.get("five_hour").unwrap();
+        assert!((five_stats.mean_pct_hr - 1.5).abs() < 1e-9); // (1+2)/2
+        assert_eq!(five_stats.worker_count, 2);
+        assert_eq!(five_stats.p75_pct_hr, 2.0); // p75 of [1, 2]
+
+        // EMA should be updated for (model, window) pairs
+        assert!(estimate.ema_state.contains_key(&(
+            "claude-sonnet-4-20250514".to_string(),
+            "five_hour".to_string()
+        )));
+    }
+
+    #[test]
+    fn estimate_with_changed_workers_skips() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(1.0), Some(0.5), Some(0.75),
+            41.0, 40.0, 60.5, 60.0, 70.75, 70.0,
+        )];
+
+        let (estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            2,  // current
+            3,  // previous (changed!)
+            &mut ema_state,
+            &baseline,
+            &HashMap::new(),
+            90.0,
+            &HashMap::new(),
+        );
+
+        assert!(!estimate.had_valid_data);
+        assert!(ema_state.is_empty()); // EMA not updated
+    }
+
+    #[test]
+    fn estimate_with_no_valid_data_returns_empty() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // All windows have null pct_delta
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            None, None, None, // all null
+            40.0, 40.0, 60.0, 60.0, 70.0, 70.0,
+        )];
+
+        let (estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &HashMap::new(),
+            90.0,
+            &HashMap::new(),
+        );
+
+        assert!(!estimate.had_valid_data);
+        assert!(forecast.binding_window.is_empty());
+    }
+
+    #[test]
+    fn binding_window_is_most_constrained() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(5.0), Some(0.5), Some(2.0),
+            45.0, 40.0, 60.5, 60.0, 72.0, 70.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 45.0);
+        utilization.insert("seven_day".to_string(), 60.5);
+        utilization.insert("seven_day_sonnet".to_string(), 72.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 100.0); // plenty of time
+        hrs_left.insert("seven_day".to_string(), 3.0);    // very constrained
+        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // seven_day: fleet_pct_hr=0.5, remain=29.5, exh=59, margin=3-59=-56 (most negative)
+        assert_eq!(forecast.binding_window, "seven_day");
+        assert!(!forecast.five_hour.binding);
+        assert!(forecast.seven_day.binding);
+        assert!(!forecast.seven_day_sonnet.binding);
+    }
+
+    #[test]
+    fn ema_updates_over_multiple_cycles() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(2.0), Some(1.0), Some(1.5),
+            42.0, 40.0, 61.0, 60.0, 71.5, 70.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 42.0);
+        utilization.insert("seven_day".to_string(), 61.0);
+        utilization.insert("seven_day_sonnet".to_string(), 71.5);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 3.0);
+        hrs_left.insert("seven_day".to_string(), 37.5);
+        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+
+        // Cycle 1: first sample, EMA initializes directly
+        estimate_burn_rates(
+            &instances,
+            1.0, 1, 1, &mut ema_state, &baseline,
+            &utilization, 90.0, &hrs_left,
+        );
+
+        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        assert_eq!(ema.samples, 1);
+        // First sample: ema = value directly = pct_per_worker = 2.0/1 = 2.0
+        assert!((ema.ema_pct - 2.0).abs() < 1e-9);
+
+        // Cycle 2: EMA updates with alpha=0.2
+        let instances2 = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            4.0, // doubled cost
+            500_000,
+            Some(4.0), Some(2.0), Some(3.0),
+            44.0, 40.0, 62.0, 60.0, 73.0, 70.0,
+        )];
+
+        estimate_burn_rates(
+            &instances2,
+            1.0, 1, 1, &mut ema_state, &baseline,
+            &utilization, 90.0, &hrs_left,
+        );
+
+        let ema2 = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        assert_eq!(ema2.samples, 2);
+        // EMA = 0.2 * 4.0 + 0.8 * 2.0 = 0.8 + 1.6 = 2.4
+        assert!((ema2.ema_pct - 2.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn baseline_used_until_min_samples() {
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 99.0,
+            dollars_per_worker_per_hour: 50.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Add 2 samples (below MIN_SAMPLES_FOR_EMA = 3)
+        for i in 0..2 {
+            let instances = vec![multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                2.0,
+                500_000,
+                Some(1.0), Some(0.5), Some(0.75),
+                41.0 + i as f64, 40.0, 60.5, 60.0, 70.75, 70.0,
+            )];
+
+            let mut utilization = HashMap::new();
+            utilization.insert("five_hour".to_string(), 41.0 + i as f64);
+            utilization.insert("seven_day".to_string(), 60.5);
+            utilization.insert("seven_day_sonnet".to_string(), 70.75);
+            let mut hrs_left = HashMap::new();
+            hrs_left.insert("five_hour".to_string(), 3.0);
+            hrs_left.insert("seven_day".to_string(), 37.5);
+            hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+
+            estimate_burn_rates(
+                &instances,
+                1.0, 1, 1, &mut ema_state, &baseline,
+                &utilization, 90.0, &hrs_left,
+            );
+        }
+
+        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        assert_eq!(ema.samples, 2);
+
+        // Should use baseline because samples < 3
+        let (pct, usd) = effective_burn_rate(ema, &baseline);
+        assert!((pct - 99.0).abs() < 1e-9);
+        assert!((usd - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ema_used_after_min_samples() {
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 99.0,
+            dollars_per_worker_per_hour: 50.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Add 3 samples (reaches MIN_SAMPLES_FOR_EMA)
+        for i in 0..3 {
+            let instances = vec![multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                2.0,
+                500_000,
+                Some(1.0), Some(0.5), Some(0.75),
+                41.0 + i as f64, 40.0, 60.5, 60.0, 70.75, 70.0,
+            )];
+
+            let mut utilization = HashMap::new();
+            utilization.insert("five_hour".to_string(), 41.0 + i as f64);
+            utilization.insert("seven_day".to_string(), 60.5);
+            utilization.insert("seven_day_sonnet".to_string(), 70.75);
+            let mut hrs_left = HashMap::new();
+            hrs_left.insert("five_hour".to_string(), 3.0);
+            hrs_left.insert("seven_day".to_string(), 37.5);
+            hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+
+            estimate_burn_rates(
+                &instances,
+                1.0, 1, 1, &mut ema_state, &baseline,
+                &utilization, 90.0, &hrs_left,
+            );
+        }
+
+        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        assert_eq!(ema.samples, 3);
+
+        // Should use EMA because samples >= 3
+        let (pct, usd) = effective_burn_rate(ema, &baseline);
+        // EMA value, not baseline
+        assert!(pct < 99.0, "Should use EMA not baseline, got {}", pct);
+        assert!(usd < 50.0, "Should use EMA not baseline, got {}", usd);
+    }
+
+    #[test]
+    fn each_window_independent_ema_sampling() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Only five_hour has valid data; seven_day and seven_day_sonnet are null
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(2.0), None, None,  // only 5h valid
+            42.0, 40.0, 60.0, 60.0, 70.0, 70.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 42.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 3.0);
+
+        estimate_burn_rates(
+            &instances,
+            1.0, 1, 1, &mut ema_state, &baseline,
+            &utilization, 90.0, &hrs_left,
+        );
+
+        let five_ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string()));
+        let seven_ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "seven_day".to_string()));
+
+        assert!(five_ema.is_some());
+        assert_eq!(five_ema.unwrap().samples, 1);
+        assert!(seven_ema.is_none());
+    }
+
+    #[test]
+    fn compute_fleet_stats_empty() {
+        let stats = compute_fleet_stats("five_hour", &[], 2);
+        assert_eq!(stats.worker_count, 2);
+        assert!((stats.mean_pct_hr - 0.0).abs() < 1e-9);
+        assert!((stats.p75_pct_hr - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_fleet_stats_single_instance() {
+        let rate = InstanceBurnRate {
+            session: "s1".to_string(),
+            model: "m1".to_string(),
+            window: "five_hour".to_string(),
+            dollar_per_hour: 5.0,
+            pct_per_hour: 2.0,
+            elapsed_hours: 1.0,
+        };
+        let stats = compute_fleet_stats("five_hour", &[&rate], 1);
+        assert!((stats.mean_pct_hr - 2.0).abs() < 1e-9);
+        assert!((stats.p75_pct_hr - 2.0).abs() < 1e-9);
+        assert!((stats.mean_usd_hr - 5.0).abs() < 1e-9);
+        assert!((stats.std_pct_hr - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_ema_first_sample_initializes() {
+        let mut ema = ModelWindowEma::default();
+        update_ema(&mut ema, 3.0, 10.0);
+        assert_eq!(ema.samples, 1);
+        assert!((ema.ema_pct - 3.0).abs() < 1e-9);
+        assert!((ema.ema_usd - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_ema_subsequent_smooths() {
+        let mut ema = ModelWindowEma {
+            ema_pct: 2.0,
+            ema_usd: 5.0,
+            samples: 1,
+        };
+        update_ema(&mut ema, 4.0, 10.0);
+        assert_eq!(ema.samples, 2);
+        // EMA = 0.2 * 4.0 + 0.8 * 2.0 = 0.8 + 1.6 = 2.4
+        assert!((ema.ema_pct - 2.4).abs() < 1e-9);
+        // EMA = 0.2 * 10.0 + 0.8 * 5.0 = 2.0 + 4.0 = 6.0
+        assert!((ema.ema_usd - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn generate_window_forecast_basic() {
+        let f = generate_window_forecast(
+            "seven_day_sonnet",
+            2.0,   // fleet_pct_hr
+            72.0,  // current utilization
+            90.0,  // target ceiling
+            37.5,  // hours remaining
+            1.0,   // p75 per worker
+        );
+
+        assert!((f.remaining_pct - 18.0).abs() < 1e-9);
+        assert!((f.hours_remaining - 37.5).abs() < 1e-9);
+        assert!((f.fleet_pct_per_hour - 2.0).abs() < 1e-9);
+        assert!((f.predicted_exhaustion_hours - 9.0).abs() < 1e-9);
+        assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
+        assert!((f.margin_hrs - 28.5).abs() < 1e-9); // 37.5 - 9
+        assert_eq!(f.safe_worker_count, Some(0)); // floor(18 / (1.0 * 37.5)) = 0
+    }
+
+    #[test]
+    fn generate_window_forecast_zero_burn() {
+        let f = generate_window_forecast(
+            "five_hour",
+            0.0,   // zero burn rate
+            36.0,
+            90.0,
+            3.0,
+            0.0,
+        );
+
+        assert!(f.predicted_exhaustion_hours.is_infinite());
+        assert!(!f.cutoff_risk);
+        assert_eq!(f.safe_worker_count, None);
+    }
+
+    #[test]
+    fn build_burn_rate_state_from_ema() {
+        let mut ema_state = HashMap::new();
+        ema_state.insert(
+            ("sonnet".to_string(), "five_hour".to_string()),
+            ModelWindowEma {
+                ema_pct: 1.5,
+                ema_usd: 5.0,
+                samples: 10,
+            },
+        );
+        ema_state.insert(
+            ("sonnet".to_string(), "seven_day".to_string()),
+            ModelWindowEma {
+                ema_pct: 0.8,
+                ema_usd: 3.0,
+                samples: 8,
+            },
+        );
+
+        let state = build_burn_rate_state(
+            &ema_state,
+            69780,
+            141350,
+            2.03,
+            2.0,
+            true,
+            Some(Utc::now()),
+            crate::state::CalibrationState::default(),
+        );
+
+        let model = state.by_model.get("sonnet").unwrap();
+        assert_eq!(model.samples, 10); // max across windows
+        assert!((model.pct_per_worker_per_hour - 1.15).abs() < 0.01); // avg of 1.5 and 0.8
+        assert!((model.dollars_per_worker_per_hour - 4.0).abs() < 0.01); // avg of 5.0 and 3.0
+        assert_eq!(state.tokens_per_pct_peak, 69780);
+        assert_eq!(state.tokens_per_pct_offpeak, 141350);
+        assert!(state.promotion_validated);
+    }
+
+    #[test]
+    fn log_capacity_forecast_does_not_panic() {
+        let forecast = crate::state::CapacityForecast {
+            five_hour: crate::state::WindowForecast {
+                target_ceiling: 90.0,
+                current_utilization: 36.0,
+                remaining_pct: 54.0,
+                hours_remaining: 1.5,
+                fleet_pct_per_hour: 7.92,
+                predicted_exhaustion_hours: 6.82,
+                cutoff_risk: false,
+                margin_hrs: -5.32,
+                binding: false,
+                safe_worker_count: None,
+            },
+            seven_day: crate::state::WindowForecast {
+                target_ceiling: 90.0,
+                current_utilization: 72.6,
+                remaining_pct: 17.4,
+                hours_remaining: 37.5,
+                fleet_pct_per_hour: 6.48,
+                predicted_exhaustion_hours: 2.69,
+                cutoff_risk: true,
+                margin_hrs: 34.81,
+                binding: false,
+                safe_worker_count: None,
+            },
+            seven_day_sonnet: crate::state::WindowForecast {
+                target_ceiling: 90.0,
+                current_utilization: 63.5,
+                remaining_pct: 26.5,
+                hours_remaining: 37.5,
+                fleet_pct_per_hour: 9.0,
+                predicted_exhaustion_hours: 2.94,
+                cutoff_risk: true,
+                margin_hrs: 34.56,
+                binding: true,
+                safe_worker_count: Some(2),
+            },
+            binding_window: "seven_day_sonnet".to_string(),
+            dollars_per_pct_7d_s: 1.648,
+            estimated_remaining_dollars: 46.1,
+        };
+
+        // Should not panic
+        log_capacity_forecast(&forecast);
     }
 }

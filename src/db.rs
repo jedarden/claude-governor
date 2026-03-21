@@ -389,6 +389,145 @@ pub fn query_last_fleets(conn: &Connection, n: usize) -> Result<Vec<serde_json::
     Ok(results)
 }
 
+/// Instance record for burn rate computation
+#[derive(Debug, Clone)]
+pub struct DbInstanceRecord {
+    /// Session identifier
+    pub session: String,
+    /// Model identifier
+    pub model: String,
+    /// Total USD cost for this interval
+    pub total_usd: f64,
+    /// Total tokens consumed this interval
+    pub total_tokens: u64,
+    /// 5-hour window pct delta (may be null if not yet annotated)
+    pub p5h: Option<f64>,
+    /// 7-day window pct delta (may be null if not yet annotated)
+    pub p7d: Option<f64>,
+    /// 7-day sonnet window pct delta (may be null if not yet annotated)
+    pub p7ds: Option<f64>,
+    /// Current 5-hour utilization snapshot (approximated from delta)
+    pub current_p5h: f64,
+    /// Previous 5-hour utilization snapshot
+    pub prev_p5h: f64,
+    /// Current 7-day utilization snapshot
+    pub current_p7d: f64,
+    /// Previous 7-day utilization snapshot
+    pub prev_p7d: f64,
+    /// Current 7-day sonnet utilization snapshot
+    pub current_p7ds: f64,
+    /// Previous 7-day sonnet utilization snapshot
+    pub prev_p7ds: f64,
+}
+
+/// Query instance records from the most recent interval for burn rate computation.
+///
+/// Returns all instance records from the last complete collection interval
+/// that have been annotated with window percentage deltas by the governor.
+pub fn query_instance_records_for_burn_rate(conn: &Connection) -> Result<Vec<DbInstanceRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT sess, model, total_usd, input_n, output_n, r_cache_n, w_cache_n, w_cache_1h_n,
+                p5h, p7d, p7ds
+         FROM i
+         WHERE p5h IS NOT NULL OR p7d IS NOT NULL OR p7ds IS NOT NULL
+         ORDER BY t1 DESC
+         LIMIT 100",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let p5h: Option<f64> = row.get(8)?;
+        let p7d: Option<f64> = row.get(9)?;
+        let p7ds: Option<f64> = row.get(10)?;
+
+        // Sum all token types for total
+        let input_n: i64 = row.get(3)?;
+        let output_n: i64 = row.get(4)?;
+        let r_cache_n: i64 = row.get(5)?;
+        let w_cache_n: i64 = row.get(6)?;
+        let w_cache_1h_n: i64 = row.get(7)?;
+        let total_tokens = (input_n + output_n + r_cache_n + w_cache_n + w_cache_1h_n) as u64;
+
+        // Approximate current/previous utilization from deltas
+        // (actual values come from governor's FleetAggregate)
+        let current_p5h = p5h.unwrap_or(0.0);
+        let prev_p5h = 0.0;
+        let current_p7d = p7d.unwrap_or(0.0);
+        let prev_p7d = 0.0;
+        let current_p7ds = p7ds.unwrap_or(0.0);
+        let prev_p7ds = 0.0;
+
+        Ok(DbInstanceRecord {
+            session: row.get(0)?,
+            model: row.get(1)?,
+            total_usd: row.get(2)?,
+            total_tokens,
+            p5h,
+            p7d,
+            p7ds,
+            current_p5h,
+            prev_p5h,
+            current_p7d,
+            prev_p7d,
+            current_p7ds,
+            prev_p7ds,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query the last N instance records from the most recent interval.
+///
+/// Returns records ordered by t1 (interval end time) descending.
+pub fn query_last_instances(conn: &Connection, n: usize) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT r, ts, t0, t1, sess, sid, model, pk, hr_et, dow,
+                input_n, input_usd, output_n, output_usd,
+                r_cache_n, r_cache_usd, w_cache_n, w_cache_usd,
+                w_cache_1h_n, w_cache_1h_usd, total_usd, p5h, p7d, p7ds
+         FROM i ORDER BY t1 DESC LIMIT ?1",
+    )?;
+
+    let rows = stmt.query_map(params![n as i64], |row| {
+        Ok(serde_json::json!({
+            "r": row.get::<_, String>(0)?,
+            "ts": row.get::<_, String>(1)?,
+            "t0": row.get::<_, String>(2)?,
+            "t1": row.get::<_, String>(3)?,
+            "sess": row.get::<_, String>(4)?,
+            "sid": row.get::<_, String>(5)?,
+            "model": row.get::<_, String>(6)?,
+            "pk": row.get::<_, i64>(7)?,
+            "hr_et": row.get::<_, i64>(8)?,
+            "dow": row.get::<_, i64>(9)?,
+            "input-n": row.get::<_, i64>(10)?,
+            "input-usd": row.get::<_, f64>(11)?,
+            "output-n": row.get::<_, i64>(12)?,
+            "output-usd": row.get::<_, f64>(13)?,
+            "r-cache-n": row.get::<_, i64>(14)?,
+            "r-cache-usd": row.get::<_, f64>(15)?,
+            "w-cache-n": row.get::<_, i64>(16)?,
+            "w-cache-usd": row.get::<_, f64>(17)?,
+            "w-cache-1h-n": row.get::<_, i64>(18)?,
+            "w-cache-1h-usd": row.get::<_, f64>(19)?,
+            "total-usd": row.get::<_, f64>(20)?,
+            "p5h": row.get::<_, Option<f64>>(21)?,
+            "p7d": row.get::<_, Option<f64>>(22)?,
+            "p7ds": row.get::<_, Option<f64>>(23)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
