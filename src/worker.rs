@@ -62,6 +62,20 @@ impl Default for WorkerConfig {
     }
 }
 
+impl WorkerConfig {
+    /// Build a WorkerConfig from an AgentConfig.
+    ///
+    /// Expands `~` in heartbeat_dir, extracts session_prefix from session_pattern.
+    pub fn from_agent_config(agent: &crate::config::AgentConfig) -> Self {
+        Self {
+            launch_cmd: agent.launch_cmd.clone(),
+            heartbeat_dir: agent.heartbeat_dir_expanded(),
+            graceful_timeout_secs: 30,
+            session_prefix: agent.session_prefix().to_string(),
+        }
+    }
+}
+
 /// Result of a worker count operation
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerCount {

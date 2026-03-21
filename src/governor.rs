@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::log_capacity_forecast;
 use crate::collector;
-use crate::config::{AlertConfig, SprintConfig};
+use crate::config::{AgentConfig, AlertConfig, SprintConfig};
 use crate::db;
 use crate::poller::Poller;
 use crate::state;
@@ -686,6 +686,7 @@ pub fn run_governor_cycle(
     max_down_per_cycle: u32,
     target_ceiling: f64,
     alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -782,17 +783,60 @@ pub fn run_governor_cycle(
     }
 
     // 4. Count current workers (from heartbeat files + tmux)
-    let worker_config = WorkerConfig::default();
-    let worker_count = worker::count_workers(&worker_config);
-    let current_total = worker_count.tmux_count as u32;
+    // Seed state.workers from agents config if empty
+    if state.workers.is_empty() && !agents.is_empty() {
+        for (name, agent) in agents {
+            state.workers.insert(
+                name.clone(),
+                state::WorkerState {
+                    current: 0,
+                    target: 0,
+                    min: agent.min_workers,
+                    max: agent.max_workers,
+                },
+            );
+        }
+    }
+
+    // Build per-agent WorkerConfigs and count workers across all agents
+    let agent_worker_configs: Vec<(String, WorkerConfig)> = agents
+        .iter()
+        .map(|(name, agent)| (name.clone(), WorkerConfig::from_agent_config(agent)))
+        .collect();
+
+    // Fall back to default if no agents configured
+    let worker_configs: Vec<(String, WorkerConfig)> = if agent_worker_configs.is_empty() {
+        vec![("default".to_string(), WorkerConfig::default())]
+    } else {
+        agent_worker_configs
+    };
+
+    // Count workers across all configured agents
+    let mut total_heartbeat_count = 0usize;
+    let mut total_tmux_count = 0usize;
+    let mut all_sessions: Vec<String> = Vec::new();
+    let mut consistent = true;
+
+    for (_name, wc) in &worker_configs {
+        let wc_count = worker::count_workers(wc);
+        total_heartbeat_count += wc_count.heartbeat_count;
+        total_tmux_count += wc_count.tmux_count;
+        all_sessions.extend(wc_count.sessions);
+        if !wc_count.consistent {
+            consistent = false;
+        }
+    }
+
+    let current_total = total_tmux_count as u32;
     let _prev_total = state.workers.values().map(|w| w.current).sum::<u32>();
 
     log::info!(
-        "[governor] workers: {} active ({} heartbeats, {} tmux sessions, consistent={})",
+        "[governor] workers: {} active ({} heartbeats, {} tmux sessions, consistent={}, agents={})",
         current_total,
-        worker_count.heartbeat_count,
-        worker_count.tmux_count,
-        worker_count.consistent,
+        total_heartbeat_count,
+        total_tmux_count,
+        consistent,
+        worker_configs.len(),
     );
 
     // Update worker state with current count
@@ -973,6 +1017,8 @@ pub fn run_governor_cycle(
     );
 
     // 6. Execute scaling (unless dry-run or no change)
+    // Use the first configured agent's WorkerConfig for scaling operations
+    let primary_worker_config = &worker_configs[0].1;
     match &decision {
         ScalingDecision::NoChange => {
             log::info!("[governor] no scaling action this cycle");
@@ -980,7 +1026,7 @@ pub fn run_governor_cycle(
         ScalingDecision::ScaleUp(n) => {
             log::info!("[governor] scaling up by {} workers", n);
             if !dry_run {
-                let launched = worker::scale_up(*n, &worker_config, false);
+                let launched = worker::scale_up(*n, primary_worker_config, false);
                 log::info!("[governor] launched {} workers", launched);
             } else {
                 log::info!("[governor] DRY RUN: would scale up by {}", n);
@@ -989,7 +1035,7 @@ pub fn run_governor_cycle(
         ScalingDecision::ScaleDown(n) => {
             log::info!("[governor] gracefully scaling down by {} workers", n);
             if !dry_run {
-                let result = worker::scale_down_graceful(*n, &worker_config, false);
+                let result = worker::scale_down_graceful(*n, primary_worker_config, false);
                 log::info!(
                     "[governor] scaled down: {} graceful, {} force-killed",
                     result.graceful,
@@ -1002,15 +1048,15 @@ pub fn run_governor_cycle(
         ScalingDecision::EmergencyBrake => {
             log::warn!("[governor] EMERGENCY BRAKE: scaling all to 0");
             if !dry_run {
-                // Kill all workers immediately
-                for session in &worker_count.sessions {
+                // Kill all workers immediately across all agents
+                for session in &all_sessions {
                     let _ = std::process::Command::new("tmux")
                         .args(["kill-session", "-t", session])
                         .output();
                 }
                 log::warn!(
                     "[governor] killed {} worker sessions",
-                    worker_count.sessions.len()
+                    all_sessions.len()
                 );
 
                 // Update state
@@ -1100,6 +1146,7 @@ pub fn run_daemon(
     max_down_per_cycle: u32,
     target_ceiling: f64,
     alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1134,6 +1181,7 @@ pub fn run_daemon(
         max_down_per_cycle,
         target_ceiling,
         alert_config,
+        agents,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -1161,6 +1209,7 @@ pub fn run_daemon(
             max_down_per_cycle,
             target_ceiling,
             alert_config,
+            agents,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures

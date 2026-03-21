@@ -825,6 +825,7 @@ fn run_daemon_command(
         daemon.max_scale_down_per_cycle,
         target_ceiling,
         &config.alerts,
+        &config.agents,
     )
 }
 
