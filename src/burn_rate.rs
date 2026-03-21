@@ -527,61 +527,78 @@ pub fn composite_risk(
 
 /// Compute the optimal worker count using composite risk optimization.
 ///
-/// When composite risk optimization is enabled and the composite cost is
-/// below the cost_threshold, this function allows scaling higher than
-/// the binding window's safe_worker_count by considering the capacity
-/// available in other windows.
+/// When composite risk optimization is enabled, this function allows scaling
+/// higher than the binding window's safe_worker_count by considering the
+/// capacity available in other windows.
+///
+/// The key insight: when the binding window is near reset, its constraint
+/// is temporary. Non-binding windows (e.g., 7-day) may have ample capacity
+/// that can absorb additional workers for the binding window's remaining time.
 ///
 /// Algorithm:
 /// 1. Find binding window's safe_worker_count (baseline)
-/// 2. For each non-binding window with ample capacity (cost > threshold):
-///    - Compute its safe_worker_count based on its own constraints
-///    - Take the maximum across all windows
-/// 3. Return the maximum, but never less than the binding window's constraint
+/// 2. For each non-binding window with cost above threshold:
+///    - Compute how many workers it can support for the binding window's
+///      remaining time (not its own hours_remaining, which would be too
+///      conservative for long windows like 7-day)
+///    - Take the maximum across all such windows
+/// 3. Return the maximum if it exceeds the binding baseline, else None
 ///
-/// Returns `None` if composite risk cannot be computed or is disabled.
+/// Returns `None` if no improvement over binding window is possible.
 pub fn compute_composite_safe_workers(
     forecasts: &[crate::state::WindowForecast],
     binding_idx: usize,
-    binding_weight: f64,
+    _binding_weight: f64,
     cost_threshold: f64,
     current_workers: u32,
 ) -> Option<u32> {
-    if forecasts.is_empty() || binding_idx >= forecasts.len() {
+    if forecasts.is_empty() || binding_idx >= forecasts.len() || current_workers == 0 {
         return None;
     }
 
-    // Compute composite risk
-    let risk = composite_risk(forecasts, binding_idx, binding_weight)?;
+    let binding = &forecasts[binding_idx];
+    let binding_hours = binding.hours_remaining;
 
-    // If composite risk is above threshold, use strict binding-window behavior
-    if risk <= cost_threshold {
+    if binding_hours <= 0.0 {
         return None;
     }
 
-    // Find the maximum safe_worker_count across all windows
-    // This allows scaling higher when non-binding windows have ample capacity
-    let mut max_safe = forecasts.get(binding_idx)
-        .and_then(|f| f.safe_worker_count)
-        .unwrap_or(0);
+    let binding_safe = binding.safe_worker_count.unwrap_or(0);
+    let mut max_safe = binding_safe;
 
     for (i, forecast) in forecasts.iter().enumerate() {
         if i == binding_idx {
             continue;
         }
 
-        // Only consider windows with positive cost (not near exhaustion)
-        let cost = window_cost(forecast.margin_hrs, forecast.hours_remaining)?;
-        if cost <= cost_threshold {
+        // Only consider non-binding windows with cost above threshold
+        if !window_cost(forecast.margin_hrs, forecast.hours_remaining)
+            .map_or(false, |c| c > cost_threshold)
+        {
             continue;
         }
 
-        if let Some(safe) = forecast.safe_worker_count {
-            max_safe = max_safe.max(safe);
-        }
+        // Compute per-worker burn rate for this window from fleet aggregate
+        let pct_per_worker = if forecast.fleet_pct_per_hour > 0.0 {
+            forecast.fleet_pct_per_hour / current_workers as f64
+        } else {
+            continue;
+        };
+
+        // Safe workers = how many workers can run for binding_hours
+        // without exhausting this non-binding window.
+        // Using binding_hours (not the window's own hours_remaining) because
+        // we only need to survive until the binding window resets.
+        let safe = (forecast.remaining_pct / (pct_per_worker * binding_hours)).floor() as u32;
+        max_safe = max_safe.max(safe);
     }
 
-    Some(max_safe)
+    // Only return composite result if it improves over binding
+    if max_safe > binding_safe {
+        Some(max_safe)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,5 +2324,238 @@ mod tests {
 
         // Should not panic
         log_capacity_forecast(&forecast);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-Window Composite Risk Optimization tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a WindowForecast with common fields defaulted.
+    fn wf(remaining_pct: f64, hours_remaining: f64, fleet_pct_hr: f64, margin_hrs: f64, safe: Option<u32>) -> crate::state::WindowForecast {
+        crate::state::WindowForecast {
+            target_ceiling: 90.0,
+            current_utilization: 90.0 - remaining_pct,
+            remaining_pct,
+            hours_remaining,
+            fleet_pct_per_hour: fleet_pct_hr,
+            predicted_exhaustion_hours: 0.0,
+            cutoff_risk: false,
+            margin_hrs,
+            binding: false,
+            safe_worker_count: safe,
+        }
+    }
+
+    #[test]
+    fn window_cost_positive_margin() {
+        // Safe window: 5 hrs margin, 10 hrs remaining → cost = 0.5
+        assert_eq!(window_cost(5.0, 10.0), Some(0.5));
+    }
+
+    #[test]
+    fn window_cost_zero_margin() {
+        // At limit: 0 margin → cost = 0
+        assert_eq!(window_cost(0.0, 10.0), Some(0.0));
+    }
+
+    #[test]
+    fn window_cost_negative_margin() {
+        // Will exhaust: -2 hrs margin, 10 hrs remaining → cost = -0.2
+        assert_eq!(window_cost(-2.0, 10.0), Some(-0.2));
+    }
+
+    #[test]
+    fn window_cost_zero_hours_remaining() {
+        // Cannot compute: 0 hours remaining
+        assert_eq!(window_cost(5.0, 0.0), None);
+    }
+
+    #[test]
+    fn window_cost_negative_hours_remaining() {
+        // Cannot compute: negative hours remaining
+        assert_eq!(window_cost(5.0, -1.0), None);
+    }
+
+    #[test]
+    fn composite_risk_basic() {
+        // Three windows: binding (idx 0) has negative cost, others positive
+        let forecasts = vec![
+            wf(5.0, 10.0, 1.0, -2.0, Some(3)),  // cost = -0.2
+            wf(60.0, 150.0, 1.0, 130.0, Some(0)), // cost = 0.867
+            wf(50.0, 150.0, 1.0, 120.0, Some(0)), // cost = 0.8
+        ];
+        // binding_weight=2: (-0.2*2 + 0.867 + 0.8) / (2+1+1) = (−0.4+1.667)/4 = 0.317
+        let risk = composite_risk(&forecasts, 0, 2.0).unwrap();
+        assert!(risk > 0.3 && risk < 0.35);
+    }
+
+    #[test]
+    fn composite_risk_empty_forecasts() {
+        assert_eq!(composite_risk(&[], 0, 2.0), None);
+    }
+
+    #[test]
+    fn composite_risk_invalid_binding_idx() {
+        let forecasts = vec![wf(5.0, 10.0, 1.0, 2.0, None)];
+        assert_eq!(composite_risk(&forecasts, 5, 2.0), None);
+    }
+
+    #[test]
+    fn composite_risk_zero_hours_in_one_window() {
+        // If one window has 0 hours_remaining, window_cost returns None,
+        // which causes composite_risk to return None (uses ? operator)
+        let forecasts = vec![
+            wf(5.0, 10.0, 1.0, 2.0, None),
+            wf(60.0, 0.0, 1.0, 130.0, None), // zero hours → None cost
+            wf(50.0, 150.0, 1.0, 120.0, None),
+        ];
+        assert_eq!(composite_risk(&forecasts, 0, 2.0), None);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_near_reset_allows_more() {
+        // Scenario: 5h window near reset with 7d window ample
+        //
+        // 5h (binding, idx 0): util=85%, remaining=5%, hours_remaining=0.5
+        //   fleet_pct_hr=3.0 (3 workers * 1%/hr each)
+        //   safe_worker_count = floor(5 / (1.0 * 0.5)) = 10
+        //   margin = 0.5 - (5/3) = -1.167
+        //
+        // 7d (idx 1): util=30%, remaining=60%, hours_remaining=150
+        //   fleet_pct_hr=3.0
+        //   safe_worker_count = floor(60 / (1.0 * 150)) = 0 (too conservative)
+        //   margin = 150 - (60/3) = 130
+        //
+        // 7d_sonnet (idx 2): similar to 7d
+        //   remaining=55%, hours_remaining=150, fleet_pct_hr=3.0
+        //   margin = 150 - (55/3) = 131.67
+        //
+        // With composite: 7d safe over binding_hours(0.5):
+        //   safe = floor(60 / (1.0 * 0.5)) = 120 >> 10
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)),   // 5h binding
+            wf(60.0, 150.0, 3.0, 130.0, Some(0)),   // 7d
+            wf(55.0, 150.0, 3.0, 131.67, Some(0)),  // 7d_sonnet
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(result.is_some(), "composite should activate for near-reset scenario");
+        let composite_safe = result.unwrap();
+        assert!(
+            composite_safe > 10,
+            "composite safe ({}) should exceed binding safe (10)",
+            composite_safe
+        );
+        // 7d: floor(60 / (1.0 * 0.5)) = 120
+        // 7d_sonnet: floor(55 / (1.0 * 0.5)) = 110
+        // max = 120
+        assert_eq!(composite_safe, 120);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_all_windows_stressed_returns_none() {
+        // All windows near exhaustion → no improvement possible
+        let forecasts = vec![
+            wf(2.0, 1.0, 3.0, -1.0, Some(2)),   // binding, cost = -1.0
+            wf(3.0, 5.0, 3.0, -4.0, Some(0)),   // cost = -0.8 > 0? No: -0.8 < 0
+            wf(1.0, 2.0, 3.0, -0.5, Some(0)),   // cost = -0.25 > 0? No
+        ];
+
+        // With cost_threshold=0.0, no non-binding window has cost > 0
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_non_binding_below_threshold_skipped() {
+        // 7d has slightly negative cost → skipped with threshold 0.0
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)), // 5h binding
+            wf(60.0, 150.0, 3.0, -10.0, Some(0)), // 7d: cost = -10/150 ≈ -0.067 < 0
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(result.is_none(), "7d below threshold should not activate composite");
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_negative_threshold_allows_stressed() {
+        // Same as above but with negative threshold → 7d cost > -0.5
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)),  // 5h binding
+            wf(60.0, 150.0, 3.0, -10.0, Some(0)),  // 7d: cost ≈ -0.067 > -0.5
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, -0.5, 3);
+        assert!(result.is_some(), "negative threshold should allow slightly stressed windows");
+        assert!(result.unwrap() > 10);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_no_improvement_returns_none() {
+        // Non-binding windows have ample cost but can't support more workers
+        // (very small remaining_pct relative to burn rate)
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)), // 5h binding, safe=10
+            wf(0.1, 150.0, 3.0, 130.0, Some(0)),  // 7d: safe over 0.5h = floor(0.1/(1.0*0.5)) = 0
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(result.is_none(), "no improvement over binding → None");
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_empty_forecasts() {
+        assert_eq!(compute_composite_safe_workers(&[], 0, 2.0, 0.0, 3), None);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_invalid_binding_idx() {
+        let forecasts = vec![wf(5.0, 10.0, 1.0, 2.0, None)];
+        assert_eq!(compute_composite_safe_workers(&forecasts, 5, 2.0, 0.0, 3), None);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_zero_current_workers() {
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)),
+            wf(60.0, 150.0, 3.0, 130.0, Some(0)),
+        ];
+        assert_eq!(compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 0), None);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_zero_binding_hours() {
+        let forecasts = vec![
+            wf(5.0, 0.0, 3.0, -1.167, Some(10)), // binding hours = 0
+            wf(60.0, 150.0, 3.0, 130.0, Some(0)),
+        ];
+        assert_eq!(compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3), None);
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_non_binding_zero_fleet_pct() {
+        // Non-binding window has no burn data → can't compute per-worker rate
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)),
+            wf(60.0, 150.0, 0.0, 130.0, Some(0)), // fleet_pct_hr = 0
+        ];
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        // No non-binding window contributes → no improvement
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compute_composite_safe_workers_binding_safe_is_none_uses_zero() {
+        // Binding window has no safe_worker_count → baseline is 0
+        // Non-binding has positive cost → composite can still improve
+        let forecasts = vec![
+            wf(5.0, 0.5, 3.0, -1.167, None),   // 5h binding, no safe count
+            wf(60.0, 150.0, 3.0, 130.0, None),  // 7d, safe over 0.5h = 120
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 120);
     }
 }

@@ -543,8 +543,9 @@ pub enum ScalingDecision {
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
-/// When composite risk optimization is enabled and the composite cost is below
-/// the threshold, allows scaling higher by considering capacity in other windows.
+/// When composite risk optimization is enabled and non-binding windows have
+/// cost above the threshold, allows scaling higher by considering their capacity
+/// over the binding window's remaining time.
 ///
 /// Falls back to the configured max if no valid forecast is available.
 ///
@@ -742,12 +743,13 @@ pub fn compute_pre_scale_target(
     reset_time: DateTime<Utc>,
     target: u32,
     current_total: u32,
+    window: &str,
 ) -> Option<u32> {
     if pre_scale_minutes == 0 {
         return None;
     }
 
-    let transition = schedule::next_transition_from(now, reset_time, promotions)?;
+    let transition = schedule::next_transition_from(now, reset_time, promotions, window)?;
 
     log::debug!(
         "[governor] next transition in {}min: {:.1}x → {:.1}x at {}",
@@ -986,15 +988,25 @@ pub fn run_governor_cycle(
     current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
     current_utilization.insert("seven_day_sonnet".to_string(), state.usage.sonnet_pct);
 
-    // Build hours remaining map from poller data
+    // Build effective hours remaining map from poller data
+    // Uses effective_hours_remaining_from so only windows in applies_to get the promo boost.
     let mut hours_remaining = HashMap::new();
     if let Ok(reset_time) = state.usage.five_hour_resets_at.parse::<DateTime<Utc>>() {
-        hours_remaining.insert("five_hour".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+        hours_remaining.insert(
+            "five_hour".to_string(),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "five_hour"),
+        );
     }
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
-        hours_remaining.insert("seven_day_sonnet".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+        hours_remaining.insert(
+            "seven_day_sonnet".to_string(),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day_sonnet"),
+        );
         // Approximate seven_day reset time as same as seven_day_sonnet
-        hours_remaining.insert("seven_day".to_string(), (reset_time - now).num_seconds() as f64 / 3600.0);
+        hours_remaining.insert(
+            "seven_day".to_string(),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
+        );
     }
 
     // Compute fleet_pct_per_hour directly from fleet aggregate window deltas
@@ -1120,7 +1132,7 @@ pub fn run_governor_cycle(
         .parse::<DateTime<Utc>>()
         .ok()
         .and_then(|reset_time| {
-            compute_pre_scale_target(now, pre_scale_minutes, promotions, reset_time, target, current_total)
+            compute_pre_scale_target(now, pre_scale_minutes, promotions, reset_time, target, current_total, "seven_day_sonnet")
         });
 
     // Use pre-scale target if set, otherwise use normal target
@@ -1720,7 +1732,7 @@ mod tests {
         let now = et(2026, 3, 16, 7, 35);
         let deadline = now + chrono::Duration::hours(2);
 
-        let t = schedule::next_transition_from(now, deadline, &promos)
+        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet")
             .expect("Should detect off-peak → peak transition");
 
         assert_eq!(t.minutes_until, 25);
@@ -1742,7 +1754,7 @@ mod tests {
         let now = et(2026, 3, 16, 7, 35);
         let reset_time = now + chrono::Duration::days(2); // well past transition
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
         assert!(result.is_some(), "pre-scale should trigger at 07:35 before 08:00 transition");
         assert_eq!(result.unwrap(), 3, "should ramp down one worker (4→3, toward post-target 2)");
@@ -1755,7 +1767,7 @@ mod tests {
         let now = et(2026, 3, 16, 6, 0);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
         assert!(result.is_none(), "should not pre-scale when transition is 120 min away");
     }
@@ -1768,7 +1780,7 @@ mod tests {
         let now = et(2026, 3, 16, 13, 45);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
         assert!(result.is_none(), "should not pre-scale when gaining a bonus");
     }
@@ -1784,12 +1796,12 @@ mod tests {
         // Let's test with current_total=1: post_target=floor(1*0.5)=0, effective=max(0,0)=0
         // Actually: post_target=0 < current_total=1, so effective_target = max(0, 0) = 0
         // Let's use current_total=2, target=2: post_target=1, effective=max(1,1)=1
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2);
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "seven_day_sonnet");
         // post_target = floor(2 * 0.5) = 1, effective = max(1, 2-1) = max(1,1) = 1
         assert_eq!(result, Some(1));
 
         // Now test where current_total already equals post_transition_target: no trigger
-        let result_at_target = compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0);
+        let result_at_target = compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0, "seven_day_sonnet");
         // post_target = 0, current_total = 0: post_target >= current_total → None
         assert!(result_at_target.is_none(), "no pre-scale needed if already at 0");
     }
@@ -1801,7 +1813,7 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2);
 
         // pre_scale_minutes = 0 disables pre-scaling entirely
-        let result = compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4);
+        let result = compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "seven_day_sonnet");
         assert!(result.is_none(), "pre_scale_minutes=0 should disable pre-scaling");
     }
 
@@ -1811,7 +1823,7 @@ mod tests {
         let now = et(2026, 3, 16, 6, 0);
         let deadline = now + chrono::Duration::hours(3);
 
-        let t = schedule::next_transition_from(now, deadline, &promos).unwrap();
+        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet").unwrap();
         assert_eq!(t.minutes_until, 120);
         assert!(t.minutes_until > 30, "outside 30-minute window");
     }
@@ -1822,7 +1834,7 @@ mod tests {
         let now = et(2026, 3, 16, 13, 45);
         let deadline = now + chrono::Duration::hours(1);
 
-        let t = schedule::next_transition_from(now, deadline, &promos).unwrap();
+        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet").unwrap();
         assert!(t.multiplier_after > t.multiplier_before, "gaining bonus");
         assert!(t.minutes_until <= 30, "within window");
         // Conservative: multiplier_after > multiplier_before → no pre-scale

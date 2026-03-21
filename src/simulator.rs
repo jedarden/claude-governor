@@ -363,9 +363,9 @@ impl SimContext {
             .unwrap_or(1.5)
     }
 
-    /// Get the promotion multiplier at a given time using the schedule module
-    fn promo_multiplier_at(&self, timestamp: DateTime<Utc>) -> f64 {
-        schedule::get_multiplier_at(timestamp, &self.promotions)
+    /// Get the promotion multiplier at a given time for a specific window using the schedule module
+    fn promo_multiplier_at(&self, timestamp: DateTime<Utc>, window: &str) -> f64 {
+        schedule::get_multiplier_at(timestamp, &self.promotions, window)
     }
 }
 
@@ -401,14 +401,11 @@ pub fn simulate(
         // Get current worker count
         let workers = config.workers.workers_at(hours_offset);
 
-        // Get promo multiplier at this time
-        let promo_multiplier = ctx.promo_multiplier_at(current_time);
-
-        // Get burn rate
+        // Get base burn rate (same for all windows; promo multiplier is per-window)
         let base_burn_rate = ctx.get_burn_rate(); // pct per worker per hour
 
-        // Apply burn rate per minute (divided by 60, adjusted for promo)
-        let burn_per_minute = base_burn_rate * workers as f64 / 60.0 / promo_multiplier;
+        // Compute display multiplier (binding/first window) for trajectory recording
+        let display_promo_multiplier = ctx.promo_multiplier_at(current_time, WINDOWS[0]);
 
         // Track events for this step
         let mut events = Vec::new();
@@ -427,6 +424,10 @@ pub fn simulate(
 
                 last_reset_check.insert(window.to_string(), current_time);
             }
+
+            // Apply burn rate per minute, adjusted for this window's promo multiplier
+            let promo_multiplier = ctx.promo_multiplier_at(current_time, window);
+            let burn_per_minute = base_burn_rate * workers as f64 / 60.0 / promo_multiplier;
 
             // Apply burn rate (clamped to 0-100)
             let current = current_utilization.get(*window).copied().unwrap_or(0.0);
@@ -457,7 +458,7 @@ pub fn simulate(
                 timestamp: current_time,
                 hours_offset,
                 windows: current_utilization.clone(),
-                promo_multiplier,
+                promo_multiplier: display_promo_multiplier,
                 workers,
                 events,
             });
