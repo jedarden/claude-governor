@@ -44,6 +44,8 @@ pub struct UsageState {
     pub five_hour_pct: f64,
     pub sonnet_resets_at: String,
     pub five_hour_resets_at: String,
+    /// True when data was sourced from stale cache (token refresh failed)
+    pub stale: bool,
 }
 
 impl Default for UsageState {
@@ -54,6 +56,7 @@ impl Default for UsageState {
             five_hour_pct: 0.0,
             sonnet_resets_at: String::new(),
             five_hour_resets_at: String::new(),
+            stale: false,
         }
     }
 }
@@ -583,6 +586,7 @@ mod tests {
                 five_hour_pct: 14.0,
                 sonnet_resets_at: "2026-03-20T03:59:59Z".to_string(),
                 five_hour_resets_at: "2026-03-18T15:59:59Z".to_string(),
+                stale: false,
             },
             last_fleet_aggregate: FleetAggregate {
                 t0: "2026-03-18T14:25:00Z".parse().unwrap(),

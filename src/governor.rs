@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::log_capacity_forecast;
 use crate::config::{AlertConfig, SprintConfig};
+use crate::poller::Poller;
 use crate::state;
 use crate::worker::{self, WorkerConfig};
 
@@ -674,6 +675,7 @@ pub fn apply_scaling(
 ///
 /// This is the core loop body executed every `loop_interval` seconds.
 pub fn run_governor_cycle(
+    poller: &mut Poller,
     state_path: &Path,
     dry_run: bool,
     loop_interval: u64,
@@ -688,6 +690,34 @@ pub fn run_governor_cycle(
 
     // 1. Load current state
     let mut state = state::load_state(state_path)?;
+
+    // 1a. Poll Anthropic API for live usage data
+    match poller.poll() {
+        Ok(usage_data) => {
+            log::info!(
+                "[governor] polled usage: sonnet={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
+                usage_data.seven_day_sonnet_utilization,
+                usage_data.seven_day_utilization,
+                usage_data.five_hour_utilization,
+                if usage_data.stale { " (stale)" } else { "" },
+            );
+            state.usage = state::UsageState {
+                sonnet_pct: usage_data.seven_day_sonnet_utilization,
+                all_models_pct: usage_data.seven_day_utilization,
+                five_hour_pct: usage_data.five_hour_utilization,
+                sonnet_resets_at: usage_data.seven_day_sonnet_resets_at,
+                five_hour_resets_at: usage_data.five_hour_resets_at,
+                stale: usage_data.stale,
+            };
+            state.token_refresh_failing = usage_data.stale;
+        }
+        Err(e) => {
+            log::warn!(
+                "[governor] poll failed, keeping previous usage data: {}",
+                e
+            );
+        }
+    }
 
     // 2. Count current workers (from heartbeat files + tmux)
     let worker_config = WorkerConfig::default();
@@ -875,8 +905,17 @@ pub fn run_daemon(
         dry_run, loop_interval, hysteresis_band, target_ceiling
     );
 
+    // Create poller for live usage data (persists across cycles for stale-data fallback)
+    let mut poller = match Poller::new() {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to create poller: {}", e));
+        }
+    };
+
     // Initial cycle
     if let Err(e) = run_governor_cycle(
+        &mut poller,
         state_path,
         dry_run,
         loop_interval,
@@ -903,6 +942,7 @@ pub fn run_daemon(
         }
 
         if let Err(e) = run_governor_cycle(
+            &mut poller,
             state_path,
             dry_run,
             loop_interval,
