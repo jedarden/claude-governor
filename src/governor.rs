@@ -1641,118 +1641,141 @@ mod tests {
 
     // --- Pre-scale tests ---
 
-    #[test]
-    fn pre_scale_triggers_before_losing_multiplier_bonus() {
-        use crate::schedule::Promotion;
-        use chrono::{Duration, TimeZone};
-
-        // Test promotion: March 15-25, 2026 with 2x off-peak
-        let promo = Promotion {
-            name: "Test Promo".to_string(),
+    // Helper: create a 2x off-peak promotion active in March 2026
+    fn march_2026_promo() -> Promotion {
+        Promotion {
+            name: "March 2026 Off-Peak Promotion".to_string(),
             start_date: "2026-03-15".to_string(),
             end_date: "2026-03-25".to_string(),
             peak_start_hour_et: 8,
             peak_end_hour_et: 14,
             offpeak_multiplier: 2.0,
             applies_to: vec!["seven_day_sonnet".to_string()],
-        };
-        let promotions = vec![promo];
+        }
+    }
 
-        // 07:35 ET on Monday March 16, 2026 (during promo, 25 min before peak)
-        let now = chrono_tz::America::New_York
-            .with_ymd_and_hms(2026, 3, 16, 7, 35, 0)
+    // Helper: create UTC from Eastern components (March 2026 = EDT, UTC-4)
+    fn et(year: i32, month: u32, day: u32, hour: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono_tz::America::New_York
+            .with_ymd_and_hms(year, month, day, hour, min, 0)
             .unwrap()
-            .with_timezone(&chrono::Utc);
+            .with_timezone(&chrono::Utc)
+    }
 
-        // Deadline: 2 hours from now (well past the 08:00 transition)
-        let deadline = now + Duration::hours(2);
+    #[test]
+    fn pre_scale_triggers_before_losing_multiplier_bonus() {
+        // Transition-detection baseline: at 07:35 ET, confirm the next transition
+        // is off-peak → peak (25 min away, losing the 2x bonus).
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 7, 35);
+        let deadline = now + chrono::Duration::hours(2);
 
-        // Check for transition
-        let transition = schedule::next_transition_from(now, deadline, &promotions);
-        assert!(transition.is_some(), "Should detect off-peak -> peak transition");
+        let t = schedule::next_transition_from(now, deadline, &promos)
+            .expect("Should detect off-peak → peak transition");
 
-        let t = transition.unwrap();
-        assert_eq!(t.minutes_until, 25, "Transition should be 25 minutes away");
-        assert!((t.multiplier_before - 2.0).abs() < 1e-9, "Before: 2x off-peak");
-        assert!((t.multiplier_after - 1.0).abs() < 1e-9, "After: 1x peak");
+        assert_eq!(t.minutes_until, 25);
+        assert!((t.multiplier_before - 2.0).abs() < 1e-9);
+        assert!((t.multiplier_after - 1.0).abs() < 1e-9);
+        assert!(t.multiplier_after < t.multiplier_before);
+        assert!(t.minutes_until <= 30, "within 30-minute pre-scale window");
+    }
 
-        // Verify this is a "losing bonus" transition (after < before)
-        assert!(t.multiplier_after < t.multiplier_before, "Should be losing bonus");
+    #[test]
+    fn compute_pre_scale_target_triggers_at_07_35() {
+        // Core bead test: mock clock at 07:35 ET during promo.
+        // With 4 workers, target=4, pre_scale_minutes=30 (window starts at 07:30):
+        //   - transition at 08:00 is 25 min away → within window
+        //   - ratio = 1.0/2.0 = 0.5 → post_transition_target = floor(4*0.5) = 2
+        //   - effective_target = max(2, 4-1) = 3
+        // Scale-down to 3 should trigger.
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 7, 35);
+        let reset_time = now + chrono::Duration::days(2); // well past transition
 
-        // With pre_scale_minutes = 30, this should trigger pre-scale
-        // (transition in 25 min is <= 30 min window)
-        assert!(t.minutes_until <= 30, "Should be within pre-scale window");
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+
+        assert!(result.is_some(), "pre-scale should trigger at 07:35 before 08:00 transition");
+        assert_eq!(result.unwrap(), 3, "should ramp down one worker (4→3, toward post-target 2)");
+    }
+
+    #[test]
+    fn compute_pre_scale_target_no_trigger_outside_window() {
+        // At 06:00 ET, peak is 2 hours away — outside 30-min window.
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 6, 0);
+        let reset_time = now + chrono::Duration::days(2);
+
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+
+        assert!(result.is_none(), "should not pre-scale when transition is 120 min away");
+    }
+
+    #[test]
+    fn compute_pre_scale_target_never_triggers_for_gaining_bonus() {
+        // Conservative-only: at 13:45 ET, peak ends in 15 min (gaining 2x bonus).
+        // Should NOT trigger pre-scale.
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 13, 45);
+        let reset_time = now + chrono::Duration::days(2);
+
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4);
+
+        assert!(result.is_none(), "should not pre-scale when gaining a bonus");
+    }
+
+    #[test]
+    fn compute_pre_scale_target_no_trigger_when_already_at_post_target() {
+        // At 07:35 with only 2 workers running — already at or below post-target (2).
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 7, 35);
+        let reset_time = now + chrono::Duration::days(2);
+
+        // current_total=2, target=2 → post_transition_target=1, but 2 > 1 so this would trigger
+        // Let's test with current_total=1: post_target=floor(1*0.5)=0, effective=max(0,0)=0
+        // Actually: post_target=0 < current_total=1, so effective_target = max(0, 0) = 0
+        // Let's use current_total=2, target=2: post_target=1, effective=max(1,1)=1
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2);
+        // post_target = floor(2 * 0.5) = 1, effective = max(1, 2-1) = max(1,1) = 1
+        assert_eq!(result, Some(1));
+
+        // Now test where current_total already equals post_transition_target: no trigger
+        let result_at_target = compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0);
+        // post_target = 0, current_total = 0: post_target >= current_total → None
+        assert!(result_at_target.is_none(), "no pre-scale needed if already at 0");
+    }
+
+    #[test]
+    fn compute_pre_scale_target_disabled_when_zero() {
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 7, 35);
+        let reset_time = now + chrono::Duration::days(2);
+
+        // pre_scale_minutes = 0 disables pre-scaling entirely
+        let result = compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4);
+        assert!(result.is_none(), "pre_scale_minutes=0 should disable pre-scaling");
     }
 
     #[test]
     fn pre_scale_does_not_trigger_when_outside_window() {
-        use crate::schedule::Promotion;
-        use chrono::{Duration, TimeZone};
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 6, 0);
+        let deadline = now + chrono::Duration::hours(3);
 
-        let promo = Promotion {
-            name: "Test Promo".to_string(),
-            start_date: "2026-03-15".to_string(),
-            end_date: "2026-03-25".to_string(),
-            peak_start_hour_et: 8,
-            peak_end_hour_et: 14,
-            offpeak_multiplier: 2.0,
-            applies_to: vec!["seven_day_sonnet".to_string()],
-        };
-        let promotions = vec![promo];
-
-        // 06:00 ET on Monday March 16, 2026 (2 hours before peak)
-        let now = chrono_tz::America::New_York
-            .with_ymd_and_hms(2026, 3, 16, 6, 0, 0)
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        let deadline = now + Duration::hours(3);
-
-        let transition = schedule::next_transition_from(now, deadline, &promotions);
-        assert!(transition.is_some());
-
-        let t = transition.unwrap();
-        assert_eq!(t.minutes_until, 120, "Transition should be 2 hours away");
-
-        // With pre_scale_minutes = 30, this should NOT trigger pre-scale
-        // (transition in 120 min is > 30 min window)
-        assert!(t.minutes_until > 30, "Should be outside pre-scale window");
+        let t = schedule::next_transition_from(now, deadline, &promos).unwrap();
+        assert_eq!(t.minutes_until, 120);
+        assert!(t.minutes_until > 30, "outside 30-minute window");
     }
 
     #[test]
     fn pre_scale_never_triggers_for_gaining_bonus() {
-        use crate::schedule::Promotion;
-        use chrono::{Duration, TimeZone};
+        let promos = vec![march_2026_promo()];
+        let now = et(2026, 3, 16, 13, 45);
+        let deadline = now + chrono::Duration::hours(1);
 
-        let promo = Promotion {
-            name: "Test Promo".to_string(),
-            start_date: "2026-03-15".to_string(),
-            end_date: "2026-03-25".to_string(),
-            peak_start_hour_et: 8,
-            peak_end_hour_et: 14,
-            offpeak_multiplier: 2.0,
-            applies_to: vec!["seven_day_sonnet".to_string()],
-        };
-        let promotions = vec![promo];
-
-        // 13:45 ET on Monday March 16, 2026 (15 min before peak ends = gaining 2x bonus)
-        let now = chrono_tz::America::New_York
-            .with_ymd_and_hms(2026, 3, 16, 13, 45, 0)
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        let deadline = now + Duration::hours(1);
-
-        let transition = schedule::next_transition_from(now, deadline, &promotions);
-        assert!(transition.is_some());
-
-        let t = transition.unwrap();
-        assert!(t.multiplier_after > t.multiplier_before, "Should be gaining bonus");
-
-        // Conservative-only: even within the window, we should NOT pre-scale up
-        // The check is: if after < before (losing bonus) -> pre-scale down
-        // If after > before (gaining bonus) -> do nothing
-        assert!(t.minutes_until <= 30, "Should be within pre-scale window");
-        assert!(t.multiplier_after > t.multiplier_before, "Should NOT trigger pre-scale (gaining bonus)");
+        let t = schedule::next_transition_from(now, deadline, &promos).unwrap();
+        assert!(t.multiplier_after > t.multiplier_before, "gaining bonus");
+        assert!(t.minutes_until <= 30, "within window");
+        // Conservative: multiplier_after > multiplier_before → no pre-scale
     }
 }
