@@ -14,6 +14,8 @@
 
 use crate::capacity_summary::{compute_pressure_level, PressureLevel, StatusExitCode};
 use crate::state::{GovernorState, WindowForecast};
+#[cfg(test)]
+use crate::state::CapacityForecast;
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
