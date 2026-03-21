@@ -63,6 +63,58 @@ pricing:
       cache_write_1h_per_mtok: 10.0
       cache_read_per_mtok: 0.50
 
+    # Short model names (as they appear in Claude Code JSONL files)
+    claude-sonnet-4-6:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    claude-opus-4-6:
+      input_per_mtok: 5.0
+      output_per_mtok: 25.0
+      cache_write_5m_per_mtok: 6.25
+      cache_write_1h_per_mtok: 10.0
+      cache_read_per_mtok: 0.50
+
+    claude-haiku-4-5-20251001:
+      input_per_mtok: 1.0
+      output_per_mtok: 5.0
+      cache_write_5m_per_mtok: 1.25
+      cache_write_1h_per_mtok: 2.0
+      cache_read_per_mtok: 0.10
+
+    # GLM model aliases (internal names used by Claude Code)
+    # glm-5 and glm-5-turbo are Sonnet-class
+    glm-5:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    glm-5-turbo:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    glm-4.7:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
+    glm-4:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
 # Agent configuration
 # Each agent is a worker pool that can be scaled by the governor.
 agents:

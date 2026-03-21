@@ -115,12 +115,17 @@ impl PricingEngine {
             return pricing.clone();
         }
 
+        // Skip warning for synthetic/non-model entries
+        if model == "unknown" || model == "<synthetic>" || model.is_empty() {
+            return Self::default_sonnet_pricing();
+        }
+
         // Fallback logic for unknown models
         let fallback = self.find_fallback_model(model);
 
         if fallback != model {
             log::warn!(
-                "Unknown model '{}', falling back to '{}' for pricing",
+                "Unknown model '{}', falling back to '{}' for pricing — add it to governor.yaml",
                 model,
                 fallback
             );
