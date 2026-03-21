@@ -561,6 +561,7 @@ mod tests {
             alerts: Vec::new(),
             safe_mode: Default::default(),
             alert_cooldown: Default::default(),
+            token_refresh_failing: false,
         }
     }
 

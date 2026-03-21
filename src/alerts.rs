@@ -29,6 +29,16 @@ pub enum AlertSeverity {
     Critical,
 }
 
+impl std::fmt::Display for AlertSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlertSeverity::Info => write!(f, "INFO"),
+            AlertSeverity::Warning => write!(f, "WARNING"),
+            AlertSeverity::Critical => write!(f, "CRITICAL"),
+        }
+    }
+}
+
 /// Types of alerts the governor can emit
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -464,6 +474,17 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
         });
     }
 
+    // Check TokenRefreshFailing: poller detected auth issues
+    if state.token_refresh_failing {
+        let msg = "OAuth token refresh failing — Claude Code sessions may be unable to make API calls. Run: claude login".to_string();
+        alerts.push(AlertCondition {
+            alert_type: AlertType::TokenRefreshFailing,
+            message: msg,
+            severity: AlertSeverity::Critical,
+            detected_at: now,
+        });
+    }
+
     alerts
 }
 
@@ -570,11 +591,15 @@ fn check_underutilization(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::config::AlertConfig;
     use crate::state::{
-        BurnRateState, CapacityForecast, FleetAggregate, GovernorState, ScheduleState,
+        AlertCooldown, BurnRateState, CapacityForecast, FleetAggregate, GovernorState, ScheduleState,
         SafeModeState, UsageState, WorkerState, WindowForecast,
     };
     use chrono::{Duration, Utc};
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use tempfile::TempDir;
 
     fn base_now() -> DateTime<Utc> {
         "2026-03-20T10:00:00Z".parse().unwrap()
@@ -621,6 +646,7 @@ mod tests {
             alerts: Vec::new(),
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
+            token_refresh_failing: false,
         }
     }
 
@@ -957,6 +983,30 @@ mod tests {
         let brake = alerts.iter().find(|a| a.alert_type == AlertType::EmergencyBrakeActivated);
         assert!(brake.is_some(), "Should have EmergencyBrakeActivated alert");
         assert_eq!(brake.unwrap().severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn token_refresh_failing_triggers() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.token_refresh_failing = true;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let trf = alerts.iter().find(|a| a.alert_type == AlertType::TokenRefreshFailing);
+        assert!(trf.is_some(), "Should have TokenRefreshFailing alert");
+        assert_eq!(trf.unwrap().severity, AlertSeverity::Critical);
+        assert!(trf.unwrap().message.contains("claude login"));
+    }
+
+    #[test]
+    fn token_refresh_failing_does_not_trigger_when_false() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.token_refresh_failing = false;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let trf = alerts.iter().find(|a| a.alert_type == AlertType::TokenRefreshFailing);
+        assert!(trf.is_none(), "Should NOT have TokenRefreshFailing when flag is false");
     }
 
     // --- Update cooldown test ---
@@ -1346,7 +1396,7 @@ mod tests {
         // Verify file was created and contains expected content
         assert!(log_path.exists());
         let contents = std::fs::read_to_string(&log_path).unwrap();
-        assert!(contents.contains("CutoffImminent"));
+        assert!(contents.contains("cutoff_imminent"));
         assert!(contents.contains("Test alert message"));
         assert!(contents.contains("Critical"));
     }
@@ -1390,8 +1440,9 @@ mod tests {
         };
         let mut state = make_state_with_forecast(forecast);
 
-        // Set cooldown to have just fired
+        // Set cooldown for both expected alert types to have just fired
         state.alert_cooldown.record_fired("cutoff_imminent", base_now());
+        state.alert_cooldown.record_fired("session_cutoff_risk", base_now());
 
         let config = AlertConfig {
             enabled: true,
@@ -1401,7 +1452,7 @@ mod tests {
         };
 
         let fired = process_alerts(&mut state, &config, base_now());
-        // CutoffImminent should be skipped due to cooldown
+        // Both CutoffImminent and SessionCutoffRisk should be skipped due to cooldown
         assert_eq!(fired, 0, "Should have fired zero alerts due to cooldown");
     }
 

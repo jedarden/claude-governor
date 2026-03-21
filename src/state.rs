@@ -365,6 +365,8 @@ pub struct GovernorState {
     pub safe_mode: SafeModeState,
     /// Per-type alert cooldown timestamps for deduplication
     pub alert_cooldown: AlertCooldown,
+    /// Whether OAuth token refresh is failing (set by poller)
+    pub token_refresh_failing: bool,
 }
 
 impl Default for GovernorState {
@@ -380,6 +382,7 @@ impl Default for GovernorState {
             alerts: Vec::new(),
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
+            token_refresh_failing: false,
         }
     }
 }
@@ -678,6 +681,7 @@ mod tests {
                     m
                 },
             },
+            token_refresh_failing: false,
         }
     }
 

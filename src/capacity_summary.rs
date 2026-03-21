@@ -260,6 +260,7 @@ mod tests {
             safe_mode: Default::default(),
             alert_cooldown: Default::default(),
             updated_at: chrono::Utc::now(),
+            token_refresh_failing: false,
         }
     }
 

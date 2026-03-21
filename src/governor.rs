@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, SprintTrigger, DEFAULT_COOLDOWN_MINUTES};
+use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger, DEFAULT_COOLDOWN_MINUTES};
 use crate::burn_rate::log_capacity_forecast;
-use crate::config::SprintConfig;
+use crate::config::{AlertConfig, SprintConfig};
 use crate::state;
 use crate::worker::{self, WorkerConfig};
 
@@ -681,6 +681,7 @@ pub fn run_governor_cycle(
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
     target_ceiling: f64,
+    alert_config: &AlertConfig,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -809,16 +810,20 @@ pub fn run_governor_cycle(
         ScalingDecision::NoChange => {}
     }
 
-    // 8. Check alerts
+    // 8. Check alerts and fire via configured command
     let alert_conditions = check_alert_conditions(&state, now);
     for alert in &alert_conditions {
         if should_fire(
             alert.alert_type,
             &state.alert_cooldown,
             now,
-            DEFAULT_COOLDOWN_MINUTES,
+            alert_config.cooldown_minutes,
         ) {
-            log::warn!("[governor] ALERT [{}]: {}", alert.alert_type, alert.message);
+            // Fire the alert: execute configured command (e.g. br create --type human)
+            // and log to governor.log
+            if let Err(e) = fire_alert(alert, alert_config) {
+                log::warn!("[governor] alert fire failed: {}", e);
+            }
             update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
             state.alerts.push(serde_json::json!({
                 "type": alert.alert_type.to_string(),
@@ -854,6 +859,7 @@ pub fn run_daemon(
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
     target_ceiling: f64,
+    alert_config: &AlertConfig,
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -878,6 +884,7 @@ pub fn run_daemon(
         max_up_per_cycle,
         max_down_per_cycle,
         target_ceiling,
+        alert_config,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -903,6 +910,7 @@ pub fn run_daemon(
             max_up_per_cycle,
             max_down_per_cycle,
             target_ceiling,
+            alert_config,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures
