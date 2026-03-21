@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
+use tempfile;
+
 /// Peak hours: 08:00-14:00 ET (half-open: 08:00 inclusive, 14:00 exclusive)
 const PEAK_START_HOUR_ET: u32 = 8;
 const PEAK_END_HOUR_ET: u32 = 14;
@@ -428,5 +431,79 @@ mod tests {
 
         let transition = find_next_transition(start, end, &promos);
         assert!(transition.is_none());
+    }
+
+    // --- Bead spec boundary: 2:01 PM ---
+
+    #[test]
+    fn weekday_at_2_01pm_is_off_peak() {
+        // Monday March 16, 2026 at 2:01 PM ET -> off-peak
+        let t = et_to_utc(2026, 3, 16, 14, 1);
+        assert!(!is_peak_at(t));
+    }
+
+    // --- Bead spec: 40h reset with 30h off-peak should be > 40 ---
+
+    #[test]
+    fn effective_hours_40h_with_30h_offpeak_exceeds_40() {
+        let promos = vec![test_promo()];
+
+        // Start: Monday March 16, 2026 at 6:00 PM ET (off-peak)
+        // Reset: Wednesday March 18, 2026 at 10:00 AM ET (peak)
+        // Total: 40 hours, with most hours off-peak
+        let start = et_to_utc(2026, 3, 16, 18, 0);
+        let reset = start + Duration::hours(40);
+
+        let effective = effective_hours_remaining_from(start, reset, &promos);
+
+        // With 2x off-peak multiplier, effective hours should exceed raw 40h
+        assert!(
+            effective > 40.0,
+            "expected > 40.0 effective hours, got {:.1}",
+            effective
+        );
+    }
+
+    // --- Load promotions from file ---
+
+    #[test]
+    fn load_promotions_from_nonexistent_file_returns_empty() {
+        let path = Path::new("/tmp/nonexistent-promotions-xyz.json");
+        let promos = load_promotions(path);
+        assert!(promos.is_empty());
+    }
+
+    #[test]
+    fn load_promotions_from_valid_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("promotions.json");
+        let json = r#"[
+            {
+                "name": "Test Promo",
+                "start_date": "2026-03-01",
+                "end_date": "2026-04-01",
+                "offpeak_multiplier": 2.0,
+                "applies_to": ["seven_day"]
+            }
+        ]"#;
+        std::fs::write(&path, json).unwrap();
+
+        let promos = load_promotions(&path);
+        assert_eq!(promos.len(), 1);
+        assert_eq!(promos[0].name, "Test Promo");
+        assert!((promos[0].offpeak_multiplier - 2.0).abs() < 1e-9);
+        // Defaults should be applied
+        assert_eq!(promos[0].peak_start_hour_et, 8);
+        assert_eq!(promos[0].peak_end_hour_et, 14);
+    }
+
+    #[test]
+    fn load_promotions_from_invalid_json_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad-promotions.json");
+        std::fs::write(&path, "not valid json").unwrap();
+
+        let promos = load_promotions(&path);
+        assert!(promos.is_empty());
     }
 }
