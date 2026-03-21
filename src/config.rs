@@ -80,6 +80,24 @@ impl AgentConfig {
     }
 }
 
+/// Daemon mode selection
+#[derive(Debug, Deserialize, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DaemonMode {
+    /// Auto-detect: use systemd if available, otherwise tmux
+    Auto,
+    /// Use systemd user units
+    Systemd,
+    /// Use tmux sessions
+    Tmux,
+}
+
+impl Default for DaemonMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// Daemon configuration
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct DaemonConfig {
@@ -107,6 +125,10 @@ pub struct DaemonConfig {
     /// Target utilization ceiling percentage (default: 90.0)
     #[serde(default = "default_target_ceiling")]
     pub target_ceiling: f64,
+
+    /// Daemon mode: auto, systemd, or tmux (default: auto)
+    #[serde(default)]
+    pub mode: DaemonMode,
 }
 
 fn default_loop_interval_secs() -> u64 { 60 }
@@ -125,6 +147,7 @@ impl Default for DaemonConfig {
             max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
             min_scale_interval_secs: default_min_scale_interval_secs(),
             target_ceiling: default_target_ceiling(),
+            mode: DaemonMode::Auto,
         }
     }
 }

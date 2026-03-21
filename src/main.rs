@@ -1013,18 +1013,104 @@ fn resolve_service_names(service: &str) -> Vec<&'static str> {
     }
 }
 
+// --- Daemon mode resolution ---
+
+/// Resolve the effective daemon mode from config, falling back to auto-detection
+fn resolve_daemon_mode(config: &GovernorConfig) -> &'static str {
+    match &config.daemon.mode {
+        claude_governor::config::DaemonMode::Systemd => "systemd",
+        claude_governor::config::DaemonMode::Tmux => "tmux",
+        claude_governor::config::DaemonMode::Auto => {
+            if systemd_user_available() {
+                "systemd"
+            } else if tmux_available() {
+                "tmux"
+            } else {
+                "none"
+            }
+        }
+    }
+}
+
+// --- tmux session management ---
+
+const GOVERNOR_SESSION: &str = "cgov-governor";
+const COLLECTOR_SESSION: &str = "cgov-collector";
+
+fn tmux_session_exists(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_kill_session(session: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .args(["kill-session", "-t", session])
+        .status()
+        .with_context(|| format!("Failed to kill tmux session {}", session))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("tmux kill-session -t {} failed", session);
+    }
+}
+
+fn tmux_start_session(session: &str, command: &str) -> Result<()> {
+    if tmux_session_exists(session) {
+        println!("  - {} is already running", session);
+        return Ok(());
+    }
+
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s", session, command])
+        .status()
+        .with_context(|| format!("Failed to start tmux session {}", session))?;
+    if status.success() {
+        println!("  ✓ Started {} (tmux session)", session);
+        Ok(())
+    } else {
+        anyhow::bail!("tmux new-session -d -s {} {} failed", session, command);
+    }
+}
+
+fn resolve_tmux_sessions(service: &str) -> Vec<&'static str> {
+    match service {
+        "governor" => vec![GOVERNOR_SESSION],
+        "collector" => vec![COLLECTOR_SESSION],
+        _ => vec![GOVERNOR_SESSION, COLLECTOR_SESSION],
+    }
+}
+
 // --- Lifecycle commands ---
 
 fn run_enable_command(force: bool) -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let config = GovernorConfig::load()?;
+    let mode = resolve_daemon_mode(&config);
 
-    if !systemd_user_available() {
+    if mode == "tmux" {
+        // tmux mode: just start the sessions
+        println!("Detected tmux mode — starting daemon sessions");
+        println!("=============================================\n");
+        tmux_start_session(GOVERNOR_SESSION, "cgov _daemon")?;
+        tmux_start_session(COLLECTOR_SESSION, "cgov _token-collector")?;
+        println!("\nAttach to sessions:");
+        println!("  tmux attach -t {}", GOVERNOR_SESSION);
+        println!("  tmux attach -t {}", COLLECTOR_SESSION);
+        return Ok(());
+    }
+
+    if mode == "none" {
         anyhow::bail!(
-            "systemd user sessions not available.\n\
-             Ensure systemd --user is enabled (loginctl enable-linger $USER)"
+            "No daemon backend available.\n\
+             Ensure systemd --user is enabled (loginctl enable-linger $USER) or tmux is installed."
         );
     }
+
+    // systemd mode
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     let user_dir = systemd_user_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine systemd user directory"))?;
@@ -1070,8 +1156,8 @@ fn run_enable_command(force: bool) -> Result<()> {
     systemctl_user(&["start", COLLECTOR_SERVICE])?;
     actions.push(format!("  ✓ Started {}", COLLECTOR_SERVICE));
 
-    println!("Claude Governor services enabled and started");
-    println!("============================================\n");
+    println!("Claude Governor services enabled and started (systemd)");
+    println!("======================================================\n");
     for action in &actions {
         println!("{}", action);
     }
@@ -1083,6 +1169,28 @@ fn run_enable_command(force: bool) -> Result<()> {
 }
 
 fn run_disable_command(purge: bool) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let mode = resolve_daemon_mode(&config);
+
+    if mode == "tmux" || mode == "none" {
+        // Kill tmux sessions if they exist
+        let mut actions = Vec::new();
+        for session in [GOVERNOR_SESSION, COLLECTOR_SESSION] {
+            if tmux_session_exists(session) {
+                tmux_kill_session(session)?;
+                actions.push(format!("  ✓ Killed tmux session {}", session));
+            } else {
+                actions.push(format!("  - {} is not running", session));
+            }
+        }
+        println!("Claude Governor sessions disabled (tmux)\n");
+        for action in &actions {
+            println!("{}", action);
+        }
+        return Ok(());
+    }
+
+    // systemd mode
     if !systemd_user_available() {
         anyhow::bail!("systemd user sessions not available");
     }
@@ -1131,8 +1239,27 @@ fn run_disable_command(purge: bool) -> Result<()> {
 }
 
 fn run_start_command(service: &str) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let mode = resolve_daemon_mode(&config);
+
+    if mode == "tmux" || (!systemd_user_available() && tmux_available()) {
+        let sessions = resolve_tmux_sessions(service);
+        for session in &sessions {
+            let cmd = match *session {
+                GOVERNOR_SESSION => "cgov _daemon",
+                COLLECTOR_SESSION => "cgov _token-collector",
+                _ => unreachable!(),
+            };
+            tmux_start_session(session, cmd)?;
+        }
+        return Ok(());
+    }
+
     if !systemd_user_available() {
-        anyhow::bail!("systemd user sessions not available");
+        anyhow::bail!(
+            "systemd user sessions not available and tmux not found.\n\
+             Install tmux or enable systemd --user (loginctl enable-linger $USER)"
+        );
     }
 
     let names = resolve_service_names(service);
@@ -1145,6 +1272,22 @@ fn run_start_command(service: &str) -> Result<()> {
 }
 
 fn run_stop_command(service: &str) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let mode = resolve_daemon_mode(&config);
+
+    if mode == "tmux" || (!systemd_user_available() && tmux_available()) {
+        let sessions = resolve_tmux_sessions(service);
+        for session in &sessions {
+            if tmux_session_exists(session) {
+                tmux_kill_session(session)?;
+                println!("  ✓ Stopped {}", session);
+            } else {
+                println!("  - {} is not running", session);
+            }
+        }
+        return Ok(());
+    }
+
     if !systemd_user_available() {
         anyhow::bail!("systemd user sessions not available");
     }
@@ -1163,6 +1306,25 @@ fn run_stop_command(service: &str) -> Result<()> {
 }
 
 fn run_restart_command(service: &str) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let mode = resolve_daemon_mode(&config);
+
+    if mode == "tmux" || (!systemd_user_available() && tmux_available()) {
+        let sessions = resolve_tmux_sessions(service);
+        for session in &sessions {
+            if tmux_session_exists(session) {
+                tmux_kill_session(session)?;
+            }
+            let cmd = match *session {
+                GOVERNOR_SESSION => "cgov _daemon",
+                COLLECTOR_SESSION => "cgov _token-collector",
+                _ => unreachable!(),
+            };
+            tmux_start_session(session, cmd)?;
+        }
+        return Ok(());
+    }
+
     if !systemd_user_available() {
         anyhow::bail!("systemd user sessions not available");
     }
@@ -1266,18 +1428,21 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
                     .with_context(|| format!("Failed to create systemd directory: {}", systemd_user_dir.display()))?;
             }
 
-            let service_path = systemd_user_dir.join("cgov.service");
-            let service_content = include_str!("../config/cgov.service");
+            // Install both unit files (governor + token-collector)
+            for (name, content) in [
+                (GOVERNOR_SERVICE, include_str!("../config/claude-governor.service")),
+                (COLLECTOR_SERVICE, include_str!("../config/claude-token-collector.service")),
+            ] {
+                let service_path = systemd_user_dir.join(name);
+                let service_content = content.replace("%h", home.to_str().unwrap_or("~"));
 
-            // Replace %h with actual home path (systemd %h specifier)
-            let service_content = service_content.replace("%h", home.to_str().unwrap_or("~"));
-
-            if service_path.exists() && !force {
-                actions_skipped.push(format!("Systemd service exists (use --force to overwrite): {}", service_path.display()));
-            } else {
-                fs::write(&service_path, &service_content)
-                    .with_context(|| format!("Failed to write systemd service: {}", service_path.display()))?;
-                actions_taken.push(format!("Installed systemd service: {}", service_path.display()));
+                if service_path.exists() && !force {
+                    actions_skipped.push(format!("Systemd service exists (use --force to overwrite): {}", service_path.display()));
+                } else {
+                    fs::write(&service_path, &service_content)
+                        .with_context(|| format!("Failed to write systemd service: {}", service_path.display()))?;
+                    actions_taken.push(format!("Installed systemd service: {}", service_path.display()));
+                }
             }
 
             // Run daemon-reload

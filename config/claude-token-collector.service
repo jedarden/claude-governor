@@ -1,0 +1,23 @@
+[Unit]
+Description=Claude Token Collector - collects token usage data for Claude Governor
+Documentation=https://github.com/anthropics/claude-governor
+After=network-online.target
+Wants=network-online.target
+PartOf=claude-governor.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cgov _token-collector
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=25%
+
+[Install]
+WantedBy=default.target
