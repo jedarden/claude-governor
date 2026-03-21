@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 /// Check result status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,94 +156,261 @@ fn credentials_path() -> PathBuf {
         .join(".credentials.json")
 }
 
+fn default_log_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("claude-governor")
+        .join("governor.log")
+}
+
+fn default_jsonl_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("state")
+        .join("token-history.jsonl")
+}
+
+fn default_promotions_path() -> PathBuf {
+    PathBuf::from("config/promotions.json")
+}
+
+// ---------------------------------------------------------------------------
+// Service detection helpers
+// ---------------------------------------------------------------------------
+
+const GOVERNOR_SERVICE: &str = "claude-governor.service";
+const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
+const GOVERNOR_SESSION: &str = "cgov-governor";
+const COLLECTOR_SESSION: &str = "cgov-collector";
+
+/// Check if systemd user sessions are available
+fn systemd_user_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "status"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if a systemd user service is active
+fn systemd_service_is_active(service: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", service])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if tmux is available
+fn tmux_available_check() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if a tmux session exists
+fn tmux_session_exists(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Daemon running status with detection method
+enum DaemonStatus {
+    RunningSystemd,
+    RunningTmux,
+    ActiveState(i64), // seconds old
+    Stopped,
+}
+
+/// Detect if the governor daemon is running
+fn detect_daemon_status() -> DaemonStatus {
+    // Priority 1: systemd
+    if systemd_user_available() && systemd_service_is_active(GOVERNOR_SERVICE) {
+        return DaemonStatus::RunningSystemd;
+    }
+
+    // Priority 2: tmux
+    if tmux_available_check() && tmux_session_exists(GOVERNOR_SESSION) {
+        return DaemonStatus::RunningTmux;
+    }
+
+    // Priority 3: state file freshness (fallback)
+    let state_path = default_state_path();
+    if let Ok(state) = crate::state::load_state(&state_path) {
+        let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
+        if age_secs < 300 {
+            return DaemonStatus::ActiveState(age_secs);
+        }
+    }
+
+    DaemonStatus::Stopped
+}
+
+/// Collector running status with detection method
+enum CollectorStatus {
+    RunningSystemd,
+    RunningTmux,
+    ActiveFleet(i64), // seconds old
+    Stopped,
+}
+
+/// Detect if the token collector is running
+fn detect_collector_status() -> CollectorStatus {
+    // Priority 1: systemd
+    if systemd_user_available() && systemd_service_is_active(COLLECTOR_SERVICE) {
+        return CollectorStatus::RunningSystemd;
+    }
+
+    // Priority 2: tmux
+    if tmux_available_check() && tmux_session_exists(COLLECTOR_SESSION) {
+        return CollectorStatus::RunningTmux;
+    }
+
+    // Priority 3: fleet aggregate freshness (fallback)
+    let state_path = default_state_path();
+    if let Ok(state) = crate::state::load_state(&state_path) {
+        let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+        if age_secs < 300 {
+            return CollectorStatus::ActiveFleet(age_secs);
+        }
+    }
+
+    CollectorStatus::Stopped
+}
+
 // ---------------------------------------------------------------------------
 // Individual health checks
 // ---------------------------------------------------------------------------
 
-/// Check if the governor daemon is running (via state file freshness)
+/// Check if the governor daemon is running (via systemd, tmux, or state file)
 fn check_daemon_running() -> CheckResult {
-    let state_path = default_state_path();
-
-    if !state_path.exists() {
-        return CheckResult::warn(
-            "daemon_running",
-            "No state file found",
-            "Run 'cgov enable' to start the governor daemon",
-        );
-    }
-
-    match crate::state::load_state(&state_path) {
-        Ok(state) => {
-            let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
-
-            if age_secs < 300 {
-                CheckResult::pass("daemon_running", format!("State updated {}s ago", age_secs))
-            } else if age_secs < 900 {
+    match detect_daemon_status() {
+        DaemonStatus::RunningSystemd => {
+            // Also verify state freshness as a sanity check
+            let state_path = default_state_path();
+            match crate::state::load_state(&state_path) {
+                Ok(state) => {
+                    let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
+                    if age_secs < 300 {
+                        CheckResult::pass("daemon_running", format!("running (systemd), state {}s old", age_secs))
+                    } else {
+                        CheckResult::warn(
+                            "daemon_running",
+                            format!("systemd active but state {}s old", age_secs),
+                            "Daemon may be stuck; check logs: journalctl --user -u claude-governor",
+                        )
+                    }
+                }
+                Err(_) => CheckResult::pass("daemon_running", "running (systemd)"),
+            }
+        }
+        DaemonStatus::RunningTmux => {
+            CheckResult::pass("daemon_running", "running (tmux)")
+        }
+        DaemonStatus::ActiveState(age_secs) => {
+            CheckResult::pass("daemon_running", format!("active (state {}s old)", age_secs))
+        }
+        DaemonStatus::Stopped => {
+            let state_path = default_state_path();
+            if state_path.exists() {
+                if let Ok(state) = crate::state::load_state(&state_path) {
+                    let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
+                    CheckResult::fail(
+                        "daemon_running",
+                        format!("stopped (state {}s old)", age_secs),
+                        "Start the governor: cgov start governor",
+                    )
+                } else {
+                    CheckResult::fail(
+                        "daemon_running",
+                        "stopped (state unreadable)",
+                        "Check state file permissions or run 'cgov init'",
+                    )
+                }
+            } else {
                 CheckResult::warn(
                     "daemon_running",
-                    format!("State is {}s old (stale)", age_secs),
-                    "Check if governor daemon is running: cgov status",
-                )
-            } else {
-                CheckResult::fail(
-                    "daemon_running",
-                    format!("State is {}s old (very stale)", age_secs),
-                    "Restart the governor: cgov restart",
+                    "not initialized",
+                    "Run 'cgov enable' to start the governor daemon",
                 )
             }
         }
-        Err(e) => CheckResult::fail(
-            "daemon_running",
-            format!("Cannot read state file: {}", e),
-            "Check state file permissions or run 'cgov init'",
-        ),
     }
 }
 
-/// Check if the token collector is running (via last fleet aggregate freshness)
+/// Check if the token collector is running (via systemd, tmux, or fleet data)
 fn check_collector_running() -> CheckResult {
-    let state_path = default_state_path();
-
-    if !state_path.exists() {
-        return CheckResult::warn(
-            "collector_running",
-            "No state file found",
-            "Run 'cgov enable' to start the collector",
-        );
-    }
-
-    match crate::state::load_state(&state_path) {
-        Ok(state) => {
-            let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
-
-            if state.last_fleet_aggregate.sonnet_workers == 0 && age_secs > 3600 {
-                // No workers ever recorded and state is old - probably just initialized
-                CheckResult::warn(
-                    "collector_running",
-                    "No fleet data recorded yet",
-                    "Wait for the collector to run or start it with 'cgov start collector'",
-                )
-            } else if age_secs < 300 {
-                CheckResult::pass("collector_running", format!("Fleet data {}s old", age_secs))
-            } else if age_secs < 900 {
-                CheckResult::warn(
-                    "collector_running",
-                    format!("Fleet data is {}s old", age_secs),
-                    "Check if collector is running: systemctl --user status claude-token-collector",
-                )
+    match detect_collector_status() {
+        CollectorStatus::RunningSystemd => {
+            // Also verify fleet freshness as a sanity check
+            let state_path = default_state_path();
+            match crate::state::load_state(&state_path) {
+                Ok(state) => {
+                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+                    if age_secs < 300 {
+                        CheckResult::pass("collector_running", format!("running (systemd), fleet {}s old", age_secs))
+                    } else {
+                        CheckResult::warn(
+                            "collector_running",
+                            format!("systemd active but fleet {}s old", age_secs),
+                            "Collector may be stuck; check logs: journalctl --user -u claude-token-collector",
+                        )
+                    }
+                }
+                Err(_) => CheckResult::pass("collector_running", "running (systemd)"),
+            }
+        }
+        CollectorStatus::RunningTmux => {
+            CheckResult::pass("collector_running", "running (tmux)")
+        }
+        CollectorStatus::ActiveFleet(age_secs) => {
+            CheckResult::pass("collector_running", format!("active (fleet {}s old)", age_secs))
+        }
+        CollectorStatus::Stopped => {
+            let state_path = default_state_path();
+            if state_path.exists() {
+                if let Ok(state) = crate::state::load_state(&state_path) {
+                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+                    if state.last_fleet_aggregate.sonnet_workers == 0 && age_secs > 3600 {
+                        CheckResult::warn(
+                            "collector_running",
+                            "no fleet data recorded yet",
+                            "Start the collector: cgov start collector",
+                        )
+                    } else if age_secs < 900 {
+                        CheckResult::warn(
+                            "collector_running",
+                            format!("stopped (fleet {}s old)", age_secs),
+                            "Start the collector: cgov start collector",
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "collector_running",
+                            format!("stopped (fleet {}s old)", age_secs),
+                            "Restart the collector: cgov restart collector",
+                        )
+                    }
+                } else {
+                    CheckResult::fail(
+                        "collector_running",
+                        "stopped (state unreadable)",
+                        "Check state file permissions",
+                    )
+                }
             } else {
-                CheckResult::fail(
+                CheckResult::warn(
                     "collector_running",
-                    format!("Fleet data is {}s old (very stale)", age_secs),
-                    "Restart the collector: cgov restart collector",
+                    "not initialized",
+                    "Run 'cgov enable' to start the collector",
                 )
             }
         }
-        Err(e) => CheckResult::fail(
-            "collector_running",
-            format!("Cannot read state file: {}", e),
-            "Check state file permissions",
-        ),
     }
 }
 
@@ -602,21 +770,21 @@ fn check_burn_rate_samples() -> CheckResult {
                 .map(|m| m.samples)
                 .sum();
 
-            if total_samples >= 10 {
+            if total_samples >= 5 {
                 CheckResult::pass(
                     "burn_rate_samples",
-                    format!("{} burn rate samples collected", total_samples),
+                    format!("{} samples collected", total_samples),
                 )
             } else if total_samples >= 3 {
                 CheckResult::warn(
                     "burn_rate_samples",
-                    format!("Only {} samples (need 10+ for reliable predictions)", total_samples),
+                    format!("Only {} samples (need 5+ per window)", total_samples),
                     "Let the governor run longer to collect more data",
                 )
             } else {
-                CheckResult::warn(
+                CheckResult::fail(
                     "burn_rate_samples",
-                    format!("Insufficient samples ({}) for predictions", total_samples),
+                    format!("Insufficient samples ({}) — using baseline fallback", total_samples),
                     "Run governor for at least 30 minutes to collect burn rate data",
                 )
             }
@@ -700,18 +868,18 @@ fn check_prediction_accuracy() -> CheckResult {
             if error < 5.0 {
                 CheckResult::pass(
                     "prediction_accuracy",
-                    format!("Median error: {:.1}% ({} predictions)", error, cal.predictions_scored),
+                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
                 )
-            } else if error < 15.0 {
+            } else if error < 10.0 {
                 CheckResult::warn(
                     "prediction_accuracy",
-                    format!("Median error: {:.1}% (moderate)", error),
+                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
                     "Predictions are within acceptable range but could improve with more data",
                 )
             } else {
-                CheckResult::warn(
+                CheckResult::fail(
                     "prediction_accuracy",
-                    format!("Median error: {:.1}% (high)", error),
+                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
                     "Safe mode may activate; check for unusual usage patterns",
                 )
             }
@@ -780,6 +948,344 @@ fn check_disk_space() -> CheckResult {
     }
 }
 
+/// Check API reachability (lightweight HEAD to Anthropic API)
+fn check_api_reachability() -> CheckResult {
+    let start = Instant::now();
+    let creds_path = credentials_path();
+
+    // Read the OAuth token for authentication
+    let token = fs::read_to_string(&creds_path).ok().and_then(|content| {
+        serde_json::from_str::<serde_json::Value>(&content).ok().and_then(|json| {
+            json.get("claudeAiOauth")
+                .and_then(|o| o.get("accessToken"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(5))
+        .timeout_write(std::time::Duration::from_secs(5))
+        .build();
+
+    let req = agent.get("https://api.anthropic.com/api/oauth/usage")
+        .set("anthropic-beta", "oauth-2025-04-20");
+    let req = if let Some(ref tok) = token {
+        req.set("Authorization", &format!("Bearer {}", tok))
+    } else {
+        req
+    };
+
+    match req.call() {
+        Ok(response) => {
+            let elapsed_ms = start.elapsed().as_millis();
+            let status = response.status();
+            if status == 200 {
+                if elapsed_ms < 2000 {
+                    CheckResult::pass("api_reachability", format!("200 OK ({}ms)", elapsed_ms))
+                } else {
+                    CheckResult::warn(
+                        "api_reachability",
+                        format!("200 OK but slow ({}ms)", elapsed_ms),
+                        "API is reachable but latency is high; check network conditions",
+                    )
+                }
+            } else if status == 401 {
+                CheckResult::fail(
+                    "api_reachability",
+                    format!("HTTP {} (auth error)", status),
+                    "Run 'claude login' to refresh credentials",
+                )
+            } else {
+                CheckResult::fail(
+                    "api_reachability",
+                    format!("HTTP {}", status),
+                    "Anthropic API returned an unexpected status; check https://status.anthropic.com",
+                )
+            }
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            CheckResult::fail(
+                "api_reachability",
+                format!("HTTP {} (error)", code),
+                "Anthropic API returned an error; check https://status.anthropic.com",
+            )
+        }
+        Err(_) => {
+            CheckResult::fail(
+                "api_reachability",
+                format!("Unreachable (timeout after {}ms)", start.elapsed().as_millis()),
+                "Check network connectivity and DNS resolution for api.anthropic.com",
+            )
+        }
+    }
+}
+
+/// Check model generation pricing — detect legacy pricing rates
+fn check_model_generation() -> CheckResult {
+    let config_path = default_config_path();
+
+    if !config_path.exists() {
+        return CheckResult::pass("model_generation", "No config file (skipped)");
+    }
+
+    match crate::config::GovernorConfig::load_from_path(&config_path) {
+        Ok(config) => {
+            // Known legacy pricing signatures to detect
+            // Opus 4 at $15/$75 input/output is the legacy rate
+            let legacy_models: Vec<&str> = config
+                .pricing
+                .models
+                .iter()
+                .filter(|(_, p)| {
+                    // Detect legacy Opus pricing: $15/MTok input, $75/MTok output
+                    (p.input_per_mtok - 15.0).abs() < 0.1 && (p.output_per_mtok - 75.0).abs() < 0.1
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+
+            if legacy_models.is_empty() {
+                CheckResult::pass("model_generation", "rates consistent")
+            } else {
+                CheckResult::fail(
+                    "model_generation",
+                    format!("legacy pricing detected: {}", legacy_models.join(", ")),
+                    "Update pricing in ~/.config/claude-governor/governor.yaml",
+                )
+            }
+        }
+        Err(_) => CheckResult::pass("model_generation", "Cannot check (config unreadable)"),
+    }
+}
+
+/// Check promotion dates — verify promotions are not expired
+fn check_promotion_dates() -> CheckResult {
+    let promo_path = default_promotions_path();
+
+    if !promo_path.exists() {
+        return CheckResult::pass("promotion_dates", "No promotions configured");
+    }
+
+    let promos: Vec<crate::schedule::Promotion> = match fs::read_to_string(&promo_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+    {
+        Some(p) => p,
+        None => return CheckResult::warn(
+            "promotion_dates",
+            "Cannot parse promotions.json",
+            "Fix JSON syntax in config/promotions.json",
+        ),
+    };
+
+    if promos.is_empty() {
+        return CheckResult::pass("promotion_dates", "No promotions configured");
+    }
+
+    let now = Utc::now();
+    let mut warnings = Vec::new();
+    let mut failures = Vec::new();
+
+    for promo in &promos {
+        // Parse end_date (YYYY-MM-DD)
+        let end_naive = match chrono::NaiveDate::parse_from_str(&promo.end_date, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => {
+                warnings.push(format!("{}: invalid end_date format", promo.name));
+                continue;
+            }
+        };
+
+        let end_dt = end_naive.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+        if end_dt < now {
+            failures.push(format!("{}: expired", promo.name));
+        } else {
+            let hours_until_expiry = (end_dt - now).num_hours();
+            if hours_until_expiry < 48 {
+                warnings.push(format!("{}: expires in {}h", promo.name, hours_until_expiry));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        CheckResult::fail(
+            "promotion_dates",
+            failures.join("; "),
+            "Remove expired promotions from config/promotions.json",
+        )
+    } else if !warnings.is_empty() {
+        CheckResult::warn("promotion_dates", warnings.join("; "), "Update or extend promotion dates")
+    } else {
+        let active: Vec<_> = promos.iter().filter(|p| {
+            chrono::NaiveDate::parse_from_str(&p.start_date, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc() <= now)
+                .unwrap_or(false)
+        }).collect();
+        if active.is_empty() {
+            CheckResult::pass("promotion_dates", "future promotions configured")
+        } else {
+            CheckResult::pass("promotion_dates", format!("{} active/future promotion(s)", promos.len()))
+        }
+    }
+}
+
+/// Check JSONL/DB row count sync
+fn check_jsonl_db_sync() -> CheckResult {
+    let jsonl_path = default_jsonl_path();
+    let db_path = default_db_path();
+
+    if !jsonl_path.exists() && !db_path.exists() {
+        return CheckResult::warn(
+            "jsonl_db_sync",
+            "Neither JSONL nor DB found",
+            "Run 'cgov collect' to start collecting token data",
+        );
+    }
+
+    if !db_path.exists() {
+        return CheckResult::fail(
+            "jsonl_db_sync",
+            "SQLite database missing",
+            "Run 'cgov token-history --rebuild-db' to create from JSONL",
+        );
+    }
+
+    if !jsonl_path.exists() {
+        return CheckResult::warn(
+            "jsonl_db_sync",
+            "JSONL source missing (DB exists)",
+            "JSONL is the authoritative source; check for accidental deletion",
+        );
+    }
+
+    // Count JSONL lines
+    let jsonl_lines = match fs::read_to_string(&jsonl_path) {
+        Ok(content) => content.lines().filter(|l| !l.trim().is_empty()).count() as i64,
+        Err(e) => {
+            return CheckResult::warn(
+                "jsonl_db_sync",
+                format!("Cannot read JSONL: {}", e),
+                "Check file permissions on token-history.jsonl",
+            );
+        }
+    };
+
+    // Count DB rows
+    let db_rows = match rusqlite::Connection::open(&db_path) {
+        Ok(conn) => {
+            conn.query_row(
+                "SELECT SUM(cnt) FROM (SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name LIKE 'usage_%')",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+        }
+        Err(_) => {
+            return CheckResult::fail(
+                "jsonl_db_sync",
+                "Cannot open database",
+                "Run 'cgov token-history --rebuild-db' to rebuild from JSONL",
+            );
+        }
+    };
+
+    if db_rows == 0 {
+        return CheckResult::fail(
+            "jsonl_db_sync",
+            format!("DB empty ({} JSONL rows)", jsonl_lines),
+            "Run 'cgov token-history --rebuild-db' to import JSONL into DB",
+        );
+    }
+
+    if jsonl_lines == 0 {
+        return CheckResult::warn(
+            "jsonl_db_sync",
+            format!("JSONL empty ({} DB rows)", db_rows),
+            "JSONL is authoritative; DB may be from a previous session",
+        );
+    }
+
+    let divergence = if jsonl_lines > db_rows {
+        (jsonl_lines - db_rows) as f64 / jsonl_lines as f64
+    } else {
+        (db_rows - jsonl_lines) as f64 / jsonl_lines as f64
+    };
+
+    if divergence < 0.01 {
+        CheckResult::pass(
+            "jsonl_db_sync",
+            format!("{} / {} rows ({:.1}%)", jsonl_lines, db_rows, (1.0 - divergence) * 100.0),
+        )
+    } else {
+        CheckResult::warn(
+            "jsonl_db_sync",
+            format!("{} / {} rows (diverge {:.1}%)", jsonl_lines, db_rows, divergence * 100.0),
+            "Run 'cgov token-history --rebuild-db' to resync DB from JSONL",
+        )
+    }
+}
+
+/// Check log file existence and size
+fn check_log_file() -> CheckResult {
+    let log_path = default_log_path();
+
+    if !log_path.exists() {
+        // Check if parent directory is writable
+        let parent = log_path.parent();
+        if let Some(dir) = parent {
+            if dir.exists() {
+                return CheckResult::warn(
+                    "log_file",
+                    "Log file not yet created",
+                    "Log will be created on first daemon run; run 'cgov start'",
+                );
+            }
+        }
+        return CheckResult::warn(
+            "log_file",
+            format!("Log directory missing: {}", log_path.display()),
+            "Create log directory or run 'cgov init'",
+        );
+    }
+
+    match fs::metadata(&log_path) {
+        Ok(metadata) => {
+            let size_bytes = metadata.len();
+            let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+
+            if !metadata.permissions().readonly() {
+                if size_mb < 100.0 {
+                    if size_mb < 1.0 {
+                        CheckResult::pass("log_file", format!("{:.1} KB", size_bytes as f64 / 1024.0))
+                    } else {
+                        CheckResult::pass("log_file", format!("{:.1} MB", size_mb))
+                    }
+                } else {
+                    CheckResult::warn(
+                        "log_file",
+                        format!("{:.1} MB", size_mb),
+                        "Consider rotating logs: truncate or archive governor.log",
+                    )
+                }
+            } else {
+                CheckResult::fail(
+                    "log_file",
+                    format!("{:.1} MB (read-only)", size_mb),
+                    "Fix permissions: chmod +w <log_path>",
+                )
+            }
+        }
+        Err(e) => CheckResult::fail(
+            "log_file",
+            format!("Cannot access log: {}", e),
+            "Check file permissions on the log file",
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -787,17 +1293,24 @@ fn check_disk_space() -> CheckResult {
 /// Run all health checks and return a report
 pub fn run_doctor() -> DoctorReport {
     let checks = vec![
-        check_daemon_running(),
-        check_collector_running(),
-        check_state_file_freshness(),
+        // Plan Component 19 core checks (ordered per spec)
         check_oauth_token_validity(),
-        check_heartbeat_consistency(),
-        check_sqlite_integrity(),
-        check_config_parseable(),
-        check_tmux_available(),
+        check_api_reachability(),
+        check_collector_running(),
         check_burn_rate_samples(),
-        check_alert_cooldown(),
+        check_config_parseable(),
+        check_model_generation(),
+        check_promotion_dates(),
+        check_sqlite_integrity(),
+        check_jsonl_db_sync(),
+        check_daemon_running(),
+        check_log_file(),
         check_prediction_accuracy(),
+        // Additional operational checks
+        check_state_file_freshness(),
+        check_heartbeat_consistency(),
+        check_tmux_available(),
+        check_alert_cooldown(),
         check_disk_space(),
     ];
 
@@ -808,8 +1321,11 @@ pub fn run_doctor() -> DoctorReport {
 pub fn format_doctor_human(report: &DoctorReport) -> String {
     let mut output = String::new();
 
-    output.push_str("Claude Governor Health Check\n");
-    output.push_str("============================\n\n");
+    // Header matching plan spec format
+    let ts = report.timestamp.format("%Y-%m-%d %H:%M UTC");
+    output.push_str(&format!("cgov doctor — {}\n", ts));
+    output.push_str(&"─".repeat(44));
+    output.push('\n');
 
     for check in &report.checks {
         let status_icon = match check.status {
@@ -818,28 +1334,23 @@ pub fn format_doctor_human(report: &DoctorReport) -> String {
             CheckStatus::Fail => "✗",
         };
 
+        // Format: "✓ check_name     message" with alignment
         output.push_str(&format!(
-            "[{}] {:20} {}\n",
+            "{} {:22} {}\n",
             status_icon, check.check, check.message
         ));
 
         if let Some(ref remediation) = check.remediation {
-            output.push_str(&format!("    → {}\n", remediation));
+            output.push_str(&format!("  → {}\n", remediation));
         }
     }
 
-    output.push_str("\n");
+    output.push_str(&"─".repeat(44));
+    output.push('\n');
     output.push_str(&format!(
-        "Summary: {} passed, {} warnings, {} failures\n",
+        "{} passed · {} warning · {} failed\n",
         report.passed, report.warned, report.failed
     ));
-
-    let overall_icon = match report.overall {
-        CheckStatus::Pass => "✓",
-        CheckStatus::Warn => "⚠",
-        CheckStatus::Fail => "✗",
-    };
-    output.push_str(&format!("Overall: [{}] {}\n", overall_icon, report.overall));
 
     output
 }
