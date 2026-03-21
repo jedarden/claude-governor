@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
+use crate::calibrator;
 use crate::collector;
 use crate::config::{AgentConfig, AlertConfig, SprintConfig, CompositeRiskConfig};
 use crate::db;
@@ -27,6 +28,24 @@ use crate::worker::{self, WorkerConfig};
 
 /// Emergency brake threshold (98%)
 const EMERGENCY_BRAKE_THRESHOLD: f64 = 98.0;
+
+/// Safe mode: enter when median absolute error (pct points) exceeds this
+const SAFE_MODE_ENTRY_ERROR_THRESHOLD: f64 = 15.0;
+
+/// Safe mode: exit when median absolute error drops below this (hysteresis gap)
+const SAFE_MODE_EXIT_ERROR_THRESHOLD: f64 = 8.0;
+
+/// Safe mode: minimum prediction samples before safe mode can trigger
+const SAFE_MODE_MIN_SAMPLES: u32 = 5;
+
+/// Safe mode: minimum new predictions since entry before exit is allowed
+const SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT: u32 = 3;
+
+/// Safe mode: target ceiling reduction (percentage points) while active
+const SAFE_MODE_CEILING_REDUCTION: f64 = 5.0;
+
+/// Safe mode: hysteresis band multiplier while active
+const SAFE_MODE_HYSTERESIS_MULTIPLIER: f64 = 2.0;
 
 /// Window names for utilization tracking
 pub const WINDOW_FIVE_HOUR: &str = "five_hour";
@@ -792,6 +811,80 @@ pub fn compute_pre_scale_target(
 }
 
 // ---------------------------------------------------------------------------
+// Safe mode calibration check
+// ---------------------------------------------------------------------------
+
+/// Update safe mode state based on current calibration accuracy statistics.
+///
+/// Entry: if median absolute error > SAFE_MODE_ENTRY_ERROR_THRESHOLD and enough samples.
+/// Exit: if median absolute error < SAFE_MODE_EXIT_ERROR_THRESHOLD (hysteresis) AND
+///       at least SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT new predictions since entry.
+///
+/// Also updates calibration.predictions_scored and calibration.median_error_7ds
+/// from the latest stats.
+///
+/// Returns true if safe mode state changed (entered or exited).
+pub fn update_safe_mode_from_calibration(
+    safe_mode: &mut state::SafeModeState,
+    calibration: &mut state::CalibrationState,
+    stats: &calibrator::CalibrationStats,
+    now: DateTime<Utc>,
+) -> bool {
+    // Always sync calibration state from latest stats
+    calibration.predictions_scored = stats.total_samples;
+    calibration.median_error_7ds = stats.median_error_7ds;
+
+    let median_error_abs = stats.median_error.abs();
+
+    if safe_mode.active {
+        // Update predictions-since-entry counter
+        safe_mode.predictions_since_entry = stats
+            .total_samples
+            .saturating_sub(safe_mode.scored_at_entry);
+
+        // Check exit: accuracy recovered past exit threshold and enough new predictions observed
+        if median_error_abs < SAFE_MODE_EXIT_ERROR_THRESHOLD
+            && safe_mode.predictions_since_entry >= SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT
+            && stats.total_samples >= SAFE_MODE_MIN_SAMPLES
+        {
+            log::info!(
+                "[governor] safe_mode exit: median_error={:.2} < exit_threshold={:.1}, \
+                 predictions_since_entry={}",
+                median_error_abs,
+                SAFE_MODE_EXIT_ERROR_THRESHOLD,
+                safe_mode.predictions_since_entry,
+            );
+            *safe_mode = state::SafeModeState::default();
+            return true;
+        }
+        false
+    } else {
+        // Check entry: accuracy degraded past entry threshold with enough samples
+        if median_error_abs > SAFE_MODE_ENTRY_ERROR_THRESHOLD
+            && stats.total_samples >= SAFE_MODE_MIN_SAMPLES
+        {
+            log::warn!(
+                "[governor] safe_mode enter: median_error={:.2} > entry_threshold={:.1}, \
+                 samples={}",
+                median_error_abs,
+                SAFE_MODE_ENTRY_ERROR_THRESHOLD,
+                stats.total_samples,
+            );
+            *safe_mode = state::SafeModeState {
+                active: true,
+                entered_at: Some(now),
+                trigger: Some("median_error".to_string()),
+                median_error_at_entry: Some(median_error_abs),
+                predictions_since_entry: 0,
+                scored_at_entry: stats.total_samples,
+            };
+            return true;
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Governor daemon loop
 // ---------------------------------------------------------------------------
 
@@ -1022,6 +1115,62 @@ pub fn run_governor_cycle(
         HashMap::new()
     };
 
+    // 5a. Check calibration accuracy and update safe mode state.
+    //
+    // This must run before the capacity forecast is built so the effective
+    // target ceiling (reduced when safe mode is active) is used in forecasts.
+    if let Ok(scores) = calibrator::read_all_scores() {
+        if !scores.is_empty() {
+            let cal_stats = calibrator::compute_stats(&scores);
+            update_safe_mode_from_calibration(
+                &mut state.safe_mode,
+                &mut state.burn_rate.calibration,
+                &cal_stats,
+                now,
+            );
+        }
+    }
+
+    // Effective settings — conservative overrides applied when safe mode is active.
+    // - target_ceiling: reduced by SAFE_MODE_CEILING_REDUCTION pct points
+    // - hysteresis_band: widened by SAFE_MODE_HYSTERESIS_MULTIPLIER
+    // - composite risk: disabled (cross-window optimisation is too uncertain)
+    // - sprint: sprint eligibility is also blocked (checked in check_underutilization_sprint)
+    let effective_target_ceiling = if state.safe_mode.active {
+        let reduced = target_ceiling - SAFE_MODE_CEILING_REDUCTION;
+        log::info!(
+            "[governor] safe_mode active: target_ceiling {:.0}% → {:.0}%",
+            target_ceiling, reduced
+        );
+        reduced.max(50.0) // never below 50%
+    } else {
+        target_ceiling
+    };
+
+    let effective_hysteresis = if state.safe_mode.active {
+        let widened = hysteresis_band * SAFE_MODE_HYSTERESIS_MULTIPLIER;
+        log::info!(
+            "[governor] safe_mode active: hysteresis_band {:.1} → {:.1}",
+            hysteresis_band, widened
+        );
+        widened.min(10.0) // cap at 10 pct points
+    } else {
+        hysteresis_band
+    };
+
+    // When safe mode is active, disable composite risk optimisation so the governor
+    // uses the conservative binding-window ceiling only.
+    let safe_composite_risk;
+    let effective_composite_risk: &CompositeRiskConfig = if state.safe_mode.active {
+        safe_composite_risk = CompositeRiskConfig {
+            enabled: false,
+            ..composite_risk_config.clone()
+        };
+        &safe_composite_risk
+    } else {
+        composite_risk_config
+    };
+
     // Build capacity forecast for each window using burn_rate module
     let mut five_hour_forecast = state::WindowForecast::default();
     let mut seven_day_forecast = state::WindowForecast::default();
@@ -1043,7 +1192,7 @@ pub fn run_governor_cycle(
             window,
             fleet_pct_hr,
             util,
-            target_ceiling,
+            effective_target_ceiling,
             hrs_left,
             pct_per_worker,
         );
@@ -1156,10 +1305,11 @@ pub fn run_governor_cycle(
     log_capacity_forecast(&state.capacity_forecast);
 
     // 4. Compute target workers
-    let target = compute_target_workers(&state, target_ceiling, composite_risk_config);
+    let target = compute_target_workers(&state, effective_target_ceiling, effective_composite_risk);
     log::info!(
-        "[governor] target workers: {} (ceiling: {:.0}%)",
-        target, target_ceiling
+        "[governor] target workers: {} (ceiling: {:.0}%{})",
+        target, effective_target_ceiling,
+        if state.safe_mode.active { ", safe_mode" } else { "" }
     );
 
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
@@ -1182,7 +1332,7 @@ pub fn run_governor_cycle(
     let decision = apply_scaling(
         effective_target,
         current_total,
-        hysteresis_band,
+        effective_hysteresis,
         max_up_per_cycle,
         max_down_per_cycle,
     );

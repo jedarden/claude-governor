@@ -300,6 +300,10 @@ pub struct BurnRateState {
     pub offpeak_ratio_observed: f64,
     pub offpeak_ratio_expected: f64,
     pub promotion_validated: bool,
+    /// Peak samples used in the most recent promotion validation
+    pub promotion_peak_samples: usize,
+    /// Off-peak samples used in the most recent promotion validation
+    pub promotion_offpeak_samples: usize,
     pub last_sample_at: Option<DateTime<Utc>>,
     pub calibration: CalibrationState,
 }
@@ -313,6 +317,8 @@ impl Default for BurnRateState {
             offpeak_ratio_observed: 0.0,
             offpeak_ratio_expected: 0.0,
             promotion_validated: false,
+            promotion_peak_samples: 0,
+            promotion_offpeak_samples: 0,
             last_sample_at: None,
             calibration: CalibrationState::default(),
         }
@@ -328,6 +334,10 @@ pub struct SafeModeState {
     pub trigger: Option<String>,
     pub median_error_at_entry: Option<f64>,
     pub predictions_since_entry: u32,
+    /// Total predictions scored at the moment safe mode was entered.
+    /// Used to compute predictions_since_entry each cycle.
+    #[serde(default)]
+    pub scored_at_entry: u32,
 }
 
 impl Default for SafeModeState {
@@ -338,6 +348,7 @@ impl Default for SafeModeState {
             trigger: None,
             median_error_at_entry: None,
             predictions_since_entry: 0,
+            scored_at_entry: 0,
         }
     }
 }
@@ -701,6 +712,8 @@ mod tests {
                 offpeak_ratio_observed: 2.03,
                 offpeak_ratio_expected: 2.0,
                 promotion_validated: true,
+                promotion_peak_samples: 0,
+                promotion_offpeak_samples: 0,
                 last_sample_at: Some("2026-03-18T14:15:00Z".parse().unwrap()),
                 calibration: CalibrationState {
                     predictions_scored: 24,
@@ -721,6 +734,7 @@ mod tests {
                 trigger: Some("median_error".to_string()),
                 median_error_at_entry: Some(14.2),
                 predictions_since_entry: 1,
+                scored_at_entry: 0,
             },
             alert_cooldown: AlertCooldown {
                 last_fired: {

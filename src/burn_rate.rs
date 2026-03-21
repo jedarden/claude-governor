@@ -195,7 +195,7 @@ pub fn compute_instance_burn(
 // ---------------------------------------------------------------------------
 
 /// Minimum samples required in each category (peak/off-peak) for validation
-const MIN_VALIDATION_SAMPLES: usize = 5;
+pub const MIN_VALIDATION_SAMPLES: usize = 5;
 
 /// Tolerance for ratio validation (10%)
 const VALIDATION_TOLERANCE: f64 = 0.10;
@@ -1030,6 +1030,8 @@ pub fn build_burn_rate_state(
     offpeak_ratio_observed: f64,
     offpeak_ratio_expected: f64,
     promotion_validated: bool,
+    promotion_peak_samples: usize,
+    promotion_offpeak_samples: usize,
     last_sample_at: Option<DateTime<Utc>>,
     calibration: crate::state::CalibrationState,
 ) -> crate::state::BurnRateState {
@@ -1074,6 +1076,8 @@ pub fn build_burn_rate_state(
         offpeak_ratio_observed,
         offpeak_ratio_expected,
         promotion_validated,
+        promotion_peak_samples,
+        promotion_offpeak_samples,
         last_sample_at,
         calibration,
     }
@@ -2265,6 +2269,8 @@ mod tests {
             2.03,
             2.0,
             true,
+            10,
+            12,
             Some(Utc::now()),
             crate::state::CalibrationState::default(),
         );

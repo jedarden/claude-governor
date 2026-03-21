@@ -638,6 +638,11 @@ pub struct InstanceRecord {
     #[serde(rename = "total-usd")]
     pub total_usd: f64,
 
+    /// Cache efficiency: cache_read_tokens / (input_tokens + cache_read_tokens)
+    /// 0.0 when no input tokens were consumed this interval
+    #[serde(rename = "cache-eff")]
+    pub cache_eff: f64,
+
     /// 5-hour window utilization % delta — `null` until governor annotates
     #[serde(rename = "p5h", skip_serializing_if = "Option::is_none")]
     pub p5h: Option<f64>,
@@ -663,6 +668,12 @@ impl InstanceRecord {
         usage: &UsageRecord,
         dollars: &crate::pricing::DollarBreakdown,
     ) -> Self {
+        let total_input = usage.input_tokens + usage.cache_read_tokens;
+        let cache_eff = if total_input > 0 {
+            usage.cache_read_tokens as f64 / total_input as f64
+        } else {
+            0.0
+        };
         Self {
             r: "i".to_string(),
             ts,
@@ -685,6 +696,7 @@ impl InstanceRecord {
             w_cache_1h_n: usage.cache_write_1h_tokens,
             w_cache_1h_usd: dollars.cache_write_1h_usd,
             total_usd: dollars.total_usd,
+            cache_eff,
             p5h: None,
             p7d: None,
             p7ds: None,
@@ -760,6 +772,14 @@ pub struct FleetRecord {
     /// USD cost per 1 % of the Sonnet 7-day window — promotion-validation signal.
     /// `null` when `p7ds` is null.
     pub usd_per_pct_7ds: Option<f64>,
+
+    /// Fleet-level cache efficiency: weighted average by total input tokens across all instances.
+    /// 0.0 when no input tokens were consumed this interval.
+    pub fleet_cache_eff: f64,
+
+    /// 25th percentile of per-instance cache efficiency values (nearest-rank method).
+    /// 0.0 when no instances reported this interval.
+    pub cache_eff_p25: f64,
 }
 
 /// Token-type suffixes used in fleet record column names, in schema order.
@@ -832,6 +852,8 @@ impl FleetRecord {
         insert_f64(&mut map, "total-usd", self.total_usd);
         insert_f64(&mut map, "p75-usd-hr", self.p75_usd_hr);
         insert_f64(&mut map, "std-usd-hr", self.std_usd_hr);
+        insert_f64(&mut map, "fleet-cache-eff", self.fleet_cache_eff);
+        insert_f64(&mut map, "cache-eff-p25", self.cache_eff_p25);
 
         // Window snapshots (null until annotated)
         let opt_val = |v: Option<f64>| {
@@ -923,6 +945,41 @@ pub fn aggregate_to_fleet(
         model_data.push((m, tok));
     }
 
+    // Per-instance cache efficiency values
+    let cache_eff_values: Vec<f64> = instances
+        .iter()
+        .map(|i| {
+            let total_input = i.input_n + i.r_cache_n;
+            if total_input > 0 {
+                i.r_cache_n as f64 / total_input as f64
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Fleet cache efficiency: weighted average by (input_n + r_cache_n)
+    let total_input_sum: u64 = instances.iter().map(|i| i.input_n + i.r_cache_n).sum();
+    let fleet_cache_eff = if total_input_sum > 0 {
+        let weighted_cache_reads: u64 = instances.iter().map(|i| i.r_cache_n).sum();
+        weighted_cache_reads as f64 / total_input_sum as f64
+    } else {
+        0.0
+    };
+
+    // 25th percentile cache efficiency (nearest-rank method)
+    let cache_eff_p25 = if cache_eff_values.is_empty() {
+        0.0
+    } else {
+        let mut sorted = cache_eff_values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let p25_idx = ((n as f64 * 0.25).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        sorted[p25_idx]
+    };
+
     let pk = if is_peak(t0) { 1 } else { 0 };
 
     FleetRecord {
@@ -941,6 +998,8 @@ pub fn aggregate_to_fleet(
         p7d: None,
         p7ds: None,
         usd_per_pct_7ds: None,
+        fleet_cache_eff,
+        cache_eff_p25,
     }
 }
 
@@ -1979,6 +2038,10 @@ mod tests {
                 w_cache_1h_n,
                 w_cache_1h_usd: w_cache_1h_n as f64 * 0.006,
                 total_usd,
+                cache_eff: {
+                    let total_input = input_n + r_cache_n;
+                    if total_input > 0 { r_cache_n as f64 / total_input as f64 } else { 0.0 }
+                },
                 p5h: None,
                 p7d: None,
                 p7ds: None,
@@ -2093,6 +2156,7 @@ mod tests {
                 w_cache_1h_n: 0,
                 w_cache_1h_usd: 0.0,
                 total_usd,
+                cache_eff: 0.0,
                 p5h: None,
                 p7d: None,
                 p7ds: None,

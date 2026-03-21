@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::burn_rate::MIN_VALIDATION_SAMPLES;
 use crate::config::AlertConfig;
 use crate::state::{AlertCooldown, CapacityForecast, GovernorState};
 
@@ -157,6 +158,16 @@ pub fn check_underutilization_sprint_for_worker(
     max_workers: u32,
     now: DateTime<Utc>,
 ) -> Option<SprintTrigger> {
+    // Safety check: don't sprint while safe mode is active —
+    // predictions are unreliable so cross-window sprinting is too risky.
+    if state.safe_mode.active {
+        log::debug!(
+            "Sprint inhibited: safe mode active (trigger: {:?})",
+            state.safe_mode.trigger
+        );
+        return None;
+    }
+
     let forecast = &state.capacity_forecast;
 
     // Safety check: don't sprint if any window has cutoff_risk
@@ -441,8 +452,21 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
         }
     }
 
-    // Check PromotionNotApplying: promo not validated and it's off-peak
-    if !state.schedule.is_peak_hour && !state.burn_rate.promotion_validated {
+    // Check PromotionNotApplying: promo is active but not validated and it's off-peak.
+    // Require is_promo_active so stale sample counts from a past promotion don't
+    // trigger a false positive after the promo expires.
+    // Suppress until we have at least MIN_VALIDATION_SAMPLES in each category —
+    // prevents false positives on zero/insufficient data (both ratios would be 0.0).
+    // Also require offpeak_ratio_expected > 0.0: if the expected ratio is zero, the
+    // validation result is uninitialised (e.g. zero-median-peak guard was hit) and
+    // "observed 0.00 vs expected 0.00" is a meaningless comparison.
+    if state.schedule.is_promo_active
+        && !state.schedule.is_peak_hour
+        && !state.burn_rate.promotion_validated
+        && state.burn_rate.promotion_peak_samples >= MIN_VALIDATION_SAMPLES
+        && state.burn_rate.promotion_offpeak_samples >= MIN_VALIDATION_SAMPLES
+        && state.burn_rate.offpeak_ratio_expected > 0.0
+    {
         let observed = state.burn_rate.offpeak_ratio_observed;
         let expected = state.burn_rate.offpeak_ratio_expected;
         let msg = format!(
@@ -882,7 +906,10 @@ mod tests {
     fn promotion_not_applying_triggers_off_peak() {
         let mut state = make_state_with_forecast(CapacityForecast::default());
         state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
         state.burn_rate.promotion_validated = false;
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
         state.burn_rate.offpeak_ratio_observed = 1.5;
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
@@ -919,7 +946,10 @@ mod tests {
         };
         let mut state = make_state_with_forecast(forecast);
         state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
         state.burn_rate.promotion_validated = false;
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
         state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(10);
 
         let alerts = check_alert_conditions(&state, base_now());

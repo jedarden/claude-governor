@@ -46,6 +46,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             w_cache_1h_n INTEGER NOT NULL DEFAULT 0,
             w_cache_1h_usd REAL NOT NULL DEFAULT 0.0,
             total_usd REAL NOT NULL DEFAULT 0.0,
+            cache_eff REAL NOT NULL DEFAULT 0.0,
             p5h       REAL,
             p7d       REAL,
             p7ds      REAL
@@ -70,6 +71,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             p7d       REAL,
             p7ds      REAL,
             usd_per_pct_7ds REAL,
+            fleet_cache_eff REAL NOT NULL DEFAULT 0.0,
+            cache_eff_p25   REAL NOT NULL DEFAULT 0.0,
             payload   TEXT NOT NULL DEFAULT '{}'
         );",
     )?;
@@ -142,6 +145,23 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
          GROUP BY pk, hr_et, model;",
     )?;
 
+    // View: workspace_cache_eff — per-instance cache efficiency over time
+    conn.execute_batch(
+        "CREATE VIEW IF NOT EXISTS workspace_cache_eff AS
+         SELECT
+             sess,
+             model,
+             t0,
+             t1,
+             pk,
+             hr_et,
+             dow,
+             cache_eff,
+             input_n + r_cache_n AS total_input_n
+         FROM i
+         ORDER BY t0 DESC;",
+    )?;
+
     Ok(())
 }
 
@@ -151,9 +171,9 @@ pub fn insert_instance(conn: &Connection, record: &serde_json::Value) -> Result<
         "INSERT INTO i (r, ts, t0, t1, sess, sid, model, pk, hr_et, dow,
                         input_n, input_usd, output_n, output_usd,
                         r_cache_n, r_cache_usd, w_cache_n, w_cache_usd,
-                        w_cache_1h_n, w_cache_1h_usd, total_usd, p5h, p7d, p7ds)
+                        w_cache_1h_n, w_cache_1h_usd, total_usd, cache_eff, p5h, p7d, p7ds)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             record.get("r").and_then(|v| v.as_str()).unwrap_or("i"),
             record.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
@@ -176,6 +196,7 @@ pub fn insert_instance(conn: &Connection, record: &serde_json::Value) -> Result<
             record.get("w-cache-1h-n").and_then(|v| v.as_u64()).unwrap_or(0) as i64,
             record.get("w-cache-1h-usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
             record.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            record.get("cache-eff").and_then(|v| v.as_f64()).unwrap_or(0.0),
             record.get("p5h").and_then(|v| v.as_f64()),
             record.get("p7d").and_then(|v| v.as_f64()),
             record.get("p7ds").and_then(|v| v.as_f64()),
@@ -192,9 +213,9 @@ pub fn insert_fleet(conn: &Connection, record: &serde_json::Value) -> Result<()>
     conn.execute(
         "INSERT INTO f (r, ts, t0, t1, pk, hr_et, dow, workers,
                         total_usd, p75_usd_hr, std_usd_hr, p5h, p7d, p7ds,
-                        usd_per_pct_7ds, payload)
+                        usd_per_pct_7ds, fleet_cache_eff, cache_eff_p25, payload)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             record.get("r").and_then(|v| v.as_str()).unwrap_or("f"),
             record.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
@@ -211,6 +232,8 @@ pub fn insert_fleet(conn: &Connection, record: &serde_json::Value) -> Result<()>
             record.get("p7d").and_then(|v| v.as_f64()),
             record.get("p7ds").and_then(|v| v.as_f64()),
             record.get("usd-per-pct-7ds").and_then(|v| v.as_f64()),
+            record.get("fleet-cache-eff").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            record.get("cache-eff-p25").and_then(|v| v.as_f64()).unwrap_or(0.0),
             payload,
         ],
     )?;

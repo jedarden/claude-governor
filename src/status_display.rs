@@ -246,7 +246,7 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     // Safe mode warning
     if state.safe_mode.active {
         output.push_str("\n");
-        output.push_str("⚠️  SAFE MODE ACTIVE\n");
+        output.push_str("WARNING  SAFE MODE ACTIVE\n");
         output.push_str(&format!(
             "  Trigger: {}\n",
             state.safe_mode.trigger.as_deref().unwrap_or("unknown")
@@ -257,6 +257,22 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
                 format_relative_time(entered, now)
             ));
         }
+        if let Some(err) = state.safe_mode.median_error_at_entry {
+            output.push_str(&format!(
+                "  Error at entry: {:.1} pct-pts (exit threshold: 8.0)\n",
+                err
+            ));
+        }
+        if state.safe_mode.predictions_since_entry > 0 {
+            output.push_str(&format!(
+                "  Predictions since entry: {}\n",
+                state.safe_mode.predictions_since_entry
+            ));
+        }
+        output.push_str(&format!(
+            "  Effect: ceiling -{:.0}%, hysteresis x2, sprint+cross-window disabled\n",
+            5.0_f64
+        ));
     }
 
     // Emergency brake / cutoff risk summary
@@ -448,6 +464,8 @@ mod tests {
                 offpeak_ratio_observed: 2.03,
                 offpeak_ratio_expected: 2.0,
                 promotion_validated: true,
+                promotion_peak_samples: 0,
+                promotion_offpeak_samples: 0,
                 last_sample_at: Some(Utc::now() - chrono::Duration::minutes(15)),
                 calibration: CalibrationState::default(),
             },
