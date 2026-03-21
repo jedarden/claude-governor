@@ -15,7 +15,7 @@
 //! - config: Print or edit active configuration
 //! - version: Print version and component status
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use log::LevelFilter;
@@ -207,6 +207,17 @@ enum Commands {
         /// Target utilization ceiling percentage (overrides config)
         #[arg(short = 'c', long)]
         ceiling: Option<f64>,
+    },
+
+    /// Initialize claude-governor configuration and systemd service
+    Init {
+        /// Force overwrite existing configuration
+        #[arg(long)]
+        force: bool,
+
+        /// Skip systemd service installation
+        #[arg(long)]
+        no_systemd: bool,
     },
 }
 
@@ -796,6 +807,9 @@ fn main() -> Result<()> {
         } => {
             run_daemon_command(dry_run, interval, hysteresis, ceiling)?;
         }
+        Commands::Init { force, no_systemd } => {
+            run_init_command(force, no_systemd)?;
+        }
     }
 
     Ok(())
@@ -827,6 +841,158 @@ fn run_daemon_command(
         &config.alerts,
         &config.agents,
     )
+}
+
+fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+
+    let mut actions_taken = Vec::new();
+    let mut actions_skipped = Vec::new();
+
+    // 1. Create ~/.config/claude-governor/ directory
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("claude-governor");
+
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir)
+            .with_context(|| format!("Failed to create config directory: {}", config_dir.display()))?;
+        actions_taken.push(format!("Created config directory: {}", config_dir.display()));
+    } else {
+        actions_skipped.push(format!("Config directory exists: {}", config_dir.display()));
+    }
+
+    // 2. Copy default governor.yaml (skip if exists and not force)
+    let config_path = config_dir.join("governor.yaml");
+    if config_path.exists() && !force {
+        actions_skipped.push(format!("Config file exists (use --force to overwrite): {}", config_path.display()));
+    } else {
+        let default_yaml = include_str!("../config/governor.yaml");
+        fs::write(&config_path, default_yaml)
+            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+        if force && config_path.exists() {
+            actions_taken.push(format!("Overwrote config file: {}", config_path.display()));
+        } else {
+            actions_taken.push(format!("Created config file: {}", config_path.display()));
+        }
+    }
+
+    // 3. Create ~/.needle/logs/ and ~/.needle/state/ directories
+    let needle_dir = home.join(".needle");
+    let logs_dir = needle_dir.join("logs");
+    let state_dir = needle_dir.join("state");
+
+    if !logs_dir.exists() {
+        fs::create_dir_all(&logs_dir)
+            .with_context(|| format!("Failed to create logs directory: {}", logs_dir.display()))?;
+        actions_taken.push(format!("Created logs directory: {}", logs_dir.display()));
+    } else {
+        actions_skipped.push(format!("Logs directory exists: {}", logs_dir.display()));
+    }
+
+    if !state_dir.exists() {
+        fs::create_dir_all(&state_dir)
+            .with_context(|| format!("Failed to create state directory: {}", state_dir.display()))?;
+        actions_taken.push(format!("Created state directory: {}", state_dir.display()));
+    } else {
+        actions_skipped.push(format!("State directory exists: {}", state_dir.display()));
+    }
+
+    // 4. Detect systemd availability and install user service units
+    let systemd_installed = if !no_systemd {
+        let systemd_user_dir = dirs::config_dir()
+            .map(|p| p.join("systemd/user"))
+            .unwrap_or_else(|| home.join(".config/systemd/user"));
+
+        // Check if systemd is available (user sessions)
+        let systemd_available = Command::new("systemctl")
+            .args(["--user", "status"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if systemd_available {
+            if !systemd_user_dir.exists() {
+                fs::create_dir_all(&systemd_user_dir)
+                    .with_context(|| format!("Failed to create systemd directory: {}", systemd_user_dir.display()))?;
+            }
+
+            let service_path = systemd_user_dir.join("cgov.service");
+            let service_content = include_str!("../config/cgov.service");
+
+            // Replace %h with actual home path (systemd %h specifier)
+            let service_content = service_content.replace("%h", home.to_str().unwrap_or("~"));
+
+            if service_path.exists() && !force {
+                actions_skipped.push(format!("Systemd service exists (use --force to overwrite): {}", service_path.display()));
+            } else {
+                fs::write(&service_path, &service_content)
+                    .with_context(|| format!("Failed to write systemd service: {}", service_path.display()))?;
+                actions_taken.push(format!("Installed systemd service: {}", service_path.display()));
+            }
+
+            // Run daemon-reload
+            let _ = Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .output();
+            actions_taken.push("Ran systemctl --user daemon-reload".to_string());
+
+            true
+        } else {
+            actions_skipped.push("Systemd user sessions not available".to_string());
+            false
+        }
+    } else {
+        actions_skipped.push("Skipped systemd installation (--no-systemd)".to_string());
+        false
+    };
+
+    // 5. Check for legacy capacity-governor.sh
+    let legacy_script = home.join("capacity-governor.sh");
+    let legacy_detected = legacy_script.exists();
+
+    // Print summary
+    println!("Claude Governor Initialization Complete");
+    println!("========================================\n");
+
+    if !actions_taken.is_empty() {
+        println!("Actions taken:");
+        for action in &actions_taken {
+            println!("  ✓ {}", action);
+        }
+        println!();
+    }
+
+    if !actions_skipped.is_empty() {
+        println!("Actions skipped:");
+        for action in &actions_skipped {
+            println!("  - {}", action);
+        }
+        println!();
+    }
+
+    if legacy_detected {
+        println!("MIGRATION NOTE:");
+        println!("  Legacy script detected: {}", legacy_script.display());
+        println!("  Consider migrating your custom logic to governor.yaml and removing the legacy script.");
+        println!();
+    }
+
+    // Quickstart message
+    println!("Quickstart:");
+    println!("  1. Edit configuration: cgov config --edit");
+    println!("  2. Check status:       cgov status");
+    println!("  3. View forecasts:     cgov forecast");
+    if systemd_installed {
+        println!("  4. Enable service:     systemctl --user enable cgov");
+        println!("  5. Start service:      systemctl --user start cgov");
+        println!("  6. View logs:          journalctl --user -u cgov -f");
+    } else {
+        println!("  4. Run daemon:         cgov daemon");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

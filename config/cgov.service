@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Governor - automated capacity governor for Claude Code
+Documentation=https://github.com/anthropics/claude-governor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cgov daemon
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=default.target
