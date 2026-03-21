@@ -434,8 +434,11 @@ mod tests {
                 is_peak_hour: false,
                 is_promo_active: true,
                 promo_multiplier: 2.0,
+                promo_multiplier_five_hour: 2.0,
                 effective_hours_remaining: 75.0,
+                effective_hours_remaining_five_hour: 75.0,
                 raw_hours_remaining: 37.5,
+                ..Default::default()
             },
             workers,
             burn_rate: BurnRateState {

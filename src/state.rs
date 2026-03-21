@@ -166,13 +166,33 @@ impl Default for CapacityForecast {
     }
 }
 
+fn serde_default_one() -> f64 {
+    1.0
+}
+
 /// Schedule block — peak hour and promotion state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScheduleState {
     pub is_peak_hour: bool,
     pub is_promo_active: bool,
+    /// Per-window promotion multipliers.
+    /// Only windows listed in the promotion's `applies_to` get > 1.0.
+    /// During peak hours all windows are 1.0.
+    #[serde(default = "serde_default_one")]
+    pub promo_multiplier_five_hour: f64,
+    #[serde(default = "serde_default_one")]
+    pub promo_multiplier_seven_day: f64,
+    #[serde(default = "serde_default_one")]
+    pub promo_multiplier_seven_day_sonnet: f64,
+    /// Display multiplier: max across all windows (for backward-compatible display).
+    #[serde(default = "serde_default_one")]
     pub promo_multiplier: f64,
+    /// Per-window effective hours remaining (wall-clock hours × multiplier).
+    pub effective_hours_remaining_five_hour: f64,
+    pub effective_hours_remaining_seven_day: f64,
+    pub effective_hours_remaining_seven_day_sonnet: f64,
+    /// Effective hours for the binding window (for display).
     pub effective_hours_remaining: f64,
     pub raw_hours_remaining: f64,
 }
@@ -182,7 +202,13 @@ impl Default for ScheduleState {
         Self {
             is_peak_hour: false,
             is_promo_active: false,
+            promo_multiplier_five_hour: 1.0,
+            promo_multiplier_seven_day: 1.0,
+            promo_multiplier_seven_day_sonnet: 1.0,
             promo_multiplier: 1.0,
+            effective_hours_remaining_five_hour: 0.0,
+            effective_hours_remaining_seven_day: 0.0,
+            effective_hours_remaining_seven_day_sonnet: 0.0,
             effective_hours_remaining: 0.0,
             raw_hours_remaining: 0.0,
         }
@@ -645,7 +671,13 @@ mod tests {
             schedule: ScheduleState {
                 is_peak_hour: false,
                 is_promo_active: true,
+                promo_multiplier_five_hour: 2.0,
+                promo_multiplier_seven_day: 1.0,
+                promo_multiplier_seven_day_sonnet: 1.0,
                 promo_multiplier: 2.0,
+                effective_hours_remaining_five_hour: 84.5,
+                effective_hours_remaining_seven_day: 37.5,
+                effective_hours_remaining_seven_day_sonnet: 37.5,
                 effective_hours_remaining: 84.5,
                 raw_hours_remaining: 37.5,
             },

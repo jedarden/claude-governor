@@ -135,6 +135,12 @@ pub fn current_multiplier(promotions: &[Promotion], window: &str) -> f64 {
     get_multiplier_at(Utc::now(), promotions, window)
 }
 
+/// Check whether any promotion is currently active (in its date range) at time t,
+/// regardless of peak/off-peak status.
+pub fn is_any_promo_active_at(t: DateTime<Utc>, promotions: &[Promotion]) -> bool {
+    promotions.iter().any(|p| is_promo_active_at(t, p))
+}
+
 /// Check if a promotion is active at a specific time
 fn is_promo_active_at(t: DateTime<Utc>, promo: &Promotion) -> bool {
     // Parse dates as ET dates (start of day in ET)

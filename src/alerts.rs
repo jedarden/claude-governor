@@ -632,9 +632,7 @@ mod tests {
             schedule: ScheduleState {
                 is_peak_hour: true,
                 is_promo_active: false,
-                promo_multiplier: 1.0,
-                effective_hours_remaining: 0.0,
-                raw_hours_remaining: 0.0,
+                ..Default::default()
             },
             workers: Default::default(),
             burn_rate: BurnRateState {

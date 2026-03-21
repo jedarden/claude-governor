@@ -1090,6 +1090,46 @@ pub fn run_governor_cycle(
         estimated_remaining_dollars: 0.0,
     };
 
+    // Update schedule state with per-window multipliers and effective hours.
+    // Each window's multiplier respects the promotion's applies_to list —
+    // only windows listed there get > 1.0; all others stay 1.0.
+    let mult_five_hour = schedule::get_multiplier_at(now, promotions, "five_hour");
+    let mult_seven_day = schedule::get_multiplier_at(now, promotions, "seven_day");
+    let mult_seven_day_sonnet = schedule::get_multiplier_at(now, promotions, "seven_day_sonnet");
+    let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
+    let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);
+    let eff_seven_day_sonnet = hours_remaining.get("seven_day_sonnet").copied().unwrap_or(0.0);
+    // Effective hours for display: use the binding window's value
+    let eff_display = match binding_window.as_str() {
+        "five_hour" => eff_five_hour,
+        "seven_day" => eff_seven_day,
+        _ => eff_seven_day_sonnet,
+    };
+    // Raw hours remaining: wall-clock hours until seven_day reset (approx)
+    let raw_hours = state
+        .usage
+        .sonnet_resets_at
+        .parse::<DateTime<Utc>>()
+        .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
+        .unwrap_or(0.0);
+    state.schedule = state::ScheduleState {
+        is_peak_hour: schedule::is_peak_at(now),
+        is_promo_active: schedule::is_any_promo_active_at(now, promotions),
+        promo_multiplier_five_hour: mult_five_hour,
+        promo_multiplier_seven_day: mult_seven_day,
+        promo_multiplier_seven_day_sonnet: mult_seven_day_sonnet,
+        // max across windows for backward-compatible display
+        promo_multiplier: [mult_five_hour, mult_seven_day, mult_seven_day_sonnet]
+            .iter()
+            .cloned()
+            .fold(1.0_f64, f64::max),
+        effective_hours_remaining_five_hour: eff_five_hour,
+        effective_hours_remaining_seven_day: eff_seven_day,
+        effective_hours_remaining_seven_day_sonnet: eff_seven_day_sonnet,
+        effective_hours_remaining: eff_display,
+        raw_hours_remaining: raw_hours,
+    };
+
     // Update burn_rate from fleet aggregate if we have valid data
     if elapsed_hours > 0.0 && current_total > 0 {
         let deltas = &state.last_fleet_aggregate.window_pct_deltas;
@@ -1838,5 +1878,61 @@ mod tests {
         assert!(t.multiplier_after > t.multiplier_before, "gaining bonus");
         assert!(t.minutes_until <= 30, "within window");
         // Conservative: multiplier_after > multiplier_before → no pre-scale
+    }
+
+    // --- Regression: per-window multiplier and applies_to ---
+
+    /// Promotion applies to only five_hour window (config/promotions.json pattern).
+    /// Verify get_multiplier_at() returns 2.0 for five_hour and 1.0 for the other
+    /// windows during an off-peak time inside the promo date range.
+    #[test]
+    fn schedule_state_per_window_applies_to_filtering() {
+        // Promo applies ONLY to five_hour (mirrors real config/promotions.json)
+        let promos = vec![Promotion {
+            name: "March 2026".to_string(),
+            start_date: "2026-03-13".to_string(),
+            end_date: "2026-03-29".to_string(),
+            peak_start_hour_et: 8,
+            peak_end_hour_et: 14,
+            offpeak_multiplier: 2.0,
+            applies_to: vec!["five_hour".to_string()],
+        }];
+
+        // Off-peak weekday inside promo range: March 18, 2026 at 06:00 ET
+        let t = et(2026, 3, 18, 6, 0);
+
+        let mult_five = schedule::get_multiplier_at(t, &promos, "five_hour");
+        let mult_7d = schedule::get_multiplier_at(t, &promos, "seven_day");
+        let mult_7ds = schedule::get_multiplier_at(t, &promos, "seven_day_sonnet");
+
+        assert!(
+            (mult_five - 2.0).abs() < 1e-9,
+            "five_hour should get 2x (in applies_to), got {mult_five}"
+        );
+        assert!(
+            (mult_7d - 1.0).abs() < 1e-9,
+            "seven_day should get 1.0x (not in applies_to), got {mult_7d}"
+        );
+        assert!(
+            (mult_7ds - 1.0).abs() < 1e-9,
+            "seven_day_sonnet should get 1.0x (not in applies_to), got {mult_7ds}"
+        );
+
+        // is_any_promo_active_at should be true (we are inside the date range)
+        assert!(
+            schedule::is_any_promo_active_at(t, &promos),
+            "promo should be active on March 18 during date range"
+        );
+
+        // Outside date range: April 1 — promo should be inactive
+        let after_promo = et(2026, 4, 1, 6, 0);
+        assert!(
+            !schedule::is_any_promo_active_at(after_promo, &promos),
+            "promo should be inactive after end_date"
+        );
+        assert!(
+            (schedule::get_multiplier_at(after_promo, &promos, "five_hour") - 1.0).abs() < 1e-9,
+            "five_hour should be 1.0x after promo ends"
+        );
     }
 }
