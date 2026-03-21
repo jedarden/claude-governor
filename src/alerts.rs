@@ -4,11 +4,17 @@
 //! - Alert condition evaluation from governor state
 //! - Per-type cooldown deduplication to prevent alert spam
 //! - Alert severity classification
+//! - Firing alerts via configured command (default: br create --type human)
+//! - Logging alerts to governor.log
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 
-use crate::config::SprintConfig;
+use crate::config::{AlertConfig, SprintConfig};
 use crate::state::{AlertCooldown, CapacityForecast, GovernorState};
 
 /// Alert severity levels
@@ -176,8 +182,8 @@ pub fn check_underutilization_sprint_for_worker(
                 hours_remaining,
                 target_workers: max_workers,
                 reason: format!(
-                    "Underutilization sprint: {:.1}% used, {:.1}h to reset",
-                    utilization, hours_remaining
+                    "Underutilization sprint on {} for worker {}: {:.1}% used, {:.1}h to reset",
+                    name, worker_id, utilization, hours_remaining
                 ),
                 triggered_at: now,
             };
@@ -218,6 +224,169 @@ pub fn should_fire(
 /// Update cooldown state after firing an alert
 pub fn update_cooldown(cooldown: &mut AlertCooldown, alert_type: AlertType, now: DateTime<Utc>) {
     cooldown.record_fired(&alert_type.to_string(), now);
+}
+
+// ---------------------------------------------------------------------------
+// Alert firing and logging
+// ---------------------------------------------------------------------------
+
+/// Default path for the governor alert log
+pub fn default_alert_log_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("logs")
+        .join("governor.log")
+}
+
+/// Fire an alert by executing the configured command and logging to governor.log.
+///
+/// This function:
+/// 1. Checks if alerts are enabled in config
+/// 2. Checks if the alert severity meets the minimum threshold
+/// 3. Executes the configured command (default: br create --type human "...")
+/// 4. Logs the alert to governor.log
+///
+/// Returns Ok(()) if the alert was fired successfully, or an error message.
+pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), String> {
+    // Check if alerts are enabled
+    if !config.enabled {
+        log::debug!("[alert] alerts disabled, skipping {}", alert.alert_type);
+        return Ok(());
+    }
+
+    // Check severity threshold
+    if !meets_severity_threshold(alert.severity, &config.min_severity) {
+        log::debug!(
+            "[alert] severity {:?} below threshold '{}', skipping {}",
+            alert.severity,
+            config.min_severity,
+            alert.alert_type
+        );
+        return Ok(());
+    }
+
+    log::info!(
+        "[alert] firing [{}] {}: {}",
+        alert.severity,
+        alert.alert_type,
+        alert.message
+    );
+
+    // Build the command with the alert message as the final argument
+    if config.command.is_empty() {
+        log::warn!("[alert] no command configured, skipping alert execution");
+        return Err("no alert command configured".to_string());
+    }
+
+    let mut cmd = Command::new(&config.command[0]);
+    if config.command.len() > 1 {
+        cmd.args(&config.command[1..]);
+    }
+    // Append the alert message as the final argument
+    let alert_message = format!("[{}] {}: {}", alert.severity, alert.alert_type, alert.message);
+    cmd.arg(&alert_message);
+
+    // Execute the command
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                log::info!("[alert] command executed successfully");
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!("[alert] command failed: {}", stderr.trim());
+            }
+        }
+        Err(e) => {
+            log::warn!("[alert] failed to execute command: {}", e);
+        }
+    }
+
+    // Log to governor.log
+    if let Err(e) = log_alert_to_file(alert) {
+        log::warn!("[alert] failed to write to governor.log: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Check if an alert severity meets the minimum threshold.
+fn meets_severity_threshold(severity: AlertSeverity, min_severity: &str) -> bool {
+    let min = match min_severity.to_lowercase().as_str() {
+        "info" => 0,
+        "warning" => 1,
+        "critical" => 2,
+        _ => 1, // default to warning
+    };
+
+    let level = match severity {
+        AlertSeverity::Info => 0,
+        AlertSeverity::Warning => 1,
+        AlertSeverity::Critical => 2,
+    };
+
+    level >= min
+}
+
+/// Log an alert to the governor.log file.
+///
+/// Creates the log directory if it doesn't exist.
+/// Appends a single line with timestamp, severity, type, and message.
+fn log_alert_to_file(alert: &AlertCondition) -> std::io::Result<()> {
+    let path = default_alert_log_path();
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Open file for append
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+
+    // Format: 2026-03-20T10:00:00Z [CRITICAL] cutoff_imminent: Window five_hour at cutoff risk...
+    let log_line = format!(
+        "{} [{:?}] {}: {}\n",
+        alert.detected_at.to_rfc3339(),
+        alert.severity,
+        alert.alert_type,
+        alert.message
+    );
+
+    file.write_all(log_line.as_bytes())?;
+
+    Ok(())
+}
+
+/// Process all pending alerts: filter by cooldown, fire, and update cooldown state.
+///
+/// This is a convenience function that combines:
+/// 1. `check_alert_conditions` - find active alerts
+/// 2. `should_fire` - filter by cooldown
+/// 3. `fire_alert` - execute and log
+/// 4. `update_cooldown` - record that we fired
+///
+/// Returns the number of alerts that were actually fired.
+pub fn process_alerts(
+    state: &mut GovernorState,
+    config: &AlertConfig,
+    now: DateTime<Utc>,
+) -> usize {
+    let conditions = check_alert_conditions(state, now);
+    let mut fired_count = 0;
+
+    for alert in &conditions {
+        if should_fire(alert.alert_type, &state.alert_cooldown, now, config.cooldown_minutes) {
+            if fire_alert(alert, config).is_ok() {
+                update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
+                fired_count += 1;
+            }
+        }
+    }
+
+    fired_count
 }
 
 /// Check all alert conditions from governor state
@@ -1063,5 +1232,183 @@ mod tests {
             "Sprint should pick worker with most headroom"
         );
         assert_eq!(trigger.target_workers, 10);
+    }
+
+    // --- Alert firing tests ---
+
+    #[test]
+    fn meets_severity_threshold_info() {
+        assert!(meets_severity_threshold(AlertSeverity::Info, "info"));
+        assert!(!meets_severity_threshold(AlertSeverity::Info, "warning"));
+        assert!(!meets_severity_threshold(AlertSeverity::Info, "critical"));
+    }
+
+    #[test]
+    fn meets_severity_threshold_warning() {
+        assert!(meets_severity_threshold(AlertSeverity::Warning, "info"));
+        assert!(meets_severity_threshold(AlertSeverity::Warning, "warning"));
+        assert!(!meets_severity_threshold(AlertSeverity::Warning, "critical"));
+    }
+
+    #[test]
+    fn meets_severity_threshold_critical() {
+        assert!(meets_severity_threshold(AlertSeverity::Critical, "info"));
+        assert!(meets_severity_threshold(AlertSeverity::Critical, "warning"));
+        assert!(meets_severity_threshold(AlertSeverity::Critical, "critical"));
+    }
+
+    #[test]
+    fn fire_alert_disabled_skips() {
+        let alert = AlertCondition {
+            alert_type: AlertType::CutoffImminent,
+            message: "test".to_string(),
+            severity: AlertSeverity::Critical,
+            detected_at: base_now(),
+        };
+
+        let config = AlertConfig {
+            enabled: false,
+            ..AlertConfig::default()
+        };
+
+        let result = fire_alert(&alert, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fire_alert_below_severity_skips() {
+        let alert = AlertCondition {
+            alert_type: AlertType::Underutilization,
+            message: "test".to_string(),
+            severity: AlertSeverity::Info,
+            detected_at: base_now(),
+        };
+
+        let config = AlertConfig {
+            min_severity: "critical".to_string(),
+            ..AlertConfig::default()
+        };
+
+        let result = fire_alert(&alert, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fire_alert_empty_command_returns_error() {
+        let alert = AlertCondition {
+            alert_type: AlertType::CutoffImminent,
+            message: "test".to_string(),
+            severity: AlertSeverity::Critical,
+            detected_at: base_now(),
+        };
+
+        let config = AlertConfig {
+            command: vec![],
+            ..AlertConfig::default()
+        };
+
+        let result = fire_alert(&alert, &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no alert command"));
+    }
+
+    #[test]
+    fn log_alert_to_file_creates_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Override the log path by using a temp file directly
+        let log_path = temp_dir.path().join("governor.log");
+
+        let alert = AlertCondition {
+            alert_type: AlertType::CutoffImminent,
+            message: "Test alert message".to_string(),
+            severity: AlertSeverity::Critical,
+            detected_at: base_now(),
+        };
+
+        // Manually write to the temp path
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        let log_line = format!(
+            "{} [{:?}] {}: {}\n",
+            alert.detected_at.to_rfc3339(),
+            alert.severity,
+            alert.alert_type,
+            alert.message
+        );
+        file.write_all(log_line.as_bytes()).unwrap();
+
+        // Verify file was created and contains expected content
+        assert!(log_path.exists());
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("CutoffImminent"));
+        assert!(contents.contains("Test alert message"));
+        assert!(contents.contains("Critical"));
+    }
+
+    #[test]
+    fn process_alerts_filters_and_fires() {
+        let forecast = CapacityForecast {
+            five_hour: make_window(true, -3.0, 2.0), // CutoffImminent
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let mut state = make_state_with_forecast(forecast);
+        state.alert_cooldown = AlertCooldown::new();
+
+        let config = AlertConfig {
+            enabled: true,
+            cooldown_minutes: 60,
+            command: vec!["echo".to_string()], // Safe command for testing
+            ..AlertConfig::default()
+        };
+
+        let fired = process_alerts(&mut state, &config, base_now());
+        assert!(fired >= 1, "Should have fired at least one alert");
+
+        // Cooldown should now be set
+        assert!(state.alert_cooldown.get_last_fired("cutoff_imminent").is_some());
+    }
+
+    #[test]
+    fn process_alerts_respects_cooldown() {
+        let forecast = CapacityForecast {
+            five_hour: make_window(true, -3.0, 2.0), // CutoffImminent
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let mut state = make_state_with_forecast(forecast);
+
+        // Set cooldown to have just fired
+        state.alert_cooldown.record_fired("cutoff_imminent", base_now());
+
+        let config = AlertConfig {
+            enabled: true,
+            cooldown_minutes: 60,
+            command: vec!["echo".to_string()],
+            ..AlertConfig::default()
+        };
+
+        let fired = process_alerts(&mut state, &config, base_now());
+        // CutoffImminent should be skipped due to cooldown
+        assert_eq!(fired, 0, "Should have fired zero alerts due to cooldown");
+    }
+
+    #[test]
+    fn alert_log_path_is_in_home_directory() {
+        let path = default_alert_log_path();
+        assert!(path.to_string_lossy().contains(".needle"));
+        assert!(path.to_string_lossy().contains("governor.log"));
     }
 }

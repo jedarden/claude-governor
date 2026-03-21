@@ -23,6 +23,10 @@ pub struct GovernorConfig {
     /// Daemon configuration
     #[serde(default)]
     pub daemon: DaemonConfig,
+
+    /// Alert configuration
+    #[serde(default)]
+    pub alerts: AlertConfig,
 }
 
 /// Daemon configuration
@@ -149,6 +153,55 @@ impl Default for SprintConfig {
             max_workers_boost: default_max_workers_boost(),
             max_cone_ratio: default_max_cone_ratio(),
             sprint_end_headroom_pct: default_sprint_end_headroom_pct(),
+        }
+    }
+}
+
+/// Alert configuration
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct AlertConfig {
+    /// Command to execute when an alert fires (default: br create --type human)
+    /// The alert message is appended as the last argument.
+    #[serde(default = "default_alert_command")]
+    pub command: Vec<String>,
+
+    /// Cooldown period in minutes between repeated alerts of the same type
+    #[serde(default = "default_cooldown_minutes")]
+    pub cooldown_minutes: i64,
+
+    /// Whether alerts are enabled (default: true)
+    #[serde(default = "default_alerts_enabled")]
+    pub enabled: bool,
+
+    /// Minimum severity level to fire alerts (default: "warning")
+    /// Options: "info", "warning", "critical"
+    #[serde(default = "default_min_severity")]
+    pub min_severity: String,
+}
+
+fn default_alert_command() -> Vec<String> {
+    vec!["br".to_string(), "create".to_string(), "--type".to_string(), "human".to_string()]
+}
+
+fn default_cooldown_minutes() -> i64 {
+    60
+}
+
+fn default_alerts_enabled() -> bool {
+    true
+}
+
+fn default_min_severity() -> String {
+    "warning".to_string()
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            command: default_alert_command(),
+            cooldown_minutes: default_cooldown_minutes(),
+            enabled: default_alerts_enabled(),
+            min_severity: default_min_severity(),
         }
     }
 }

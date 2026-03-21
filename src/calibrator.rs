@@ -408,10 +408,10 @@ mod tests {
     fn score_prediction_handles_zero_actual() {
         let now = Utc::now();
 
-        // Predicted 5, actual 0: 100% error
+        // Predicted 5, actual 0: -100% error (over-predicted)
         let score = score_prediction("five_hour", 5.0, 0.0, now);
         assert!((score.error - (-5.0)).abs() < 1e-9);
-        assert!((score.pct_error - 100.0).abs() < 1e-9);
+        assert!((score.pct_error - (-100.0)).abs() < 1e-9);
 
         // Both zero: 0% error
         let score2 = score_prediction("five_hour", 0.0, 0.0, now);

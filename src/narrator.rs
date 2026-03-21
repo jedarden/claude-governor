@@ -689,7 +689,7 @@ mod tests {
         assert!(entry.reason.contains("safe to at-risk"));
         assert!(entry.reason.contains("seven_day"));
         assert!(entry.reason.contains("85.0% utilization"));
-        assert!(entry.reason.contains("predicted exhaustion"));
+        assert!(entry.reason.contains("Predicted exhaustion"));
     }
 
     #[test]
