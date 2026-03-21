@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::{AlertConfig, SprintConfig};
+use crate::config::AlertConfig;
 use crate::state::{AlertCooldown, CapacityForecast, GovernorState};
 
 /// Alert severity levels
@@ -591,7 +591,7 @@ fn check_underutilization(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use crate::config::AlertConfig;
+    use crate::config::{AlertConfig, SprintConfig};
     use crate::state::{
         AlertCooldown, BurnRateState, CapacityForecast, FleetAggregate, GovernorState, ScheduleState,
         SafeModeState, UsageState, WorkerState, WindowForecast,
