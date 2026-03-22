@@ -116,8 +116,8 @@ pub struct ScaleDownResult {
 /// This provides a consistency check - if heartbeat and tmux counts differ,
 /// something may be wrong (stale heartbeats, orphaned sessions, etc.)
 pub fn count_workers(config: &WorkerConfig) -> WorkerCount {
-    // Count heartbeat files
-    let heartbeat_count = count_heartbeat_files(&config.heartbeat_dir);
+    // Count heartbeat files, filtered to this agent's session prefix
+    let heartbeat_count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
 
     // Count tmux sessions
     let (tmux_count, sessions) = count_tmux_sessions(&config.session_prefix);
@@ -130,24 +130,12 @@ pub fn count_workers(config: &WorkerConfig) -> WorkerCount {
     }
 }
 
-/// Count heartbeat JSON files in the heartbeat directory.
-fn count_heartbeat_files(dir: &Path) -> usize {
-    if !dir.exists() {
-        return 0;
-    }
-
-    match fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension().map(|ext| ext == "json").unwrap_or(false)
-            })
-            .count(),
-        Err(e) => {
-            log::warn!("[worker] failed to read heartbeat dir {}: {}", dir.display(), e);
-            0
-        }
-    }
+/// Count heartbeat JSON files in the heartbeat directory, filtered by session prefix.
+///
+/// Only counts files whose `session` field starts with `session_prefix`, so workers
+/// from other projects sharing the same heartbeat directory are excluded.
+fn count_heartbeat_files(dir: &Path, session_prefix: &str) -> usize {
+    read_heartbeats(dir, session_prefix).len()
 }
 
 /// Count tmux sessions with the given prefix.
@@ -194,7 +182,13 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
 
     for i in 0..n {
         let worker_id = format!("{}-{}-{}", config.session_prefix, timestamp, i);
-        let cmd = config.launch_cmd.replace("{id}", &worker_id);
+        let workspace = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .into_owned();
+        let cmd = config.launch_cmd
+            .replace("{id}", &worker_id)
+            .replace("{workspace}", &workspace);
 
         if dry_run {
             log::info!("[worker] DRY RUN: would launch: {}", cmd);
@@ -346,7 +340,7 @@ pub fn scale_down_graceful(n: u32, config: &WorkerConfig, dry_run: bool) -> Scal
 ///
 /// Returns up to `n` session names, sorted by idle status and heartbeat age.
 fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
-    let heartbeats = read_heartbeats(&config.heartbeat_dir);
+    let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
 
     // Sort workers: idle first, then by heartbeat age (oldest first)
     let mut workers: Vec<_> = heartbeats.into_iter().collect();
@@ -369,8 +363,11 @@ fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
         .collect()
 }
 
-/// Read all heartbeat files from the directory.
-fn read_heartbeats(dir: &Path) -> HashMap<String, Heartbeat> {
+/// Read heartbeat files from the directory, filtered to sessions with the given prefix.
+///
+/// Only heartbeats whose `session` field starts with `session_prefix` are returned,
+/// so workers from other projects sharing the same heartbeat directory are excluded.
+fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbeat> {
     let mut heartbeats = HashMap::new();
 
     if !dir.exists() {
@@ -395,7 +392,9 @@ fn read_heartbeats(dir: &Path) -> HashMap<String, Heartbeat> {
             Ok(content) => {
                 match serde_json::from_str::<Heartbeat>(&content) {
                     Ok(hb) => {
-                        heartbeats.insert(hb.session.clone(), hb);
+                        if hb.session.starts_with(session_prefix) {
+                            heartbeats.insert(hb.session.clone(), hb);
+                        }
                     }
                     Err(e) => {
                         log::debug!("[worker] invalid heartbeat {}: {}", path.display(), e);
@@ -493,7 +492,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = test_config(&temp);
 
-        let count = count_heartbeat_files(&config.heartbeat_dir);
+        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
         assert_eq!(count, 0);
     }
 
@@ -504,19 +503,24 @@ mod tests {
 
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
-        // Create some heartbeat files
+        // Create heartbeat files whose sessions match the prefix "test-worker"
         fs::write(
-            config.heartbeat_dir.join("worker-1.json"),
-            r#"{"session":"worker-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
+            config.heartbeat_dir.join("test-worker-1.json"),
+            r#"{"session":"test-worker-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
         ).unwrap();
         fs::write(
-            config.heartbeat_dir.join("worker-2.json"),
-            r#"{"session":"worker-2","timestamp":"2026-03-20T10:00:00Z","is_idle":false,"current_task":"task-123","model":"sonnet"}"#,
+            config.heartbeat_dir.join("test-worker-2.json"),
+            r#"{"session":"test-worker-2","timestamp":"2026-03-20T10:00:00Z","is_idle":false,"current_task":"task-123","model":"sonnet"}"#,
         ).unwrap();
         // Non-JSON file should be ignored
         fs::write(config.heartbeat_dir.join("readme.txt"), "hello").unwrap();
+        // Heartbeat from a different project (different prefix) should be excluded
+        fs::write(
+            config.heartbeat_dir.join("other-project-1.json"),
+            r#"{"session":"other-project-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
+        ).unwrap();
 
-        let count = count_heartbeat_files(&config.heartbeat_dir);
+        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
         assert_eq!(count, 2);
     }
 
@@ -528,14 +532,14 @@ mod tests {
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
         fs::write(
-            config.heartbeat_dir.join("worker-1.json"),
-            r#"{"session":"worker-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
+            config.heartbeat_dir.join("test-worker-1.json"),
+            r#"{"session":"test-worker-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
         ).unwrap();
 
-        let heartbeats = read_heartbeats(&config.heartbeat_dir);
+        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
 
         assert_eq!(heartbeats.len(), 1);
-        let hb = heartbeats.get("worker-1").unwrap();
+        let hb = heartbeats.get("test-worker-1").unwrap();
         assert!(hb.is_idle);
         assert_eq!(hb.model, "sonnet");
     }
@@ -547,22 +551,22 @@ mod tests {
 
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
-        // Create busy worker
+        // Create busy worker (prefixed)
         fs::write(
-            config.heartbeat_dir.join("busy.json"),
-            r#"{"session":"busy","timestamp":"2026-03-20T10:00:00Z","is_idle":false,"current_task":"task-1","model":"sonnet"}"#,
+            config.heartbeat_dir.join("test-worker-busy.json"),
+            r#"{"session":"test-worker-busy","timestamp":"2026-03-20T10:00:00Z","is_idle":false,"current_task":"task-1","model":"sonnet"}"#,
         ).unwrap();
 
-        // Create idle worker
+        // Create idle worker (prefixed)
         fs::write(
-            config.heartbeat_dir.join("idle.json"),
-            r#"{"session":"idle","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
+            config.heartbeat_dir.join("test-worker-idle.json"),
+            r#"{"session":"test-worker-idle","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
         ).unwrap();
 
         let to_stop = find_workers_to_stop(1, &config);
 
         // Should prefer idle worker
-        assert_eq!(to_stop, vec!["idle"]);
+        assert_eq!(to_stop, vec!["test-worker-idle"]);
     }
 
     #[test]
@@ -574,9 +578,9 @@ mod tests {
 
         for i in 0..5 {
             fs::write(
-                config.heartbeat_dir.join(format!("worker-{}.json", i)),
+                config.heartbeat_dir.join(format!("test-worker-{}.json", i)),
                 format!(
-                    r#"{{"session":"worker-{}","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}}"#,
+                    r#"{{"session":"test-worker-{}","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}}"#,
                     i
                 ),
             ).unwrap();
@@ -616,7 +620,7 @@ mod tests {
 
         // Create a heartbeat file
         fs::write(
-            config.heartbeat_dir.join("worker-1.json"),
+            config.heartbeat_dir.join("test-worker-1.json"),
             r#"{"session":"test-worker-1","timestamp":"2026-03-20T10:00:00Z","is_idle":true,"current_task":null,"model":"sonnet"}"#,
         ).unwrap();
 

@@ -119,8 +119,8 @@ pricing:
 # Each agent is a worker pool that can be scaled by the governor.
 agents:
   needle-sonnet:
-    launch_cmd: "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor"
-    session_pattern: "needle-claude-*"
+    launch_cmd: "needle run --agent claude-code-glm-5 --workspace {workspace} --session-prefix needle-cgov"
+    session_pattern: "needle-cgov-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
     max_workers: 8
