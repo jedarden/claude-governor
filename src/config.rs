@@ -105,7 +105,11 @@ impl Default for DaemonMode {
 /// Daemon configuration
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct DaemonConfig {
-    /// Loop interval in seconds (default: 60)
+    /// Loop interval in seconds (default: 300)
+    ///
+    /// 300s (5 min) is the minimum useful polling interval — the Anthropic API
+    /// percentage values don't change visibly at shorter intervals, which keeps
+    /// window_pct_deltas at zero and breaks the burn-rate EMA.
     #[serde(default = "default_loop_interval_secs")]
     pub loop_interval_secs: u64,
 
@@ -143,7 +147,7 @@ pub struct DaemonConfig {
     pub pre_scale_minutes: u64,
 }
 
-fn default_loop_interval_secs() -> u64 { 60 }
+fn default_loop_interval_secs() -> u64 { 300 }
 fn default_hysteresis_band() -> f64 { 1.0 }
 fn default_max_scale_up_per_cycle() -> u32 { 1 }
 fn default_max_scale_down_per_cycle() -> u32 { 1 }
@@ -154,7 +158,7 @@ fn default_pre_scale_minutes() -> u64 { 30 }
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            loop_interval_secs: default_loop_interval_secs(),
+            loop_interval_secs: default_loop_interval_secs(), // 300
             hysteresis_band: default_hysteresis_band(),
             max_scale_up_per_cycle: default_max_scale_up_per_cycle(),
             max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
@@ -538,7 +542,7 @@ pricing:
   models: {}
 "#;
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.daemon.loop_interval_secs, 60);
+        assert_eq!(config.daemon.loop_interval_secs, 300);
         assert!((config.daemon.hysteresis_band - 1.0).abs() < 1e-9);
         assert_eq!(config.daemon.max_scale_up_per_cycle, 1);
         assert_eq!(config.daemon.max_scale_down_per_cycle, 1);

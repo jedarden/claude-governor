@@ -468,6 +468,7 @@ mod tests {
                 promotion_offpeak_samples: 0,
                 last_sample_at: Some(Utc::now() - chrono::Duration::minutes(15)),
                 calibration: CalibrationState::default(),
+                ..Default::default()
             },
             alerts: vec![],
             safe_mode: SafeModeState::default(),

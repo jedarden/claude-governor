@@ -922,6 +922,86 @@ mod tests {
     }
 
     #[test]
+    fn promotion_not_applying_suppressed_when_zero_samples() {
+        // Both ratios 0.0 and no samples — the original false-positive scenario
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
+        state.burn_rate.promotion_validated = false;
+        // peak/offpeak samples default to 0
+        // offpeak_ratio_observed/expected default to 0.0
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        assert!(
+            promo.is_none(),
+            "Should NOT fire PromotionNotApplying when both ratios are 0.0 (no samples collected)"
+        );
+    }
+
+    #[test]
+    fn promotion_not_applying_suppressed_when_insufficient_peak_samples() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
+        state.burn_rate.promotion_validated = false;
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES - 1;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 1.5;
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        assert!(
+            promo.is_none(),
+            "Should NOT fire PromotionNotApplying when peak samples < MIN_VALIDATION_SAMPLES"
+        );
+    }
+
+    #[test]
+    fn promotion_not_applying_suppressed_when_insufficient_offpeak_samples() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
+        state.burn_rate.promotion_validated = false;
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES - 1;
+        state.burn_rate.offpeak_ratio_observed = 1.5;
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        assert!(
+            promo.is_none(),
+            "Should NOT fire PromotionNotApplying when offpeak samples < MIN_VALIDATION_SAMPLES"
+        );
+    }
+
+    #[test]
+    fn promotion_not_applying_suppressed_when_expected_ratio_zero() {
+        // Enough samples but expected ratio uninitialised (zero-median-peak guard hit)
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.schedule.is_peak_hour = false;
+        state.schedule.is_promo_active = true;
+        state.burn_rate.promotion_validated = false;
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 0.0;
+        state.burn_rate.offpeak_ratio_expected = 0.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        assert!(
+            promo.is_none(),
+            "Should NOT fire PromotionNotApplying when expected_ratio is 0.0"
+        );
+    }
+
+    #[test]
     fn collector_offline_triggers_when_stale() {
         let mut state = make_state_with_forecast(CapacityForecast::default());
         // Set last fleet aggregate to 10 minutes ago

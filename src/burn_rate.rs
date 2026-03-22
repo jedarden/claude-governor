@@ -1080,6 +1080,13 @@ pub fn build_burn_rate_state(
         promotion_offpeak_samples,
         last_sample_at,
         calibration,
+        // EMA fields are not computed here; they are managed by the governor loop
+        fleet_pct_hr_ema: crate::state::WindowPctDeltas::default(),
+        usd_per_pct_ema_five_hour: 0.0,
+        usd_per_pct_ema_seven_day: 0.0,
+        usd_per_pct_ema_seven_day_sonnet: 0.0,
+        fleet_pct_ema_samples: 0,
+        prev_usage_snapshot: None,
     }
 }
 

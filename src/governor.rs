@@ -1069,6 +1069,131 @@ pub fn run_governor_cycle(
     }
 
     // 5. Compute burn rates and update capacity forecast using fleet aggregate data
+
+    // 5-pre. Update fleet_pct_hr_ema from consecutive API reading deltas.
+    //
+    // The fleet record's p5h/p7d/p7ds fields are always null (the collector writes them
+    // null and never fills them in), so dividing them by elapsed_hours always yields 0.
+    // Instead we compute pct_hr from the delta between consecutive poller readings,
+    // applying an EMA that is only updated on positive deltas — zero-delta cycles
+    // (when the API percentage hasn't moved in the past N seconds) are skipped so
+    // they can't drive the EMA down to zero.
+    {
+        const EMA_ALPHA: f64 = 0.2;
+        // Require at least 60 s between delta samples to avoid noise from very short windows
+        const MIN_ELAPSED_SECS: f64 = 60.0;
+        // If the governor was paused for > 30 min, the snapshot is too stale to use
+        const MAX_ELAPSED_SECS: f64 = 1800.0;
+
+        let new_five_hour = state.usage.five_hour_pct;
+        let new_seven_day = state.usage.all_models_pct;
+        let new_seven_day_sonnet = state.usage.sonnet_pct;
+
+        if !state.usage.stale {
+            if let Some(snap) = state.burn_rate.prev_usage_snapshot.clone() {
+                let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
+                let elapsed_hours_snap = elapsed_secs / 3600.0;
+
+                if elapsed_secs >= MIN_ELAPSED_SECS && elapsed_secs <= MAX_ELAPSED_SECS {
+                    // Per-window deltas — positive only; negatives indicate a quota reset
+                    let delta_5h = new_five_hour - snap.five_hour_pct;
+                    let delta_7d = new_seven_day - snap.seven_day_pct;
+                    let delta_7ds = new_seven_day_sonnet - snap.seven_day_sonnet_pct;
+
+                    // Fleet total USD/hr from the most recent fleet aggregate
+                    let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
+                        * state.last_fleet_aggregate.sonnet_workers as f64;
+
+                    let samples = state.burn_rate.fleet_pct_ema_samples;
+                    let mut updated_any = false;
+
+                    if delta_5h > 0.0 {
+                        let rate = delta_5h / elapsed_hours_snap;
+                        if samples == 0 {
+                            state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
+                        } else {
+                            state.burn_rate.fleet_pct_hr_ema.five_hour =
+                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
+                        }
+                        if fleet_usd_hr > 0.0 {
+                            let ratio = fleet_usd_hr / rate;
+                            if samples == 0 {
+                                state.burn_rate.usd_per_pct_ema_five_hour = ratio;
+                            } else {
+                                state.burn_rate.usd_per_pct_ema_five_hour =
+                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
+                            }
+                        }
+                        updated_any = true;
+                    }
+
+                    if delta_7d > 0.0 {
+                        let rate = delta_7d / elapsed_hours_snap;
+                        if samples == 0 {
+                            state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
+                        } else {
+                            state.burn_rate.fleet_pct_hr_ema.seven_day =
+                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
+                        }
+                        if fleet_usd_hr > 0.0 {
+                            let ratio = fleet_usd_hr / rate;
+                            if samples == 0 {
+                                state.burn_rate.usd_per_pct_ema_seven_day = ratio;
+                            } else {
+                                state.burn_rate.usd_per_pct_ema_seven_day =
+                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day;
+                            }
+                        }
+                        updated_any = true;
+                    }
+
+                    if delta_7ds > 0.0 {
+                        let rate = delta_7ds / elapsed_hours_snap;
+                        if samples == 0 {
+                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet = rate;
+                        } else {
+                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet =
+                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet;
+                        }
+                        if fleet_usd_hr > 0.0 {
+                            let ratio = fleet_usd_hr / rate;
+                            if samples == 0 {
+                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet = ratio;
+                            } else {
+                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet =
+                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day_sonnet;
+                            }
+                        }
+                        updated_any = true;
+                    }
+
+                    if updated_any {
+                        state.burn_rate.fleet_pct_ema_samples =
+                            state.burn_rate.fleet_pct_ema_samples.saturating_add(1);
+                    }
+
+                    log::debug!(
+                        "[governor] API delta in {:.0}s: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
+                         → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
+                        elapsed_secs, delta_5h, delta_7d, delta_7ds,
+                        state.burn_rate.fleet_pct_hr_ema.five_hour,
+                        state.burn_rate.fleet_pct_hr_ema.seven_day,
+                        state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet,
+                        state.burn_rate.fleet_pct_ema_samples,
+                    );
+                }
+            }
+
+            // Update the snapshot for use in the next cycle
+            state.burn_rate.prev_usage_snapshot = Some(state::PrevUsageSnapshot {
+                taken_at: now,
+                five_hour_pct: new_five_hour,
+                seven_day_pct: new_seven_day,
+                seven_day_sonnet_pct: new_seven_day_sonnet,
+            });
+        }
+    }
+
     let elapsed_hours = if state.last_fleet_aggregate.t0 != state.last_fleet_aggregate.t1 {
         (state.last_fleet_aggregate.t1 - state.last_fleet_aggregate.t0).num_seconds() as f64 / 3600.0
     } else {
@@ -1102,17 +1227,46 @@ pub fn run_governor_cycle(
         );
     }
 
-    // Compute fleet_pct_per_hour directly from fleet aggregate window deltas
-    // This is the key integration: use observed burn from collector output
-    let fleet_pct_per_hour: HashMap<String, f64> = if elapsed_hours > 0.0 {
-        let deltas = &state.last_fleet_aggregate.window_pct_deltas;
+    // Compute fleet_pct_per_hour from the accumulated API-delta EMA.
+    //
+    // Strategy (in priority order):
+    //   (A) EMA from consecutive API readings — use when at least one positive delta
+    //       has been observed (fleet_pct_ema_samples >= 1).
+    //   (B) Dollar fallback — when the EMA for a window is still zero but the
+    //       collector's USD/hr and a learned usd_per_pct ratio are both available,
+    //       estimate pct/hr = fleet_usd_hr / usd_per_pct_ema.
+    //   (C) Zero — no data available yet; forecasts will show infinity / no safe count.
+    let fleet_pct_per_hour: HashMap<String, f64> = {
+        let ema = &state.burn_rate.fleet_pct_hr_ema;
+        let samples = state.burn_rate.fleet_pct_ema_samples;
+        // Fleet total USD/hr (p75 per-worker × active workers)
+        let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
+            * state.last_fleet_aggregate.sonnet_workers as f64;
+
+        let rate_for = |ema_val: f64, usd_per_pct: f64| -> f64 {
+            if samples >= 1 && ema_val > 0.0 {
+                ema_val // (A)
+            } else if fleet_usd_hr > 0.0 && usd_per_pct > 0.0 {
+                fleet_usd_hr / usd_per_pct // (B)
+            } else {
+                0.0 // (C)
+            }
+        };
+
         let mut map = HashMap::new();
-        map.insert("five_hour".to_string(), deltas.five_hour / elapsed_hours);
-        map.insert("seven_day".to_string(), deltas.seven_day / elapsed_hours);
-        map.insert("seven_day_sonnet".to_string(), deltas.seven_day_sonnet / elapsed_hours);
+        map.insert(
+            "five_hour".to_string(),
+            rate_for(ema.five_hour, state.burn_rate.usd_per_pct_ema_five_hour),
+        );
+        map.insert(
+            "seven_day".to_string(),
+            rate_for(ema.seven_day, state.burn_rate.usd_per_pct_ema_seven_day),
+        );
+        map.insert(
+            "seven_day_sonnet".to_string(),
+            rate_for(ema.seven_day_sonnet, state.burn_rate.usd_per_pct_ema_seven_day_sonnet),
+        );
         map
-    } else {
-        HashMap::new()
     };
 
     // 5a. Check calibration accuracy and update safe mode state.

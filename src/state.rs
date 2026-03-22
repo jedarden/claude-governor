@@ -107,6 +107,31 @@ impl Default for WindowPctDeltas {
     }
 }
 
+/// Previous API usage snapshot for computing percentage deltas across governor cycles.
+///
+/// Persisted in state so that the governor can compute pct/hr from consecutive
+/// API readings even across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrevUsageSnapshot {
+    /// When this snapshot was taken (wall-clock time of the API poll)
+    pub taken_at: DateTime<Utc>,
+    pub five_hour_pct: f64,
+    pub seven_day_pct: f64,
+    pub seven_day_sonnet_pct: f64,
+}
+
+impl Default for PrevUsageSnapshot {
+    fn default() -> Self {
+        Self {
+            taken_at: DateTime::<Utc>::default(),
+            five_hour_pct: 0.0,
+            seven_day_pct: 0.0,
+            seven_day_sonnet_pct: 0.0,
+        }
+    }
+}
+
 /// Deserializes an f64 field, treating JSON null as f64::INFINITY.
 /// serde_json serializes f64::INFINITY as null (JSON has no infinity literal),
 /// so we need to round-trip null → infinity on deserialization.
@@ -306,6 +331,32 @@ pub struct BurnRateState {
     pub promotion_offpeak_samples: usize,
     pub last_sample_at: Option<DateTime<Utc>>,
     pub calibration: CalibrationState,
+
+    /// EMA of fleet-level pct/hr for each window, derived from consecutive API reading deltas.
+    ///
+    /// Only updated when a positive delta is observed — zero-delta cycles (no measurable
+    /// API change) leave the EMA unchanged so a single stale sample can't zero it out.
+    #[serde(default)]
+    pub fleet_pct_hr_ema: WindowPctDeltas,
+
+    /// EMA of USD-per-pct ratio for each window (fleet total USD/hr ÷ fleet pct/hr).
+    ///
+    /// Used as a fallback: when fleet_pct_hr_ema is zero but dollar burn is non-zero,
+    /// estimate pct/hr = fleet_usd_hr / usd_per_pct_ema.
+    #[serde(default)]
+    pub usd_per_pct_ema_five_hour: f64,
+    #[serde(default)]
+    pub usd_per_pct_ema_seven_day: f64,
+    #[serde(default)]
+    pub usd_per_pct_ema_seven_day_sonnet: f64,
+
+    /// Number of positive-delta samples accumulated in fleet_pct_hr_ema.
+    #[serde(default)]
+    pub fleet_pct_ema_samples: u32,
+
+    /// Previous API usage snapshot, used to compute cross-cycle pct deltas.
+    #[serde(default)]
+    pub prev_usage_snapshot: Option<PrevUsageSnapshot>,
 }
 
 impl Default for BurnRateState {
@@ -321,6 +372,12 @@ impl Default for BurnRateState {
             promotion_offpeak_samples: 0,
             last_sample_at: None,
             calibration: CalibrationState::default(),
+            fleet_pct_hr_ema: WindowPctDeltas::default(),
+            usd_per_pct_ema_five_hour: 0.0,
+            usd_per_pct_ema_seven_day: 0.0,
+            usd_per_pct_ema_seven_day_sonnet: 0.0,
+            fleet_pct_ema_samples: 0,
+            prev_usage_snapshot: None,
         }
     }
 }
@@ -722,6 +779,7 @@ mod tests {
                     auto_tuned_hysteresis: 1.0,
                     last_tuned_at: Some("2026-03-20T04:00:00Z".parse().unwrap()),
                 },
+                ..Default::default()
             },
             alerts: vec![serde_json::json!({
                 "type": "cutoff_risk",
