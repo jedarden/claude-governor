@@ -141,7 +141,7 @@ enum Commands {
         workers: String,
 
         /// Hours to simulate
-        #[arg(short, long, default_value = "24")]
+        #[arg(long, default_value = "24")]
         hours: f64,
 
         /// Output resolution in minutes
