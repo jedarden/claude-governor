@@ -199,15 +199,24 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
         log::info!("[worker] launching: {}", cmd);
 
         match execute_shell_command(&cmd) {
-            Ok(true) => {
+            Ok(result) if result.success => {
                 log::info!("[worker] launched worker {}", worker_id);
+                if !result.stdout.is_empty() {
+                    log::debug!("[worker] stdout: {}", result.stdout);
+                }
                 launched += 1;
             }
-            Ok(false) => {
-                log::warn!("[worker] launch command returned non-zero for {}", worker_id);
+            Ok(result) => {
+                log::warn!(
+                    "[worker] launch failed for {} (exit_code={:?}): stderr={:?}, stdout={:?}",
+                    worker_id,
+                    result.exit_code,
+                    result.stderr,
+                    result.stdout,
+                );
             }
             Err(e) => {
-                log::error!("[worker] failed to launch worker {}: {}", worker_id, e);
+                log::error!("[worker] failed to execute launch command for {}: {}", worker_id, e);
             }
         }
     }
@@ -215,17 +224,34 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
     launched
 }
 
+/// Result of executing a shell command.
+pub struct ShellOutput {
+    /// Whether the command exited successfully (exit code 0).
+    pub success: bool,
+    /// The exit code, if available.
+    pub exit_code: Option<i32>,
+    /// Captured stderr (trimmed).
+    pub stderr: String,
+    /// Captured stdout (trimmed).
+    pub stdout: String,
+}
+
 /// Execute a shell command string.
 ///
-/// Returns Ok(true) if the command succeeded, Ok(false) if it failed,
-/// or Err if the command couldn't be executed.
-fn execute_shell_command(cmd: &str) -> anyhow::Result<bool> {
+/// Returns Ok(ShellOutput) with exit code, stdout, and stderr,
+/// or Err if the command couldn't be executed at all.
+fn execute_shell_command(cmd: &str) -> anyhow::Result<ShellOutput> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .output()?;
 
-    Ok(output.status.success())
+    Ok(ShellOutput {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    })
 }
 
 /// Scale down gracefully by finding idle workers and shutting them down.
