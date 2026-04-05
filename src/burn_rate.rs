@@ -774,7 +774,14 @@ fn effective_burn_rate(
 /// Generate a capacity forecast for a single window
 ///
 /// Computes fleet_pct_per_hour, predicted_exhaustion_hours,
-/// will_exhaust_before_reset, and safe_worker_count.
+/// will_exhaust_before_reset, safe_worker_count, and the confidence cone
+/// (exh_hrs_p25/p50/p75, cone_ratio) using per-worker burn rate stddev.
+///
+/// The cone is derived from the Normal distribution assumption:
+///   rate_p25 = fleet_pct_hr - 0.675 * std_pct_hr  (slow burn → more hours → p75 of hours)
+///   rate_p75 = fleet_pct_hr + 0.675 * std_pct_hr  (fast burn → fewer hours → p25 of hours)
+///
+/// When std_pct_hr is zero (no spread data), p25/p50/p75 all equal the p50 estimate.
 pub fn generate_window_forecast(
     _window: &str,
     fleet_pct_hr: f64,
@@ -782,6 +789,7 @@ pub fn generate_window_forecast(
     target_ceiling: f64,
     hours_remaining: f64,
     p75_rate_per_worker: f64,
+    std_pct_hr: f64,
 ) -> crate::state::WindowForecast {
     let remaining_pct = (target_ceiling - current_utilization).max(0.0);
 
@@ -801,6 +809,32 @@ pub fn generate_window_forecast(
         None
     };
 
+    // Confidence cone using ±0.675σ (25th/75th percentile of a Normal distribution).
+    // High burn rate → fewer remaining hours, so:
+    //   exh_hrs_p25 (pessimistic) uses rate at +0.675σ (fast burn)
+    //   exh_hrs_p75 (optimistic)  uses rate at -0.675σ (slow burn)
+    const Z_0_675: f64 = 0.675;
+    const MIN_RATE: f64 = 1e-9;
+
+    let (exh_hrs_p25, exh_hrs_p50, exh_hrs_p75, cone_ratio) = if fleet_pct_hr > 0.0 {
+        let rate_fast = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
+        let rate_slow = (fleet_pct_hr - Z_0_675 * std_pct_hr).max(MIN_RATE);
+
+        let p25 = remaining_pct / rate_fast;
+        let p50 = predicted_exhaustion_hours;
+        let p75 = remaining_pct / rate_slow;
+
+        let ratio = if p25 > 0.0 { p75 / p25 } else { 1.0 };
+        (p25, p50, p75, ratio)
+    } else {
+        (
+            predicted_exhaustion_hours,
+            predicted_exhaustion_hours,
+            predicted_exhaustion_hours,
+            1.0,
+        )
+    };
+
     crate::state::WindowForecast {
         target_ceiling,
         current_utilization,
@@ -812,10 +846,10 @@ pub fn generate_window_forecast(
         margin_hrs,
         binding: false,
         safe_worker_count,
-        exh_hrs_p25: predicted_exhaustion_hours,
-        exh_hrs_p50: predicted_exhaustion_hours,
-        exh_hrs_p75: predicted_exhaustion_hours,
-        cone_ratio: 1.0,
+        exh_hrs_p25,
+        exh_hrs_p50,
+        exh_hrs_p75,
+        cone_ratio,
     }
 }
 
@@ -941,6 +975,7 @@ pub fn estimate_burn_rates(
                 target_ceiling,
                 hrs_left,
                 p75_per_worker,
+                stats.std_pct_hr,
             ),
         );
     }
@@ -2232,6 +2267,7 @@ mod tests {
             90.0,  // target ceiling
             37.5,  // hours remaining
             1.0,   // p75 per worker
+            0.0,   // std_pct_hr (no spread)
         );
 
         assert!((f.remaining_pct - 18.0).abs() < 1e-9);
@@ -2241,6 +2277,11 @@ mod tests {
         assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
         assert!((f.margin_hrs - 28.5).abs() < 1e-9); // 37.5 - 9
         assert_eq!(f.safe_worker_count, Some(0)); // floor(18 / (1.0 * 37.5)) = 0
+        // With zero stddev, all cone values equal the p50
+        assert!((f.exh_hrs_p25 - 9.0).abs() < 1e-9);
+        assert!((f.exh_hrs_p50 - 9.0).abs() < 1e-9);
+        assert!((f.exh_hrs_p75 - 9.0).abs() < 1e-9);
+        assert!((f.cone_ratio - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2252,6 +2293,7 @@ mod tests {
             90.0,
             3.0,
             0.0,
+            0.0,   // std_pct_hr
         );
 
         assert!(f.predicted_exhaustion_hours.is_infinite());

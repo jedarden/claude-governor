@@ -1390,6 +1390,18 @@ pub fn run_governor_cycle(
             0.0
         };
 
+        // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
+        // Falls back to baseline ratio (~3.33 $/pct) when the learned ratio is unavailable.
+        const BASELINE_USD_PER_PCT: f64 = 5.0 / 1.5;
+        let usd_per_pct = match *window {
+            "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
+            "seven_day" => state.burn_rate.usd_per_pct_ema_seven_day,
+            "seven_day_sonnet" => state.burn_rate.usd_per_pct_ema_seven_day_sonnet,
+            _ => 0.0,
+        };
+        let effective_usd_per_pct = if usd_per_pct > 0.0 { usd_per_pct } else { BASELINE_USD_PER_PCT };
+        let std_pct_hr = state.last_fleet_aggregate.sonnet_std_usd_hr / effective_usd_per_pct;
+
         let forecast = generate_window_forecast(
             window,
             fleet_pct_hr,
@@ -1397,6 +1409,7 @@ pub fn run_governor_cycle(
             effective_target_ceiling,
             hrs_left,
             pct_per_worker,
+            std_pct_hr,
         );
 
         match *window {
@@ -2477,6 +2490,7 @@ mod tests {
             90.0,  // target ceiling
             24.0,  // hours remaining
             estimated_pct_hr / 2.0, // p75 per-worker (half fleet for 2 workers)
+            0.0,   // std_pct_hr (no spread data in this test)
         );
 
         assert!(
