@@ -19,7 +19,7 @@ use crate::alerts::{check_alert_conditions, check_low_cache_efficiency, should_f
 use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
 use crate::calibrator;
 use crate::collector;
-use crate::config::{AgentConfig, AlertConfig, SprintConfig, CompositeRiskConfig};
+use crate::config::{AgentConfig, AlertConfig, ConeScalingConfig, SprintConfig, CompositeRiskConfig};
 use crate::db;
 use crate::poller::Poller;
 use crate::schedule::{self, Promotion};
@@ -587,17 +587,25 @@ fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: 
 ///
 /// Falls back to the configured max if no valid forecast is available.
 ///
+/// ## Cone-based scaling aggressiveness
+///
+/// The binding window carries a `cone_ratio` (= exh_hrs_p75 / exh_hrs_p25):
+/// - `cone_ratio < cone_scaling.narrow_threshold` → narrow cone → use `safe_worker_count` (p50)
+/// - `cone_ratio >= cone_scaling.narrow_threshold` → wide cone → use `safe_worker_count_p75` (p75)
+///
 /// Steps:
 /// 1. Check emergency brake (any window >= 98%) → return 0
 /// 2. Get binding window from capacity forecast
-/// 3. If composite risk enabled, try composite optimization
-/// 4. Otherwise use safe_worker_count from binding window if available
-/// 5. Apply sprint boost if active
-/// 6. Clamp to [min, max] from worker state
+/// 3. Select p50 or p75 safe worker count based on cone_ratio vs narrow_threshold
+/// 4. If composite risk enabled, try composite optimization
+/// 5. Otherwise use cone-selected safe worker count from binding window
+/// 6. Apply sprint boost if active
+/// 7. Clamp to [min, max] from worker state
 pub fn compute_target_workers(
     state: &state::GovernorState,
     _target_ceiling: f64,
     composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
 ) -> u32 {
     // Aggregate min/max across all configured agents
     let mut global_min = u32::MAX;
@@ -647,6 +655,25 @@ pub fn compute_target_workers(
         _ => &forecast.seven_day_sonnet,
     };
 
+    // Select safe worker count based on cone_ratio vs narrow_threshold.
+    // Narrow cone (low uncertainty) → use p50 median estimate.
+    // Wide cone (high uncertainty) → use p75 conservative estimate.
+    let cone_ratio = binding_forecast.cone_ratio;
+    let cone_is_wide = cone_ratio >= cone_scaling_config.narrow_threshold;
+    let selected_safe = if cone_is_wide {
+        log::debug!(
+            "[governor] cone_ratio {:.2} >= narrow_threshold {:.2}: using p75 safe worker count (conservative)",
+            cone_ratio, cone_scaling_config.narrow_threshold
+        );
+        binding_forecast.safe_worker_count_p75
+    } else {
+        log::debug!(
+            "[governor] cone_ratio {:.2} < narrow_threshold {:.2}: using p50 safe worker count (median)",
+            cone_ratio, cone_scaling_config.narrow_threshold
+        );
+        binding_forecast.safe_worker_count
+    };
+
     // Try composite risk optimization if enabled
     let base_target = if composite_risk_config.enabled {
         let all_forecasts = &[
@@ -664,27 +691,30 @@ pub fn compute_target_workers(
         ) {
             Some(composite_safe) => {
                 log::debug!(
-                    "[governor] composite risk optimization: binding_safe={:?}, composite_safe={}",
-                    binding_forecast.safe_worker_count,
+                    "[governor] composite risk optimization: binding_safe={:?} (cone_is_wide={}), composite_safe={}",
+                    selected_safe,
+                    cone_is_wide,
                     composite_safe
                 );
                 composite_safe
             }
             None => {
-                // Composite risk not applicable, fall back to binding window
-                safe_worker_count_or_max(binding_forecast.safe_worker_count, global_max, current_total)
+                // Composite risk not applicable, fall back to cone-selected binding window estimate
+                safe_worker_count_or_max(selected_safe, global_max, current_total)
             }
         }
     } else {
-        safe_worker_count_or_max(binding_forecast.safe_worker_count, global_max, current_total)
+        safe_worker_count_or_max(selected_safe, global_max, current_total)
     };
 
     let target = base_target.min(global_max).max(global_min);
 
     log::debug!(
-        "[governor] compute_target_workers: binding={}, safe_w={:?}, current={}, target={} (min={}, max={}, composite={})",
+        "[governor] compute_target_workers: binding={}, cone_ratio={:.2}, cone_is_wide={}, safe_w={:?}, current={}, target={} (min={}, max={}, composite={})",
         forecast.binding_window,
-        binding_forecast.safe_worker_count,
+        cone_ratio,
+        cone_is_wide,
+        selected_safe,
         current_total,
         target,
         global_min,
@@ -918,6 +948,7 @@ pub fn run_governor_cycle(
     pre_scale_minutes: u64,
     promotions: &[Promotion],
     composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -1373,6 +1404,18 @@ pub fn run_governor_cycle(
         composite_risk_config
     };
 
+    // When safe mode is active, force the p75 (conservative) estimate regardless of cone width.
+    let safe_cone_scaling;
+    let effective_cone_scaling: &ConeScalingConfig = if state.safe_mode.active {
+        // narrow_threshold = 0.0 → cone_ratio (always ≥ 1.0) is always "wide" → always p75
+        safe_cone_scaling = ConeScalingConfig {
+            narrow_threshold: 0.0,
+        };
+        &safe_cone_scaling
+    } else {
+        cone_scaling_config
+    };
+
     // Build capacity forecast for each window using burn_rate module
     let mut five_hour_forecast = state::WindowForecast::default();
     let mut seven_day_forecast = state::WindowForecast::default();
@@ -1520,7 +1563,7 @@ pub fn run_governor_cycle(
     log_capacity_forecast(&state.capacity_forecast);
 
     // 4. Compute target workers
-    let target = compute_target_workers(&state, effective_target_ceiling, effective_composite_risk);
+    let target = compute_target_workers(&state, effective_target_ceiling, effective_composite_risk, effective_cone_scaling);
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%{})",
         target, effective_target_ceiling,
@@ -1695,6 +1738,7 @@ pub fn run_daemon(
     pre_scale_minutes: u64,
     promotions: &[Promotion],
     composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1733,6 +1777,7 @@ pub fn run_daemon(
         pre_scale_minutes,
         promotions,
         composite_risk_config,
+        cone_scaling_config,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -1764,6 +1809,7 @@ pub fn run_daemon(
             pre_scale_minutes,
             promotions,
             composite_risk_config,
+            cone_scaling_config,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures
@@ -2489,7 +2535,7 @@ mod tests {
             50.0,  // current utilization
             90.0,  // target ceiling
             24.0,  // hours remaining
-            estimated_pct_hr / 2.0, // p75 per-worker (half fleet for 2 workers)
+            estimated_pct_hr / 2.0, // mean per-worker (half fleet for 2 workers)
             0.0,   // std_pct_hr (no spread data in this test)
         );
 
@@ -2539,6 +2585,7 @@ mod tests {
             &state,
             90.0,
             &CompositeRiskConfig { enabled: false, ..Default::default() },
+            &ConeScalingConfig::default(),
         );
 
         // Should be global_max (6), clamped to [min=1, max=6]

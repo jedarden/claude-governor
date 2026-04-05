@@ -788,7 +788,7 @@ pub fn generate_window_forecast(
     current_utilization: f64,
     target_ceiling: f64,
     hours_remaining: f64,
-    p75_rate_per_worker: f64,
+    mean_rate_per_worker: f64,
     std_pct_hr: f64,
 ) -> crate::state::WindowForecast {
     let remaining_pct = (target_ceiling - current_utilization).max(0.0);
@@ -802,19 +802,33 @@ pub fn generate_window_forecast(
     let cutoff_risk = predicted_exhaustion_hours < hours_remaining;
     let margin_hrs = hours_remaining - predicted_exhaustion_hours;
 
-    let safe_worker_count = if p75_rate_per_worker > 0.0 && hours_remaining > 0.0 {
-        let safe = (remaining_pct / (p75_rate_per_worker * hours_remaining)).floor() as u64;
+    // p50 safe workers: uses the mean per-worker burn rate.
+    let safe_worker_count = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 {
+        let safe = (remaining_pct / (mean_rate_per_worker * hours_remaining)).floor() as u64;
         Some(safe.min(u32::MAX as u64) as u32)
     } else {
         None
+    };
+
+    const Z_0_675: f64 = 0.675;
+    const MIN_RATE: f64 = 1e-9;
+
+    // p75 safe workers: uses the p75 (fast-burn) per-worker rate — more conservative.
+    // Derived by scaling the mean rate by the ratio of the fleet's p75 burn rate to p50.
+    // When std_pct_hr == 0, p75 rate == p50 rate and safe_worker_count_p75 == safe_worker_count.
+    let safe_worker_count_p75 = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 && fleet_pct_hr > 0.0 {
+        let rate_p75_fleet = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
+        let rate_p75_per_worker = mean_rate_per_worker * rate_p75_fleet / fleet_pct_hr;
+        let safe = (remaining_pct / (rate_p75_per_worker * hours_remaining)).floor() as u64;
+        Some(safe.min(u32::MAX as u64) as u32)
+    } else {
+        safe_worker_count
     };
 
     // Confidence cone using ±0.675σ (25th/75th percentile of a Normal distribution).
     // High burn rate → fewer remaining hours, so:
     //   exh_hrs_p25 (pessimistic) uses rate at +0.675σ (fast burn)
     //   exh_hrs_p75 (optimistic)  uses rate at -0.675σ (slow burn)
-    const Z_0_675: f64 = 0.675;
-    const MIN_RATE: f64 = 1e-9;
 
     let (exh_hrs_p25, exh_hrs_p50, exh_hrs_p75, cone_ratio) = if fleet_pct_hr > 0.0 {
         let rate_fast = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
@@ -846,6 +860,7 @@ pub fn generate_window_forecast(
         margin_hrs,
         binding: false,
         safe_worker_count,
+        safe_worker_count_p75,
         exh_hrs_p25,
         exh_hrs_p50,
         exh_hrs_p75,

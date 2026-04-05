@@ -1034,6 +1034,7 @@ fn run_daemon_command(
         daemon.pre_scale_minutes,
         &promotions,
         &config.composite_risk,
+        &config.cone_scaling,
     )
 }
 

@@ -165,6 +165,11 @@ pub struct WindowForecast {
     pub binding: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_worker_count: Option<u32>,
+    /// Conservative safe worker count using the p75 (fast-burn) per-worker rate.
+    /// Lower than safe_worker_count when burn rate spread is non-zero.
+    /// Used when cone_ratio is wide (uncertain predictions) to scale conservatively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_worker_count_p75: Option<u32>,
     /// Confidence cone: pessimistic exhaustion hours (mean + 1σ burn rate → fewer hours)
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
@@ -195,6 +200,7 @@ impl Default for WindowForecast {
             margin_hrs: 0.0,
             binding: false,
             safe_worker_count: None,
+            safe_worker_count_p75: None,
             exh_hrs_p25: 0.0,
             exh_hrs_p50: 0.0,
             exh_hrs_p75: 0.0,

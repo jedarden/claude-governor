@@ -32,6 +32,10 @@ pub struct GovernorConfig {
     #[serde(default)]
     pub composite_risk: CompositeRiskConfig,
 
+    /// Cone-based scaling aggressiveness configuration
+    #[serde(default)]
+    pub cone_scaling: ConeScalingConfig,
+
     /// Agent configurations (worker pools that can be scaled by the governor)
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentConfig>,
@@ -291,6 +295,46 @@ impl Default for CompositeRiskConfig {
             enabled: false,
             cost_threshold: 0.0,
             binding_weight: default_binding_weight(),
+        }
+    }
+}
+
+/// Cone-based scaling aggressiveness configuration.
+///
+/// Controls whether the governor targets p50 (median) or p75 (conservative)
+/// safe worker counts based on how wide the prediction cone is.
+///
+/// ## How it works
+///
+/// Each window forecast carries a `cone_ratio` (= exh_hrs_p75 / exh_hrs_p25):
+/// - `cone_ratio ≈ 1.0`: burn rate is well-known, p50 and p75 estimates are close.
+/// - `cone_ratio >> 1.0`: high variance in burn rate, predictions are uncertain.
+///
+/// When the cone is **narrow** (`cone_ratio < narrow_threshold`):
+/// - The governor uses `safe_worker_count` (p50 / mean rate) — act on the median estimate.
+///
+/// When the cone is **wide** (`cone_ratio >= narrow_threshold`):
+/// - The governor uses `safe_worker_count_p75` (p75 rate) — be conservative under uncertainty.
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct ConeScalingConfig {
+    /// cone_ratio threshold separating narrow from wide prediction cones.
+    ///
+    /// - Below this value → narrow cone → use p50 safe worker count (median estimate).
+    /// - At or above this value → wide cone → use p75 safe worker count (conservative).
+    ///
+    /// Default: 1.5  A cone_ratio of 1.5 means the optimistic exhaustion estimate
+    /// (p75) is 50% farther out than the pessimistic one (p25) — moderate uncertainty
+    /// where it becomes safer to act on the p75 burn-rate assumption.
+    #[serde(default = "default_cone_narrow_threshold")]
+    pub narrow_threshold: f64,
+}
+
+fn default_cone_narrow_threshold() -> f64 { 1.5 }
+
+impl Default for ConeScalingConfig {
+    fn default() -> Self {
+        Self {
+            narrow_threshold: default_cone_narrow_threshold(),
         }
     }
 }
