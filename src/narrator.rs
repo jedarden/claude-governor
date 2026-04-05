@@ -524,6 +524,7 @@ mod tests {
             margin_hrs,
             binding: true,
             safe_worker_count: None,
+            ..Default::default()
         };
 
         GovernorState {
@@ -565,6 +566,7 @@ mod tests {
             safe_mode: Default::default(),
             alert_cooldown: Default::default(),
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 

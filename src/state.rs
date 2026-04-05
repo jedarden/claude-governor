@@ -72,6 +72,10 @@ pub struct FleetAggregate {
     pub sonnet_p75_usd_hr: f64,
     pub sonnet_std_usd_hr: f64,
     pub window_pct_deltas: WindowPctDeltas,
+    /// Fleet-level cache efficiency (weighted average by total input tokens)
+    pub fleet_cache_eff: f64,
+    /// 25th percentile of per-instance cache efficiency
+    pub cache_eff_p25: f64,
 }
 
 impl Default for FleetAggregate {
@@ -84,6 +88,8 @@ impl Default for FleetAggregate {
             sonnet_p75_usd_hr: 0.0,
             sonnet_std_usd_hr: 0.0,
             window_pct_deltas: WindowPctDeltas::default(),
+            fleet_cache_eff: 0.0,
+            cache_eff_p25: 0.0,
         }
     }
 }
@@ -159,6 +165,21 @@ pub struct WindowForecast {
     pub binding: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_worker_count: Option<u32>,
+    /// Confidence cone: pessimistic exhaustion hours (mean + 1σ burn rate → fewer hours)
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
+    pub exh_hrs_p25: f64,
+    /// Confidence cone: central exhaustion hours (mean burn rate, same as predicted_exhaustion_hours)
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
+    pub exh_hrs_p50: f64,
+    /// Confidence cone: optimistic exhaustion hours (mean − 1σ burn rate → more hours)
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
+    pub exh_hrs_p75: f64,
+    /// Cone ratio = exh_hrs_p75 / exh_hrs_p25 (1.0 = no spread, higher = wider uncertainty)
+    #[serde(default)]
+    pub cone_ratio: f64,
 }
 
 impl Default for WindowForecast {
@@ -174,6 +195,10 @@ impl Default for WindowForecast {
             margin_hrs: 0.0,
             binding: false,
             safe_worker_count: None,
+            exh_hrs_p25: 0.0,
+            exh_hrs_p50: 0.0,
+            exh_hrs_p75: 0.0,
+            cone_ratio: 0.0,
         }
     }
 }
@@ -476,6 +501,10 @@ pub struct GovernorState {
     pub alert_cooldown: AlertCooldown,
     /// Whether OAuth token refresh is failing (set by poller)
     pub token_refresh_failing: bool,
+    /// Number of consecutive collection intervals where fleet_cache_eff was below threshold.
+    /// Reset to 0 when efficiency recovers. Used by LowCacheEfficiency alert.
+    #[serde(default)]
+    pub low_cache_eff_consecutive: u32,
 }
 
 impl Default for GovernorState {
@@ -492,6 +521,7 @@ impl Default for GovernorState {
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 }
@@ -706,6 +736,8 @@ mod tests {
                     seven_day: 0.54,
                     seven_day_sonnet: 0.75,
                 },
+                fleet_cache_eff: 0.0,
+                cache_eff_p25: 0.0,
             },
             capacity_forecast: CapacityForecast {
                 five_hour: WindowForecast {
@@ -719,6 +751,7 @@ mod tests {
                     margin_hrs: 4.64,
                     binding: false,
                     safe_worker_count: None,
+                    ..Default::default()
                 },
                 seven_day: WindowForecast {
                     target_ceiling: 90.0,
@@ -731,6 +764,7 @@ mod tests {
                     margin_hrs: -34.81,
                     binding: false,
                     safe_worker_count: None,
+                    ..Default::default()
                 },
                 seven_day_sonnet: WindowForecast {
                     target_ceiling: 90.0,
@@ -743,6 +777,7 @@ mod tests {
                     margin_hrs: -34.56,
                     binding: true,
                     safe_worker_count: Some(2),
+                    ..Default::default()
                 },
                 binding_window: "seven_day_sonnet".to_string(),
                 dollars_per_pct_7d_s: 1.648,
@@ -802,6 +837,7 @@ mod tests {
                 },
             },
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 

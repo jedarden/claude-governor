@@ -404,6 +404,8 @@ mod tests {
                 sonnet_p75_usd_hr: 6.50,
                 sonnet_std_usd_hr: 1.20,
                 window_pct_deltas: Default::default(),
+                fleet_cache_eff: 0.0,
+                cache_eff_p25: 0.0,
             },
             capacity_forecast: CapacityForecast {
                 five_hour: WindowForecast {
@@ -417,6 +419,7 @@ mod tests {
                     margin_hrs: 4.64,
                     binding: false,
                     safe_worker_count: None,
+                    ..Default::default()
                 },
                 seven_day: WindowForecast {
                     target_ceiling: 90.0,
@@ -429,6 +432,7 @@ mod tests {
                     margin_hrs: -34.81,
                     binding: false,
                     safe_worker_count: None,
+                    ..Default::default()
                 },
                 seven_day_sonnet: WindowForecast {
                     target_ceiling: 90.0,
@@ -441,6 +445,7 @@ mod tests {
                     margin_hrs: -34.56,
                     binding: true,
                     safe_worker_count: Some(2),
+                    ..Default::default()
                 },
                 binding_window: "seven_day_sonnet".to_string(),
                 dollars_per_pct_7d_s: 1.648,
@@ -474,6 +479,7 @@ mod tests {
             safe_mode: SafeModeState::default(),
             alert_cooldown: Default::default(),
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 

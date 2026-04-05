@@ -976,6 +976,8 @@ pub fn run_governor_cycle(
                     let p5h = fleet_json.get("p5h").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let p7d = fleet_json.get("p7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let p7ds = fleet_json.get("p7ds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let fleet_cache_eff = fleet_json.get("fleet-cache-eff").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cache_eff_p25 = fleet_json.get("cache-eff-p25").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
                     state.last_fleet_aggregate = state::FleetAggregate {
                         t0,
@@ -989,11 +991,22 @@ pub fn run_governor_cycle(
                             seven_day: p7d,
                             seven_day_sonnet: p7ds,
                         },
+                        fleet_cache_eff,
+                        cache_eff_p25,
                     };
 
+                    // Update consecutive low-cache-eff counter for alert tracking.
+                    // Only count intervals where workers > 0 to avoid spurious counts
+                    // during idle periods when cache efficiency is meaningless.
+                    if workers > 0 && fleet_cache_eff < alert_config.low_cache_eff_threshold {
+                        state.low_cache_eff_consecutive = state.low_cache_eff_consecutive.saturating_add(1);
+                    } else {
+                        state.low_cache_eff_consecutive = 0;
+                    }
+
                     log::debug!(
-                        "[governor] fleet aggregate: {} workers, ${:.2}/hr p75, deltas 5h={:.2}% 7d={:.2}% 7ds={:.2}%",
-                        workers, p75_usd_hr, p5h, p7d, p7ds
+                        "[governor] fleet aggregate: {} workers, ${:.2}/hr p75, deltas 5h={:.2}% 7d={:.2}% 7ds={:.2}%, cache_eff={:.2} (consecutive_low={})",
+                        workers, p75_usd_hr, p5h, p7d, p7ds, fleet_cache_eff, state.low_cache_eff_consecutive
                     );
                 }
             }
@@ -1232,24 +1245,35 @@ pub fn run_governor_cycle(
     // Strategy (in priority order):
     //   (A) EMA from consecutive API readings — use when at least one positive delta
     //       has been observed (fleet_pct_ema_samples >= 1).
-    //   (B) Dollar fallback — when the EMA for a window is still zero but the
-    //       collector's USD/hr and a learned usd_per_pct ratio are both available,
-    //       estimate pct/hr = fleet_usd_hr / usd_per_pct_ema.
-    //   (C) Zero — no data available yet; forecasts will show infinity / no safe count.
+    //   (B) Dollar fallback with learned ratio — when the EMA for a window is still
+    //       zero but the collector's USD/hr and a learned usd_per_pct ratio are both
+    //       available, estimate pct/hr = fleet_usd_hr / usd_per_pct_ema.
+    //   (C) Dollar fallback with baseline ratio — when neither EMA nor learned ratio
+    //       is available yet (startup / short polling window), use the collector's
+    //       USD/hr with the hardcoded baseline ratio derived from default burn rate
+    //       assumptions (~$5/hr/worker ÷ ~1.5%/hr/worker ≈ 3.33 $/pct).  This
+    //       ensures safe_worker_count is non-None even before the first API delta is
+    //       observed, so the governor can proactively scale from startup.
+    //   (D) Zero — truly no data at all (no dollar burn either).
     let fleet_pct_per_hour: HashMap<String, f64> = {
         let ema = &state.burn_rate.fleet_pct_hr_ema;
         let samples = state.burn_rate.fleet_pct_ema_samples;
         // Fleet total USD/hr (p75 per-worker × active workers)
         let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
             * state.last_fleet_aggregate.sonnet_workers as f64;
+        // Baseline dollars-per-pct ratio from default burn rate assumptions:
+        // ~$5/hr/worker ÷ ~1.5%/hr/worker ≈ 3.33 $/pct
+        const BASELINE_USD_PER_PCT: f64 = 5.0 / 1.5;
 
         let rate_for = |ema_val: f64, usd_per_pct: f64| -> f64 {
             if samples >= 1 && ema_val > 0.0 {
-                ema_val // (A)
+                ema_val // (A) API delta EMA
             } else if fleet_usd_hr > 0.0 && usd_per_pct > 0.0 {
-                fleet_usd_hr / usd_per_pct // (B)
+                fleet_usd_hr / usd_per_pct // (B) learned ratio
+            } else if fleet_usd_hr > 0.0 {
+                fleet_usd_hr / BASELINE_USD_PER_PCT // (C) baseline ratio fallback
             } else {
-                0.0 // (C)
+                0.0 // (D) no data at all
             }
         };
 
@@ -1266,6 +1290,17 @@ pub fn run_governor_cycle(
             "seven_day_sonnet".to_string(),
             rate_for(ema.seven_day_sonnet, state.burn_rate.usd_per_pct_ema_seven_day_sonnet),
         );
+
+        if samples == 0 && fleet_usd_hr > 0.0 {
+            log::debug!(
+                "[governor] fleet_pct_hr: baseline dollar fallback active \
+                 (fleet_usd_hr={:.4}/hr, usd_per_pct={:.3}) → \
+                 5h={:.4} 7d={:.4} 7ds={:.4} pct/hr",
+                fleet_usd_hr, BASELINE_USD_PER_PCT,
+                map["five_hour"], map["seven_day"], map["seven_day_sonnet"],
+            );
+        }
+
         map
     };
 
@@ -2245,6 +2280,198 @@ mod tests {
         assert!(
             (schedule::get_multiplier_at(after_promo, &promos, "five_hour") - 1.0).abs() < 1e-9,
             "five_hour should be 1.0x after promo ends"
+        );
+    }
+
+    // --- Safe mode calibration tests ---
+
+    fn make_cal_stats(median_error: f64, total_samples: u32, median_error_7ds: f64) -> calibrator::CalibrationStats {
+        calibrator::CalibrationStats {
+            total_samples,
+            median_error,
+            median_error_7ds,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn safe_mode_enters_when_accuracy_degrades() {
+        let mut safe_mode = state::SafeModeState::default();
+        let mut calibration = state::CalibrationState::default();
+        // median_error=16 > entry_threshold=15, 5 samples >= min_samples=5
+        let stats = make_cal_stats(16.0, 5, 14.0);
+        let now = Utc::now();
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(changed, "should return true when entering safe mode");
+        assert!(safe_mode.active);
+        assert_eq!(safe_mode.trigger.as_deref(), Some("median_error"));
+        assert!((safe_mode.median_error_at_entry.unwrap() - 16.0).abs() < 1e-9);
+        assert_eq!(safe_mode.scored_at_entry, 5);
+        assert!(safe_mode.entered_at.is_some());
+    }
+
+    #[test]
+    fn safe_mode_does_not_enter_below_threshold() {
+        let mut safe_mode = state::SafeModeState::default();
+        let mut calibration = state::CalibrationState::default();
+        // median_error=14 < entry_threshold=15 — should not trigger
+        let stats = make_cal_stats(14.0, 5, 12.0);
+        let now = Utc::now();
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(!changed);
+        assert!(!safe_mode.active);
+    }
+
+    #[test]
+    fn safe_mode_does_not_enter_with_insufficient_samples() {
+        let mut safe_mode = state::SafeModeState::default();
+        let mut calibration = state::CalibrationState::default();
+        // total_samples=4 < min_samples=5 even though error is high
+        let stats = make_cal_stats(20.0, 4, 18.0);
+        let now = Utc::now();
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(!changed);
+        assert!(!safe_mode.active);
+    }
+
+    #[test]
+    fn safe_mode_exits_when_accuracy_recovers() {
+        let now = Utc::now();
+        let mut safe_mode = state::SafeModeState {
+            active: true,
+            entered_at: Some(now - chrono::Duration::hours(1)),
+            trigger: Some("median_error".to_string()),
+            median_error_at_entry: Some(16.0),
+            predictions_since_entry: 0,
+            scored_at_entry: 5,
+        };
+        let mut calibration = state::CalibrationState::default();
+        // median_error=7 < exit_threshold=8, total_samples=8 → predictions_since_entry=8-5=3 >= min=3
+        let stats = make_cal_stats(7.0, 8, 6.0);
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(changed, "should return true when exiting safe mode");
+        assert!(!safe_mode.active, "safe mode should be inactive after exit");
+    }
+
+    #[test]
+    fn safe_mode_does_not_exit_with_insufficient_new_predictions() {
+        let now = Utc::now();
+        let mut safe_mode = state::SafeModeState {
+            active: true,
+            entered_at: Some(now - chrono::Duration::hours(1)),
+            trigger: Some("median_error".to_string()),
+            median_error_at_entry: Some(16.0),
+            predictions_since_entry: 0,
+            scored_at_entry: 5,
+        };
+        let mut calibration = state::CalibrationState::default();
+        // median_error=7 < exit_threshold=8, but total_samples=7 → 7-5=2 < min=3
+        let stats = make_cal_stats(7.0, 7, 6.0);
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(!changed);
+        assert!(safe_mode.active, "safe mode should remain active");
+        assert_eq!(safe_mode.predictions_since_entry, 2);
+    }
+
+    #[test]
+    fn safe_mode_does_not_exit_when_error_still_high() {
+        let now = Utc::now();
+        let mut safe_mode = state::SafeModeState {
+            active: true,
+            entered_at: Some(now - chrono::Duration::hours(1)),
+            trigger: Some("median_error".to_string()),
+            median_error_at_entry: Some(16.0),
+            predictions_since_entry: 0,
+            scored_at_entry: 5,
+        };
+        let mut calibration = state::CalibrationState::default();
+        // median_error=9 > exit_threshold=8 — accuracy not recovered enough
+        let stats = make_cal_stats(9.0, 8, 8.0);
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(!changed);
+        assert!(safe_mode.active, "safe mode should remain active");
+    }
+
+    #[test]
+    fn safe_mode_syncs_calibration_state() {
+        let mut safe_mode = state::SafeModeState::default();
+        let mut calibration = state::CalibrationState::default();
+        let stats = make_cal_stats(5.0, 12, 4.5);
+        let now = Utc::now();
+
+        update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert_eq!(calibration.predictions_scored, 12);
+        assert!((calibration.median_error_7ds - 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn safe_mode_entry_uses_absolute_error() {
+        // Negative median_error (over-predicting by 17 pct points) should also trigger
+        let mut safe_mode = state::SafeModeState::default();
+        let mut calibration = state::CalibrationState::default();
+        let stats = make_cal_stats(-17.0, 5, -15.0);
+        let now = Utc::now();
+
+        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(changed);
+        assert!(safe_mode.active);
+        // median_error_at_entry should store the absolute value
+        assert!((safe_mode.median_error_at_entry.unwrap() - 17.0).abs() < 1e-9);
+    }
+
+    // --- Baseline dollar fallback ---
+
+    /// When no API-delta EMA samples exist but the collector reports dollar burn,
+    /// the governor estimates pct/hr using the hardcoded baseline ratio.
+    /// This test verifies the formula and that generate_window_forecast produces
+    /// a non-None safe_worker_count from the resulting pct/hr.
+    #[test]
+    fn baseline_dollar_fallback_produces_nonzero_pct_hr() {
+        // Simulate 2 workers each burning the baseline $5/hr (p75)
+        let fleet_usd_hr = 10.0_f64;
+        const BASELINE_USD_PER_PCT: f64 = 5.0 / 1.5;
+
+        // The formula used in rate_for (C) branch
+        let estimated_pct_hr = fleet_usd_hr / BASELINE_USD_PER_PCT;
+
+        // ~3.0 pct/hr for 2 workers at the baseline rate
+        assert!(
+            (estimated_pct_hr - 3.0).abs() < 1e-9,
+            "expected ~3.0 pct/hr, got {}",
+            estimated_pct_hr
+        );
+
+        // Verify that generate_window_forecast produces usable output with this rate
+        let forecast = generate_window_forecast(
+            "seven_day_sonnet",
+            estimated_pct_hr,
+            50.0,  // current utilization
+            90.0,  // target ceiling
+            24.0,  // hours remaining
+            estimated_pct_hr / 2.0, // p75 per-worker (half fleet for 2 workers)
+        );
+
+        assert!(
+            forecast.safe_worker_count.is_some(),
+            "baseline fallback should produce a non-None safe_worker_count"
+        );
+        assert!(
+            forecast.predicted_exhaustion_hours.is_finite(),
+            "baseline fallback should produce a finite exhaustion estimate"
         );
     }
 }

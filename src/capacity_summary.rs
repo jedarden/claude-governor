@@ -264,6 +264,7 @@ mod tests {
             alert_cooldown: Default::default(),
             updated_at: chrono::Utc::now(),
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 

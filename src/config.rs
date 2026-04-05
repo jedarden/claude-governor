@@ -315,6 +315,16 @@ pub struct AlertConfig {
     /// Options: "info", "warning", "critical"
     #[serde(default = "default_min_severity")]
     pub min_severity: String,
+
+    /// fleet_cache_eff below this fraction triggers a LowCacheEfficiency alert
+    /// (default: 0.30 — warn when less than 30% of input tokens come from cache)
+    #[serde(default = "default_low_cache_eff_threshold")]
+    pub low_cache_eff_threshold: f64,
+
+    /// Number of consecutive intervals with low cache efficiency before alerting
+    /// (default: 5 — roughly 25 minutes at 5-minute collection intervals)
+    #[serde(default = "default_low_cache_eff_intervals")]
+    pub low_cache_eff_intervals: u32,
 }
 
 fn default_alert_command() -> Vec<String> {
@@ -333,6 +343,14 @@ fn default_min_severity() -> String {
     "warning".to_string()
 }
 
+fn default_low_cache_eff_threshold() -> f64 {
+    0.30
+}
+
+fn default_low_cache_eff_intervals() -> u32 {
+    5
+}
+
 impl Default for AlertConfig {
     fn default() -> Self {
         Self {
@@ -340,6 +358,8 @@ impl Default for AlertConfig {
             cooldown_minutes: default_cooldown_minutes(),
             enabled: default_alerts_enabled(),
             min_severity: default_min_severity(),
+            low_cache_eff_threshold: default_low_cache_eff_threshold(),
+            low_cache_eff_intervals: default_low_cache_eff_intervals(),
         }
     }
 }

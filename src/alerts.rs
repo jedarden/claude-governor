@@ -62,6 +62,8 @@ pub enum AlertType {
     PromotionNotApplying,
     /// Token collector has stopped reporting
     CollectorOffline,
+    /// Fleet cache efficiency below threshold for N consecutive intervals
+    LowCacheEfficiency,
 }
 
 impl std::fmt::Display for AlertType {
@@ -76,6 +78,7 @@ impl std::fmt::Display for AlertType {
             AlertType::EmergencyBrakeActivated => write!(f, "emergency_brake_activated"),
             AlertType::PromotionNotApplying => write!(f, "promotion_not_applying"),
             AlertType::CollectorOffline => write!(f, "collector_offline"),
+            AlertType::LowCacheEfficiency => write!(f, "low_cache_efficiency"),
         }
     }
 }
@@ -641,6 +644,7 @@ mod tests {
             margin_hrs,
             binding: false,
             safe_worker_count: None,
+            ..Default::default()
         }
     }
 
@@ -669,6 +673,7 @@ mod tests {
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
             token_refresh_failing: false,
+            low_cache_eff_consecutive: 0,
         }
     }
 
@@ -1059,6 +1064,7 @@ mod tests {
                 margin_hrs: -2.5,
                 binding: true,
                 safe_worker_count: Some(1),
+                ..Default::default()
             },
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
@@ -1152,6 +1158,7 @@ mod tests {
             margin_hrs: hrs_left - (90.0 - util) / 5.0,
             binding: false,
             safe_worker_count: None,
+            ..Default::default()
         }
     }
 

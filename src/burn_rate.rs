@@ -812,6 +812,10 @@ pub fn generate_window_forecast(
         margin_hrs,
         binding: false,
         safe_worker_count,
+        exh_hrs_p25: predicted_exhaustion_hours,
+        exh_hrs_p50: predicted_exhaustion_hours,
+        exh_hrs_p75: predicted_exhaustion_hours,
+        cone_ratio: 1.0,
     }
 }
 
@@ -2305,6 +2309,7 @@ mod tests {
                 margin_hrs: -5.32,
                 binding: false,
                 safe_worker_count: None,
+                ..Default::default()
             },
             seven_day: crate::state::WindowForecast {
                 target_ceiling: 90.0,
@@ -2317,6 +2322,7 @@ mod tests {
                 margin_hrs: 34.81,
                 binding: false,
                 safe_worker_count: None,
+                ..Default::default()
             },
             seven_day_sonnet: crate::state::WindowForecast {
                 target_ceiling: 90.0,
@@ -2329,6 +2335,7 @@ mod tests {
                 margin_hrs: 34.56,
                 binding: true,
                 safe_worker_count: Some(2),
+                ..Default::default()
             },
             binding_window: "seven_day_sonnet".to_string(),
             dollars_per_pct_7d_s: 1.648,
@@ -2356,6 +2363,7 @@ mod tests {
             margin_hrs,
             binding: false,
             safe_worker_count: safe,
+            ..Default::default()
         }
     }
 
