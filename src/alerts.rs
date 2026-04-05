@@ -587,6 +587,39 @@ fn check_session_cutoff_risk(
     }
 }
 
+/// Check for LowCacheEfficiency: fleet_cache_eff below threshold for N consecutive intervals.
+///
+/// Only fires when workers > 0 (the consecutive counter is only incremented during active
+/// intervals, so this guard is belt-and-suspenders). Returns None when the condition is
+/// not met so callers can extend an existing alert list with `extend(check_low_cache_efficiency(…))`.
+pub fn check_low_cache_efficiency(
+    state: &GovernorState,
+    config: &crate::config::AlertConfig,
+    now: DateTime<Utc>,
+) -> Option<AlertCondition> {
+    let workers = state.last_fleet_aggregate.sonnet_workers;
+    let consecutive = state.low_cache_eff_consecutive;
+    let eff = state.last_fleet_aggregate.fleet_cache_eff;
+
+    if workers > 0 && consecutive >= config.low_cache_eff_intervals {
+        let msg = format!(
+            "Fleet cache efficiency {:.1}% below threshold {:.0}% for {} consecutive intervals (~{} min)",
+            eff * 100.0,
+            config.low_cache_eff_threshold * 100.0,
+            consecutive,
+            consecutive * 5,
+        );
+        Some(AlertCondition {
+            alert_type: AlertType::LowCacheEfficiency,
+            message: msg,
+            severity: AlertSeverity::Warning,
+            detected_at: now,
+        })
+    } else {
+        None
+    }
+}
+
 /// Check for Underutilization: all windows have margin_hrs > hrs_left * 0.5
 fn check_underutilization(
     forecast: &CapacityForecast,
@@ -1121,6 +1154,68 @@ mod tests {
 
         let trf = alerts.iter().find(|a| a.alert_type == AlertType::TokenRefreshFailing);
         assert!(trf.is_none(), "Should NOT have TokenRefreshFailing when flag is false");
+    }
+
+    // --- LowCacheEfficiency tests ---
+
+    fn default_alert_config() -> AlertConfig {
+        AlertConfig::default()
+    }
+
+    #[test]
+    fn low_cache_eff_fires_after_n_consecutive_intervals() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.last_fleet_aggregate.sonnet_workers = 2;
+        state.last_fleet_aggregate.fleet_cache_eff = 0.10; // 10%, below 30% threshold
+        state.low_cache_eff_consecutive = 5; // meets default of 5 intervals
+
+        let config = default_alert_config();
+        let alert = check_low_cache_efficiency(&state, &config, base_now());
+
+        assert!(alert.is_some(), "Should fire LowCacheEfficiency after N intervals");
+        let a = alert.unwrap();
+        assert_eq!(a.alert_type, AlertType::LowCacheEfficiency);
+        assert_eq!(a.severity, AlertSeverity::Warning);
+        assert!(a.message.contains("10.0%"), "Should show current efficiency");
+        assert!(a.message.contains("30%"), "Should show threshold");
+        assert!(a.message.contains("5 consecutive"), "Should show count");
+    }
+
+    #[test]
+    fn low_cache_eff_does_not_fire_below_interval_threshold() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.last_fleet_aggregate.sonnet_workers = 2;
+        state.last_fleet_aggregate.fleet_cache_eff = 0.10;
+        state.low_cache_eff_consecutive = 4; // one short of default 5
+
+        let config = default_alert_config();
+        let alert = check_low_cache_efficiency(&state, &config, base_now());
+        assert!(alert.is_none(), "Should NOT fire when consecutive count < threshold");
+    }
+
+    #[test]
+    fn low_cache_eff_does_not_fire_when_eff_above_threshold() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.last_fleet_aggregate.sonnet_workers = 2;
+        state.last_fleet_aggregate.fleet_cache_eff = 0.50; // above threshold
+        // counter would be 0 because governor resets it when eff is good
+        state.low_cache_eff_consecutive = 0;
+
+        let config = default_alert_config();
+        let alert = check_low_cache_efficiency(&state, &config, base_now());
+        assert!(alert.is_none(), "Should NOT fire when efficiency is above threshold");
+    }
+
+    #[test]
+    fn low_cache_eff_does_not_fire_when_no_workers() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.last_fleet_aggregate.sonnet_workers = 0; // idle
+        state.last_fleet_aggregate.fleet_cache_eff = 0.0;
+        state.low_cache_eff_consecutive = 10; // would normally trigger
+
+        let config = default_alert_config();
+        let alert = check_low_cache_efficiency(&state, &config, base_now());
+        assert!(alert.is_none(), "Should NOT fire when no workers are active");
     }
 
     // --- Update cooldown test ---

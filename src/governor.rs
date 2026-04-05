@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::alerts::{check_alert_conditions, should_fire, update_cooldown, fire_alert, SprintTrigger};
+use crate::alerts::{check_alert_conditions, check_low_cache_efficiency, should_fire, update_cooldown, fire_alert, SprintTrigger};
 use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
 use crate::calibrator;
 use crate::collector;
@@ -1628,7 +1628,8 @@ pub fn run_governor_cycle(
     }
 
     // 8. Check alerts and fire via configured command
-    let alert_conditions = check_alert_conditions(&state, now);
+    let mut alert_conditions = check_alert_conditions(&state, now);
+    alert_conditions.extend(check_low_cache_efficiency(&state, alert_config, now));
     for alert in &alert_conditions {
         if should_fire(
             alert.alert_type,
