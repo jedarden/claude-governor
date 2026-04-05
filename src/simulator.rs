@@ -282,6 +282,14 @@ struct SimContext {
     /// Per-model burn rate (pct per worker per hour)
     model_burn_rate: HashMap<String, f64>,
 
+    /// Fleet-level EMA pct/hr per window (total fleet, not per worker).
+    /// Used as fallback when per-model rates are zero.
+    fleet_pct_hr_ema: HashMap<String, f64>,
+
+    /// Worker count that was active when fleet_pct_hr_ema was last updated.
+    /// Used to convert fleet total rate → per-worker rate.
+    baseline_workers: u32,
+
     /// Active promotions from promotions.json
     promotions: Vec<schedule::Promotion>,
 }
@@ -342,25 +350,61 @@ impl SimContext {
             model_burn_rate.insert("default".to_string(), 1.5);
         }
 
+        // Extract fleet EMA rates per window (total fleet pct/hr)
+        let ema = &state.burn_rate.fleet_pct_hr_ema;
+        let mut fleet_pct_hr_ema = HashMap::new();
+        if ema.five_hour > 0.0 {
+            fleet_pct_hr_ema.insert("five_hour".to_string(), ema.five_hour);
+        }
+        if ema.seven_day > 0.0 {
+            fleet_pct_hr_ema.insert("seven_day".to_string(), ema.seven_day);
+        }
+        if ema.seven_day_sonnet > 0.0 {
+            fleet_pct_hr_ema.insert("seven_day_sonnet".to_string(), ema.seven_day_sonnet);
+        }
+
+        // Baseline worker count: use last fleet aggregate's worker count so we can
+        // convert fleet total pct/hr → per-worker rate for the fallback path.
+        let baseline_workers = state.last_fleet_aggregate.sonnet_workers.max(1);
+
         Ok(Self {
             start: state.updated_at,
             window_utilization,
             window_ceiling,
             window_resets_at,
             model_burn_rate,
+            fleet_pct_hr_ema,
+            baseline_workers,
             promotions,
         })
     }
 
-    /// Get the effective burn rate (pct per worker per hour)
-    fn get_burn_rate(&self) -> f64 {
-        // Use sonnet burn rate as default, or the first available model
-        self.model_burn_rate
+    /// Get the effective burn rate per worker per hour for a given window.
+    ///
+    /// Priority:
+    /// 1. Per-model pct_per_worker_per_hour (from burn rate estimator)
+    /// 2. Fleet EMA for this window divided by baseline_workers (when model rate is zero)
+    /// 3. Static fallback: 1.5%/worker/hr
+    fn get_burn_rate_for_window(&self, window: &str) -> f64 {
+        // Try per-model rate
+        let model_rate = self.model_burn_rate
             .get("claude-sonnet-4-20250514")
             .or_else(|| self.model_burn_rate.get("claude-sonnet-4-6"))
             .or_else(|| self.model_burn_rate.values().next())
             .copied()
-            .unwrap_or(1.5)
+            .unwrap_or(0.0);
+
+        if model_rate > 0.0 {
+            return model_rate;
+        }
+
+        // Fall back to fleet EMA / baseline_workers for this specific window
+        if let Some(&fleet_rate) = self.fleet_pct_hr_ema.get(window) {
+            return fleet_rate / self.baseline_workers as f64;
+        }
+
+        // Final fallback
+        1.5
     }
 
     /// Get the promotion multiplier at a given time for a specific window using the schedule module
@@ -402,7 +446,7 @@ pub fn simulate(
         let workers = config.workers.workers_at(hours_offset);
 
         // Get base burn rate (same for all windows; promo multiplier is per-window)
-        let base_burn_rate = ctx.get_burn_rate(); // pct per worker per hour
+        let base_burn_rate = ctx.get_burn_rate_for_window("five_hour"); // pct per worker per hour
 
         // Compute display multiplier as max across all windows (shows if any promotion is active)
         let display_promo_multiplier = WINDOWS.iter()
