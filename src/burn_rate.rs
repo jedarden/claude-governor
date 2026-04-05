@@ -1004,14 +1004,17 @@ pub fn estimate_burn_rates(
 
     if !binding_window.is_empty() {
         let binding_forecast = forecasts.get(&binding_window);
-        let safe_w = binding_forecast
-            .and_then(|f| f.safe_worker_count)
-            .unwrap_or(0);
-        log::info!(
-            "[burn_rate] → target: {} workers (safe_worker_count from binding window {})",
-            safe_w,
-            binding_window,
-        );
+        match binding_forecast.and_then(|f| f.safe_worker_count) {
+            None => log::info!(
+                "[burn_rate] → binding window {}: insufficient burn rate data, using max_workers as ceiling",
+                binding_window,
+            ),
+            Some(safe_w) => log::info!(
+                "[burn_rate] → target: {} workers (safe_worker_count from binding window {})",
+                safe_w,
+                binding_window,
+            ),
+        }
     }
 
     (
@@ -1128,14 +1131,17 @@ pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
             "seven_day" => &forecast.seven_day,
             _ => &forecast.seven_day_sonnet,
         };
-        let safe_w = binding_forecast
-            .safe_worker_count
-            .unwrap_or(0);
-        log::info!(
-            "[governor] → target: {} workers (safe_worker_count from binding window {})",
-            safe_w,
-            forecast.binding_window,
-        );
+        match binding_forecast.safe_worker_count {
+            None => log::info!(
+                "[governor] → binding window {}: insufficient burn rate data, will use max_workers as ceiling",
+                forecast.binding_window,
+            ),
+            Some(w) => log::info!(
+                "[governor] → safe_worker_count: {} workers from binding window {}",
+                w,
+                forecast.binding_window,
+            ),
+        }
     }
 }
 

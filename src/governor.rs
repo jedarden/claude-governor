@@ -559,6 +559,25 @@ pub enum ScalingDecision {
     EmergencyBrake,
 }
 
+/// Resolve safe_worker_count to a concrete target, with an explicit fallback when
+/// the burn rate data is insufficient (None).
+///
+/// - `None` → `max_workers`: no burn rate data yet; use the configured ceiling so the
+///   fleet stays at full capacity rather than freezing at current_total.
+/// - `Some(0)` → `current_total`: formula computed 0 (near-exhaustion) but we don't
+///   drop below current to avoid a sudden cold-start penalty.
+/// - `Some(w)` → `w`: normal case.
+fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: u32) -> u32 {
+    match safe {
+        None => {
+            log::info!("[governor] insufficient burn rate data, using max_workers as ceiling");
+            max_workers
+        }
+        Some(0) => current_total,
+        Some(w) => w,
+    }
+}
+
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
@@ -653,17 +672,11 @@ pub fn compute_target_workers(
             }
             None => {
                 // Composite risk not applicable, fall back to binding window
-                binding_forecast
-                    .safe_worker_count
-                    .filter(|&w| w > 0)
-                    .unwrap_or(current_total)
+                safe_worker_count_or_max(binding_forecast.safe_worker_count, global_max, current_total)
             }
         }
     } else {
-        binding_forecast
-            .safe_worker_count
-            .filter(|&w| w > 0)
-            .unwrap_or(current_total)
+        safe_worker_count_or_max(binding_forecast.safe_worker_count, global_max, current_total)
     };
 
     let target = base_target.min(global_max).max(global_min);
@@ -2473,5 +2486,47 @@ mod tests {
             forecast.predicted_exhaustion_hours.is_finite(),
             "baseline fallback should produce a finite exhaustion estimate"
         );
+    }
+
+    // --- safe_worker_count_or_max fallback tests ---
+
+    #[test]
+    fn safe_worker_count_none_uses_max_workers() {
+        // None → max_workers, not current_total
+        assert_eq!(safe_worker_count_or_max(None, 8, 3), 8);
+    }
+
+    #[test]
+    fn safe_worker_count_some_zero_uses_current_total() {
+        // Some(0) → current_total (near-exhaustion, avoid cold-start drop)
+        assert_eq!(safe_worker_count_or_max(Some(0), 8, 3), 3);
+    }
+
+    #[test]
+    fn safe_worker_count_some_nonzero_uses_value() {
+        assert_eq!(safe_worker_count_or_max(Some(5), 8, 3), 5);
+    }
+
+    #[test]
+    fn compute_target_workers_none_safe_count_falls_back_to_max() {
+        // When safe_worker_count is None (zero burn rate, no data yet), the governor
+        // must fall back to global_max rather than current_total to keep the fleet
+        // running at full capacity.
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "w1".to_string(),
+            state::WorkerState { current: 2, target: 2, min: 1, max: 6 },
+        );
+        state.capacity_forecast.binding_window = "seven_day_sonnet".to_string();
+        // Leave safe_worker_count as None (default)
+
+        let target = compute_target_workers(
+            &state,
+            90.0,
+            &CompositeRiskConfig { enabled: false, ..Default::default() },
+        );
+
+        // Should be global_max (6), clamped to [min=1, max=6]
+        assert_eq!(target, 6, "expected fallback to max_workers=6 when safe_worker_count is None");
     }
 }
