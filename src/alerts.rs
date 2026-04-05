@@ -1494,6 +1494,37 @@ mod tests {
         assert_eq!(trigger.target_workers, 10);
     }
 
+    #[test]
+    fn sprint_inhibited_when_safe_mode_active() {
+        // five_hour underutilized and close to reset — conditions that would normally trigger a sprint
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(45.0, 1.5, false),
+            seven_day: make_window_with_util(45.0, 100.0, false),
+            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "sonnet".to_string(),
+            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+        );
+
+        let mut state = make_state_with_workers(forecast, workers);
+        state.safe_mode.active = true;
+        state.safe_mode.trigger = Some("median_error".to_string());
+
+        let config = default_sprint_config();
+
+        let trigger = check_underutilization_sprint(&state, &config);
+        assert!(
+            trigger.is_none(),
+            "Sprint should NOT trigger when safe mode is active"
+        );
+    }
+
     // --- Alert firing tests ---
 
     #[test]
