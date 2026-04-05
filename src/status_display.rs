@@ -34,6 +34,15 @@ fn format_hours(hours: f64) -> String {
     }
 }
 
+/// Format exhaustion hours — handles infinity / very large values
+fn format_exh_hrs(hrs: f64) -> String {
+    if hrs.is_infinite() || hrs > 9999.0 {
+        ">9999h".to_string()
+    } else {
+        format_hours(hrs)
+    }
+}
+
 /// Format a timestamp as a relative time string
 fn format_relative_time(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let diff = now.signed_duration_since(ts);
@@ -125,6 +134,29 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
 
     // Legend for binding marker
     output.push_str(" * = binding window\n");
+    output.push_str("\n");
+
+    // Confidence Cone section
+    output.push_str("Confidence Cone\n");
+    output.push_str("---------------\n");
+    output.push_str(&format!(
+        "{:<10} {:>10} {:>10} {:>10} {:>10}\n",
+        "Window", "p25(fast)", "p50(mid)", "p75(slow)", "ConeRatio"
+    ));
+    for (name, win) in &windows {
+        let p25 = format_exh_hrs(win.exh_hrs_p25);
+        let p50 = format_exh_hrs(win.exh_hrs_p50);
+        let p75 = format_exh_hrs(win.exh_hrs_p75);
+        let ratio = if win.cone_ratio > 0.0 {
+            format!("{:.1}x", win.cone_ratio)
+        } else {
+            "—".to_string()
+        };
+        output.push_str(&format!(
+            "{:<10} {:>10} {:>10} {:>10} {:>10}\n",
+            name, p25, p50, p75, ratio
+        ));
+    }
     output.push_str("\n");
 
     // Workers section
@@ -322,6 +354,10 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 "risk": risk_indicator(v),
                 "binding": v.binding,
                 "cutoff_risk": v.cutoff_risk,
+                "exh_hrs_p25": if v.exh_hrs_p25.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p25) },
+                "exh_hrs_p50": if v.exh_hrs_p50.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p50) },
+                "exh_hrs_p75": if v.exh_hrs_p75.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p75) },
+                "cone_ratio": v.cone_ratio,
             }))
         }).collect::<std::collections::HashMap<&str, serde_json::Value>>(),
         "workers": {

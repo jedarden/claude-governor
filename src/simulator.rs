@@ -216,6 +216,19 @@ pub struct CeilingBreach {
     pub ceiling: f64,
 }
 
+/// Confidence cone for a single window (captured from state at simulation time)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowCone {
+    /// Pessimistic exhaustion hours (fast-burn / p25 scenario)
+    pub exh_hrs_p25: f64,
+    /// Central exhaustion hours (mean burn rate / p50)
+    pub exh_hrs_p50: f64,
+    /// Optimistic exhaustion hours (slow-burn / p75 scenario)
+    pub exh_hrs_p75: f64,
+    /// Spread ratio: exh_hrs_p75 / exh_hrs_p25 (1.0 = no spread, higher = wider uncertainty)
+    pub cone_ratio: f64,
+}
+
 /// Complete trajectory output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trajectory {
@@ -227,6 +240,9 @@ pub struct Trajectory {
 
     /// Simulation configuration summary
     pub config: TrajectoryConfig,
+
+    /// Confidence cone per window (from state at simulation time)
+    pub cone: std::collections::HashMap<String, WindowCone>,
 }
 
 /// Configuration summary included in trajectory output
@@ -521,6 +537,22 @@ pub fn simulate(
             .join(","),
     };
 
+    // Capture confidence cone from current state's window forecasts
+    let mut cone = std::collections::HashMap::new();
+    let forecast = &state.capacity_forecast;
+    for (key, win) in [
+        ("five_hour", &forecast.five_hour),
+        ("seven_day", &forecast.seven_day),
+        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+    ] {
+        cone.insert(key.to_string(), WindowCone {
+            exh_hrs_p25: win.exh_hrs_p25,
+            exh_hrs_p50: win.exh_hrs_p50,
+            exh_hrs_p75: win.exh_hrs_p75,
+            cone_ratio: win.cone_ratio,
+        });
+    }
+
     Ok(Trajectory {
         points,
         breaches,
@@ -529,7 +561,23 @@ pub fn simulate(
             hours: config.hours,
             resolution_minutes: config.resolution_minutes,
         },
+        cone,
     })
+}
+
+/// Format exhaustion hours for display — handles infinity / very large values
+fn format_exh_hrs(hrs: f64) -> String {
+    if hrs.is_infinite() || hrs > 9999.0 {
+        ">9999h".to_string()
+    } else if hrs <= 0.0 {
+        "now".to_string()
+    } else if hrs < 1.0 {
+        format!("{:.0}m", hrs * 60.0)
+    } else if hrs < 24.0 {
+        format!("{:.1}h", hrs)
+    } else {
+        format!("{:.1}d", hrs / 24.0)
+    }
 }
 
 /// Format trajectory as ASCII table for human consumption
@@ -543,6 +591,39 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
     ));
     output.push_str(&"=".repeat(80));
     output.push_str("\n\n");
+
+    // Confidence cone section
+    if !trajectory.cone.is_empty() {
+        output.push_str("Confidence Cone (starting conditions)\n");
+        output.push_str(&"-".repeat(60));
+        output.push_str("\n");
+        output.push_str(&format!(
+            "{:<14} {:>10} {:>10} {:>10} {:>10}\n",
+            "Window", "p25(fast)", "p50(mid)", "p75(slow)", "ConeRatio"
+        ));
+        for (key, label) in [
+            ("five_hour", "5h"),
+            ("seven_day", "7d"),
+            ("seven_day_sonnet", "7d-sonnet"),
+        ] {
+            if let Some(c) = trajectory.cone.get(key) {
+                let ratio = if c.cone_ratio > 0.0 {
+                    format!("{:.1}x", c.cone_ratio)
+                } else {
+                    "—".to_string()
+                };
+                output.push_str(&format!(
+                    "{:<14} {:>10} {:>10} {:>10} {:>10}\n",
+                    label,
+                    format_exh_hrs(c.exh_hrs_p25),
+                    format_exh_hrs(c.exh_hrs_p50),
+                    format_exh_hrs(c.exh_hrs_p75),
+                    ratio,
+                ));
+            }
+        }
+        output.push_str("\n");
+    }
 
     // Column headers
     output.push_str(&format!(
