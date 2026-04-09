@@ -230,7 +230,11 @@ pub fn compute_stats(scores: &[PredictionScore]) -> CalibrationStats {
 /// - If consistently over-predicting (bias < 0): decrease alpha (more stable)
 /// - High variance: increase hysteresis (require bigger changes before acting)
 /// - Low variance: decrease hysteresis (can act on smaller changes)
-pub fn auto_tune(stats: &CalibrationStats, current_alpha: f64, current_hysteresis: f64) -> TunedParams {
+pub fn auto_tune(
+    stats: &CalibrationStats,
+    current_alpha: f64,
+    current_hysteresis: f64,
+) -> TunedParams {
     if stats.total_samples < MIN_SAMPLES_FOR_TUNING {
         return TunedParams {
             alpha: current_alpha,
@@ -242,7 +246,7 @@ pub fn auto_tune(stats: &CalibrationStats, current_alpha: f64, current_hysteresi
 
     // Adjust alpha based on bias
     let alpha_adjustment = match stats.bias {
-        b if b > 0.0 => 0.05, // Under-predicting: be more responsive
+        b if b > 0.0 => 0.05,  // Under-predicting: be more responsive
         b if b < 0.0 => -0.05, // Over-predicting: be more stable
         _ => 0.0,
     };
@@ -258,7 +262,8 @@ pub fn auto_tune(stats: &CalibrationStats, current_alpha: f64, current_hysteresi
     } else {
         0.0
     };
-    let new_hysteresis = (current_hysteresis + hysteresis_adjustment).clamp(HYSTERESIS_MIN, HYSTERESIS_MAX);
+    let new_hysteresis =
+        (current_hysteresis + hysteresis_adjustment).clamp(HYSTERESIS_MIN, HYSTERESIS_MAX);
 
     // Suggest target utilization adjustment based on systematic bias
     // If we're consistently under-predicting, the target might be too aggressive
@@ -305,10 +310,7 @@ pub fn append_score_to_path(score: &PredictionScore, path: &PathBuf) -> std::io:
     }
 
     // Open file for append (create if doesn't exist)
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     // Serialize and write as a single line
     let json = serde_json::to_string(score)?;
@@ -334,9 +336,8 @@ pub fn read_all_scores_from_path(path: &PathBuf) -> std::io::Result<Vec<Predicti
     let scores: Vec<PredictionScore> = reader
         .lines()
         .filter_map(|line| {
-            line.ok().and_then(|l| {
-                serde_json::from_str::<PredictionScore>(&l).ok()
-            })
+            line.ok()
+                .and_then(|l| serde_json::from_str::<PredictionScore>(&l).ok())
         })
         .collect();
 
@@ -349,7 +350,10 @@ pub fn read_last_scores(n: usize) -> std::io::Result<Vec<PredictionScore>> {
 }
 
 /// Read the last N prediction scores from a specific path
-pub fn read_last_scores_from_path(n: usize, path: &PathBuf) -> std::io::Result<Vec<PredictionScore>> {
+pub fn read_last_scores_from_path(
+    n: usize,
+    path: &PathBuf,
+) -> std::io::Result<Vec<PredictionScore>> {
     let all_scores = read_all_scores_from_path(path)?;
 
     let start = if all_scores.len() > n {
@@ -503,7 +507,10 @@ mod tests {
             .collect();
 
         let stats = compute_stats(&scores);
-        assert!(stats.bias > 0.0, "Should detect positive bias (under-predicting)");
+        assert!(
+            stats.bias > 0.0,
+            "Should detect positive bias (under-predicting)"
+        );
     }
 
     #[test]
@@ -558,7 +565,7 @@ mod tests {
     fn auto_tune_increases_alpha_when_under_predicting() {
         let stats = CalibrationStats {
             total_samples: 20,
-            mean_error: 2.0,  // Positive = under-predicting
+            mean_error: 2.0, // Positive = under-predicting
             stddev_error: 1.0,
             bias: 1.0,
             ..Default::default()
@@ -566,7 +573,10 @@ mod tests {
 
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, DEFAULT_HYSTERESIS);
         assert!(tuned.tuned);
-        assert!(tuned.alpha > DEFAULT_ALPHA, "Alpha should increase when under-predicting");
+        assert!(
+            tuned.alpha > DEFAULT_ALPHA,
+            "Alpha should increase when under-predicting"
+        );
     }
 
     #[test]
@@ -581,7 +591,10 @@ mod tests {
 
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, DEFAULT_HYSTERESIS);
         assert!(tuned.tuned);
-        assert!(tuned.alpha < DEFAULT_ALPHA, "Alpha should decrease when over-predicting");
+        assert!(
+            tuned.alpha < DEFAULT_ALPHA,
+            "Alpha should decrease when over-predicting"
+        );
     }
 
     #[test]
@@ -594,7 +607,10 @@ mod tests {
         };
 
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, DEFAULT_HYSTERESIS);
-        assert!(tuned.hysteresis > DEFAULT_HYSTERESIS, "Hysteresis should increase with high variance");
+        assert!(
+            tuned.hysteresis > DEFAULT_HYSTERESIS,
+            "Hysteresis should increase with high variance"
+        );
     }
 
     #[test]
@@ -607,7 +623,10 @@ mod tests {
         };
 
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, DEFAULT_HYSTERESIS);
-        assert!(tuned.hysteresis < DEFAULT_HYSTERESIS, "Hysteresis should decrease with low variance");
+        assert!(
+            tuned.hysteresis < DEFAULT_HYSTERESIS,
+            "Hysteresis should decrease with low variance"
+        );
     }
 
     #[test]
@@ -622,7 +641,10 @@ mod tests {
 
         // Start at max alpha
         let tuned = auto_tune(&stats, ALPHA_MAX, DEFAULT_HYSTERESIS);
-        assert!((tuned.alpha - ALPHA_MAX).abs() < 1e-9, "Alpha should be clamped to max");
+        assert!(
+            (tuned.alpha - ALPHA_MAX).abs() < 1e-9,
+            "Alpha should be clamped to max"
+        );
 
         // Start at min alpha with over-prediction
         let stats2 = CalibrationStats {
@@ -633,7 +655,10 @@ mod tests {
             ..Default::default()
         };
         let tuned2 = auto_tune(&stats2, ALPHA_MIN, DEFAULT_HYSTERESIS);
-        assert!((tuned2.alpha - ALPHA_MIN).abs() < 1e-9, "Alpha should be clamped to min");
+        assert!(
+            (tuned2.alpha - ALPHA_MIN).abs() < 1e-9,
+            "Alpha should be clamped to min"
+        );
     }
 
     #[test]
@@ -647,7 +672,10 @@ mod tests {
 
         // Start at max hysteresis
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, HYSTERESIS_MAX);
-        assert!((tuned.hysteresis - HYSTERESIS_MAX).abs() < 1e-9, "Hysteresis should be clamped to max");
+        assert!(
+            (tuned.hysteresis - HYSTERESIS_MAX).abs() < 1e-9,
+            "Hysteresis should be clamped to max"
+        );
     }
 
     #[test]
@@ -662,7 +690,10 @@ mod tests {
 
         let tuned = auto_tune(&stats, DEFAULT_ALPHA, DEFAULT_HYSTERESIS);
         // Adjustment should be in direction to compensate for bias
-        assert!(tuned.target_util_adjustment > 0.0, "Should suggest raising target util");
+        assert!(
+            tuned.target_util_adjustment > 0.0,
+            "Should suggest raising target util"
+        );
         assert!(tuned.target_util_adjustment <= TARGET_UTIL_ADJUST_MAX);
     }
 

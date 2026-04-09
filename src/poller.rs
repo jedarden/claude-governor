@@ -159,7 +159,8 @@ pub struct Poller {
 impl Poller {
     /// Create a new poller instance
     pub fn new() -> Result<Self> {
-        let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
         let credentials_path = home_dir.join(CREDENTIALS_PATH);
 
         // Build ureq agent with rustls TLS
@@ -180,20 +181,23 @@ impl Poller {
 
     /// Read and parse the credentials file
     fn read_credentials(&self) -> Result<Credentials> {
-        let content = fs::read_to_string(&self.credentials_path)
-            .map_err(|_| anyhow::anyhow!(PollerError::CredentialsNotFound(self.credentials_path.clone())))?;
+        let content = fs::read_to_string(&self.credentials_path).map_err(|_| {
+            anyhow::anyhow!(PollerError::CredentialsNotFound(
+                self.credentials_path.clone()
+            ))
+        })?;
 
-        serde_json::from_str(&content)
-            .map_err(|e: serde_json::Error| anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string())))
+        serde_json::from_str(&content).map_err(|e: serde_json::Error| {
+            anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
+        })
     }
 
     /// Write updated credentials back to the file
     fn write_credentials(&self, creds: &Credentials) -> Result<()> {
-        let content = serde_json::to_string_pretty(creds)
-            .context("Failed to serialize credentials")?;
+        let content =
+            serde_json::to_string_pretty(creds).context("Failed to serialize credentials")?;
 
-        fs::write(&self.credentials_path, content)
-            .context("Failed to write credentials file")?;
+        fs::write(&self.credentials_path, content).context("Failed to write credentials file")?;
 
         Ok(())
     }
@@ -212,29 +216,39 @@ impl Poller {
             refresh_token: refresh_token.to_string(),
         };
 
-        let json_payload = serde_json::to_string(&payload)
-            .context("Failed to serialize refresh request")?;
+        let json_payload =
+            serde_json::to_string(&payload).context("Failed to serialize refresh request")?;
 
-        let response = self.agent
+        let response = self
+            .agent
             .post(TOKEN_ENDPOINT)
             .set("Content-Type", "application/json")
             .set("User-Agent", USER_AGENT)
             .send_string(&json_payload)
-            .map_err(|e| anyhow::anyhow!(PollerError::TokenRefreshFailed(format!("HTTP error: {}", e))))?;
+            .map_err(|e| {
+                anyhow::anyhow!(PollerError::TokenRefreshFailed(format!(
+                    "HTTP error: {}",
+                    e
+                )))
+            })?;
 
         if response.status() != 200 {
             let status = response.status();
             let text = response.into_string().unwrap_or_default();
-            return Err(anyhow::anyhow!(PollerError::TokenRefreshFailed(
-                format!("HTTP {}: {}", status, text)
-            )));
+            return Err(anyhow::anyhow!(PollerError::TokenRefreshFailed(format!(
+                "HTTP {}: {}",
+                status, text
+            ))));
         }
 
-        let response_text = response.into_string()
+        let response_text = response
+            .into_string()
             .map_err(|e| anyhow::anyhow!(PollerError::ParseError(e.to_string())))?;
 
-        let refresh_response: RefreshResponse = serde_json::from_str(&response_text)
-            .map_err(|e: serde_json::Error| anyhow::anyhow!(PollerError::ParseError(e.to_string())))?;
+        let refresh_response: RefreshResponse =
+            serde_json::from_str(&response_text).map_err(|e: serde_json::Error| {
+                anyhow::anyhow!(PollerError::ParseError(e.to_string()))
+            })?;
 
         Ok(refresh_response)
     }
@@ -283,7 +297,10 @@ impl Poller {
         }
 
         // Retry after delay
-        log::info!("Retrying token refresh in {} seconds...", REFRESH_RETRY_DELAY_SECS);
+        log::info!(
+            "Retrying token refresh in {} seconds...",
+            REFRESH_RETRY_DELAY_SECS
+        );
         std::thread::sleep(std::time::Duration::from_secs(REFRESH_RETRY_DELAY_SECS));
 
         match self.refresh_token(refresh_token) {
@@ -318,27 +335,34 @@ impl Poller {
     fn fetch_usage(&self, access_token: &str) -> Result<UsageResponse> {
         let url = format!("{}{}", API_BASE, USAGE_ENDPOINT);
 
-        let response = self.agent
+        let response = self
+            .agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", access_token))
             .set("anthropic-beta", "oauth-2025-04-20")
             .set("User-Agent", USER_AGENT)
             .call()
-            .map_err(|e| anyhow::anyhow!(PollerError::ApiRequestFailed(format!("HTTP error: {}", e))))?;
+            .map_err(|e| {
+                anyhow::anyhow!(PollerError::ApiRequestFailed(format!("HTTP error: {}", e)))
+            })?;
 
         if response.status() != 200 {
             let status = response.status();
             let text = response.into_string().unwrap_or_default();
-            return Err(anyhow::anyhow!(PollerError::ApiError(
-                format!("HTTP {}: {}", status, text)
-            )));
+            return Err(anyhow::anyhow!(PollerError::ApiError(format!(
+                "HTTP {}: {}",
+                status, text
+            ))));
         }
 
-        let response_text = response.into_string()
+        let response_text = response
+            .into_string()
             .map_err(|e| anyhow::anyhow!(PollerError::ParseError(e.to_string())))?;
 
-        let usage: UsageResponse = serde_json::from_str(&response_text)
-            .map_err(|e: serde_json::Error| anyhow::anyhow!(PollerError::ParseError(e.to_string())))?;
+        let usage: UsageResponse =
+            serde_json::from_str(&response_text).map_err(|e: serde_json::Error| {
+                anyhow::anyhow!(PollerError::ParseError(e.to_string()))
+            })?;
 
         Ok(usage)
     }
@@ -377,12 +401,9 @@ impl Poller {
         let usage = self.fetch_usage(&access_token)?;
 
         // Compute hours remaining for each window
-        let seven_day_sonnet_hours = usage.seven_day_sonnet.hours_remaining()
-            .unwrap_or(0.0);
-        let seven_day_hours = usage.seven_day.hours_remaining()
-            .unwrap_or(0.0);
-        let five_hour_hours = usage.five_hour.hours_remaining()
-            .unwrap_or(0.0);
+        let seven_day_sonnet_hours = usage.seven_day_sonnet.hours_remaining().unwrap_or(0.0);
+        let seven_day_hours = usage.seven_day.hours_remaining().unwrap_or(0.0);
+        let five_hour_hours = usage.five_hour.hours_remaining().unwrap_or(0.0);
 
         let data = UsageData {
             seven_day_sonnet_utilization: usage.seven_day_sonnet.utilization,
@@ -470,7 +491,8 @@ mod tests {
     #[test]
     fn test_credentials_parsing() {
         let temp_dir = TempDir::new().unwrap();
-        let creds_path = create_test_credentials(&temp_dir, Utc::now().timestamp_millis() + 3600000);
+        let creds_path =
+            create_test_credentials(&temp_dir, Utc::now().timestamp_millis() + 3600000);
 
         let content = fs::read_to_string(&creds_path).unwrap();
         let creds: Credentials = serde_json::from_str(&content).unwrap();

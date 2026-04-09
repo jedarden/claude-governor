@@ -185,6 +185,10 @@ pub struct WindowForecast {
     /// Cone ratio = exh_hrs_p75 / exh_hrs_p25 (1.0 = no spread, higher = wider uncertainty)
     #[serde(default)]
     pub cone_ratio: f64,
+    /// Composite risk score (higher = riskier). Factors in margin, duration, and volatility.
+    /// Used for binding window selection.
+    #[serde(default)]
+    pub risk_score: f64,
 }
 
 impl Default for WindowForecast {
@@ -205,6 +209,7 @@ impl Default for WindowForecast {
             exh_hrs_p50: 0.0,
             exh_hrs_p75: 0.0,
             cone_ratio: 0.0,
+            risk_score: 0.0,
         }
     }
 }
@@ -549,7 +554,10 @@ impl GovernorState {
 /// Returns a default state and logs a warning if the file is corrupt.
 pub fn load_state(path: &Path) -> Result<GovernorState> {
     if !path.exists() {
-        log::debug!("[state] no state file at {}, starting fresh", path.display());
+        log::debug!(
+            "[state] no state file at {}, starting fresh",
+            path.display()
+        );
         return Ok(GovernorState::new());
     }
 
@@ -838,7 +846,10 @@ mod tests {
             alert_cooldown: AlertCooldown {
                 last_fired: {
                     let mut m = HashMap::new();
-                    m.insert("cutoff_imminent".to_string(), "2026-03-18T14:00:00Z".parse().unwrap());
+                    m.insert(
+                        "cutoff_imminent".to_string(),
+                        "2026-03-18T14:00:00Z".parse().unwrap(),
+                    );
                     m
                 },
             },
@@ -858,25 +869,16 @@ mod tests {
 
         assert_eq!(loaded.usage.sonnet_pct, 72.0);
         assert_eq!(loaded.usage.all_models_pct, 81.0);
-        assert_eq!(
-            loaded.capacity_forecast.binding_window,
-            "seven_day_sonnet"
-        );
+        assert_eq!(loaded.capacity_forecast.binding_window, "seven_day_sonnet");
         assert_eq!(loaded.burn_rate.tokens_per_pct_peak, 69780);
         assert_eq!(loaded.burn_rate.by_model["claude-sonnet-4-6"].samples, 12);
         assert_eq!(loaded.workers["claude-anthropic-sonnet"].current, 2);
         assert_eq!(loaded.alerts.len(), 1);
         assert_eq!(loaded.safe_mode.active, true);
-        assert_eq!(
-            loaded.safe_mode.trigger.as_deref(),
-            Some("median_error")
-        );
+        assert_eq!(loaded.safe_mode.trigger.as_deref(), Some("median_error"));
         assert_eq!(loaded.burn_rate.calibration.predictions_scored, 24);
         assert_eq!(
-            loaded
-                .capacity_forecast
-                .seven_day_sonnet
-                .safe_worker_count,
+            loaded.capacity_forecast.seven_day_sonnet.safe_worker_count,
             Some(2)
         );
     }
@@ -985,7 +987,11 @@ mod tests {
     #[test]
     fn save_creates_parent_directories() {
         let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("nested").join("dir").join("governor-state.json");
+        let path = temp_dir
+            .path()
+            .join("nested")
+            .join("dir")
+            .join("governor-state.json");
 
         let state = full_state();
         save_state(&state, &path).unwrap();
@@ -1015,10 +1021,7 @@ mod tests {
         // Load it back
         let loaded = load_previous_state(&path).unwrap().unwrap();
         assert_eq!(loaded.usage.sonnet_pct, 72.0);
-        assert_eq!(
-            loaded.capacity_forecast.binding_window,
-            "seven_day_sonnet"
-        );
+        assert_eq!(loaded.capacity_forecast.binding_window, "seven_day_sonnet");
     }
 
     #[test]
@@ -1073,7 +1076,11 @@ mod tests {
         assert_eq!(state.schedule.promo_multiplier, 1.0);
         assert!(state.capacity_forecast.binding_window.is_empty());
         assert!(!state.capacity_forecast.five_hour.cutoff_risk);
-        assert!(state.capacity_forecast.five_hour.safe_worker_count.is_none());
+        assert!(state
+            .capacity_forecast
+            .five_hour
+            .safe_worker_count
+            .is_none());
         assert_eq!(state.burn_rate.calibration.predictions_scored, 0);
     }
 
@@ -1292,7 +1299,8 @@ mod null_roundtrip_test {
     #[test]
     fn test_window_forecast_null_roundtrip() {
         let json = r#"{"target_ceiling":90.0,"current_utilization":12.0,"remaining_pct":78.0,"hours_remaining":7.2,"fleet_pct_per_hour":0.0,"predicted_exhaustion_hours":null,"cutoff_risk":false,"margin_hrs":null,"binding":true}"#;
-        let wf: WindowForecast = serde_json::from_str(json).expect("should deserialize null as infinity");
+        let wf: WindowForecast =
+            serde_json::from_str(json).expect("should deserialize null as infinity");
         assert!(wf.predicted_exhaustion_hours.is_infinite());
         assert!(wf.margin_hrs.is_infinite() || wf.margin_hrs.is_sign_negative());
     }

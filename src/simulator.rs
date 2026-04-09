@@ -137,9 +137,9 @@ fn parse_worker_schedule(s: &str) -> Result<Vec<WorkerSegment>> {
         }
 
         // Format: "N:Xh" where N is worker count, X is hours
-        let colon_pos = part
-            .find(':')
-            .ok_or_else(|| SimError::ParseError(format!("Invalid segment '{}': missing ':'", part)))?;
+        let colon_pos = part.find(':').ok_or_else(|| {
+            SimError::ParseError(format!("Invalid segment '{}': missing ':'", part))
+        })?;
 
         let workers_str = &part[..colon_pos];
         let duration_str = &part[colon_pos + 1..];
@@ -150,9 +150,12 @@ fn parse_worker_schedule(s: &str) -> Result<Vec<WorkerSegment>> {
 
         // Duration should end with 'h'
         let duration_str = duration_str.trim();
-        let hours_str = duration_str
-            .strip_suffix('h')
-            .ok_or_else(|| SimError::ParseError(format!("Invalid duration '{}': must end with 'h'", duration_str)))?;
+        let hours_str = duration_str.strip_suffix('h').ok_or_else(|| {
+            SimError::ParseError(format!(
+                "Invalid duration '{}': must end with 'h'",
+                duration_str
+            ))
+        })?;
 
         let duration_hours: f64 = hours_str
             .parse()
@@ -321,11 +324,17 @@ impl SimContext {
         let forecast = &state.capacity_forecast;
 
         // Five hour window
-        window_utilization.insert("five_hour".to_string(), forecast.five_hour.current_utilization);
+        window_utilization.insert(
+            "five_hour".to_string(),
+            forecast.five_hour.current_utilization,
+        );
         window_ceiling.insert("five_hour".to_string(), forecast.five_hour.target_ceiling);
 
         // Seven day window
-        window_utilization.insert("seven_day".to_string(), forecast.seven_day.current_utilization);
+        window_utilization.insert(
+            "seven_day".to_string(),
+            forecast.seven_day.current_utilization,
+        );
         window_ceiling.insert("seven_day".to_string(), forecast.seven_day.target_ceiling);
 
         // Seven day sonnet window
@@ -403,7 +412,8 @@ impl SimContext {
     /// 3. Static fallback: 1.5%/worker/hr
     fn get_burn_rate_for_window(&self, window: &str) -> f64 {
         // Try per-model rate
-        let model_rate = self.model_burn_rate
+        let model_rate = self
+            .model_burn_rate
             .get("claude-sonnet-4-20250514")
             .or_else(|| self.model_burn_rate.get("claude-sonnet-4-6"))
             .or_else(|| self.model_burn_rate.values().next())
@@ -465,7 +475,8 @@ pub fn simulate(
         let base_burn_rate = ctx.get_burn_rate_for_window("five_hour"); // pct per worker per hour
 
         // Compute display multiplier as max across all windows (shows if any promotion is active)
-        let display_promo_multiplier = WINDOWS.iter()
+        let display_promo_multiplier = WINDOWS
+            .iter()
             .map(|w| ctx.promo_multiplier_at(current_time, w))
             .fold(1.0_f64, f64::max);
 
@@ -545,12 +556,15 @@ pub fn simulate(
         ("seven_day", &forecast.seven_day),
         ("seven_day_sonnet", &forecast.seven_day_sonnet),
     ] {
-        cone.insert(key.to_string(), WindowCone {
-            exh_hrs_p25: win.exh_hrs_p25,
-            exh_hrs_p50: win.exh_hrs_p50,
-            exh_hrs_p75: win.exh_hrs_p75,
-            cone_ratio: win.cone_ratio,
-        });
+        cone.insert(
+            key.to_string(),
+            WindowCone {
+                exh_hrs_p25: win.exh_hrs_p25,
+                exh_hrs_p50: win.exh_hrs_p50,
+                exh_hrs_p75: win.exh_hrs_p75,
+                cone_ratio: win.cone_ratio,
+            },
+        );
     }
 
     Ok(Trajectory {
@@ -638,7 +652,11 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
         let time_str = point.timestamp.format("%Y-%m-%d %H:%M").to_string();
         let five_h = point.windows.get("five_hour").copied().unwrap_or(0.0);
         let seven_d = point.windows.get("seven_day").copied().unwrap_or(0.0);
-        let seven_ds = point.windows.get("seven_day_sonnet").copied().unwrap_or(0.0);
+        let seven_ds = point
+            .windows
+            .get("seven_day_sonnet")
+            .copied()
+            .unwrap_or(0.0);
 
         let events_str = if point.events.is_empty() {
             String::new()
@@ -648,13 +666,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
 
         output.push_str(&format!(
             "{:<20} {:>9.1}% {:>9.1}% {:>9.1}% {:>5.1}x {:>4}  {}\n",
-            time_str,
-            five_h,
-            seven_d,
-            seven_ds,
-            point.promo_multiplier,
-            point.workers,
-            events_str
+            time_str, five_h, seven_d, seven_ds, point.promo_multiplier, point.workers, events_str
         ));
     }
 
@@ -799,8 +811,14 @@ mod tests {
     #[test]
     fn worker_schedule_at_offset() {
         let schedule = WorkerSchedule::Schedule(vec![
-            WorkerSegment { workers: 4, duration_hours: 6.0 },
-            WorkerSegment { workers: 2, duration_hours: 6.0 },
+            WorkerSegment {
+                workers: 4,
+                duration_hours: 6.0,
+            },
+            WorkerSegment {
+                workers: 2,
+                duration_hours: 6.0,
+            },
         ]);
 
         assert_eq!(schedule.workers_at(0.0), 4);
@@ -836,7 +854,11 @@ mod tests {
         // After 19h: 50% + 38% = 88%, then reset to 0%
         // After 5 more hours: 0% + 10% = ~10%
         let final_util = last.windows.get("seven_day_sonnet").copied().unwrap_or(0.0);
-        assert!((final_util - 10.0).abs() < 1.0, "Expected ~10%, got {}", final_util);
+        assert!(
+            (final_util - 10.0).abs() < 1.0,
+            "Expected ~10%, got {}",
+            final_util
+        );
     }
 
     #[test]
@@ -866,17 +888,27 @@ mod tests {
             .find(|p| (p.hours_offset - 2.25).abs() < 0.01)
             .expect("Should have point after reset");
 
-        let before_util = before_reset.windows.get("five_hour").copied().unwrap_or(0.0);
+        let before_util = before_reset
+            .windows
+            .get("five_hour")
+            .copied()
+            .unwrap_or(0.0);
         let after_util = after_reset.windows.get("five_hour").copied().unwrap_or(0.0);
 
         // Utilization should drop significantly at reset
-        assert!(after_util < before_util, "Utilization should drop at reset: before={}, after={}", before_util, after_util);
+        assert!(
+            after_util < before_util,
+            "Utilization should drop at reset: before={}, after={}",
+            before_util,
+            after_util
+        );
 
         // Check for reset event
-        let reset_point = trajectory
-            .points
-            .iter()
-            .find(|p| p.events.iter().any(|e| e.contains("window_reset:five_hour")));
+        let reset_point = trajectory.points.iter().find(|p| {
+            p.events
+                .iter()
+                .any(|e| e.contains("window_reset:five_hour"))
+        });
         assert!(reset_point.is_some(), "Should have window_reset event");
     }
 
@@ -942,7 +974,10 @@ mod tests {
         let trajectory = simulate(&state, &config, vec![]).unwrap();
 
         // Should detect breach
-        assert!(!trajectory.breaches.is_empty(), "Should have ceiling breach");
+        assert!(
+            !trajectory.breaches.is_empty(),
+            "Should have ceiling breach"
+        );
 
         let breach = trajectory
             .breaches
@@ -962,16 +997,30 @@ mod tests {
         // Schedule: 4 workers for 2h, then 1 worker for 2h
         let config = SimConfig {
             workers: WorkerSchedule::Schedule(vec![
-                WorkerSegment { workers: 4, duration_hours: 2.0 },
-                WorkerSegment { workers: 1, duration_hours: 2.0 },
+                WorkerSegment {
+                    workers: 4,
+                    duration_hours: 2.0,
+                },
+                WorkerSegment {
+                    workers: 1,
+                    duration_hours: 2.0,
+                },
             ]),
             hours: 4.0,
             resolution_minutes: 15,
         };
 
         let trajectory = simulate(&state, &config, vec![]).unwrap();
-        let at_1h = trajectory.points.iter().find(|p| (p.hours_offset - 1.0).abs() < 0.01).unwrap();
-        let at_3h = trajectory.points.iter().find(|p| (p.hours_offset - 3.0).abs() < 0.01).unwrap();
+        let at_1h = trajectory
+            .points
+            .iter()
+            .find(|p| (p.hours_offset - 1.0).abs() < 0.01)
+            .unwrap();
+        let at_3h = trajectory
+            .points
+            .iter()
+            .find(|p| (p.hours_offset - 3.0).abs() < 0.01)
+            .unwrap();
 
         assert_eq!(at_1h.workers, 4, "Should have 4 workers at 1h");
         assert_eq!(at_3h.workers, 1, "Should have 1 worker at 3h");
@@ -1040,7 +1089,12 @@ mod tests {
         let trajectory = simulate(&state, &config, vec![]).unwrap();
         for point in &trajectory.points {
             for (window, &util) in &point.windows {
-                assert!(util <= 100.0, "{} utilization {} exceeds 100%", window, util);
+                assert!(
+                    util <= 100.0,
+                    "{} utilization {} exceeds 100%",
+                    window,
+                    util
+                );
             }
         }
     }

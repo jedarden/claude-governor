@@ -63,8 +63,12 @@ impl std::fmt::Display for ScaleAction {
             ScaleAction::EmergencyBrakeEngage => write!(f, "emergency_brake_engage"),
             ScaleAction::EmergencyBrakeRelease => write!(f, "emergency_brake_release"),
             ScaleAction::PromotionTransition => write!(f, "promotion_transition"),
-            ScaleAction::CutoffRiskTransitionSafeToRisk => write!(f, "cutoff_risk_transition_safe_to_risk"),
-            ScaleAction::CutoffRiskTransitionRiskToSafe => write!(f, "cutoff_risk_transition_risk_to_safe"),
+            ScaleAction::CutoffRiskTransitionSafeToRisk => {
+                write!(f, "cutoff_risk_transition_safe_to_risk")
+            }
+            ScaleAction::CutoffRiskTransitionRiskToSafe => {
+                write!(f, "cutoff_risk_transition_risk_to_safe")
+            }
             ScaleAction::PredictionAccuracyScore => write!(f, "prediction_accuracy_score"),
         }
     }
@@ -202,10 +206,7 @@ fn generate_reason(
         ScaleAction::ScaleDown => {
             let win = get_window_forecast(ctx.after, binding_window);
             let util_info = win.map_or(String::new(), |w| {
-                format!(
-                    " at {:.1}% utilization",
-                    w.current_utilization
-                )
+                format!(" at {:.1}% utilization", w.current_utilization)
             });
             format!(
                 "Scaled down from {} to {} workers. Binding window '{}'{} had margin {:.1}h, now predicted {:.1}h.",
@@ -249,7 +250,10 @@ fn generate_reason(
         ScaleAction::PreScale => {
             let win = get_window_forecast(ctx.before, binding_window);
             let exhaustion_info = win.map_or(String::new(), |w| {
-                format!(" predicted exhaustion in {:.1}h", w.predicted_exhaustion_hours)
+                format!(
+                    " predicted exhaustion in {:.1}h",
+                    w.predicted_exhaustion_hours
+                )
             });
             format!(
                 "Pre-emptive scale from {} to {} workers. Binding window '{}'{} to prevent cutoff. Margin: {:.1}h -> {:.1}h.",
@@ -358,10 +362,7 @@ pub fn append_decision_to_path(entry: &DecisionEntry, path: &PathBuf) -> std::io
     }
 
     // Open file for append (create if doesn't exist)
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     // Serialize and write as a single line
     let json = serde_json::to_string(entry)?;
@@ -379,7 +380,10 @@ pub fn read_last_decisions(n: usize) -> std::io::Result<Vec<DecisionEntry>> {
 }
 
 /// Read the last N decisions from a specific path
-pub fn read_last_decisions_from_path(n: usize, path: &PathBuf) -> std::io::Result<Vec<DecisionEntry>> {
+pub fn read_last_decisions_from_path(
+    n: usize,
+    path: &PathBuf,
+) -> std::io::Result<Vec<DecisionEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -391,9 +395,8 @@ pub fn read_last_decisions_from_path(n: usize, path: &PathBuf) -> std::io::Resul
     let all_entries: Vec<DecisionEntry> = reader
         .lines()
         .filter_map(|line| {
-            line.ok().and_then(|l| {
-                serde_json::from_str::<DecisionEntry>(&l).ok()
-            })
+            line.ok()
+                .and_then(|l| serde_json::from_str::<DecisionEntry>(&l).ok())
         })
         .collect();
 
@@ -427,9 +430,8 @@ pub fn read_all_decisions_from_path(path: &PathBuf) -> std::io::Result<Vec<Decis
     let entries: Vec<DecisionEntry> = reader
         .lines()
         .filter_map(|line| {
-            line.ok().and_then(|l| {
-                serde_json::from_str::<DecisionEntry>(&l).ok()
-            })
+            line.ok()
+                .and_then(|l| serde_json::from_str::<DecisionEntry>(&l).ok())
         })
         .collect();
 
@@ -465,8 +467,10 @@ pub fn format_decision_human(entry: &DecisionEntry) -> String {
         entry.action.to_string().to_uppercase().replace('_', " ")
     ));
     output.push_str(&format!("  Workers: {} -> {}\n", entry.from, entry.to));
-    output.push_str(&format!("  Binding: {} (margin {:.1}h -> {:.1}h)\n",
-        entry.binding_window, entry.margin_before, entry.margin_after));
+    output.push_str(&format!(
+        "  Binding: {} (margin {:.1}h -> {:.1}h)\n",
+        entry.binding_window, entry.margin_before, entry.margin_after
+    ));
     output.push_str(&format!("  Trigger: {}\n", entry.trigger));
     output.push_str(&format!("  {}\n", entry.reason));
 
@@ -532,9 +536,21 @@ mod tests {
             usage: UsageState::default(),
             last_fleet_aggregate: FleetAggregate::default(),
             capacity_forecast: CapacityForecast {
-                five_hour: if binding_window == "five_hour" { window.clone() } else { WindowForecast::default() },
-                seven_day: if binding_window == "seven_day" { window.clone() } else { WindowForecast::default() },
-                seven_day_sonnet: if binding_window == "seven_day_sonnet" { window.clone() } else { WindowForecast::default() },
+                five_hour: if binding_window == "five_hour" {
+                    window.clone()
+                } else {
+                    WindowForecast::default()
+                },
+                seven_day: if binding_window == "seven_day" {
+                    window.clone()
+                } else {
+                    WindowForecast::default()
+                },
+                seven_day_sonnet: if binding_window == "seven_day_sonnet" {
+                    window.clone()
+                } else {
+                    WindowForecast::default()
+                },
                 binding_window: binding_window.to_string(),
                 dollars_per_pct_7d_s: 1.5,
                 estimated_remaining_dollars: 50.0,
@@ -883,8 +899,14 @@ mod tests {
     #[test]
     fn test_scale_action_display() {
         assert_eq!(ScaleAction::ScaleUp.to_string(), "scale_up");
-        assert_eq!(ScaleAction::EmergencyBrakeEngage.to_string(), "emergency_brake_engage");
-        assert_eq!(ScaleAction::CutoffRiskTransitionSafeToRisk.to_string(), "cutoff_risk_transition_safe_to_risk");
+        assert_eq!(
+            ScaleAction::EmergencyBrakeEngage.to_string(),
+            "emergency_brake_engage"
+        );
+        assert_eq!(
+            ScaleAction::CutoffRiskTransitionSafeToRisk.to_string(),
+            "cutoff_risk_transition_safe_to_risk"
+        );
     }
 
     #[test]

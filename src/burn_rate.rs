@@ -45,7 +45,12 @@ pub struct WindowUtilization {
 
 impl WindowUtilization {
     /// Create a WindowUtilization from percentage delta and current/previous values
-    pub fn from_pct_delta(window: &str, pct_delta: Option<f64>, current: f64, previous: f64) -> Self {
+    pub fn from_pct_delta(
+        window: &str,
+        pct_delta: Option<f64>,
+        current: f64,
+        previous: f64,
+    ) -> Self {
         Self {
             window: window.to_string(),
             pct_delta,
@@ -146,10 +151,7 @@ const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 /// - Window pct_delta is not null
 /// - Window pct_delta is not zero when tokens > 0 (API rounding artifact)
 /// - No window reset detected (utilization drop > 1pp)
-pub fn compute_instance_burn(
-    record: &InstanceRecord,
-    elapsed_hours: f64,
-) -> Vec<InstanceBurnRate> {
+pub fn compute_instance_burn(record: &InstanceRecord, elapsed_hours: f64) -> Vec<InstanceBurnRate> {
     let mut results = Vec::new();
 
     // Guard: skip if elapsed < 2 minutes
@@ -460,6 +462,219 @@ pub fn effective_multiplier(result: &PromotionValidationResult) -> f64 {
     1.0
 }
 
+/// Result of empirical promo ratio computation from token-history DB
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmpiricalPromoRatio {
+    /// Observed ratio (median off-peak / median peak)
+    pub observed_ratio: f64,
+
+    /// Median tokens_per_pct for peak samples
+    pub median_peak: f64,
+
+    /// Median tokens_per_pct for off-peak samples
+    pub median_offpeak: f64,
+
+    /// Number of peak samples used
+    pub peak_samples: usize,
+
+    /// Number of off-peak samples used
+    pub offpeak_samples: usize,
+
+    /// Whether there's sufficient data for validation (>= 10 samples each)
+    pub sufficient_data: bool,
+}
+
+/// Compute empirical promo ratio from token-history DB
+///
+/// Reads the last N instance records from the database, groups them by
+/// peak/off-peak periods, and computes the median tokens-per-percent for
+/// each period type. Returns the observed ratio.
+///
+/// Returns None if the database cannot be read or if no samples are found.
+pub fn compute_empirical_promo_ratio(db_path: &std::path::Path) -> Option<EmpiricalPromoRatio> {
+    use crate::db::open_db;
+
+    let conn = open_db(db_path).ok()?;
+
+    // Query the last 500 instance records with p7ds data
+    let mut stmt = conn
+        .prepare(
+            "SELECT pk, p7ds, input_n + output_n + r_cache_n + w_cache_n + w_cache_1h_n AS total_tokens
+             FROM i
+             WHERE p7ds IS NOT NULL AND p7ds > 0
+             ORDER BY t1 DESC
+             LIMIT 500",
+        )
+        .ok()?;
+
+    let mut peak_tokens_per_pct: Vec<f64> = Vec::new();
+    let mut offpeak_tokens_per_pct: Vec<f64> = Vec::new();
+
+    let rows = stmt
+        .query_map([], |row| {
+            let pk: i64 = row.get(0)?;
+            let p7ds: f64 = row.get(1)?;
+            let total_tokens: i64 = row.get(2)?;
+            Ok((pk != 0, p7ds, total_tokens as f64))
+        })
+        .ok()?;
+
+    for row in rows {
+        let (is_peak, p7ds, total_tokens) = row.ok()?;
+        let tokens_per_pct = total_tokens / p7ds;
+
+        if is_peak {
+            peak_tokens_per_pct.push(tokens_per_pct);
+        } else {
+            offpeak_tokens_per_pct.push(tokens_per_pct);
+        }
+    }
+
+    if peak_tokens_per_pct.is_empty() || offpeak_tokens_per_pct.is_empty() {
+        return None;
+    }
+
+    let median_peak = median(&peak_tokens_per_pct);
+    let median_offpeak = median(&offpeak_tokens_per_pct);
+
+    let observed_ratio = if median_peak > 0.0 {
+        median_offpeak / median_peak
+    } else {
+        0.0
+    };
+
+    let peak_samples = peak_tokens_per_pct.len();
+    let offpeak_samples = offpeak_tokens_per_pct.len();
+    let sufficient_data = peak_samples >= 10 && offpeak_samples >= 10;
+
+    Some(EmpiricalPromoRatio {
+        observed_ratio,
+        median_peak,
+        median_offpeak,
+        peak_samples,
+        offpeak_samples,
+        sufficient_data,
+    })
+}
+
+/// Validate promotion using empirical data from token-history DB
+///
+/// This is a convenience function that combines `compute_empirical_promo_ratio`
+/// with validation logic. Returns a PromotionValidationResult.
+pub fn validate_promotion_from_db(
+    db_path: &std::path::Path,
+    declared_multiplier: f64,
+) -> PromotionValidationResult {
+    let empirical = match compute_empirical_promo_ratio(db_path) {
+        Some(e) => e,
+        None => {
+            return PromotionValidationResult {
+                validated: false,
+                observed_ratio: 0.0,
+                declared_multiplier,
+                median_peak: 0.0,
+                median_offpeak: 0.0,
+                peak_samples: 0,
+                offpeak_samples: 0,
+                reason: Some("no data found in token-history DB".to_string()),
+            }
+        }
+    };
+
+    // Check minimum sample counts (10 each for empirical validation)
+    if empirical.peak_samples < 10 || empirical.offpeak_samples < 10 {
+        return PromotionValidationResult {
+            validated: false,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: Some(format!(
+                "insufficient samples: {} peak, {} off-peak (need 10 each)",
+                empirical.peak_samples, empirical.offpeak_samples
+            )),
+        };
+    }
+
+    // Guard against zero median peak
+    if empirical.median_peak <= 0.0 {
+        return PromotionValidationResult {
+            validated: false,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: Some("median peak tokens_per_pct is zero".to_string()),
+        };
+    }
+
+    let lower_bound = declared_multiplier * (1.0 - VALIDATION_TOLERANCE);
+    let upper_bound = declared_multiplier * (1.0 + VALIDATION_TOLERANCE);
+
+    if empirical.observed_ratio >= lower_bound && empirical.observed_ratio <= upper_bound {
+        // Within 10% of declared: validated
+        PromotionValidationResult {
+            validated: true,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: None,
+        }
+    } else if empirical.observed_ratio < PROMO_NOT_APPLYING_THRESHOLD {
+        // Ratio too low: promotion may not be applying
+        PromotionValidationResult {
+            validated: false,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: Some(format!(
+                "observed ratio {:.2} < {:.2}: promotion may not be applying",
+                empirical.observed_ratio, PROMO_NOT_APPLYING_THRESHOLD
+            )),
+        }
+    } else if empirical.observed_ratio > ANOMALY_THRESHOLD {
+        // Ratio too high: anomaly
+        PromotionValidationResult {
+            validated: false,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: Some(format!(
+                "observed ratio {:.2} > {:.2}: anomaly, use observed ratio",
+                empirical.observed_ratio, ANOMALY_THRESHOLD
+            )),
+        }
+    } else {
+        // Outside tolerance but not in anomaly/not-applying range
+        PromotionValidationResult {
+            validated: false,
+            observed_ratio: empirical.observed_ratio,
+            declared_multiplier,
+            median_peak: empirical.median_peak,
+            median_offpeak: empirical.median_offpeak,
+            peak_samples: empirical.peak_samples,
+            offpeak_samples: empirical.offpeak_samples,
+            reason: Some(format!(
+                "observed ratio {:.2} outside tolerance [{:.2}, {:.2}]",
+                empirical.observed_ratio, lower_bound, upper_bound
+            )),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-Window Composite Risk Optimization
 // ---------------------------------------------------------------------------
@@ -512,7 +727,11 @@ pub fn composite_risk(
 
     for (i, forecast) in forecasts.iter().enumerate() {
         let cost = window_cost(forecast.margin_hrs, forecast.hours_remaining)?;
-        let weight = if i == binding_idx { binding_weight } else { 1.0 };
+        let weight = if i == binding_idx {
+            binding_weight
+        } else {
+            1.0
+        };
         weighted_sum += cost * weight;
         total_weight += weight;
         has_valid = true;
@@ -757,10 +976,7 @@ fn update_ema(ema: &mut ModelWindowEma, pct_hr: f64, usd_hr: f64) {
 ///
 /// Returns the EMA value if enough samples have been accumulated,
 /// otherwise falls back to the baseline.
-fn effective_burn_rate(
-    ema: &ModelWindowEma,
-    baseline: &BaselineBurnRates,
-) -> (f64, f64) {
+fn effective_burn_rate(ema: &ModelWindowEma, baseline: &BaselineBurnRates) -> (f64, f64) {
     if ema.samples >= MIN_SAMPLES_FOR_EMA {
         (ema.ema_pct, ema.ema_usd)
     } else {
@@ -771,11 +987,82 @@ fn effective_burn_rate(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-Window Risk Score Computation
+// ---------------------------------------------------------------------------
+
+/// Duration weight for each window type.
+///
+/// Shorter windows are higher risk because they reset more frequently,
+/// meaning we have less time to recover from exhaustion.
+fn duration_weight(window: &str) -> f64 {
+    match window {
+        "five_hour" => 3.0,        // 5h window: highest urgency (resets every 5 hours)
+        "seven_day_sonnet" => 1.5, // 7d sonnet: medium urgency
+        "seven_day" => 1.0,        // 7d: lowest urgency (resets every 7 days)
+        _ => 1.0,
+    }
+}
+
+/// Compute the composite risk score for a single window.
+///
+/// The risk score combines three factors:
+/// 1. **Margin urgency**: How close are we to exhaustion? (1.0 - margin_pct)
+/// 2. **Duration weight**: Shorter windows are higher risk (5h > 7d-sonnet > 7d)
+/// 3. **Volatility factor**: Wider confidence cone = higher uncertainty = higher risk
+///
+/// Formula:
+/// ```text
+/// risk_score = (1.0 - margin_pct) * duration_weight * volatility_factor
+/// ```
+///
+/// Where:
+/// - `margin_pct` = margin_hrs / hours_remaining (fraction of time remaining)
+/// - `duration_weight` = 3.0 for 5h, 1.5 for 7d-sonnet, 1.0 for 7d
+/// - `volatility_factor` = cone_ratio (wider cone = higher risk)
+///
+/// A higher risk_score means the window is more urgent and should be prioritized
+/// as the binding window for scaling decisions.
+///
+/// Returns `None` if hours_remaining is 0 (cannot compute margin percentage).
+pub fn compute_risk_score(
+    window: &str,
+    margin_hrs: f64,
+    hours_remaining: f64,
+    cone_ratio: f64,
+) -> Option<f64> {
+    if hours_remaining <= 0.0 {
+        return None;
+    }
+
+    // Margin as a percentage of time remaining
+    // Positive margin: safe (margin_pct > 0)
+    // Zero margin: at limit (margin_pct = 0)
+    // Negative margin: will exhaust (margin_pct < 0)
+    let margin_pct = margin_hrs / hours_remaining;
+
+    // (1.0 - margin_pct) gives us urgency:
+    // - margin_pct = 1.0 (100% headroom) → urgency = 0.0 (no risk)
+    // - margin_pct = 0.0 (at limit) → urgency = 1.0 (high risk)
+    // - margin_pct < 0.0 (will exhaust) → urgency > 1.0 (very high risk)
+    let urgency = 1.0 - margin_pct;
+
+    // Duration weight: shorter windows = higher urgency
+    let weight = duration_weight(window);
+
+    // Volatility factor: wider cone = higher uncertainty = higher risk
+    // cone_ratio = exh_hrs_p75 / exh_hrs_p25 (1.0 = no spread, higher = wider)
+    let volatility = cone_ratio.max(1.0);
+
+    Some(urgency * weight * volatility)
+}
+
 /// Generate a capacity forecast for a single window
 ///
 /// Computes fleet_pct_per_hour, predicted_exhaustion_hours,
-/// will_exhaust_before_reset, safe_worker_count, and the confidence cone
-/// (exh_hrs_p25/p50/p75, cone_ratio) using per-worker burn rate stddev.
+/// will_exhaust_before_reset, safe_worker_count, the confidence cone
+/// (exh_hrs_p25/p50/p75, cone_ratio) using per-worker burn rate stddev,
+/// and the composite risk_score for binding window selection.
 ///
 /// The cone is derived from the Normal distribution assumption:
 ///   rate_p25 = fleet_pct_hr - 0.675 * std_pct_hr  (slow burn → more hours → p75 of hours)
@@ -783,7 +1070,7 @@ fn effective_burn_rate(
 ///
 /// When std_pct_hr is zero (no spread data), p25/p50/p75 all equal the p50 estimate.
 pub fn generate_window_forecast(
-    _window: &str,
+    window: &str,
     fleet_pct_hr: f64,
     current_utilization: f64,
     target_ceiling: f64,
@@ -816,14 +1103,15 @@ pub fn generate_window_forecast(
     // p75 safe workers: uses the p75 (fast-burn) per-worker rate — more conservative.
     // Derived by scaling the mean rate by the ratio of the fleet's p75 burn rate to p50.
     // When std_pct_hr == 0, p75 rate == p50 rate and safe_worker_count_p75 == safe_worker_count.
-    let safe_worker_count_p75 = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 && fleet_pct_hr > 0.0 {
-        let rate_p75_fleet = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
-        let rate_p75_per_worker = mean_rate_per_worker * rate_p75_fleet / fleet_pct_hr;
-        let safe = (remaining_pct / (rate_p75_per_worker * hours_remaining)).floor() as u64;
-        Some(safe.min(u32::MAX as u64) as u32)
-    } else {
-        safe_worker_count
-    };
+    let safe_worker_count_p75 =
+        if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 && fleet_pct_hr > 0.0 {
+            let rate_p75_fleet = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
+            let rate_p75_per_worker = mean_rate_per_worker * rate_p75_fleet / fleet_pct_hr;
+            let safe = (remaining_pct / (rate_p75_per_worker * hours_remaining)).floor() as u64;
+            Some(safe.min(u32::MAX as u64) as u32)
+        } else {
+            safe_worker_count
+        };
 
     // Confidence cone using ±0.675σ (25th/75th percentile of a Normal distribution).
     // High burn rate → fewer remaining hours, so:
@@ -849,6 +1137,10 @@ pub fn generate_window_forecast(
         )
     };
 
+    // Compute composite risk score for binding window selection
+    let risk_score =
+        compute_risk_score(window, margin_hrs, hours_remaining, cone_ratio).unwrap_or(0.0);
+
     crate::state::WindowForecast {
         target_ceiling,
         current_utilization,
@@ -865,6 +1157,7 @@ pub fn generate_window_forecast(
         exh_hrs_p50,
         exh_hrs_p75,
         cone_ratio,
+        risk_score,
     }
 }
 
@@ -880,7 +1173,7 @@ pub fn estimate_burn_rates(
     current_workers: u32,
     prev_workers: u32,
     ema_state: &mut HashMap<(String, String), ModelWindowEma>,
-    baseline: &BaselineBurnRates,
+    _baseline: &BaselineBurnRates,
     current_utilization: &HashMap<String, f64>, // window -> current %
     target_ceiling: f64,
     hours_remaining: &HashMap<String, f64>, // window -> hours until reset
@@ -932,7 +1225,10 @@ pub fn estimate_burn_rates(
     // Compute fleet stats per window
     let mut fleet_stats: HashMap<String, FleetWorkerStats> = HashMap::new();
     for window in WINDOWS {
-        let rates = rates_by_window.get(*window).map(|v| v.as_slice()).unwrap_or(&[]);
+        let rates = rates_by_window
+            .get(*window)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         fleet_stats.insert(
             window.to_string(),
             compute_fleet_stats(window, rates, current_workers),
@@ -960,13 +1256,16 @@ pub fn estimate_burn_rates(
     // Generate capacity forecasts
     let mut forecasts = HashMap::new();
     for window in WINDOWS {
-        let stats = fleet_stats.get(*window).cloned().unwrap_or_else(|| FleetWorkerStats {
-            worker_count: current_workers,
-            mean_pct_hr: 0.0,
-            p75_pct_hr: 0.0,
-            std_pct_hr: 0.0,
-            mean_usd_hr: 0.0,
-        });
+        let stats = fleet_stats
+            .get(*window)
+            .cloned()
+            .unwrap_or_else(|| FleetWorkerStats {
+                worker_count: current_workers,
+                mean_pct_hr: 0.0,
+                p75_pct_hr: 0.0,
+                std_pct_hr: 0.0,
+                mean_usd_hr: 0.0,
+            });
 
         // Use fleet-level mean pct/hr as the fleet burn rate
         let fleet_pct_hr = stats.mean_pct_hr;
@@ -999,8 +1298,14 @@ pub fn estimate_burn_rates(
     let binding_window = WINDOWS
         .iter()
         .min_by(|&a, &b| {
-            let fa = forecasts.get(*a).map(|f| f.margin_hrs).unwrap_or(f64::INFINITY);
-            let fb = forecasts.get(*b).map(|f| f.margin_hrs).unwrap_or(f64::INFINITY);
+            let fa = forecasts
+                .get(*a)
+                .map(|f| f.margin_hrs)
+                .unwrap_or(f64::INFINITY);
+            let fb = forecasts
+                .get(*b)
+                .map(|f| f.margin_hrs)
+                .unwrap_or(f64::INFINITY);
             fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|w| w.to_string())
@@ -1013,14 +1318,8 @@ pub fn estimate_burn_rates(
 
     // Build CapacityForecast state
     let capacity_forecast = crate::state::CapacityForecast {
-        five_hour: forecasts
-            .get("five_hour")
-            .cloned()
-            .unwrap_or_default(),
-        seven_day: forecasts
-            .get("seven_day")
-            .cloned()
-            .unwrap_or_default(),
+        five_hour: forecasts.get("five_hour").cloned().unwrap_or_default(),
+        seven_day: forecasts.get("seven_day").cloned().unwrap_or_default(),
         seven_day_sonnet: forecasts
             .get("seven_day_sonnet")
             .cloned()
@@ -1097,10 +1396,7 @@ pub fn build_burn_rate_state(
     // Aggregate per-model: use the max samples across windows, and average rates
     let mut model_windows: HashMap<String, Vec<&ModelWindowEma>> = HashMap::new();
     for ((model, _window), ema) in ema_state {
-        model_windows
-            .entry(model.clone())
-            .or_default()
-            .push(ema);
+        model_windows.entry(model.clone()).or_default().push(ema);
     }
 
     for (model, emas) in &model_windows {
@@ -1200,12 +1496,7 @@ mod tests {
     use super::*;
 
     /// Helper: build a WindowUtilization for a named window
-    fn win(
-        name: &str,
-        pct_delta: Option<f64>,
-        current: f64,
-        previous: f64,
-    ) -> WindowUtilization {
+    fn win(name: &str, pct_delta: Option<f64>, current: f64, previous: f64) -> WindowUtilization {
         WindowUtilization {
             window: name.to_string(),
             pct_delta,
@@ -1360,8 +1651,8 @@ mod tests {
             total_usd: 1.50,
             total_tokens: 500_000,
             windows: vec![
-                win("five_hour", Some(2.0), 38.0, 40.0),   // reset: drop of 2pp
-                win("seven_day", Some(3.0), 65.0, 62.0),    // normal: rise of 3pp
+                win("five_hour", Some(2.0), 38.0, 40.0), // reset: drop of 2pp
+                win("seven_day", Some(3.0), 65.0, 62.0), // normal: rise of 3pp
             ],
         };
 
@@ -1463,8 +1754,8 @@ mod tests {
             total_usd: 1.0,
             total_tokens: 100_000,
             windows: vec![
-                win("five_hour", None, 41.0, 40.0),             // null pct_delta -> skip
-                win("seven_day", Some(0.0), 63.0, 63.0),        // zero pct + tokens -> skip
+                win("five_hour", None, 41.0, 40.0),      // null pct_delta -> skip
+                win("seven_day", Some(0.0), 63.0, 63.0), // zero pct + tokens -> skip
                 win("seven_day_sonnet", Some(2.0), 72.0, 70.0), // valid
             ],
         };
@@ -1818,7 +2109,11 @@ mod tests {
         samples.extend(offpeak);
 
         let result = validate_promotion(&samples, 2.0);
-        assert!(result.validated, "expected validated, got reason: {:?}", result.reason);
+        assert!(
+            result.validated,
+            "expected validated, got reason: {:?}",
+            result.reason
+        );
         // median peak = 70_000, median offpeak = 140_000 -> ratio = 2.0
         assert!((result.median_peak - 70_000.0).abs() < 1e-9);
         assert!((result.median_offpeak - 140_000.0).abs() < 1e-9);
@@ -1838,7 +2133,10 @@ mod tests {
 
         let result = validate_promotion(&samples, 2.0);
         assert!(!result.validated);
-        assert!(result.reason.unwrap().contains("median peak tokens_per_pct is zero"));
+        assert!(result
+            .reason
+            .unwrap()
+            .contains("median peak tokens_per_pct is zero"));
     }
 
     // -----------------------------------------------------------------------
@@ -1869,7 +2167,12 @@ mod tests {
             windows: vec![
                 win("five_hour", five_hour_delta, five_current, five_prev),
                 win("seven_day", seven_day_delta, seven_current, seven_prev),
-                win("seven_day_sonnet", seven_ds_delta, seven_ds_current, seven_ds_prev),
+                win(
+                    "seven_day_sonnet",
+                    seven_ds_delta,
+                    seven_ds_current,
+                    seven_ds_prev,
+                ),
             ],
         }
     }
@@ -1883,22 +2186,32 @@ mod tests {
             multi_window_record(
                 "w1",
                 "claude-sonnet-4-20250514",
-                2.0,  // $2/hr
+                2.0, // $2/hr
                 500_000,
-                Some(1.0), Some(0.5), Some(0.75),
-                41.0, 40.0,  // 5h: delta=1
-                60.5, 60.0,  // 7d: delta=0.5
-                70.75, 70.0, // 7ds: delta=0.75
+                Some(1.0),
+                Some(0.5),
+                Some(0.75),
+                41.0,
+                40.0, // 5h: delta=1
+                60.5,
+                60.0, // 7d: delta=0.5
+                70.75,
+                70.0, // 7ds: delta=0.75
             ),
             multi_window_record(
                 "w2",
                 "claude-sonnet-4-20250514",
-                3.0,  // $3/hr
+                3.0, // $3/hr
                 750_000,
-                Some(2.0), Some(1.0), Some(1.5),
-                42.0, 40.0,  // 5h: delta=2
-                61.0, 60.0,  // 7d: delta=1
-                71.5, 70.0,  // 7ds: delta=1.5
+                Some(2.0),
+                Some(1.0),
+                Some(1.5),
+                42.0,
+                40.0, // 5h: delta=2
+                61.0,
+                60.0, // 7d: delta=1
+                71.5,
+                70.0, // 7ds: delta=1.5
             ),
         ];
 
@@ -1951,15 +2264,22 @@ mod tests {
             "claude-sonnet-4-20250514",
             2.0,
             500_000,
-            Some(1.0), Some(0.5), Some(0.75),
-            41.0, 40.0, 60.5, 60.0, 70.75, 70.0,
+            Some(1.0),
+            Some(0.5),
+            Some(0.75),
+            41.0,
+            40.0,
+            60.5,
+            60.0,
+            70.75,
+            70.0,
         )];
 
         let (estimate, forecast) = estimate_burn_rates(
             &instances,
             1.0,
-            2,  // current
-            3,  // previous (changed!)
+            2, // current
+            3, // previous (changed!)
             &mut ema_state,
             &baseline,
             &HashMap::new(),
@@ -1982,8 +2302,15 @@ mod tests {
             "claude-sonnet-4-20250514",
             2.0,
             500_000,
-            None, None, None, // all null
-            40.0, 40.0, 60.0, 60.0, 70.0, 70.0,
+            None,
+            None,
+            None, // all null
+            40.0,
+            40.0,
+            60.0,
+            60.0,
+            70.0,
+            70.0,
         )];
 
         let (estimate, forecast) = estimate_burn_rates(
@@ -2012,8 +2339,15 @@ mod tests {
             "claude-sonnet-4-20250514",
             2.0,
             500_000,
-            Some(5.0), Some(0.5), Some(2.0),
-            45.0, 40.0, 60.5, 60.0, 72.0, 70.0,
+            Some(5.0),
+            Some(0.5),
+            Some(2.0),
+            45.0,
+            40.0,
+            60.5,
+            60.0,
+            72.0,
+            70.0,
         )];
 
         let mut utilization = HashMap::new();
@@ -2022,7 +2356,7 @@ mod tests {
         utilization.insert("seven_day_sonnet".to_string(), 72.0);
         let mut hrs_left = HashMap::new();
         hrs_left.insert("five_hour".to_string(), 100.0); // plenty of time
-        hrs_left.insert("seven_day".to_string(), 3.0);    // very constrained
+        hrs_left.insert("seven_day".to_string(), 3.0); // very constrained
         hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
 
         let (_estimate, forecast) = estimate_burn_rates(
@@ -2054,8 +2388,15 @@ mod tests {
             "claude-sonnet-4-20250514",
             2.0,
             500_000,
-            Some(2.0), Some(1.0), Some(1.5),
-            42.0, 40.0, 61.0, 60.0, 71.5, 70.0,
+            Some(2.0),
+            Some(1.0),
+            Some(1.5),
+            42.0,
+            40.0,
+            61.0,
+            60.0,
+            71.5,
+            70.0,
         )];
 
         let mut utilization = HashMap::new();
@@ -2070,11 +2411,22 @@ mod tests {
         // Cycle 1: first sample, EMA initializes directly
         estimate_burn_rates(
             &instances,
-            1.0, 1, 1, &mut ema_state, &baseline,
-            &utilization, 90.0, &hrs_left,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
         );
 
-        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        let ema = ema_state
+            .get(&(
+                "claude-sonnet-4-20250514".to_string(),
+                "five_hour".to_string(),
+            ))
+            .unwrap();
         assert_eq!(ema.samples, 1);
         // First sample: ema = value directly = pct_per_worker = 2.0/1 = 2.0
         assert!((ema.ema_pct - 2.0).abs() < 1e-9);
@@ -2085,17 +2437,35 @@ mod tests {
             "claude-sonnet-4-20250514",
             4.0, // doubled cost
             500_000,
-            Some(4.0), Some(2.0), Some(3.0),
-            44.0, 40.0, 62.0, 60.0, 73.0, 70.0,
+            Some(4.0),
+            Some(2.0),
+            Some(3.0),
+            44.0,
+            40.0,
+            62.0,
+            60.0,
+            73.0,
+            70.0,
         )];
 
         estimate_burn_rates(
             &instances2,
-            1.0, 1, 1, &mut ema_state, &baseline,
-            &utilization, 90.0, &hrs_left,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
         );
 
-        let ema2 = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        let ema2 = ema_state
+            .get(&(
+                "claude-sonnet-4-20250514".to_string(),
+                "five_hour".to_string(),
+            ))
+            .unwrap();
         assert_eq!(ema2.samples, 2);
         // EMA = 0.2 * 4.0 + 0.8 * 2.0 = 0.8 + 1.6 = 2.4
         assert!((ema2.ema_pct - 2.4).abs() < 1e-9);
@@ -2116,8 +2486,15 @@ mod tests {
                 "claude-sonnet-4-20250514",
                 2.0,
                 500_000,
-                Some(1.0), Some(0.5), Some(0.75),
-                41.0 + i as f64, 40.0, 60.5, 60.0, 70.75, 70.0,
+                Some(1.0),
+                Some(0.5),
+                Some(0.75),
+                41.0 + i as f64,
+                40.0,
+                60.5,
+                60.0,
+                70.75,
+                70.0,
             )];
 
             let mut utilization = HashMap::new();
@@ -2131,12 +2508,23 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
-                1.0, 1, 1, &mut ema_state, &baseline,
-                &utilization, 90.0, &hrs_left,
+                1.0,
+                1,
+                1,
+                &mut ema_state,
+                &baseline,
+                &utilization,
+                90.0,
+                &hrs_left,
             );
         }
 
-        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        let ema = ema_state
+            .get(&(
+                "claude-sonnet-4-20250514".to_string(),
+                "five_hour".to_string(),
+            ))
+            .unwrap();
         assert_eq!(ema.samples, 2);
 
         // Should use baseline because samples < 3
@@ -2160,8 +2548,15 @@ mod tests {
                 "claude-sonnet-4-20250514",
                 2.0,
                 500_000,
-                Some(1.0), Some(0.5), Some(0.75),
-                41.0 + i as f64, 40.0, 60.5, 60.0, 70.75, 70.0,
+                Some(1.0),
+                Some(0.5),
+                Some(0.75),
+                41.0 + i as f64,
+                40.0,
+                60.5,
+                60.0,
+                70.75,
+                70.0,
             )];
 
             let mut utilization = HashMap::new();
@@ -2175,12 +2570,23 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
-                1.0, 1, 1, &mut ema_state, &baseline,
-                &utilization, 90.0, &hrs_left,
+                1.0,
+                1,
+                1,
+                &mut ema_state,
+                &baseline,
+                &utilization,
+                90.0,
+                &hrs_left,
             );
         }
 
-        let ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string())).unwrap();
+        let ema = ema_state
+            .get(&(
+                "claude-sonnet-4-20250514".to_string(),
+                "five_hour".to_string(),
+            ))
+            .unwrap();
         assert_eq!(ema.samples, 3);
 
         // Should use EMA because samples >= 3
@@ -2201,8 +2607,15 @@ mod tests {
             "claude-sonnet-4-20250514",
             2.0,
             500_000,
-            Some(2.0), None, None,  // only 5h valid
-            42.0, 40.0, 60.0, 60.0, 70.0, 70.0,
+            Some(2.0),
+            None,
+            None, // only 5h valid
+            42.0,
+            40.0,
+            60.0,
+            60.0,
+            70.0,
+            70.0,
         )];
 
         let mut utilization = HashMap::new();
@@ -2212,12 +2625,24 @@ mod tests {
 
         estimate_burn_rates(
             &instances,
-            1.0, 1, 1, &mut ema_state, &baseline,
-            &utilization, 90.0, &hrs_left,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
         );
 
-        let five_ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string()));
-        let seven_ema = ema_state.get(&("claude-sonnet-4-20250514".to_string(), "seven_day".to_string()));
+        let five_ema = ema_state.get(&(
+            "claude-sonnet-4-20250514".to_string(),
+            "five_hour".to_string(),
+        ));
+        let seven_ema = ema_state.get(&(
+            "claude-sonnet-4-20250514".to_string(),
+            "seven_day".to_string(),
+        ));
 
         assert!(five_ema.is_some());
         assert_eq!(five_ema.unwrap().samples, 1);
@@ -2277,12 +2702,12 @@ mod tests {
     fn generate_window_forecast_basic() {
         let f = generate_window_forecast(
             "seven_day_sonnet",
-            2.0,   // fleet_pct_hr
-            72.0,  // current utilization
-            90.0,  // target ceiling
-            37.5,  // hours remaining
-            1.0,   // p75 per worker
-            0.0,   // std_pct_hr (no spread)
+            2.0,  // fleet_pct_hr
+            72.0, // current utilization
+            90.0, // target ceiling
+            37.5, // hours remaining
+            1.0,  // p75 per worker
+            0.0,  // std_pct_hr (no spread)
         );
 
         assert!((f.remaining_pct - 18.0).abs() < 1e-9);
@@ -2292,7 +2717,7 @@ mod tests {
         assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
         assert!((f.margin_hrs - 28.5).abs() < 1e-9); // 37.5 - 9
         assert_eq!(f.safe_worker_count, Some(0)); // floor(18 / (1.0 * 37.5)) = 0
-        // With zero stddev, all cone values equal the p50
+                                                  // With zero stddev, all cone values equal the p50
         assert!((f.exh_hrs_p25 - 9.0).abs() < 1e-9);
         assert!((f.exh_hrs_p50 - 9.0).abs() < 1e-9);
         assert!((f.exh_hrs_p75 - 9.0).abs() < 1e-9);
@@ -2303,12 +2728,12 @@ mod tests {
     fn generate_window_forecast_zero_burn() {
         let f = generate_window_forecast(
             "five_hour",
-            0.0,   // zero burn rate
+            0.0, // zero burn rate
             36.0,
             90.0,
             3.0,
             0.0,
-            0.0,   // std_pct_hr
+            0.0, // std_pct_hr
         );
 
         assert!(f.predicted_exhaustion_hours.is_infinite());
@@ -2414,7 +2839,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build a WindowForecast with common fields defaulted.
-    fn wf(remaining_pct: f64, hours_remaining: f64, fleet_pct_hr: f64, margin_hrs: f64, safe: Option<u32>) -> crate::state::WindowForecast {
+    fn wf(
+        remaining_pct: f64,
+        hours_remaining: f64,
+        fleet_pct_hr: f64,
+        margin_hrs: f64,
+        safe: Option<u32>,
+    ) -> crate::state::WindowForecast {
         crate::state::WindowForecast {
             target_ceiling: 90.0,
             current_utilization: 90.0 - remaining_pct,
@@ -2464,7 +2895,7 @@ mod tests {
     fn composite_risk_basic() {
         // Three windows: binding (idx 0) has negative cost, others positive
         let forecasts = vec![
-            wf(5.0, 10.0, 1.0, -2.0, Some(3)),  // cost = -0.2
+            wf(5.0, 10.0, 1.0, -2.0, Some(3)),    // cost = -0.2
             wf(60.0, 150.0, 1.0, 130.0, Some(0)), // cost = 0.867
             wf(50.0, 150.0, 1.0, 120.0, Some(0)), // cost = 0.8
         ];
@@ -2518,12 +2949,15 @@ mod tests {
         //   safe = floor(60 / (1.0 * 0.5)) = 120 >> 10
         let forecasts = vec![
             wf(5.0, 0.5, 3.0, -1.167, Some(10)),   // 5h binding
-            wf(60.0, 150.0, 3.0, 130.0, Some(0)),   // 7d
-            wf(55.0, 150.0, 3.0, 131.67, Some(0)),  // 7d_sonnet
+            wf(60.0, 150.0, 3.0, 130.0, Some(0)),  // 7d
+            wf(55.0, 150.0, 3.0, 131.67, Some(0)), // 7d_sonnet
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
-        assert!(result.is_some(), "composite should activate for near-reset scenario");
+        assert!(
+            result.is_some(),
+            "composite should activate for near-reset scenario"
+        );
         let composite_safe = result.unwrap();
         assert!(
             composite_safe > 10,
@@ -2540,9 +2974,9 @@ mod tests {
     fn compute_composite_safe_workers_all_windows_stressed_returns_none() {
         // All windows near exhaustion → no improvement possible
         let forecasts = vec![
-            wf(2.0, 1.0, 3.0, -1.0, Some(2)),   // binding, cost = -1.0
-            wf(3.0, 5.0, 3.0, -4.0, Some(0)),   // cost = -0.8 > 0? No: -0.8 < 0
-            wf(1.0, 2.0, 3.0, -0.5, Some(0)),   // cost = -0.25 > 0? No
+            wf(2.0, 1.0, 3.0, -1.0, Some(2)), // binding, cost = -1.0
+            wf(3.0, 5.0, 3.0, -4.0, Some(0)), // cost = -0.8 > 0? No: -0.8 < 0
+            wf(1.0, 2.0, 3.0, -0.5, Some(0)), // cost = -0.25 > 0? No
         ];
 
         // With cost_threshold=0.0, no non-binding window has cost > 0
@@ -2554,12 +2988,15 @@ mod tests {
     fn compute_composite_safe_workers_non_binding_below_threshold_skipped() {
         // 7d has slightly negative cost → skipped with threshold 0.0
         let forecasts = vec![
-            wf(5.0, 0.5, 3.0, -1.167, Some(10)), // 5h binding
+            wf(5.0, 0.5, 3.0, -1.167, Some(10)),  // 5h binding
             wf(60.0, 150.0, 3.0, -10.0, Some(0)), // 7d: cost = -10/150 ≈ -0.067 < 0
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
-        assert!(result.is_none(), "7d below threshold should not activate composite");
+        assert!(
+            result.is_none(),
+            "7d below threshold should not activate composite"
+        );
     }
 
     #[test]
@@ -2567,11 +3004,14 @@ mod tests {
         // Same as above but with negative threshold → 7d cost > -0.5
         let forecasts = vec![
             wf(5.0, 0.5, 3.0, -1.167, Some(10)),  // 5h binding
-            wf(60.0, 150.0, 3.0, -10.0, Some(0)),  // 7d: cost ≈ -0.067 > -0.5
+            wf(60.0, 150.0, 3.0, -10.0, Some(0)), // 7d: cost ≈ -0.067 > -0.5
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, -0.5, 3);
-        assert!(result.is_some(), "negative threshold should allow slightly stressed windows");
+        assert!(
+            result.is_some(),
+            "negative threshold should allow slightly stressed windows"
+        );
         assert!(result.unwrap() > 10);
     }
 
@@ -2581,7 +3021,7 @@ mod tests {
         // (very small remaining_pct relative to burn rate)
         let forecasts = vec![
             wf(5.0, 0.5, 3.0, -1.167, Some(10)), // 5h binding, safe=10
-            wf(0.1, 150.0, 3.0, 130.0, Some(0)),  // 7d: safe over 0.5h = floor(0.1/(1.0*0.5)) = 0
+            wf(0.1, 150.0, 3.0, 130.0, Some(0)), // 7d: safe over 0.5h = floor(0.1/(1.0*0.5)) = 0
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
@@ -2596,7 +3036,10 @@ mod tests {
     #[test]
     fn compute_composite_safe_workers_invalid_binding_idx() {
         let forecasts = vec![wf(5.0, 10.0, 1.0, 2.0, None)];
-        assert_eq!(compute_composite_safe_workers(&forecasts, 5, 2.0, 0.0, 3), None);
+        assert_eq!(
+            compute_composite_safe_workers(&forecasts, 5, 2.0, 0.0, 3),
+            None
+        );
     }
 
     #[test]
@@ -2605,7 +3048,10 @@ mod tests {
             wf(5.0, 0.5, 3.0, -1.167, Some(10)),
             wf(60.0, 150.0, 3.0, 130.0, Some(0)),
         ];
-        assert_eq!(compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 0), None);
+        assert_eq!(
+            compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 0),
+            None
+        );
     }
 
     #[test]
@@ -2614,7 +3060,10 @@ mod tests {
             wf(5.0, 0.0, 3.0, -1.167, Some(10)), // binding hours = 0
             wf(60.0, 150.0, 3.0, 130.0, Some(0)),
         ];
-        assert_eq!(compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3), None);
+        assert_eq!(
+            compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3),
+            None
+        );
     }
 
     #[test]
@@ -2635,11 +3084,165 @@ mod tests {
         // Non-binding has positive cost → composite can still improve
         let forecasts = vec![
             wf(5.0, 0.5, 3.0, -1.167, None),   // 5h binding, no safe count
-            wf(60.0, 150.0, 3.0, 130.0, None),  // 7d, safe over 0.5h = 120
+            wf(60.0, 150.0, 3.0, 130.0, None), // 7d, safe over 0.5h = 120
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), 120);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-Window Risk Score tests (composite risk edge cases)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_risk_score_five_hour_higher_risk_than_seven_day_same_margin() {
+        // Same margin_pct (20%) but 5h window has 3x duration weight → higher risk
+        let margin_pct = 0.2; // 20% margin
+        let hours_remaining_5h = 5.0;
+        let hours_remaining_7d = 168.0; // 7 days
+        let cone_ratio = 1.0; // no volatility
+
+        // Scale margin_hrs to achieve the same margin_pct for each window
+        let margin_hrs_5h = margin_pct * hours_remaining_5h; // 1.0
+        let margin_hrs_7d = margin_pct * hours_remaining_7d; // 33.6
+
+        let risk_5h =
+            compute_risk_score("five_hour", margin_hrs_5h, hours_remaining_5h, cone_ratio).unwrap();
+        let risk_7d =
+            compute_risk_score("seven_day", margin_hrs_7d, hours_remaining_7d, cone_ratio).unwrap();
+
+        // Same urgency (1.0 - 0.2 = 0.8) but 5h has 3x the duration weight
+        // risk_5h = 0.8 * 3.0 * 1.0 = 2.4
+        // risk_7d = 0.8 * 1.0 * 1.0 = 0.8
+        // ratio = 3.0
+        assert!(risk_5h > risk_7d);
+        assert!((risk_5h / risk_7d - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_risk_score_negative_margin_increases_risk() {
+        // Negative margin (will exhaust) → urgency > 1.0 → higher risk
+        let margin_hrs = -2.0; // will exhaust 2 hours before reset
+        let hours_remaining = 10.0;
+        let cone_ratio = 1.0;
+
+        let risk =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // margin_pct = -2/10 = -0.2, urgency = 1.0 - (-0.2) = 1.2
+        // risk_score = 1.2 * 1.0 * 1.0 = 1.2
+        assert!((risk - 1.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_risk_score_wide_cone_increases_risk() {
+        // Wide cone (high uncertainty) amplifies risk
+        let margin_hrs = 2.0;
+        let hours_remaining = 10.0;
+        let cone_ratio_narrow = 1.0; // no spread
+        let cone_ratio_wide = 2.5; // wide spread
+
+        let risk_narrow =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio_narrow)
+                .unwrap();
+        let risk_wide =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio_wide).unwrap();
+
+        // Wide cone should have 2.5x the risk
+        assert!((risk_wide / risk_narrow - 2.5).abs() < 0.1);
+    }
+
+    #[test]
+    fn compute_risk_score_zero_hours_returns_none() {
+        // Cannot compute risk when hours_remaining is 0
+        let result = compute_risk_score("five_hour", 1.0, 0.0, 1.0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compute_risk_score_all_factors_combine() {
+        // Test full formula: (1.0 - margin_pct) * duration_weight * volatility
+        let margin_hrs = -1.0; // will exhaust
+        let hours_remaining = 5.0; // 5h window
+        let cone_ratio = 2.0; // moderate volatility
+
+        let risk =
+            compute_risk_score("five_hour", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // margin_pct = -1/5 = -0.2
+        // urgency = 1.0 - (-0.2) = 1.2
+        // duration_weight = 3.0 (five_hour)
+        // volatility = 2.0
+        // risk = 1.2 * 3.0 * 2.0 = 7.2
+        assert!((risk - 7.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_risk_score_positive_margin_decreases_risk() {
+        // Positive margin (safe) → urgency < 1.0 → lower risk
+        let margin_hrs = 5.0; // 5 hours of headroom
+        let hours_remaining = 10.0; // 50% margin
+        let cone_ratio = 1.0;
+
+        let risk =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // margin_pct = 5/10 = 0.5
+        // urgency = 1.0 - 0.5 = 0.5
+        // risk = 0.5 * 1.0 * 1.0 = 0.5
+        assert!((risk - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_risk_score_duration_weights_correct() {
+        // Verify duration weights: 5h > 7d-sonnet > 7d
+        let margin_hrs = 1.0;
+        let hours_remaining = 10.0;
+        let cone_ratio = 1.0;
+
+        let risk_5h =
+            compute_risk_score("five_hour", margin_hrs, hours_remaining, cone_ratio).unwrap();
+        let risk_7ds =
+            compute_risk_score("seven_day_sonnet", margin_hrs, hours_remaining, cone_ratio)
+                .unwrap();
+        let risk_7d =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // All have same margin_pct and volatility, so ratios should equal duration weight ratios
+        assert!((risk_5h / risk_7d - 3.0).abs() < 0.1); // 5h weight is 3x 7d
+        assert!((risk_5h / risk_7ds - 2.0).abs() < 0.1); // 5h weight is 2x 7d-sonnet
+        assert!((risk_7ds / risk_7d - 1.5).abs() < 0.1); // 7d-sonnet weight is 1.5x 7d
+    }
+
+    #[test]
+    fn compute_risk_score_edge_case_exactly_at_limit() {
+        // Zero margin (at limit) → urgency = 1.0
+        let margin_hrs = 0.0;
+        let hours_remaining = 10.0;
+        let cone_ratio = 1.0;
+
+        let risk =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // margin_pct = 0, urgency = 1.0, risk = 1.0 * 1.0 * 1.0 = 1.0
+        assert!((risk - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_risk_score_volatility_min_is_1_0() {
+        // Even with cone_ratio < 1.0 (invalid), volatility factor is clamped to 1.0
+        let margin_hrs = 1.0;
+        let hours_remaining = 10.0;
+        let cone_ratio = 0.5; // Below 1.0
+
+        let risk =
+            compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
+
+        // volatility = max(0.5, 1.0) = 1.0
+        // margin_pct = 0.1, urgency = 0.9
+        // risk = 0.9 * 1.0 * 1.0 = 0.9
+        assert!((risk - 0.9).abs() < 0.01);
     }
 }

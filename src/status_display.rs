@@ -13,9 +13,9 @@
 //! - 3 = emergency brake engaged
 
 use crate::capacity_summary::{compute_pressure_level, PressureLevel, StatusExitCode};
-use crate::state::{GovernorState, WindowForecast};
 #[cfg(test)]
 use crate::state::CapacityForecast;
+use crate::state::{GovernorState, WindowForecast};
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -84,10 +84,7 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         PressureLevel::High => "🔴",
     };
 
-    output.push_str(&format!(
-        "Claude Governor Status {}\n",
-        pressure_emoji
-    ));
+    output.push_str(&format!("Claude Governor Status {}\n", pressure_emoji));
     output.push_str(&format!(
         "Pressure: {} ({})\n",
         pressure,
@@ -189,6 +186,11 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
                 "  Rate: ${:.2}/hr total, ${:.2}/hr p75\n",
                 fleet.sonnet_usd_total, fleet.sonnet_p75_usd_hr
             ));
+            output.push_str(&format!(
+                "  Cache efficiency: {:.1}% (p25: {:.1}%)\n",
+                fleet.fleet_cache_eff * 100.0,
+                fleet.cache_eff_p25 * 100.0
+            ));
         }
     }
 
@@ -203,8 +205,16 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         output.push_str("No burn rate data yet (collecting...)\n");
     } else {
         // Aggregate across models
-        let total_pct: f64 = burn.by_model.values().map(|m| m.pct_per_worker_per_hour).sum();
-        let total_usd: f64 = burn.by_model.values().map(|m| m.dollars_per_worker_per_hour).sum();
+        let total_pct: f64 = burn
+            .by_model
+            .values()
+            .map(|m| m.pct_per_worker_per_hour)
+            .sum();
+        let total_usd: f64 = burn
+            .by_model
+            .values()
+            .map(|m| m.dollars_per_worker_per_hour)
+            .sum();
         let samples: u32 = burn.by_model.values().map(|m| m.samples).max().unwrap_or(0);
 
         output.push_str(&format!(
@@ -313,7 +323,9 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         output.push_str("\n");
         match exit_code {
             StatusExitCode::CutoffRisk => {
-                output.push_str("⚠️  CUTOFF RISK: One or more windows may exceed ceiling before reset\n");
+                output.push_str(
+                    "⚠️  CUTOFF RISK: One or more windows may exceed ceiling before reset\n",
+                );
             }
             StatusExitCode::Emergency => {
                 output.push_str("🚨 EMERGENCY: Governor is in safe mode\n");
@@ -333,7 +345,10 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
     let windows: HashMap<&str, &WindowForecast> = [
         ("five_hour", &state.capacity_forecast.five_hour),
         ("seven_day", &state.capacity_forecast.seven_day),
-        ("seven_day_sonnet", &state.capacity_forecast.seven_day_sonnet),
+        (
+            "seven_day_sonnet",
+            &state.capacity_forecast.seven_day_sonnet,
+        ),
     ]
     .into_iter()
     .collect();
@@ -358,6 +373,7 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 "exh_hrs_p50": if v.exh_hrs_p50.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p50) },
                 "exh_hrs_p75": if v.exh_hrs_p75.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p75) },
                 "cone_ratio": v.cone_ratio,
+                "risk_score": v.risk_score,
             }))
         }).collect::<std::collections::HashMap<&str, serde_json::Value>>(),
         "workers": {
@@ -377,6 +393,17 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 .max()
                 .unwrap_or(0),
             "promotion_validated": state.burn_rate.promotion_validated,
+            "offpeak_ratio_observed": state.burn_rate.offpeak_ratio_observed,
+            "offpeak_ratio_expected": state.burn_rate.offpeak_ratio_expected,
+            "promotion_peak_samples": state.burn_rate.promotion_peak_samples,
+            "promotion_offpeak_samples": state.burn_rate.promotion_offpeak_samples,
+        },
+        "fleet": {
+            "cache_efficiency": state.last_fleet_aggregate.fleet_cache_eff,
+            "cache_efficiency_p25": state.last_fleet_aggregate.cache_eff_p25,
+            "workers": state.last_fleet_aggregate.sonnet_workers,
+            "usd_per_hr_total": state.last_fleet_aggregate.sonnet_usd_total,
+            "usd_per_hr_p75": state.last_fleet_aggregate.sonnet_p75_usd_hr,
         },
         "schedule": {
             "is_peak_hour": state.schedule.is_peak_hour,

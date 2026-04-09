@@ -129,7 +129,11 @@ pub fn compute_pressure_level(forecast: &CapacityForecast) -> PressureLevel {
 
 /// Find the window with the smallest (most constrained) margin
 fn find_most_constrained_window(forecast: &CapacityForecast) -> &WindowForecast {
-    let windows = [&forecast.five_hour, &forecast.seven_day, &forecast.seven_day_sonnet];
+    let windows = [
+        &forecast.five_hour,
+        &forecast.seven_day,
+        &forecast.seven_day_sonnet,
+    ];
 
     windows
         .iter()
@@ -219,12 +223,7 @@ pub fn generate_capacity_summary(state: &GovernorState) -> String {
 - Binding window: {} — {:.0}% headroom, resets in {}
 - Capacity pressure: {} ({})
 - Recommendation: {}"#,
-        binding_name,
-        headroom_pct,
-        reset_time,
-        pressure_level,
-        pressure_reason,
-        recommendation
+        binding_name, headroom_pct, reset_time, pressure_level, pressure_reason, recommendation
     )
 }
 
@@ -244,7 +243,11 @@ mod tests {
             margin_hrs,
             hours_remaining,
             cutoff_risk,
-            remaining_pct: if margin_hrs > 0.0 { margin_hrs * 2.0 } else { 5.0 },
+            remaining_pct: if margin_hrs > 0.0 {
+                margin_hrs * 2.0
+            } else {
+                5.0
+            },
             binding,
             ..WindowForecast::default()
         }
@@ -371,7 +374,10 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        assert_eq!(StatusExitCode::from_state(&state), StatusExitCode::CutoffRisk);
+        assert_eq!(
+            StatusExitCode::from_state(&state),
+            StatusExitCode::CutoffRisk
+        );
         assert_eq!(StatusExitCode::from_state(&state).as_exit_code(), 2);
     }
 
@@ -386,7 +392,10 @@ mod tests {
         let mut state = make_state(forecast);
         state.safe_mode.active = true;
 
-        assert_eq!(StatusExitCode::from_state(&state), StatusExitCode::Emergency);
+        assert_eq!(
+            StatusExitCode::from_state(&state),
+            StatusExitCode::Emergency
+        );
         assert_eq!(StatusExitCode::from_state(&state).as_exit_code(), 3);
     }
 
@@ -402,7 +411,10 @@ mod tests {
         let mut state = make_state(forecast);
         state.safe_mode.active = true;
 
-        assert_eq!(StatusExitCode::from_state(&state), StatusExitCode::Emergency);
+        assert_eq!(
+            StatusExitCode::from_state(&state),
+            StatusExitCode::Emergency
+        );
     }
 
     // --- Summary Format Tests ---

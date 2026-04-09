@@ -65,14 +65,21 @@ pub struct AgentConfig {
     pub max_workers: u32,
 }
 
-fn default_max_workers() -> u32 { 8 }
+fn default_max_workers() -> u32 {
+    8
+}
 
 impl AgentConfig {
     /// Get the heartbeat directory with tilde (~) expanded to the home directory
     pub fn heartbeat_dir_expanded(&self) -> PathBuf {
         if self.heartbeat_dir.starts_with('~') {
             if let Some(home) = dirs::home_dir() {
-                return home.join(self.heartbeat_dir.strip_prefix('~').unwrap_or("").trim_start_matches('/'));
+                return home.join(
+                    self.heartbeat_dir
+                        .strip_prefix('~')
+                        .unwrap_or("")
+                        .trim_start_matches('/'),
+                );
             }
         }
         PathBuf::from(&self.heartbeat_dir)
@@ -151,13 +158,27 @@ pub struct DaemonConfig {
     pub pre_scale_minutes: u64,
 }
 
-fn default_loop_interval_secs() -> u64 { 300 }
-fn default_hysteresis_band() -> f64 { 1.0 }
-fn default_max_scale_up_per_cycle() -> u32 { 1 }
-fn default_max_scale_down_per_cycle() -> u32 { 1 }
-fn default_min_scale_interval_secs() -> u64 { 60 }
-fn default_target_ceiling() -> f64 { 90.0 }
-fn default_pre_scale_minutes() -> u64 { 30 }
+fn default_loop_interval_secs() -> u64 {
+    300
+}
+fn default_hysteresis_band() -> f64 {
+    1.0
+}
+fn default_max_scale_up_per_cycle() -> u32 {
+    1
+}
+fn default_max_scale_down_per_cycle() -> u32 {
+    1
+}
+fn default_min_scale_interval_secs() -> u64 {
+    60
+}
+fn default_target_ceiling() -> f64 {
+    90.0
+}
+fn default_pre_scale_minutes() -> u64 {
+    30
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -287,7 +308,9 @@ pub struct CompositeRiskConfig {
     pub binding_weight: f64,
 }
 
-fn default_binding_weight() -> f64 { 2.0 }
+fn default_binding_weight() -> f64 {
+    2.0
+}
 
 impl Default for CompositeRiskConfig {
     fn default() -> Self {
@@ -329,7 +352,9 @@ pub struct ConeScalingConfig {
     pub narrow_threshold: f64,
 }
 
-fn default_cone_narrow_threshold() -> f64 { 1.5 }
+fn default_cone_narrow_threshold() -> f64 {
+    1.5
+}
 
 impl Default for ConeScalingConfig {
     fn default() -> Self {
@@ -372,7 +397,12 @@ pub struct AlertConfig {
 }
 
 fn default_alert_command() -> Vec<String> {
-    vec!["br".to_string(), "create".to_string(), "--type".to_string(), "human".to_string()]
+    vec![
+        "br".to_string(),
+        "create".to_string(),
+        "--type".to_string(),
+        "human".to_string(),
+    ]
 }
 
 fn default_cooldown_minutes() -> i64 {
@@ -491,8 +521,9 @@ impl GovernorConfig {
     fn create_default_config(path: &Path) -> Result<()> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
         let default_yaml = include_str!("../config/governor.yaml");
@@ -532,7 +563,11 @@ pricing:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.pricing.models.len(), 1);
 
-        let pricing = config.pricing.models.get("claude-sonnet-4-20250514").unwrap();
+        let pricing = config
+            .pricing
+            .models
+            .get("claude-sonnet-4-20250514")
+            .unwrap();
         assert_eq!(pricing.input_per_mtok, 3.0);
         assert_eq!(pricing.output_per_mtok, 15.0);
         assert_eq!(pricing.cache_write_5m_per_mtok, 3.75);
@@ -669,7 +704,10 @@ agents:
         assert_eq!(config.agents.len(), 2);
 
         let needle_sonnet = config.agents.get("needle-sonnet").unwrap();
-        assert_eq!(needle_sonnet.launch_cmd, "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor");
+        assert_eq!(
+            needle_sonnet.launch_cmd,
+            "needle run --agent claude-code-glm-5 --workspace /home/coding/claude-governor"
+        );
         assert_eq!(needle_sonnet.session_pattern, "needle-claude-*");
         assert_eq!(needle_sonnet.heartbeat_dir, "~/.needle/state/heartbeats");
         assert_eq!(needle_sonnet.min_workers, 0);

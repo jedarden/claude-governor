@@ -142,7 +142,10 @@ fn count_heartbeat_files(dir: &Path, session_prefix: &str) -> usize {
 ///
 /// Returns (count, session_names).
 fn count_tmux_sessions(prefix: &str) -> (usize, Vec<String>) {
-    let output = match Command::new("tmux").args(["list-sessions", "-F", "#{session_name}"]).output() {
+    let output = match Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
         Ok(o) => o,
         Err(e) => {
             // tmux not running or not installed
@@ -186,7 +189,8 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
             .unwrap_or_else(|_| PathBuf::from("."))
             .to_string_lossy()
             .into_owned();
-        let cmd = config.launch_cmd
+        let cmd = config
+            .launch_cmd
             .replace("{id}", &worker_id)
             .replace("{workspace}", &workspace);
 
@@ -216,7 +220,11 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
                 );
             }
             Err(e) => {
-                log::error!("[worker] failed to execute launch command for {}: {}", worker_id, e);
+                log::error!(
+                    "[worker] failed to execute launch command for {}: {}",
+                    worker_id,
+                    e
+                );
             }
         }
     }
@@ -241,10 +249,7 @@ pub struct ShellOutput {
 /// Returns Ok(ShellOutput) with exit code, stdout, and stderr,
 /// or Err if the command couldn't be executed at all.
 fn execute_shell_command(cmd: &str) -> anyhow::Result<ShellOutput> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()?;
+    let output = Command::new("sh").arg("-c").arg(cmd).output()?;
 
     Ok(ShellOutput {
         success: output.status.success(),
@@ -403,7 +408,11 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            log::warn!("[worker] failed to read heartbeat dir {}: {}", dir.display(), e);
+            log::warn!(
+                "[worker] failed to read heartbeat dir {}: {}",
+                dir.display(),
+                e
+            );
             return heartbeats;
         }
     };
@@ -415,20 +424,22 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
         }
 
         match fs::read_to_string(&path) {
-            Ok(content) => {
-                match serde_json::from_str::<Heartbeat>(&content) {
-                    Ok(hb) => {
-                        if hb.session.starts_with(session_prefix) {
-                            heartbeats.insert(hb.session.clone(), hb);
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!("[worker] invalid heartbeat {}: {}", path.display(), e);
+            Ok(content) => match serde_json::from_str::<Heartbeat>(&content) {
+                Ok(hb) => {
+                    if hb.session.starts_with(session_prefix) {
+                        heartbeats.insert(hb.session.clone(), hb);
                     }
                 }
-            }
+                Err(e) => {
+                    log::debug!("[worker] invalid heartbeat {}: {}", path.display(), e);
+                }
+            },
             Err(e) => {
-                log::debug!("[worker] failed to read heartbeat {}: {}", path.display(), e);
+                log::debug!(
+                    "[worker] failed to read heartbeat {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }

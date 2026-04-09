@@ -52,7 +52,11 @@ impl CheckResult {
         }
     }
 
-    fn warn(check: &'static str, message: impl Into<String>, remediation: impl Into<String>) -> Self {
+    fn warn(
+        check: &'static str,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             check: check.to_string(),
             status: CheckStatus::Warn,
@@ -61,7 +65,11 @@ impl CheckResult {
         }
     }
 
-    fn fail(check: &'static str, message: impl Into<String>, remediation: impl Into<String>) -> Self {
+    fn fail(
+        check: &'static str,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             check: check.to_string(),
             status: CheckStatus::Fail,
@@ -89,9 +97,18 @@ pub struct DoctorReport {
 impl DoctorReport {
     /// Create a new report from check results
     pub fn new(checks: Vec<CheckResult>) -> Self {
-        let passed = checks.iter().filter(|c| c.status == CheckStatus::Pass).count();
-        let warned = checks.iter().filter(|c| c.status == CheckStatus::Warn).count();
-        let failed = checks.iter().filter(|c| c.status == CheckStatus::Fail).count();
+        let passed = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Pass)
+            .count();
+        let warned = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Warn)
+            .count();
+        let failed = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Fail)
+            .count();
 
         let overall = if failed > 0 {
             CheckStatus::Fail
@@ -275,7 +292,9 @@ fn detect_collector_status() -> CollectorStatus {
     // Priority 3: fleet aggregate freshness (fallback)
     let state_path = default_state_path();
     if let Ok(state) = crate::state::load_state(&state_path) {
-        let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+        let age_secs = (Utc::now() - state.last_fleet_aggregate.t1)
+            .num_seconds()
+            .abs();
         if age_secs < 300 {
             return CollectorStatus::ActiveFleet(age_secs);
         }
@@ -298,7 +317,10 @@ fn check_daemon_running() -> CheckResult {
                 Ok(state) => {
                     let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
                     if age_secs < 300 {
-                        CheckResult::pass("daemon_running", format!("running (systemd), state {}s old", age_secs))
+                        CheckResult::pass(
+                            "daemon_running",
+                            format!("running (systemd), state {}s old", age_secs),
+                        )
                     } else {
                         CheckResult::warn(
                             "daemon_running",
@@ -310,12 +332,11 @@ fn check_daemon_running() -> CheckResult {
                 Err(_) => CheckResult::pass("daemon_running", "running (systemd)"),
             }
         }
-        DaemonStatus::RunningTmux => {
-            CheckResult::pass("daemon_running", "running (tmux)")
-        }
-        DaemonStatus::ActiveState(age_secs) => {
-            CheckResult::pass("daemon_running", format!("active (state {}s old)", age_secs))
-        }
+        DaemonStatus::RunningTmux => CheckResult::pass("daemon_running", "running (tmux)"),
+        DaemonStatus::ActiveState(age_secs) => CheckResult::pass(
+            "daemon_running",
+            format!("active (state {}s old)", age_secs),
+        ),
         DaemonStatus::Stopped => {
             let state_path = default_state_path();
             if state_path.exists() {
@@ -352,9 +373,14 @@ fn check_collector_running() -> CheckResult {
             let state_path = default_state_path();
             match crate::state::load_state(&state_path) {
                 Ok(state) => {
-                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1)
+                        .num_seconds()
+                        .abs();
                     if age_secs < 300 {
-                        CheckResult::pass("collector_running", format!("running (systemd), fleet {}s old", age_secs))
+                        CheckResult::pass(
+                            "collector_running",
+                            format!("running (systemd), fleet {}s old", age_secs),
+                        )
                     } else {
                         CheckResult::warn(
                             "collector_running",
@@ -366,17 +392,18 @@ fn check_collector_running() -> CheckResult {
                 Err(_) => CheckResult::pass("collector_running", "running (systemd)"),
             }
         }
-        CollectorStatus::RunningTmux => {
-            CheckResult::pass("collector_running", "running (tmux)")
-        }
-        CollectorStatus::ActiveFleet(age_secs) => {
-            CheckResult::pass("collector_running", format!("active (fleet {}s old)", age_secs))
-        }
+        CollectorStatus::RunningTmux => CheckResult::pass("collector_running", "running (tmux)"),
+        CollectorStatus::ActiveFleet(age_secs) => CheckResult::pass(
+            "collector_running",
+            format!("active (fleet {}s old)", age_secs),
+        ),
         CollectorStatus::Stopped => {
             let state_path = default_state_path();
             if state_path.exists() {
                 if let Ok(state) = crate::state::load_state(&state_path) {
-                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds().abs();
+                    let age_secs = (Utc::now() - state.last_fleet_aggregate.t1)
+                        .num_seconds()
+                        .abs();
                     if state.last_fleet_aggregate.sonnet_workers == 0 && age_secs > 3600 {
                         CheckResult::warn(
                             "collector_running",
@@ -592,7 +619,10 @@ fn check_heartbeat_consistency() -> CheckResult {
             } else if fresh_count > 0 && stale_count > 0 {
                 CheckResult::warn(
                     "heartbeat_files",
-                    format!("{} fresh, {} stale heartbeat files", fresh_count, stale_count),
+                    format!(
+                        "{} fresh, {} stale heartbeat files",
+                        fresh_count, stale_count
+                    ),
                     "Some workers may have stopped; check 'cgov workers'",
                 )
             } else if stale_count > 0 {
@@ -632,15 +662,15 @@ fn check_sqlite_integrity() -> CheckResult {
     // Use rusqlite to run PRAGMA integrity_check
     match rusqlite::Connection::open(&db_path) {
         Ok(conn) => {
-            match conn.query_row("PRAGMA integrity_check;", [], |row| {
-                row.get::<_, String>(0)
-            }) {
+            match conn.query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0)) {
                 Ok(result) => {
                     if result == "ok" {
                         // Also check for the known FrankenSQLite corruption pattern
-                        match conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |row| {
-                            row.get::<_, i64>(0)
-                        }) {
+                        match conn.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        ) {
                             Ok(table_count) => {
                                 if table_count >= 3 {
                                     CheckResult::pass(
@@ -655,7 +685,9 @@ fn check_sqlite_integrity() -> CheckResult {
                                     )
                                 }
                             }
-                            Err(_) => CheckResult::pass("sqlite_integrity", "Database integrity OK"),
+                            Err(_) => {
+                                CheckResult::pass("sqlite_integrity", "Database integrity OK")
+                            }
                         }
                     } else {
                         CheckResult::fail(
@@ -734,10 +766,7 @@ fn check_tmux_available() -> CheckResult {
                 .unwrap_or(false);
 
             if systemd_available {
-                CheckResult::pass(
-                    "tmux_available",
-                    "systemd available (tmux not required)",
-                )
+                CheckResult::pass("tmux_available", "systemd available (tmux not required)")
             } else {
                 CheckResult::warn(
                     "tmux_available",
@@ -763,12 +792,7 @@ fn check_burn_rate_samples() -> CheckResult {
 
     match crate::state::load_state(&state_path) {
         Ok(state) => {
-            let total_samples: u32 = state
-                .burn_rate
-                .by_model
-                .values()
-                .map(|m| m.samples)
-                .sum();
+            let total_samples: u32 = state.burn_rate.by_model.values().map(|m| m.samples).sum();
 
             if total_samples >= 5 {
                 CheckResult::pass(
@@ -784,7 +808,10 @@ fn check_burn_rate_samples() -> CheckResult {
             } else {
                 CheckResult::fail(
                     "burn_rate_samples",
-                    format!("Insufficient samples ({}) — using baseline fallback", total_samples),
+                    format!(
+                        "Insufficient samples ({}) — using baseline fallback",
+                        total_samples
+                    ),
                     "Run governor for at least 30 minutes to collect burn rate data",
                 )
             }
@@ -858,7 +885,10 @@ fn check_prediction_accuracy() -> CheckResult {
             if cal.predictions_scored < 5 {
                 return CheckResult::warn(
                     "prediction_accuracy",
-                    format!("Only {} predictions scored (need 5+)", cal.predictions_scored),
+                    format!(
+                        "Only {} predictions scored (need 5+)",
+                        cal.predictions_scored
+                    ),
                     "Let the governor run longer to calibrate predictions",
                 );
             }
@@ -868,18 +898,27 @@ fn check_prediction_accuracy() -> CheckResult {
             if error < 5.0 {
                 CheckResult::pass(
                     "prediction_accuracy",
-                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
+                    format!(
+                        "median error {:.1}% ({} scored)",
+                        error, cal.predictions_scored
+                    ),
                 )
             } else if error < 10.0 {
                 CheckResult::warn(
                     "prediction_accuracy",
-                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
+                    format!(
+                        "median error {:.1}% ({} scored)",
+                        error, cal.predictions_scored
+                    ),
                     "Predictions are within acceptable range but could improve with more data",
                 )
             } else {
                 CheckResult::fail(
                     "prediction_accuracy",
-                    format!("median error {:.1}% ({} scored)", error, cal.predictions_scored),
+                    format!(
+                        "median error {:.1}% ({} scored)",
+                        error, cal.predictions_scored
+                    ),
                     "Safe mode may activate; check for unusual usage patterns",
                 )
             }
@@ -955,12 +994,14 @@ fn check_api_reachability() -> CheckResult {
 
     // Read the OAuth token for authentication
     let token = fs::read_to_string(&creds_path).ok().and_then(|content| {
-        serde_json::from_str::<serde_json::Value>(&content).ok().and_then(|json| {
-            json.get("claudeAiOauth")
-                .and_then(|o| o.get("accessToken"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|json| {
+                json.get("claudeAiOauth")
+                    .and_then(|o| o.get("accessToken"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
     });
 
     let agent = ureq::AgentBuilder::new()
@@ -968,7 +1009,8 @@ fn check_api_reachability() -> CheckResult {
         .timeout_write(std::time::Duration::from_secs(5))
         .build();
 
-    let req = agent.get("https://api.anthropic.com/api/oauth/usage")
+    let req = agent
+        .get("https://api.anthropic.com/api/oauth/usage")
         .set("anthropic-beta", "oauth-2025-04-20");
     let req = if let Some(ref tok) = token {
         req.set("Authorization", &format!("Bearer {}", tok))
@@ -1004,20 +1046,19 @@ fn check_api_reachability() -> CheckResult {
                 )
             }
         }
-        Err(ureq::Error::Status(code, _)) => {
-            CheckResult::fail(
-                "api_reachability",
-                format!("HTTP {} (error)", code),
-                "Anthropic API returned an error; check https://status.anthropic.com",
-            )
-        }
-        Err(_) => {
-            CheckResult::fail(
-                "api_reachability",
-                format!("Unreachable (timeout after {}ms)", start.elapsed().as_millis()),
-                "Check network connectivity and DNS resolution for api.anthropic.com",
-            )
-        }
+        Err(ureq::Error::Status(code, _)) => CheckResult::fail(
+            "api_reachability",
+            format!("HTTP {} (error)", code),
+            "Anthropic API returned an error; check https://status.anthropic.com",
+        ),
+        Err(_) => CheckResult::fail(
+            "api_reachability",
+            format!(
+                "Unreachable (timeout after {}ms)",
+                start.elapsed().as_millis()
+            ),
+            "Check network connectivity and DNS resolution for api.anthropic.com",
+        ),
     }
 }
 
@@ -1071,11 +1112,13 @@ fn check_promotion_dates() -> CheckResult {
         .and_then(|c| serde_json::from_str(&c).ok())
     {
         Some(p) => p,
-        None => return CheckResult::warn(
-            "promotion_dates",
-            "Cannot parse promotions.json",
-            "Fix JSON syntax in config/promotions.json",
-        ),
+        None => {
+            return CheckResult::warn(
+                "promotion_dates",
+                "Cannot parse promotions.json",
+                "Fix JSON syntax in config/promotions.json",
+            )
+        }
     };
 
     if promos.is_empty() {
@@ -1103,7 +1146,10 @@ fn check_promotion_dates() -> CheckResult {
         } else {
             let hours_until_expiry = (end_dt - now).num_hours();
             if hours_until_expiry < 48 {
-                warnings.push(format!("{}: expires in {}h", promo.name, hours_until_expiry));
+                warnings.push(format!(
+                    "{}: expires in {}h",
+                    promo.name, hours_until_expiry
+                ));
             }
         }
     }
@@ -1115,17 +1161,27 @@ fn check_promotion_dates() -> CheckResult {
             "Remove expired promotions from config/promotions.json",
         )
     } else if !warnings.is_empty() {
-        CheckResult::warn("promotion_dates", warnings.join("; "), "Update or extend promotion dates")
+        CheckResult::warn(
+            "promotion_dates",
+            warnings.join("; "),
+            "Update or extend promotion dates",
+        )
     } else {
-        let active: Vec<_> = promos.iter().filter(|p| {
-            chrono::NaiveDate::parse_from_str(&p.start_date, "%Y-%m-%d")
-                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc() <= now)
-                .unwrap_or(false)
-        }).collect();
+        let active: Vec<_> = promos
+            .iter()
+            .filter(|p| {
+                chrono::NaiveDate::parse_from_str(&p.start_date, "%Y-%m-%d")
+                    .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc() <= now)
+                    .unwrap_or(false)
+            })
+            .collect();
         if active.is_empty() {
             CheckResult::pass("promotion_dates", "future promotions configured")
         } else {
-            CheckResult::pass("promotion_dates", format!("{} active/future promotion(s)", promos.len()))
+            CheckResult::pass(
+                "promotion_dates",
+                format!("{} active/future promotion(s)", promos.len()),
+            )
         }
     }
 }
@@ -1175,9 +1231,15 @@ fn check_jsonl_db_sync() -> CheckResult {
     let db_rows = match rusqlite::Connection::open(&db_path) {
         Ok(conn) => {
             // Count total rows across all three tables (i = instance, f = fleet, w = window)
-            let ci: i64 = conn.query_row("SELECT COUNT(*) FROM i", [], |r| r.get(0)).unwrap_or(0);
-            let cf: i64 = conn.query_row("SELECT COUNT(*) FROM f", [], |r| r.get(0)).unwrap_or(0);
-            let cw: i64 = conn.query_row("SELECT COUNT(*) FROM w", [], |r| r.get(0)).unwrap_or(0);
+            let ci: i64 = conn
+                .query_row("SELECT COUNT(*) FROM i", [], |r| r.get(0))
+                .unwrap_or(0);
+            let cf: i64 = conn
+                .query_row("SELECT COUNT(*) FROM f", [], |r| r.get(0))
+                .unwrap_or(0);
+            let cw: i64 = conn
+                .query_row("SELECT COUNT(*) FROM w", [], |r| r.get(0))
+                .unwrap_or(0);
             ci + cf + cw
         }
         Err(_) => {
@@ -1214,12 +1276,22 @@ fn check_jsonl_db_sync() -> CheckResult {
     if divergence < 0.01 {
         CheckResult::pass(
             "jsonl_db_sync",
-            format!("{} / {} rows ({:.1}%)", jsonl_lines, db_rows, (1.0 - divergence) * 100.0),
+            format!(
+                "{} / {} rows ({:.1}%)",
+                jsonl_lines,
+                db_rows,
+                (1.0 - divergence) * 100.0
+            ),
         )
     } else {
         CheckResult::warn(
             "jsonl_db_sync",
-            format!("{} / {} rows (diverge {:.1}%)", jsonl_lines, db_rows, divergence * 100.0),
+            format!(
+                "{} / {} rows (diverge {:.1}%)",
+                jsonl_lines,
+                db_rows,
+                divergence * 100.0
+            ),
             "Run 'cgov token-history --rebuild-db' to resync DB from JSONL",
         )
     }
@@ -1256,7 +1328,10 @@ fn check_log_file() -> CheckResult {
             if !metadata.permissions().readonly() {
                 if size_mb < 100.0 {
                     if size_mb < 1.0 {
-                        CheckResult::pass("log_file", format!("{:.1} KB", size_bytes as f64 / 1024.0))
+                        CheckResult::pass(
+                            "log_file",
+                            format!("{:.1} KB", size_bytes as f64 / 1024.0),
+                        )
                     } else {
                         CheckResult::pass("log_file", format!("{:.1} MB", size_mb))
                     }
@@ -1414,10 +1489,7 @@ mod tests {
 
     #[test]
     fn test_doctor_report_overall_pass() {
-        let checks = vec![
-            CheckResult::pass("a", "ok"),
-            CheckResult::pass("b", "ok"),
-        ];
+        let checks = vec![CheckResult::pass("a", "ok"), CheckResult::pass("b", "ok")];
 
         let report = DoctorReport::new(checks);
         assert_eq!(report.overall, CheckStatus::Pass);
@@ -1440,9 +1512,7 @@ mod tests {
 
     #[test]
     fn test_report_serialization() {
-        let report = DoctorReport::new(vec![
-            CheckResult::pass("test_check", "All good"),
-        ]);
+        let report = DoctorReport::new(vec![CheckResult::pass("test_check", "All good")]);
 
         let json = serde_json::to_string(&report).unwrap();
         // Compact JSON format has no space after colon

@@ -67,14 +67,20 @@ impl PricingEngine {
     pub fn new() -> Result<Self> {
         let config = GovernorConfig::load()?;
         let pricing_map = config.pricing.models.clone();
-        Ok(Self { config, pricing_map })
+        Ok(Self {
+            config,
+            pricing_map,
+        })
     }
 
     /// Create a new pricing engine from a specific config path
     pub fn from_config_path(path: &std::path::Path) -> Result<Self> {
         let config = GovernorConfig::load_from_path(path)?;
         let pricing_map = config.pricing.models.clone();
-        Ok(Self { config, pricing_map })
+        Ok(Self {
+            config,
+            pricing_map,
+        })
     }
 
     /// Compute dollar costs for a usage record
@@ -86,11 +92,15 @@ impl PricingEngine {
 
         let input_usd = (usage.input_tokens as f64) * pricing.input_per_mtok / 1_000_000.0;
         let output_usd = (usage.output_tokens as f64) * pricing.output_per_mtok / 1_000_000.0;
-        let cache_read_usd = (usage.cache_read_tokens as f64) * pricing.cache_read_per_mtok / 1_000_000.0;
-        let cache_write_5m_usd = (usage.cache_write_5m_tokens as f64) * pricing.cache_write_5m_per_mtok / 1_000_000.0;
-        let cache_write_1h_usd = (usage.cache_write_1h_tokens as f64) * pricing.cache_write_1h_per_mtok / 1_000_000.0;
+        let cache_read_usd =
+            (usage.cache_read_tokens as f64) * pricing.cache_read_per_mtok / 1_000_000.0;
+        let cache_write_5m_usd =
+            (usage.cache_write_5m_tokens as f64) * pricing.cache_write_5m_per_mtok / 1_000_000.0;
+        let cache_write_1h_usd =
+            (usage.cache_write_1h_tokens as f64) * pricing.cache_write_1h_per_mtok / 1_000_000.0;
 
-        let total_usd = input_usd + output_usd + cache_read_usd + cache_write_5m_usd + cache_write_1h_usd;
+        let total_usd =
+            input_usd + output_usd + cache_read_usd + cache_write_5m_usd + cache_write_1h_usd;
 
         DollarBreakdown {
             input_usd,
@@ -182,11 +192,15 @@ impl PricingEngine {
 pub fn compute_dollars_explicit(usage: &UsageRecord, pricing: &ModelPricing) -> DollarBreakdown {
     let input_usd = (usage.input_tokens as f64) * pricing.input_per_mtok / 1_000_000.0;
     let output_usd = (usage.output_tokens as f64) * pricing.output_per_mtok / 1_000_000.0;
-    let cache_read_usd = (usage.cache_read_tokens as f64) * pricing.cache_read_per_mtok / 1_000_000.0;
-    let cache_write_5m_usd = (usage.cache_write_5m_tokens as f64) * pricing.cache_write_5m_per_mtok / 1_000_000.0;
-    let cache_write_1h_usd = (usage.cache_write_1h_tokens as f64) * pricing.cache_write_1h_per_mtok / 1_000_000.0;
+    let cache_read_usd =
+        (usage.cache_read_tokens as f64) * pricing.cache_read_per_mtok / 1_000_000.0;
+    let cache_write_5m_usd =
+        (usage.cache_write_5m_tokens as f64) * pricing.cache_write_5m_per_mtok / 1_000_000.0;
+    let cache_write_1h_usd =
+        (usage.cache_write_1h_tokens as f64) * pricing.cache_write_1h_per_mtok / 1_000_000.0;
 
-    let total_usd = input_usd + output_usd + cache_read_usd + cache_write_5m_usd + cache_write_1h_usd;
+    let total_usd =
+        input_usd + output_usd + cache_read_usd + cache_write_5m_usd + cache_write_1h_usd;
 
     DollarBreakdown {
         input_usd,

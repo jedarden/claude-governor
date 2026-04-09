@@ -64,6 +64,8 @@ pub enum AlertType {
     CollectorOffline,
     /// Fleet cache efficiency below threshold for N consecutive intervals
     LowCacheEfficiency,
+    /// Off-peak promotion ratio anomaly (observed > 2.5 or < 0.8)
+    PromotionRatioAnomaly,
 }
 
 impl std::fmt::Display for AlertType {
@@ -183,9 +185,7 @@ pub fn check_underutilization_sprint_for_worker(
     // Check for cutoff_risk in any window - safety check
     let any_cutoff_risk = windows.iter().any(|(_, win)| win.cutoff_risk);
     if any_cutoff_risk {
-        log::debug!(
-            "Sprint inhibited: another window has cutoff_risk"
-        );
+        log::debug!("Sprint inhibited: another window has cutoff_risk");
         return None;
     }
 
@@ -308,7 +308,10 @@ pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), St
         cmd.args(&config.command[1..]);
     }
     // Append the alert message as the final argument
-    let alert_message = format!("[{}] {}: {}", alert.severity, alert.alert_type, alert.message);
+    let alert_message = format!(
+        "[{}] {}: {}",
+        alert.severity, alert.alert_type, alert.message
+    );
     cmd.arg(&alert_message);
 
     // Execute the command
@@ -365,10 +368,7 @@ fn log_alert_to_file(alert: &AlertCondition) -> std::io::Result<()> {
     }
 
     // Open file for append
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
 
     // Format: 2026-03-20T10:00:00Z [CRITICAL] cutoff_imminent: Window five_hour at cutoff risk...
     let log_line = format!(
@@ -402,7 +402,12 @@ pub fn process_alerts(
     let mut fired_count = 0;
 
     for alert in &conditions {
-        if should_fire(alert.alert_type, &state.alert_cooldown, now, config.cooldown_minutes) {
+        if should_fire(
+            alert.alert_type,
+            &state.alert_cooldown,
+            now,
+            config.cooldown_minutes,
+        ) {
             if fire_alert(alert, config).is_ok() {
                 update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
                 fired_count += 1;
@@ -443,7 +448,11 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
             if trigger == "emergency_brake" {
                 let msg = format!(
                     "Emergency brake active since {}",
-                    state.safe_mode.entered_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "unknown".to_string())
+                    state
+                        .safe_mode
+                        .entered_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".to_string())
                 );
                 alerts.push(AlertCondition {
                     alert_type: AlertType::EmergencyBrakeActivated,
@@ -632,9 +641,9 @@ fn check_underutilization(
         ("seven_day_sonnet", &forecast.seven_day_sonnet),
     ];
 
-    let all_abundant = windows.iter().all(|(_, win)| {
-        win.hours_remaining > 0.0 && win.margin_hrs > win.hours_remaining * 0.5
-    });
+    let all_abundant = windows
+        .iter()
+        .all(|(_, win)| win.hours_remaining > 0.0 && win.margin_hrs > win.hours_remaining * 0.5);
 
     if all_abundant {
         let msg = "All windows have abundant capacity: safe to increase worker count".to_string();
@@ -650,13 +659,13 @@ fn check_underutilization(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::config::{AlertConfig, SprintConfig};
     use crate::state::{
-        AlertCooldown, BurnRateState, CapacityForecast, FleetAggregate, GovernorState, ScheduleState,
-        SafeModeState, UsageState, WorkerState, WindowForecast,
+        AlertCooldown, BurnRateState, CapacityForecast, FleetAggregate, GovernorState,
+        SafeModeState, ScheduleState, UsageState, WindowForecast, WorkerState,
     };
     use chrono::{Duration, Utc};
+    use std::collections::HashMap;
     use std::fs::OpenOptions;
     use std::io::Write;
     use tempfile::TempDir;
@@ -715,8 +724,14 @@ mod tests {
     #[test]
     fn alert_type_display() {
         assert_eq!(AlertType::CutoffImminent.to_string(), "cutoff_imminent");
-        assert_eq!(AlertType::SonnetCutoffRisk.to_string(), "sonnet_cutoff_risk");
-        assert_eq!(AlertType::SessionCutoffRisk.to_string(), "session_cutoff_risk");
+        assert_eq!(
+            AlertType::SonnetCutoffRisk.to_string(),
+            "sonnet_cutoff_risk"
+        );
+        assert_eq!(
+            AlertType::SessionCutoffRisk.to_string(),
+            "session_cutoff_risk"
+        );
         assert_eq!(AlertType::BurnRateSpike.to_string(), "burn_rate_spike");
         assert_eq!(AlertType::Underutilization.to_string(), "underutilization");
     }
@@ -832,7 +847,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let imminent = alerts.iter().find(|a| a.alert_type == AlertType::CutoffImminent);
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent);
         assert!(imminent.is_some(), "Should have CutoffImminent alert");
         let alert = imminent.unwrap();
         assert_eq!(alert.severity, AlertSeverity::Critical);
@@ -855,7 +872,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let imminent = alerts.iter().find(|a| a.alert_type == AlertType::CutoffImminent);
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent);
         assert!(
             imminent.is_none(),
             "Should NOT have CutoffImminent when margin_hrs > -2"
@@ -876,7 +895,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let sonnet = alerts.iter().find(|a| a.alert_type == AlertType::SonnetCutoffRisk);
+        let sonnet = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SonnetCutoffRisk);
         assert!(sonnet.is_some(), "Should have SonnetCutoffRisk alert");
         assert!(sonnet.unwrap().message.contains("Seven-day Sonnet"));
     }
@@ -895,7 +916,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let session = alerts.iter().find(|a| a.alert_type == AlertType::SessionCutoffRisk);
+        let session = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SessionCutoffRisk);
         assert!(session.is_some(), "Should have SessionCutoffRisk alert");
         assert!(session.unwrap().message.contains("Five-hour"));
     }
@@ -903,7 +926,7 @@ mod tests {
     #[test]
     fn underutilization_triggers_when_all_abundant() {
         let forecast = CapacityForecast {
-            five_hour: make_window(false, 5.0, 2.0),  // margin > hrs_left * 0.5
+            five_hour: make_window(false, 5.0, 2.0), // margin > hrs_left * 0.5
             seven_day: make_window(false, 20.0, 30.0), // margin > hrs_left * 0.5
             seven_day_sonnet: make_window(false, 20.0, 30.0),
             binding_window: "seven_day_sonnet".to_string(),
@@ -914,7 +937,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let underutil = alerts.iter().find(|a| a.alert_type == AlertType::Underutilization);
+        let underutil = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::Underutilization);
         assert!(underutil.is_some(), "Should have Underutilization alert");
         assert_eq!(underutil.unwrap().severity, AlertSeverity::Info);
     }
@@ -933,7 +958,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let underutil = alerts.iter().find(|a| a.alert_type == AlertType::Underutilization);
+        let underutil = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::Underutilization);
         assert!(
             underutil.is_none(),
             "Should NOT have Underutilization when any window constrained"
@@ -953,7 +980,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        let promo = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionNotApplying);
         assert!(promo.is_some(), "Should have PromotionNotApplying alert");
         assert!(promo.unwrap().message.contains("1.50"));
         assert!(promo.unwrap().message.contains("2.00"));
@@ -971,7 +1000,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        let promo = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionNotApplying);
         assert!(
             promo.is_none(),
             "Should NOT fire PromotionNotApplying when both ratios are 0.0 (no samples collected)"
@@ -991,7 +1022,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        let promo = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionNotApplying);
         assert!(
             promo.is_none(),
             "Should NOT fire PromotionNotApplying when peak samples < MIN_VALIDATION_SAMPLES"
@@ -1011,7 +1044,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        let promo = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionNotApplying);
         assert!(
             promo.is_none(),
             "Should NOT fire PromotionNotApplying when offpeak samples < MIN_VALIDATION_SAMPLES"
@@ -1032,7 +1067,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let promo = alerts.iter().find(|a| a.alert_type == AlertType::PromotionNotApplying);
+        let promo = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionNotApplying);
         assert!(
             promo.is_none(),
             "Should NOT fire PromotionNotApplying when expected_ratio is 0.0"
@@ -1047,7 +1084,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let offline = alerts.iter().find(|a| a.alert_type == AlertType::CollectorOffline);
+        let offline = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CollectorOffline);
         assert!(offline.is_some(), "Should have CollectorOffline alert");
         assert!(offline.unwrap().message.contains("10 minutes ago"));
     }
@@ -1073,7 +1112,11 @@ mod tests {
         let alerts = check_alert_conditions(&state, base_now());
 
         // Should have: CutoffImminent, SessionCutoffRisk, SonnetCutoffRisk, PromotionNotApplying, CollectorOffline
-        assert!(alerts.len() >= 4, "Should have multiple alerts, got {:?}", alerts);
+        assert!(
+            alerts.len() >= 4,
+            "Should have multiple alerts, got {:?}",
+            alerts
+        );
 
         let types: Vec<AlertType> = alerts.iter().map(|a| a.alert_type).collect();
         assert!(types.contains(&AlertType::CutoffImminent));
@@ -1109,7 +1152,10 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let imminent = alerts.iter().find(|a| a.alert_type == AlertType::CutoffImminent).unwrap();
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent)
+            .unwrap();
 
         // Message should contain window name, percentages, and hours
         assert!(imminent.message.contains("five_hour"));
@@ -1127,7 +1173,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let brake = alerts.iter().find(|a| a.alert_type == AlertType::EmergencyBrakeActivated);
+        let brake = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::EmergencyBrakeActivated);
         assert!(brake.is_some(), "Should have EmergencyBrakeActivated alert");
         assert_eq!(brake.unwrap().severity, AlertSeverity::Critical);
     }
@@ -1139,7 +1187,9 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let trf = alerts.iter().find(|a| a.alert_type == AlertType::TokenRefreshFailing);
+        let trf = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::TokenRefreshFailing);
         assert!(trf.is_some(), "Should have TokenRefreshFailing alert");
         assert_eq!(trf.unwrap().severity, AlertSeverity::Critical);
         assert!(trf.unwrap().message.contains("claude login"));
@@ -1152,8 +1202,13 @@ mod tests {
 
         let alerts = check_alert_conditions(&state, base_now());
 
-        let trf = alerts.iter().find(|a| a.alert_type == AlertType::TokenRefreshFailing);
-        assert!(trf.is_none(), "Should NOT have TokenRefreshFailing when flag is false");
+        let trf = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::TokenRefreshFailing);
+        assert!(
+            trf.is_none(),
+            "Should NOT have TokenRefreshFailing when flag is false"
+        );
     }
 
     // --- LowCacheEfficiency tests ---
@@ -1172,11 +1227,17 @@ mod tests {
         let config = default_alert_config();
         let alert = check_low_cache_efficiency(&state, &config, base_now());
 
-        assert!(alert.is_some(), "Should fire LowCacheEfficiency after N intervals");
+        assert!(
+            alert.is_some(),
+            "Should fire LowCacheEfficiency after N intervals"
+        );
         let a = alert.unwrap();
         assert_eq!(a.alert_type, AlertType::LowCacheEfficiency);
         assert_eq!(a.severity, AlertSeverity::Warning);
-        assert!(a.message.contains("10.0%"), "Should show current efficiency");
+        assert!(
+            a.message.contains("10.0%"),
+            "Should show current efficiency"
+        );
         assert!(a.message.contains("30%"), "Should show threshold");
         assert!(a.message.contains("5 consecutive"), "Should show count");
     }
@@ -1190,7 +1251,10 @@ mod tests {
 
         let config = default_alert_config();
         let alert = check_low_cache_efficiency(&state, &config, base_now());
-        assert!(alert.is_none(), "Should NOT fire when consecutive count < threshold");
+        assert!(
+            alert.is_none(),
+            "Should NOT fire when consecutive count < threshold"
+        );
     }
 
     #[test]
@@ -1198,12 +1262,15 @@ mod tests {
         let mut state = make_state_with_forecast(CapacityForecast::default());
         state.last_fleet_aggregate.sonnet_workers = 2;
         state.last_fleet_aggregate.fleet_cache_eff = 0.50; // above threshold
-        // counter would be 0 because governor resets it when eff is good
+                                                           // counter would be 0 because governor resets it when eff is good
         state.low_cache_eff_consecutive = 0;
 
         let config = default_alert_config();
         let alert = check_low_cache_efficiency(&state, &config, base_now());
-        assert!(alert.is_none(), "Should NOT fire when efficiency is above threshold");
+        assert!(
+            alert.is_none(),
+            "Should NOT fire when efficiency is above threshold"
+        );
     }
 
     #[test]
@@ -1215,7 +1282,10 @@ mod tests {
 
         let config = default_alert_config();
         let alert = check_low_cache_efficiency(&state, &config, base_now());
-        assert!(alert.is_none(), "Should NOT fire when no workers are active");
+        assert!(
+            alert.is_none(),
+            "Should NOT fire when no workers are active"
+        );
     }
 
     // --- Update cooldown test ---
@@ -1237,18 +1307,18 @@ mod tests {
         SprintConfig::default()
     }
 
-    fn make_window_with_util(
-        util: f64,
-        hrs_left: f64,
-        cutoff_risk: bool,
-    ) -> WindowForecast {
+    fn make_window_with_util(util: f64, hrs_left: f64, cutoff_risk: bool) -> WindowForecast {
         WindowForecast {
             target_ceiling: 90.0,
             current_utilization: util,
             remaining_pct: 90.0 - util,
             hours_remaining: hrs_left,
             fleet_pct_per_hour: 5.0,
-            predicted_exhaustion_hours: if hrs_left > 0.0 { (90.0 - util) / 5.0 } else { 0.0 },
+            predicted_exhaustion_hours: if hrs_left > 0.0 {
+                (90.0 - util) / 5.0
+            } else {
+                0.0
+            },
             cutoff_risk,
             margin_hrs: hrs_left - (90.0 - util) / 5.0,
             binding: false,
@@ -1281,14 +1351,22 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
         let config = default_sprint_config();
 
         let trigger = check_underutilization_sprint(&state, &config);
-        assert!(trigger.is_some(), "Sprint should trigger at 45% with 1.5h to reset");
+        assert!(
+            trigger.is_some(),
+            "Sprint should trigger at 45% with 1.5h to reset"
+        );
 
         let t = trigger.unwrap();
         assert_eq!(t.worker_id, "sonnet");
@@ -1311,7 +1389,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1339,7 +1422,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1367,7 +1455,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1394,7 +1487,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 8 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 8,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1421,7 +1519,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 5, target: 5, min: 1, max: 5 }, // already at max
+            WorkerState {
+                current: 5,
+                target: 5,
+                min: 1,
+                max: 5,
+            }, // already at max
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1448,7 +1551,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1476,11 +1584,21 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 3, target: 3, min: 1, max: 5 }, // headroom: 2
+            WorkerState {
+                current: 3,
+                target: 3,
+                min: 1,
+                max: 5,
+            }, // headroom: 2
         );
         workers.insert(
             "opus".to_string(),
-            WorkerState { current: 1, target: 1, min: 1, max: 10 }, // headroom: 9
+            WorkerState {
+                current: 1,
+                target: 1,
+                min: 1,
+                max: 10,
+            }, // headroom: 9
         );
 
         let state = make_state_with_workers(forecast, workers);
@@ -1509,7 +1627,12 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "sonnet".to_string(),
-            WorkerState { current: 2, target: 2, min: 1, max: 5 },
+            WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 5,
+            },
         );
 
         let mut state = make_state_with_workers(forecast, workers);
@@ -1538,14 +1661,20 @@ mod tests {
     fn meets_severity_threshold_warning() {
         assert!(meets_severity_threshold(AlertSeverity::Warning, "info"));
         assert!(meets_severity_threshold(AlertSeverity::Warning, "warning"));
-        assert!(!meets_severity_threshold(AlertSeverity::Warning, "critical"));
+        assert!(!meets_severity_threshold(
+            AlertSeverity::Warning,
+            "critical"
+        ));
     }
 
     #[test]
     fn meets_severity_threshold_critical() {
         assert!(meets_severity_threshold(AlertSeverity::Critical, "info"));
         assert!(meets_severity_threshold(AlertSeverity::Critical, "warning"));
-        assert!(meets_severity_threshold(AlertSeverity::Critical, "critical"));
+        assert!(meets_severity_threshold(
+            AlertSeverity::Critical,
+            "critical"
+        ));
     }
 
     #[test]
@@ -1666,7 +1795,10 @@ mod tests {
         assert!(fired >= 1, "Should have fired at least one alert");
 
         // Cooldown should now be set
-        assert!(state.alert_cooldown.get_last_fired("cutoff_imminent").is_some());
+        assert!(state
+            .alert_cooldown
+            .get_last_fired("cutoff_imminent")
+            .is_some());
     }
 
     #[test]
@@ -1682,8 +1814,12 @@ mod tests {
         let mut state = make_state_with_forecast(forecast);
 
         // Set cooldown for both expected alert types to have just fired
-        state.alert_cooldown.record_fired("cutoff_imminent", base_now());
-        state.alert_cooldown.record_fired("session_cutoff_risk", base_now());
+        state
+            .alert_cooldown
+            .record_fired("cutoff_imminent", base_now());
+        state
+            .alert_cooldown
+            .record_fired("session_cutoff_risk", base_now());
 
         let config = AlertConfig {
             enabled: true,

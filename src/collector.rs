@@ -5,7 +5,7 @@
 //! - Parsing usage blocks from assistant messages
 //! - Tracking per-model token usage by type
 
-use chrono::{Datelike, DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::US::Eastern;
 use glob::glob;
 use serde::{Deserialize, Serialize};
@@ -451,10 +451,7 @@ pub fn compute_window_forecast(
 /// The binding window is the one with the smallest (most negative) `margin_hrs`.
 /// All other windows get `bind = 0`. The binding window also gets `safe_w`
 /// computed based on the provided per-worker rate.
-pub fn find_binding_window(
-    forecasts: &mut [WindowRecord],
-    p75_rate_per_worker: f64,
-) {
+pub fn find_binding_window(forecasts: &mut [WindowRecord], p75_rate_per_worker: f64) {
     if forecasts.is_empty() {
         return;
     }
@@ -542,9 +539,7 @@ pub fn hr_et(t: DateTime<Utc>) -> u8 {
 
 /// Returns the day-of-week in US Eastern time at timestamp `t` (0=Mon … 6=Sun).
 pub fn dow(t: DateTime<Utc>) -> u8 {
-    t.with_timezone(&Eastern)
-        .weekday()
-        .num_days_from_monday() as u8
+    t.with_timezone(&Eastern).weekday().num_days_from_monday() as u8
 }
 
 /// Instance-level JSONL record — type `"i"`, one row per session per collection interval.
@@ -1086,7 +1081,10 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
     // Discover JSONL files
     let files = discover_jsonl_files(&session_base);
     if files.is_empty() {
-        log::info!("[collector] no JSONL files found under {}", session_base.display());
+        log::info!(
+            "[collector] no JSONL files found under {}",
+            session_base.display()
+        );
         return Ok(CollectionResult {
             lines_processed: 0,
             instance_records: 0,
@@ -1131,7 +1129,8 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
     if session_usage.is_empty() {
         log::info!("[collector] no new usage data found");
         // Still save cursors even if no data
-        cursors.save(&cursor_path)
+        cursors
+            .save(&cursor_path)
             .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
         return Ok(CollectionResult {
             lines_processed: total_lines,
@@ -1195,7 +1194,8 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
     }
 
     // Save cursors
-    cursors.save(&cursor_path)
+    cursors
+        .save(&cursor_path)
         .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
 
     let result = CollectionResult {
@@ -1514,7 +1514,10 @@ mod tests {
         #[test]
         fn infer_model_from_path_detects_sonnet() {
             let path = Path::new("/home/user/sessions/sonnet/test.jsonl");
-            assert_eq!(infer_model_from_path(path), Some("claude-sonnet".to_string()));
+            assert_eq!(
+                infer_model_from_path(path),
+                Some("claude-sonnet".to_string())
+            );
         }
 
         #[test]
@@ -1526,13 +1529,19 @@ mod tests {
         #[test]
         fn infer_model_from_path_detects_haiku() {
             let path = Path::new("/home/user/haiku/test.jsonl");
-            assert_eq!(infer_model_from_path(path), Some("claude-haiku".to_string()));
+            assert_eq!(
+                infer_model_from_path(path),
+                Some("claude-haiku".to_string())
+            );
         }
 
         #[test]
         fn infer_model_from_path_is_case_insensitive() {
             let path = Path::new("/home/user/SONNET/test.jsonl");
-            assert_eq!(infer_model_from_path(path), Some("claude-sonnet".to_string()));
+            assert_eq!(
+                infer_model_from_path(path),
+                Some("claude-sonnet".to_string())
+            );
         }
 
         #[test]
@@ -1842,8 +1851,7 @@ mod tests {
             );
 
             // Now with a burn rate that makes exh_hrs > hrs_left -> negative margin
-            let rec2 =
-                compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
+            let rec2 = compute_window_forecast("five_hour", 36.0, 90.0, reset, now, 2.0, false);
             // exh_hrs=27, margin=3-27=-24
             assert!(
                 (rec2.margin_hrs - (-24.0)).abs() < 1e-9,
@@ -1876,7 +1884,8 @@ mod tests {
         fn record_type_and_window_name() {
             let now = base_now();
             let reset = reset_5h_from(now);
-            let rec = compute_window_forecast("seven_day_sonnet", 80.0, 90.0, reset, now, 1.0, false);
+            let rec =
+                compute_window_forecast("seven_day_sonnet", 80.0, 90.0, reset, now, 1.0, false);
 
             assert_eq!(rec.r, "w");
             assert_eq!(rec.win, "seven_day_sonnet");
@@ -1889,8 +1898,24 @@ mod tests {
             // 7d window: margin_hrs = +5 (less constrained)
             let now = base_now();
             let mut forecasts = vec![
-                compute_window_forecast("five_hour", 36.0, 90.0, now + Duration::hours(3), now, 30.0, false),
-                compute_window_forecast("seven_day", 36.0, 90.0, now + Duration::hours(100), now, 2.0, false),
+                compute_window_forecast(
+                    "five_hour",
+                    36.0,
+                    90.0,
+                    now + Duration::hours(3),
+                    now,
+                    30.0,
+                    false,
+                ),
+                compute_window_forecast(
+                    "seven_day",
+                    36.0,
+                    90.0,
+                    now + Duration::hours(100),
+                    now,
+                    2.0,
+                    false,
+                ),
             ];
 
             // Before: both bind=0
@@ -1911,9 +1936,33 @@ mod tests {
         fn seven_day_sonnet_binding() {
             let now = base_now();
             let mut forecasts = vec![
-                compute_window_forecast("five_hour", 30.0, 90.0, now + Duration::hours(4), now, 1.0, false),
-                compute_window_forecast("seven_day", 30.0, 90.0, now + Duration::hours(100), now, 0.5, false),
-                compute_window_forecast("seven_day_sonnet", 85.0, 90.0, now + Duration::hours(50), now, 0.2, false),
+                compute_window_forecast(
+                    "five_hour",
+                    30.0,
+                    90.0,
+                    now + Duration::hours(4),
+                    now,
+                    1.0,
+                    false,
+                ),
+                compute_window_forecast(
+                    "seven_day",
+                    30.0,
+                    90.0,
+                    now + Duration::hours(100),
+                    now,
+                    0.5,
+                    false,
+                ),
+                compute_window_forecast(
+                    "seven_day_sonnet",
+                    85.0,
+                    90.0,
+                    now + Duration::hours(50),
+                    now,
+                    0.2,
+                    false,
+                ),
             ];
 
             find_binding_window(&mut forecasts, 1.0);
@@ -2040,7 +2089,11 @@ mod tests {
                 total_usd,
                 cache_eff: {
                     let total_input = input_n + r_cache_n;
-                    if total_input > 0 { r_cache_n as f64 / total_input as f64 } else { 0.0 }
+                    if total_input > 0 {
+                        r_cache_n as f64 / total_input as f64
+                    } else {
+                        0.0
+                    }
                 },
                 p5h: None,
                 p7d: None,
@@ -2052,7 +2105,17 @@ mod tests {
         fn serialization_has_correct_field_names() {
             // March 18 2026 is a Wednesday; 14:00 UTC = 10:00 ET (EDT, UTC-4)
             let t0 = ts("2026-03-18T14:00:00Z");
-            let rec = make_instance("sess-1", "claude-sonnet-4-20250514", 1000, 500, 200, 100, 50, 0.05, t0);
+            let rec = make_instance(
+                "sess-1",
+                "claude-sonnet-4-20250514",
+                1000,
+                500,
+                200,
+                100,
+                50,
+                0.05,
+                t0,
+            );
 
             let json = serde_json::to_value(&rec).unwrap();
             let obj = json.as_object().unwrap();
@@ -2060,7 +2123,10 @@ mod tests {
             assert_eq!(obj.get("r").unwrap().as_str().unwrap(), "i");
             assert_eq!(obj.get("sess").unwrap().as_str().unwrap(), "sess-1");
             assert_eq!(obj.get("sid").unwrap().as_str().unwrap(), "sess-1");
-            assert_eq!(obj.get("model").unwrap().as_str().unwrap(), "claude-sonnet-4-20250514");
+            assert_eq!(
+                obj.get("model").unwrap().as_str().unwrap(),
+                "claude-sonnet-4-20250514"
+            );
             assert_eq!(obj.get("pk").unwrap().as_u64().unwrap(), 1);
             assert_eq!(obj.get("hr_et").unwrap().as_u64().unwrap(), 10);
             assert_eq!(obj.get("dow").unwrap().as_u64().unwrap(), 2); // Wed
@@ -2172,20 +2238,18 @@ mod tests {
             let inst1 = make_instance("worker-a", "claude-sonnet-4-20250514", 1000, 0.05, t0);
             let inst2 = make_instance("worker-b", "claude-sonnet-4-20250514", 2000, 0.10, t0);
 
-            let fleet = aggregate_to_fleet(
-                &[inst1, inst2],
-                t1,
-                t0,
-                t1,
-                &all_models,
-            );
+            let fleet = aggregate_to_fleet(&[inst1, inst2], t1, t0, t1, &all_models);
 
             assert_eq!(fleet.workers, 2);
             assert_eq!(fleet.pk, 1);
             assert!((fleet.total_usd - 0.15).abs() < 1e-9);
 
             // Per-model columns should sum
-            let sonnet_tok = fleet.model_data.iter().find(|(m, _)| m == "claude-sonnet-4-20250514").unwrap();
+            let sonnet_tok = fleet
+                .model_data
+                .iter()
+                .find(|(m, _)| m == "claude-sonnet-4-20250514")
+                .unwrap();
             assert_eq!(sonnet_tok.1.input_n, 3000); // 1000 + 2000
         }
 
@@ -2200,13 +2264,7 @@ mod tests {
             let inst2 = make_instance("b", "claude-sonnet-4-20250514", 100, 2.0, t0);
             let inst3 = make_instance("c", "claude-sonnet-4-20250514", 100, 3.0, t0);
 
-            let fleet = aggregate_to_fleet(
-                &[inst1, inst2, inst3],
-                t1,
-                t0,
-                t1,
-                &all_models,
-            );
+            let fleet = aggregate_to_fleet(&[inst1, inst2, inst3], t1, t0, t1, &all_models);
 
             // p75 nearest-rank: n=3, ceil(3*0.75)-1 = ceil(2.25)-1 = 3-1 = 2 → rates[2] = 3.0
             assert_eq!(fleet.p75_usd_hr, 3.0);
@@ -2242,15 +2300,45 @@ mod tests {
             let obj = json.as_object().unwrap();
 
             // Opus should have zero-filled columns
-            assert_eq!(obj.get("claude-opus-4-20250514-input-n").unwrap().as_u64().unwrap(), 0);
-            assert_eq!(obj.get("claude-opus-4-20250514-input-usd").unwrap().as_f64().unwrap(), 0.0);
-            assert_eq!(obj.get("claude-opus-4-20250514-output-n").unwrap().as_u64().unwrap(), 0);
+            assert_eq!(
+                obj.get("claude-opus-4-20250514-input-n")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                obj.get("claude-opus-4-20250514-input-usd")
+                    .unwrap()
+                    .as_f64()
+                    .unwrap(),
+                0.0
+            );
+            assert_eq!(
+                obj.get("claude-opus-4-20250514-output-n")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+                0
+            );
 
             // Haiku should also be zero-filled
-            assert_eq!(obj.get("claude-haiku-4-5-20251001-input-n").unwrap().as_u64().unwrap(), 0);
+            assert_eq!(
+                obj.get("claude-haiku-4-5-20251001-input-n")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+                0
+            );
 
             // Sonnet should have actual data
-            assert_eq!(obj.get("claude-sonnet-4-20250514-input-n").unwrap().as_u64().unwrap(), 500);
+            assert_eq!(
+                obj.get("claude-sonnet-4-20250514-input-n")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+                500
+            );
         }
 
         #[test]
@@ -2408,7 +2496,11 @@ mod tests {
         #[test]
         fn creates_parent_directories() {
             let temp_dir = TempDir::new().unwrap();
-            let path = temp_dir.path().join("nested").join("dir").join("test.jsonl");
+            let path = temp_dir
+                .path()
+                .join("nested")
+                .join("dir")
+                .join("test.jsonl");
 
             let records = vec![serde_json::json!({"r": "i"})];
             append_jsonl(&path, &records).unwrap();

@@ -15,11 +15,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::alerts::{check_alert_conditions, check_low_cache_efficiency, should_fire, update_cooldown, fire_alert, SprintTrigger};
-use crate::burn_rate::{log_capacity_forecast, generate_window_forecast, compute_composite_safe_workers};
+use crate::alerts::{
+    check_alert_conditions, check_low_cache_efficiency, fire_alert, should_fire, update_cooldown,
+    SprintTrigger,
+};
+use crate::burn_rate::{
+    compute_composite_safe_workers, generate_window_forecast, log_capacity_forecast,
+};
 use crate::calibrator;
 use crate::collector;
-use crate::config::{AgentConfig, AlertConfig, ConeScalingConfig, SprintConfig, CompositeRiskConfig};
+use crate::config::{
+    AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, SprintConfig,
+};
 use crate::db;
 use crate::poller::Poller;
 use crate::schedule::{self, Promotion};
@@ -68,11 +75,7 @@ impl UsageSnapshot {
     }
 
     /// Create a snapshot from individual window values
-    pub fn from_windows(
-        five_hour: f64,
-        seven_day: f64,
-        seven_day_sonnet: f64,
-    ) -> Self {
+    pub fn from_windows(five_hour: f64, seven_day: f64, seven_day_sonnet: f64) -> Self {
         let mut windows = HashMap::new();
         windows.insert(WINDOW_FIVE_HOUR.to_string(), five_hour);
         windows.insert(WINDOW_SEVEN_DAY.to_string(), seven_day);
@@ -325,7 +328,10 @@ impl GovernorState {
 
         log::info!(
             "[sprint] Applied: boosting {} from {} to {} workers (window: {})",
-            trigger.worker_id, original_workers, trigger.target_workers, trigger.window
+            trigger.worker_id,
+            original_workers,
+            trigger.target_workers,
+            trigger.window
         );
     }
 
@@ -338,7 +344,8 @@ impl GovernorState {
                 agent.workers = sprint.original_workers;
                 log::info!(
                     "[sprint] Cleared: restored {} to {} workers",
-                    sprint.worker_id, sprint.original_workers
+                    sprint.worker_id,
+                    sprint.original_workers
                 );
             } else {
                 log::info!(
@@ -357,7 +364,11 @@ impl GovernorState {
     /// Sprint ends when:
     /// - Usage exceeds the underutilization threshold (sprint achieved its goal), OR
     /// - The triggering window has reset (hours_remaining jumped significantly)
-    pub fn check_sprint_end(&mut self, usage: &UsageSnapshot, sprint_config: &SprintConfig) -> bool {
+    pub fn check_sprint_end(
+        &mut self,
+        usage: &UsageSnapshot,
+        sprint_config: &SprintConfig,
+    ) -> bool {
         let sprint = match &self.sprint {
             Some(s) => s.clone(),
             None => return false,
@@ -370,7 +381,9 @@ impl GovernorState {
             if util >= sprint_config.underutilization_threshold_pct {
                 log::info!(
                     "[sprint] Sprint ended: {} utilization reached {:.1}% (threshold: {:.1}%)",
-                    sprint.window, util, sprint_config.underutilization_threshold_pct
+                    sprint.window,
+                    util,
+                    sprint_config.underutilization_threshold_pct
                 );
                 return self.clear_sprint();
             }
@@ -417,7 +430,9 @@ impl GovernorState {
         if window_ctx.hours_remaining > horizon_hours {
             log::debug!(
                 "[sprint] Blocked: window {} resets in {:.1}h (horizon: {:.1}h)",
-                window_ctx.name, window_ctx.hours_remaining, horizon_hours
+                window_ctx.name,
+                window_ctx.hours_remaining,
+                horizon_hours
             );
             return false;
         }
@@ -426,14 +441,19 @@ impl GovernorState {
         if window_ctx.headroom_pct <= config.min_headroom_pct {
             log::debug!(
                 "[sprint] Blocked: window {} headroom {:.1}% <= min {:.1}%",
-                window_ctx.name, window_ctx.headroom_pct, config.min_headroom_pct
+                window_ctx.name,
+                window_ctx.headroom_pct,
+                config.min_headroom_pct
             );
             return false;
         }
 
         // Check for backlog
         if !window_ctx.has_backlog {
-            log::debug!("[sprint] Blocked: no backlog for window {}", window_ctx.name);
+            log::debug!(
+                "[sprint] Blocked: no backlog for window {}",
+                window_ctx.name
+            );
             return false;
         }
 
@@ -453,7 +473,8 @@ impl GovernorState {
             if cone_ratio > config.max_cone_ratio {
                 log::debug!(
                     "[sprint] Blocked: cone ratio {:.2} > max {:.2}",
-                    cone_ratio, config.max_cone_ratio
+                    cone_ratio,
+                    config.max_cone_ratio
                 );
                 return false;
             }
@@ -495,7 +516,8 @@ impl GovernorState {
         if window_ctx.headroom_pct < config.sprint_end_headroom_pct {
             log::info!(
                 "[sprint] End-of-window sprint ended: headroom {:.1}% < {:.1}%",
-                window_ctx.headroom_pct, config.sprint_end_headroom_pct
+                window_ctx.headroom_pct,
+                config.sprint_end_headroom_pct
             );
             return self.clear_sprint();
         }
@@ -527,7 +549,9 @@ impl GovernorState {
                 let effective = boosted.min(cap);
                 log::debug!(
                     "[sprint] effective_max: {} (boosted: {}, cap: {})",
-                    effective, boosted, cap
+                    effective,
+                    boosted,
+                    cap
                 );
                 effective
             }
@@ -636,7 +660,9 @@ pub fn compute_target_workers(
         if win.current_utilization >= EMERGENCY_BRAKE_THRESHOLD {
             log::warn!(
                 "[governor] EMERGENCY BRAKE: {} at {:.1}% >= {:.0}%",
-                _name, win.current_utilization, EMERGENCY_BRAKE_THRESHOLD
+                _name,
+                win.current_utilization,
+                EMERGENCY_BRAKE_THRESHOLD
             );
             return 0;
         }
@@ -742,10 +768,7 @@ pub fn apply_scaling(
 ) -> ScalingDecision {
     // Emergency brake: target is 0
     if target == 0 && current > 0 {
-        log::warn!(
-            "[governor] EMERGENCY: scaling {} -> 0 workers",
-            current
-        );
+        log::warn!("[governor] EMERGENCY: scaling {} -> 0 workers", current);
         return ScalingDecision::EmergencyBrake;
     }
 
@@ -755,7 +778,10 @@ pub fn apply_scaling(
     if delta.abs() <= hysteresis {
         log::debug!(
             "[governor] hysteresis: |{} - {}| = {} <= {:.1}, no change",
-            target, current, delta.abs(), hysteresis_band
+            target,
+            current,
+            delta.abs(),
+            hysteresis_band
         );
         return ScalingDecision::NoChange;
     }
@@ -764,7 +790,9 @@ pub fn apply_scaling(
         let scale = (delta as u32).min(max_up_per_cycle);
         log::info!(
             "[governor] scale UP: {} -> {} (+{})",
-            current, current + scale, scale
+            current,
+            current + scale,
+            scale
         );
         return ScalingDecision::ScaleUp(scale);
     }
@@ -773,7 +801,9 @@ pub fn apply_scaling(
     let scale = (delta.abs() as u32).min(max_down_per_cycle);
     log::info!(
         "[governor] scale DOWN: {} -> {} (-{})",
-        current, current - scale, scale
+        current,
+        current - scale,
+        scale
     );
     ScalingDecision::ScaleDown(scale)
 }
@@ -977,10 +1007,7 @@ pub fn run_governor_cycle(
             state.token_refresh_failing = usage_data.stale;
         }
         Err(e) => {
-            log::warn!(
-                "[governor] poll failed, keeping previous usage data: {}",
-                e
-            );
+            log::warn!("[governor] poll failed, keeping previous usage data: {}", e);
         }
     }
 
@@ -1011,17 +1038,44 @@ pub fn run_governor_cycle(
                 ) {
                     let t0: DateTime<Utc> = t0_str.parse().unwrap_or_else(|_| now);
                     let t1: DateTime<Utc> = t1_str.parse().unwrap_or_else(|_| now);
-                    let workers = fleet_json.get("workers").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let total_usd = fleet_json.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p75_usd_hr = fleet_json.get("p75-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let std_usd_hr = fleet_json.get("std-usd-hr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let workers = fleet_json
+                        .get("workers")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let total_usd = fleet_json
+                        .get("total-usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p75_usd_hr = fleet_json
+                        .get("p75-usd-hr")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let std_usd_hr = fleet_json
+                        .get("std-usd-hr")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
 
                     // Extract window percentage deltas
-                    let p5h = fleet_json.get("p5h").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p7d = fleet_json.get("p7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p7ds = fleet_json.get("p7ds").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let fleet_cache_eff = fleet_json.get("fleet-cache-eff").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let cache_eff_p25 = fleet_json.get("cache-eff-p25").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p5h = fleet_json
+                        .get("p5h")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p7d = fleet_json
+                        .get("p7d")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p7ds = fleet_json
+                        .get("p7ds")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let fleet_cache_eff = fleet_json
+                        .get("fleet-cache-eff")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let cache_eff_p25 = fleet_json
+                        .get("cache-eff-p25")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
 
                     state.last_fleet_aggregate = state::FleetAggregate {
                         t0,
@@ -1043,7 +1097,8 @@ pub fn run_governor_cycle(
                     // Only count intervals where workers > 0 to avoid spurious counts
                     // during idle periods when cache efficiency is meaningless.
                     if workers > 0 && fleet_cache_eff < alert_config.low_cache_eff_threshold {
-                        state.low_cache_eff_consecutive = state.low_cache_eff_consecutive.saturating_add(1);
+                        state.low_cache_eff_consecutive =
+                            state.low_cache_eff_consecutive.saturating_add(1);
                     } else {
                         state.low_cache_eff_consecutive = 0;
                     }
@@ -1169,16 +1224,16 @@ pub fn run_governor_cycle(
                         if samples == 0 {
                             state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
                         } else {
-                            state.burn_rate.fleet_pct_hr_ema.five_hour =
-                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
+                            state.burn_rate.fleet_pct_hr_ema.five_hour = EMA_ALPHA * rate
+                                + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
                         }
                         if fleet_usd_hr > 0.0 {
                             let ratio = fleet_usd_hr / rate;
                             if samples == 0 {
                                 state.burn_rate.usd_per_pct_ema_five_hour = ratio;
                             } else {
-                                state.burn_rate.usd_per_pct_ema_five_hour =
-                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
+                                state.burn_rate.usd_per_pct_ema_five_hour = EMA_ALPHA * ratio
+                                    + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
                             }
                         }
                         updated_any = true;
@@ -1189,16 +1244,16 @@ pub fn run_governor_cycle(
                         if samples == 0 {
                             state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
                         } else {
-                            state.burn_rate.fleet_pct_hr_ema.seven_day =
-                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
+                            state.burn_rate.fleet_pct_hr_ema.seven_day = EMA_ALPHA * rate
+                                + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
                         }
                         if fleet_usd_hr > 0.0 {
                             let ratio = fleet_usd_hr / rate;
                             if samples == 0 {
                                 state.burn_rate.usd_per_pct_ema_seven_day = ratio;
                             } else {
-                                state.burn_rate.usd_per_pct_ema_seven_day =
-                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day;
+                                state.burn_rate.usd_per_pct_ema_seven_day = EMA_ALPHA * ratio
+                                    + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day;
                             }
                         }
                         updated_any = true;
@@ -1209,16 +1264,19 @@ pub fn run_governor_cycle(
                         if samples == 0 {
                             state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet = rate;
                         } else {
-                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet =
-                                EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet;
+                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet = EMA_ALPHA * rate
+                                + (1.0 - EMA_ALPHA)
+                                    * state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet;
                         }
                         if fleet_usd_hr > 0.0 {
                             let ratio = fleet_usd_hr / rate;
                             if samples == 0 {
                                 state.burn_rate.usd_per_pct_ema_seven_day_sonnet = ratio;
                             } else {
-                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet =
-                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day_sonnet;
+                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet = EMA_ALPHA
+                                    * ratio
+                                    + (1.0 - EMA_ALPHA)
+                                        * state.burn_rate.usd_per_pct_ema_seven_day_sonnet;
                             }
                         }
                         updated_any = true;
@@ -1232,7 +1290,10 @@ pub fn run_governor_cycle(
                     log::debug!(
                         "[governor] API delta in {:.0}s: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
                          → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
-                        elapsed_secs, delta_5h, delta_7d, delta_7ds,
+                        elapsed_secs,
+                        delta_5h,
+                        delta_7d,
+                        delta_7ds,
                         state.burn_rate.fleet_pct_hr_ema.five_hour,
                         state.burn_rate.fleet_pct_hr_ema.seven_day,
                         state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet,
@@ -1252,7 +1313,8 @@ pub fn run_governor_cycle(
     }
 
     let elapsed_hours = if state.last_fleet_aggregate.t0 != state.last_fleet_aggregate.t1 {
-        (state.last_fleet_aggregate.t1 - state.last_fleet_aggregate.t0).num_seconds() as f64 / 3600.0
+        (state.last_fleet_aggregate.t1 - state.last_fleet_aggregate.t0).num_seconds() as f64
+            / 3600.0
     } else {
         0.0
     };
@@ -1275,7 +1337,12 @@ pub fn run_governor_cycle(
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
         hours_remaining.insert(
             "seven_day_sonnet".to_string(),
-            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day_sonnet"),
+            schedule::effective_hours_remaining_from(
+                now,
+                reset_time,
+                promotions,
+                "seven_day_sonnet",
+            ),
         );
         // Approximate seven_day reset time as same as seven_day_sonnet
         hours_remaining.insert(
@@ -1332,7 +1399,10 @@ pub fn run_governor_cycle(
         );
         map.insert(
             "seven_day_sonnet".to_string(),
-            rate_for(ema.seven_day_sonnet, state.burn_rate.usd_per_pct_ema_seven_day_sonnet),
+            rate_for(
+                ema.seven_day_sonnet,
+                state.burn_rate.usd_per_pct_ema_seven_day_sonnet,
+            ),
         );
 
         if samples == 0 && fleet_usd_hr > 0.0 {
@@ -1340,8 +1410,11 @@ pub fn run_governor_cycle(
                 "[governor] fleet_pct_hr: baseline dollar fallback active \
                  (fleet_usd_hr={:.4}/hr, usd_per_pct={:.3}) → \
                  5h={:.4} 7d={:.4} 7ds={:.4} pct/hr",
-                fleet_usd_hr, BASELINE_USD_PER_PCT,
-                map["five_hour"], map["seven_day"], map["seven_day_sonnet"],
+                fleet_usd_hr,
+                BASELINE_USD_PER_PCT,
+                map["five_hour"],
+                map["seven_day"],
+                map["seven_day_sonnet"],
             );
         }
 
@@ -1373,7 +1446,8 @@ pub fn run_governor_cycle(
         let reduced = target_ceiling - SAFE_MODE_CEILING_REDUCTION;
         log::info!(
             "[governor] safe_mode active: target_ceiling {:.0}% → {:.0}%",
-            target_ceiling, reduced
+            target_ceiling,
+            reduced
         );
         reduced.max(50.0) // never below 50%
     } else {
@@ -1384,7 +1458,8 @@ pub fn run_governor_cycle(
         let widened = hysteresis_band * SAFE_MODE_HYSTERESIS_MULTIPLIER;
         log::info!(
             "[governor] safe_mode active: hysteresis_band {:.1} → {:.1}",
-            hysteresis_band, widened
+            hysteresis_band,
+            widened
         );
         widened.min(10.0) // cap at 10 pct points
     } else {
@@ -1442,7 +1517,11 @@ pub fn run_governor_cycle(
             "seven_day_sonnet" => state.burn_rate.usd_per_pct_ema_seven_day_sonnet,
             _ => 0.0,
         };
-        let effective_usd_per_pct = if usd_per_pct > 0.0 { usd_per_pct } else { BASELINE_USD_PER_PCT };
+        let effective_usd_per_pct = if usd_per_pct > 0.0 {
+            usd_per_pct
+        } else {
+            BASELINE_USD_PER_PCT
+        };
         let std_pct_hr = state.last_fleet_aggregate.sonnet_std_usd_hr / effective_usd_per_pct;
 
         let forecast = generate_window_forecast(
@@ -1463,7 +1542,9 @@ pub fn run_governor_cycle(
         }
     }
 
-    // Identify binding window (most negative margin_hrs)
+    // Identify binding window (highest risk_score)
+    // The risk_score combines margin urgency, duration weight, and volatility (cone_ratio).
+    // Higher risk_score = more urgent window that should drive scaling decisions.
     let windows = [
         ("five_hour", &five_hour_forecast),
         ("seven_day", &seven_day_forecast),
@@ -1472,8 +1553,10 @@ pub fn run_governor_cycle(
 
     let binding_window = windows
         .iter()
-        .min_by(|(_, a), (_, b)| {
-            a.margin_hrs.partial_cmp(&b.margin_hrs).unwrap_or(std::cmp::Ordering::Equal)
+        .max_by(|(_, a), (_, b)| {
+            a.risk_score
+                .partial_cmp(&b.risk_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(name, _)| name.to_string())
         .unwrap_or_default();
@@ -1505,7 +1588,10 @@ pub fn run_governor_cycle(
     let mult_seven_day_sonnet = schedule::get_multiplier_at(now, promotions, "seven_day_sonnet");
     let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
     let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);
-    let eff_seven_day_sonnet = hours_remaining.get("seven_day_sonnet").copied().unwrap_or(0.0);
+    let eff_seven_day_sonnet = hours_remaining
+        .get("seven_day_sonnet")
+        .copied()
+        .unwrap_or(0.0);
     // Effective hours for display: use the binding window's value
     let eff_display = match binding_window.as_str() {
         "five_hour" => eff_five_hour,
@@ -1543,11 +1629,15 @@ pub fn run_governor_cycle(
         let total_pct_delta = deltas.five_hour + deltas.seven_day + deltas.seven_day_sonnet;
         let avg_pct_per_hour = total_pct_delta / (elapsed_hours * 3.0); // Average across windows
 
-        let entry = state.burn_rate.by_model.entry("claude-sonnet-4-20250514".to_string()).or_insert(state::ModelBurnRate {
-            pct_per_worker_per_hour: 0.0,
-            dollars_per_worker_per_hour: 0.0,
-            samples: 0,
-        });
+        let entry = state
+            .burn_rate
+            .by_model
+            .entry("claude-sonnet-4-20250514".to_string())
+            .or_insert(state::ModelBurnRate {
+                pct_per_worker_per_hour: 0.0,
+                dollars_per_worker_per_hour: 0.0,
+                samples: 0,
+            });
 
         // Compute per-worker rates
         let pct_per_worker = avg_pct_per_hour / current_total as f64;
@@ -1563,11 +1653,21 @@ pub fn run_governor_cycle(
     log_capacity_forecast(&state.capacity_forecast);
 
     // 4. Compute target workers
-    let target = compute_target_workers(&state, effective_target_ceiling, effective_composite_risk, effective_cone_scaling);
+    let target = compute_target_workers(
+        &state,
+        effective_target_ceiling,
+        effective_composite_risk,
+        effective_cone_scaling,
+    );
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%{})",
-        target, effective_target_ceiling,
-        if state.safe_mode.active { ", safe_mode" } else { "" }
+        target,
+        effective_target_ceiling,
+        if state.safe_mode.active {
+            ", safe_mode"
+        } else {
+            ""
+        }
     );
 
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
@@ -1580,7 +1680,15 @@ pub fn run_governor_cycle(
         .parse::<DateTime<Utc>>()
         .ok()
         .and_then(|reset_time| {
-            compute_pre_scale_target(now, pre_scale_minutes, promotions, reset_time, target, current_total, "seven_day_sonnet")
+            compute_pre_scale_target(
+                now,
+                pre_scale_minutes,
+                promotions,
+                reset_time,
+                target,
+                current_total,
+                "seven_day_sonnet",
+            )
         });
 
     // Use pre-scale target if set, otherwise use normal target
@@ -1633,10 +1741,7 @@ pub fn run_governor_cycle(
                         .args(["kill-session", "-t", session])
                         .output();
                 }
-                log::warn!(
-                    "[governor] killed {} worker sessions",
-                    all_sessions.len()
-                );
+                log::warn!("[governor] killed {} worker sessions", all_sessions.len());
 
                 // Update state
                 for ws in state.workers.values_mut() {
@@ -1715,7 +1820,8 @@ pub fn run_governor_cycle(
 
     log::info!(
         "[governor] === cycle complete (decision: {:?}, next in {}s) ===",
-        decision, loop_interval
+        decision,
+        loop_interval
     );
 
     Ok(())
@@ -1751,7 +1857,10 @@ pub fn run_daemon(
 
     log::info!(
         "[governor] daemon started (dry_run={}, interval={}s, hysteresis={:.1}, ceiling={:.0}%)",
-        dry_run, loop_interval, hysteresis_band, target_ceiling
+        dry_run,
+        loop_interval,
+        hysteresis_band,
+        target_ceiling
     );
 
     // Create poller for live usage data (persists across cycles for stale-data fallback)
@@ -2214,10 +2323,18 @@ mod tests {
         let now = et(2026, 3, 16, 7, 35);
         let reset_time = now + chrono::Duration::days(2); // well past transition
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+        let result =
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
-        assert!(result.is_some(), "pre-scale should trigger at 07:35 before 08:00 transition");
-        assert_eq!(result.unwrap(), 3, "should ramp down one worker (4→3, toward post-target 2)");
+        assert!(
+            result.is_some(),
+            "pre-scale should trigger at 07:35 before 08:00 transition"
+        );
+        assert_eq!(
+            result.unwrap(),
+            3,
+            "should ramp down one worker (4→3, toward post-target 2)"
+        );
     }
 
     #[test]
@@ -2227,9 +2344,13 @@ mod tests {
         let now = et(2026, 3, 16, 6, 0);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+        let result =
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
-        assert!(result.is_none(), "should not pre-scale when transition is 120 min away");
+        assert!(
+            result.is_none(),
+            "should not pre-scale when transition is 120 min away"
+        );
     }
 
     #[test]
@@ -2240,9 +2361,13 @@ mod tests {
         let now = et(2026, 3, 16, 13, 45);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+        let result =
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
 
-        assert!(result.is_none(), "should not pre-scale when gaining a bonus");
+        assert!(
+            result.is_none(),
+            "should not pre-scale when gaining a bonus"
+        );
     }
 
     #[test]
@@ -2256,14 +2381,19 @@ mod tests {
         // Let's test with current_total=1: post_target=floor(1*0.5)=0, effective=max(0,0)=0
         // Actually: post_target=0 < current_total=1, so effective_target = max(0, 0) = 0
         // Let's use current_total=2, target=2: post_target=1, effective=max(1,1)=1
-        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "seven_day_sonnet");
+        let result =
+            compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "seven_day_sonnet");
         // post_target = floor(2 * 0.5) = 1, effective = max(1, 2-1) = max(1,1) = 1
         assert_eq!(result, Some(1));
 
         // Now test where current_total already equals post_transition_target: no trigger
-        let result_at_target = compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0, "seven_day_sonnet");
+        let result_at_target =
+            compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0, "seven_day_sonnet");
         // post_target = 0, current_total = 0: post_target >= current_total → None
-        assert!(result_at_target.is_none(), "no pre-scale needed if already at 0");
+        assert!(
+            result_at_target.is_none(),
+            "no pre-scale needed if already at 0"
+        );
     }
 
     #[test]
@@ -2273,8 +2403,12 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2);
 
         // pre_scale_minutes = 0 disables pre-scaling entirely
-        let result = compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "seven_day_sonnet");
-        assert!(result.is_none(), "pre_scale_minutes=0 should disable pre-scaling");
+        let result =
+            compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "seven_day_sonnet");
+        assert!(
+            result.is_none(),
+            "pre_scale_minutes=0 should disable pre-scaling"
+        );
     }
 
     #[test]
@@ -2358,7 +2492,11 @@ mod tests {
 
     // --- Safe mode calibration tests ---
 
-    fn make_cal_stats(median_error: f64, total_samples: u32, median_error_7ds: f64) -> calibrator::CalibrationStats {
+    fn make_cal_stats(
+        median_error: f64,
+        total_samples: u32,
+        median_error_7ds: f64,
+    ) -> calibrator::CalibrationStats {
         calibrator::CalibrationStats {
             total_samples,
             median_error,
@@ -2375,7 +2513,8 @@ mod tests {
         let stats = make_cal_stats(16.0, 5, 14.0);
         let now = Utc::now();
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(changed, "should return true when entering safe mode");
         assert!(safe_mode.active);
@@ -2393,7 +2532,8 @@ mod tests {
         let stats = make_cal_stats(14.0, 5, 12.0);
         let now = Utc::now();
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(!changed);
         assert!(!safe_mode.active);
@@ -2407,7 +2547,8 @@ mod tests {
         let stats = make_cal_stats(20.0, 4, 18.0);
         let now = Utc::now();
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(!changed);
         assert!(!safe_mode.active);
@@ -2428,7 +2569,8 @@ mod tests {
         // median_error=7 < exit_threshold=8, total_samples=8 → predictions_since_entry=8-5=3 >= min=3
         let stats = make_cal_stats(7.0, 8, 6.0);
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(changed, "should return true when exiting safe mode");
         assert!(!safe_mode.active, "safe mode should be inactive after exit");
@@ -2449,7 +2591,8 @@ mod tests {
         // median_error=7 < exit_threshold=8, but total_samples=7 → 7-5=2 < min=3
         let stats = make_cal_stats(7.0, 7, 6.0);
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(!changed);
         assert!(safe_mode.active, "safe mode should remain active");
@@ -2471,7 +2614,8 @@ mod tests {
         // median_error=9 > exit_threshold=8 — accuracy not recovered enough
         let stats = make_cal_stats(9.0, 8, 8.0);
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(!changed);
         assert!(safe_mode.active, "safe mode should remain active");
@@ -2498,7 +2642,8 @@ mod tests {
         let stats = make_cal_stats(-17.0, 5, -15.0);
         let now = Utc::now();
 
-        let changed = update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
 
         assert!(changed);
         assert!(safe_mode.active);
@@ -2532,11 +2677,11 @@ mod tests {
         let forecast = generate_window_forecast(
             "seven_day_sonnet",
             estimated_pct_hr,
-            50.0,  // current utilization
-            90.0,  // target ceiling
-            24.0,  // hours remaining
+            50.0,                   // current utilization
+            90.0,                   // target ceiling
+            24.0,                   // hours remaining
             estimated_pct_hr / 2.0, // mean per-worker (half fleet for 2 workers)
-            0.0,   // std_pct_hr (no spread data in this test)
+            0.0,                    // std_pct_hr (no spread data in this test)
         );
 
         assert!(
@@ -2576,7 +2721,12 @@ mod tests {
         let mut state = state::GovernorState::new();
         state.workers.insert(
             "w1".to_string(),
-            state::WorkerState { current: 2, target: 2, min: 1, max: 6 },
+            state::WorkerState {
+                current: 2,
+                target: 2,
+                min: 1,
+                max: 6,
+            },
         );
         state.capacity_forecast.binding_window = "seven_day_sonnet".to_string();
         // Leave safe_worker_count as None (default)
@@ -2584,11 +2734,17 @@ mod tests {
         let target = compute_target_workers(
             &state,
             90.0,
-            &CompositeRiskConfig { enabled: false, ..Default::default() },
+            &CompositeRiskConfig {
+                enabled: false,
+                ..Default::default()
+            },
             &ConeScalingConfig::default(),
         );
 
         // Should be global_max (6), clamped to [min=1, max=6]
-        assert_eq!(target, 6, "expected fallback to max_workers=6 when safe_worker_count is None");
+        assert_eq!(
+            target, 6,
+            "expected fallback to max_workers=6 when safe_worker_count is None"
+        );
     }
 }

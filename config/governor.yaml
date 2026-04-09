@@ -129,3 +129,19 @@ agents:
 # Controls the governor's scaling behavior
 daemon:
   pre_scale_minutes: 30             # Look-ahead for multiplier transitions (0 = disabled)
+  loop_interval_secs: 300           # Polling interval in seconds (5 min)
+  hysteresis_band: 1.0              # Scaling hysteresis band
+  max_scale_up_per_cycle: 1         # Max workers to scale up per cycle
+  max_scale_down_per_cycle: 1       # Max workers to scale down per cycle
+  min_scale_interval_secs: 60       # Minimum time between scale operations
+  target_ceiling: 90.0              # Target utilization ceiling percentage
+  mode: auto                        # Daemon mode: auto, systemd, or tmux
+
+# Alert configuration
+# Controls alert firing and cooldown behavior
+alerts:
+  enabled: true                     # Enable/disable alerts
+  cooldown_minutes: 60              # Cooldown period between repeated alerts
+  min_severity: warning             # Minimum severity level: info, warning, critical
+  low_cache_eff_threshold: 0.30     # Fleet cache efficiency below this fraction triggers alert (30%)
+  low_cache_eff_intervals: 5        # Number of consecutive intervals below threshold before alerting

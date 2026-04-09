@@ -338,7 +338,11 @@ fn format_human(data: &UsageData) -> String {
         data.seven_day_sonnet_utilization,
         data.seven_day_sonnet_resets_at,
         data.seven_day_sonnet_hours_remaining,
-        if data.stale { "STALE (auth errors)" } else { "OK" }
+        if data.stale {
+            "STALE (auth errors)"
+        } else {
+            "OK"
+        }
     )
 }
 
@@ -408,7 +412,11 @@ fn format_forecast_human(state: &GovernorState) -> String {
 
     for (name, win) in windows {
         let binding = if win.binding { " [BINDING]" } else { "" };
-        let cutoff = if win.cutoff_risk { " ⚠️ CUTOFF RISK" } else { "" };
+        let cutoff = if win.cutoff_risk {
+            " ⚠️ CUTOFF RISK"
+        } else {
+            ""
+        };
         output.push_str(&format!(
             "{}{}\n  Utilization: {:.1}% / {:.0}% ceiling\n  Remaining: {:.1}% ({:.1}h)\n  Burn Rate: {:.2}%/hr\n  Exhaustion: {:.1}h {}\n  Margin: {:.1}h\n\n",
             name,
@@ -525,7 +533,9 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
 
     // Check if safe mode is active
     if state.safe_mode.active {
-        log::warn!("Scale command issued during safe mode - this may be overridden by emergency brake");
+        log::warn!(
+            "Scale command issued during safe mode - this may be overridden by emergency brake"
+        );
     }
 
     // Validate count against worker limits
@@ -544,10 +554,7 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     if dry_run {
         println!("DRY RUN: Would set target worker count to {}", count);
         for (agent_id, worker) in &state.workers {
-            println!(
-                "  Agent {}: {} -> {}",
-                agent_id, worker.target, count
-            );
+            println!("  Agent {}: {} -> {}", agent_id, worker.target, count);
         }
         return Ok(());
     }
@@ -616,9 +623,7 @@ fn run_config_command(edit: bool) -> Result<()> {
     if edit {
         // Open in editor
         let editor = env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
-        let status = Command::new(&editor)
-            .arg(&config_path)
-            .status()?;
+        let status = Command::new(&editor).arg(&config_path).status()?;
 
         if !status.success() {
             anyhow::bail!("Editor exited with error");
@@ -704,16 +709,25 @@ fn run_version_command() -> Result<()> {
     println!("  Mode:      {}", detected_daemon_mode_string());
     println!();
     println!("Build Info:");
-    println!("  Target:    {}", option_env!("TARGET").unwrap_or("unknown"));
-    println!("  Profile:   {}", option_env!("PROFILE").unwrap_or("unknown"));
-    println!("  Rust:      {}", option_env!("RUSTC_VERSION").unwrap_or("unknown"));
+    println!(
+        "  Target:    {}",
+        option_env!("TARGET").unwrap_or("unknown")
+    );
+    println!(
+        "  Profile:   {}",
+        option_env!("PROFILE").unwrap_or("unknown")
+    );
+    println!(
+        "  Rust:      {}",
+        option_env!("RUSTC_VERSION").unwrap_or("unknown")
+    );
 
     Ok(())
 }
 
 fn run_explain_command(last: usize, json: bool) -> Result<()> {
-    let decisions = narrator::read_last_decisions(last)
-        .with_context(|| "Failed to read decision log")?;
+    let decisions =
+        narrator::read_last_decisions(last).with_context(|| "Failed to read decision log")?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&decisions)?);
@@ -750,8 +764,7 @@ fn run_simulate_command(workers: &str, hours: f64, resolution: i64, json: bool) 
     let state = state::load_state(&state_path)?;
 
     // Parse worker schedule
-    let mut config = SimConfig::parse_workers(workers)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut config = SimConfig::parse_workers(workers).map_err(|e| anyhow::anyhow!("{}", e))?;
     config.hours = hours;
     config.resolution_minutes = resolution;
 
@@ -760,8 +773,8 @@ fn run_simulate_command(workers: &str, hours: f64, resolution: i64, json: bool) 
     let promotions = schedule::load_promotions(&promo_path);
 
     // Run simulation (read-only)
-    let trajectory = simulator::simulate(&state, &config, promotions)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let trajectory =
+        simulator::simulate(&state, &config, promotions).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let output = if json {
         serde_json::to_string_pretty(&trajectory).map_err(|e| anyhow::anyhow!("{}", e))?
@@ -800,7 +813,10 @@ fn run_token_history_command(
         if json {
             println!("{}", serde_json::to_string_pretty(&results)?);
         } else {
-            println!("{:<30} {:<30} {:>10} {:>10} {:>10}", "session", "model", "total_usd", "usd/hr", "usd/%7ds");
+            println!(
+                "{:<30} {:<30} {:>10} {:>10} {:>10}",
+                "session", "model", "total_usd", "usd/hr", "usd/%7ds"
+            );
             println!("{}", "-".repeat(95));
             for r in &results {
                 let usd_pct = match r.get("usd_per_pct_7ds") {
@@ -850,7 +866,10 @@ fn run_token_history_command(
         if results.is_empty() {
             println!("No instance records found. Run `cgov collect` to populate.");
         } else {
-            println!("{:<32} {:<30} {:>10} {:>8} {:>8}", "ts", "model", "total_usd", "in_tok", "out_tok");
+            println!(
+                "{:<32} {:<30} {:>10} {:>8} {:>8}",
+                "ts", "model", "total_usd", "in_tok", "out_tok"
+            );
             println!("{}", "-".repeat(94));
             for r in &results {
                 let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
@@ -858,7 +877,10 @@ fn run_token_history_command(
                 let usd = r.get("total-usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let in_n = r.get("input-n").and_then(|v| v.as_i64()).unwrap_or(0);
                 let out_n = r.get("output-n").and_then(|v| v.as_i64()).unwrap_or(0);
-                println!("{:<32} {:<30} {:>10.4} {:>8} {:>8}", ts, model, usd, in_n, out_n);
+                println!(
+                    "{:<32} {:<30} {:>10.4} {:>8} {:>8}",
+                    ts, model, usd, in_n, out_n
+                );
             }
         }
     }
@@ -875,12 +897,13 @@ fn main() -> Result<()> {
     } else {
         LevelFilter::Info
     };
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .init();
+    env_logger::Builder::new().filter_level(log_level).init();
 
     match cli.command {
-        Commands::Poll { format, fail_on_stale } => {
+        Commands::Poll {
+            format,
+            fail_on_stale,
+        } => {
             run_poll_command(&format, fail_on_stale)?;
         }
         Commands::Forecast { json } => {
@@ -1073,7 +1096,11 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        anyhow::bail!("systemctl --user {} failed with exit code {:?}", args.join(" "), status.code())
+        anyhow::bail!(
+            "systemctl --user {} failed with exit code {:?}",
+            args.join(" "),
+            status.code()
+        )
     }
 }
 
@@ -1186,8 +1213,8 @@ fn run_enable_command(force: bool) -> Result<()> {
     }
 
     // systemd mode
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     let user_dir = systemd_user_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine systemd user directory"))?;
@@ -1200,14 +1227,23 @@ fn run_enable_command(force: bool) -> Result<()> {
 
     // Install both unit files
     for (name, content) in [
-        (GOVERNOR_SERVICE, include_str!("../config/claude-governor.service")),
-        (COLLECTOR_SERVICE, include_str!("../config/claude-token-collector.service")),
+        (
+            GOVERNOR_SERVICE,
+            include_str!("../config/claude-governor.service"),
+        ),
+        (
+            COLLECTOR_SERVICE,
+            include_str!("../config/claude-token-collector.service"),
+        ),
     ] {
         let path = user_dir.join(name);
         let content = content.replace("%h", home.to_str().unwrap_or("~"));
 
         if path.exists() && !force {
-            actions.push(format!("  - {} already exists (use --force to overwrite)", name));
+            actions.push(format!(
+                "  - {} already exists (use --force to overwrite)",
+                name
+            ));
         } else {
             fs::write(&path, &content)
                 .with_context(|| format!("Failed to write {}", path.display()))?;
@@ -1307,7 +1343,10 @@ fn run_disable_command(purge: bool) -> Result<()> {
         }
     }
 
-    println!("Claude Governor services disabled{}\n", if purge { " and purged" } else { "" });
+    println!(
+        "Claude Governor services disabled{}\n",
+        if purge { " and purged" } else { "" }
+    );
     for action in &actions {
         println!("{}", action);
     }
@@ -1431,8 +1470,8 @@ fn run_internal_token_collector_command(interval: u64) -> Result<()> {
 }
 
 fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     let mut actions_taken = Vec::new();
     let mut actions_skipped = Vec::new();
@@ -1443,9 +1482,16 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
         .join("claude-governor");
 
     if !config_dir.exists() {
-        fs::create_dir_all(&config_dir)
-            .with_context(|| format!("Failed to create config directory: {}", config_dir.display()))?;
-        actions_taken.push(format!("Created config directory: {}", config_dir.display()));
+        fs::create_dir_all(&config_dir).with_context(|| {
+            format!(
+                "Failed to create config directory: {}",
+                config_dir.display()
+            )
+        })?;
+        actions_taken.push(format!(
+            "Created config directory: {}",
+            config_dir.display()
+        ));
     } else {
         actions_skipped.push(format!("Config directory exists: {}", config_dir.display()));
     }
@@ -1453,7 +1499,10 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
     // 2. Copy default governor.yaml (skip if exists and not force)
     let config_path = config_dir.join("governor.yaml");
     if config_path.exists() && !force {
-        actions_skipped.push(format!("Config file exists (use --force to overwrite): {}", config_path.display()));
+        actions_skipped.push(format!(
+            "Config file exists (use --force to overwrite): {}",
+            config_path.display()
+        ));
     } else {
         let default_yaml = include_str!("../config/governor.yaml");
         fs::write(&config_path, default_yaml)
@@ -1479,8 +1528,9 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
     }
 
     if !state_dir.exists() {
-        fs::create_dir_all(&state_dir)
-            .with_context(|| format!("Failed to create state directory: {}", state_dir.display()))?;
+        fs::create_dir_all(&state_dir).with_context(|| {
+            format!("Failed to create state directory: {}", state_dir.display())
+        })?;
         actions_taken.push(format!("Created state directory: {}", state_dir.display()));
     } else {
         actions_skipped.push(format!("State directory exists: {}", state_dir.display()));
@@ -1501,24 +1551,44 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
 
         if systemd_available {
             if !systemd_user_dir.exists() {
-                fs::create_dir_all(&systemd_user_dir)
-                    .with_context(|| format!("Failed to create systemd directory: {}", systemd_user_dir.display()))?;
+                fs::create_dir_all(&systemd_user_dir).with_context(|| {
+                    format!(
+                        "Failed to create systemd directory: {}",
+                        systemd_user_dir.display()
+                    )
+                })?;
             }
 
             // Install both unit files (governor + token-collector)
             for (name, content) in [
-                (GOVERNOR_SERVICE, include_str!("../config/claude-governor.service")),
-                (COLLECTOR_SERVICE, include_str!("../config/claude-token-collector.service")),
+                (
+                    GOVERNOR_SERVICE,
+                    include_str!("../config/claude-governor.service"),
+                ),
+                (
+                    COLLECTOR_SERVICE,
+                    include_str!("../config/claude-token-collector.service"),
+                ),
             ] {
                 let service_path = systemd_user_dir.join(name);
                 let service_content = content.replace("%h", home.to_str().unwrap_or("~"));
 
                 if service_path.exists() && !force {
-                    actions_skipped.push(format!("Systemd service exists (use --force to overwrite): {}", service_path.display()));
+                    actions_skipped.push(format!(
+                        "Systemd service exists (use --force to overwrite): {}",
+                        service_path.display()
+                    ));
                 } else {
-                    fs::write(&service_path, &service_content)
-                        .with_context(|| format!("Failed to write systemd service: {}", service_path.display()))?;
-                    actions_taken.push(format!("Installed systemd service: {}", service_path.display()));
+                    fs::write(&service_path, &service_content).with_context(|| {
+                        format!(
+                            "Failed to write systemd service: {}",
+                            service_path.display()
+                        )
+                    })?;
+                    actions_taken.push(format!(
+                        "Installed systemd service: {}",
+                        service_path.display()
+                    ));
                 }
             }
 

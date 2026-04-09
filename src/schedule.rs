@@ -55,7 +55,10 @@ fn default_peak_end() -> u32 {
 /// Load promotions from a JSON file
 pub fn load_promotions(path: &Path) -> Vec<Promotion> {
     if !path.exists() {
-        log::debug!("[schedule] no promotions file at {}, returning empty", path.display());
+        log::debug!(
+            "[schedule] no promotions file at {}, returning empty",
+            path.display()
+        );
         return Vec::new();
     }
 
@@ -448,7 +451,11 @@ mod tests {
         // seven_day_sonnet gets the 2x boost
         let effective = effective_hours_remaining_from(start, reset, &promos, "seven_day_sonnet");
         assert!(effective > 48.0, "expected > 48, got {}", effective);
-        assert!(effective > 70.0, "expected significantly more than 48, got {}", effective);
+        assert!(
+            effective > 70.0,
+            "expected significantly more than 48, got {}",
+            effective
+        );
 
         // five_hour is NOT in applies_to: effective hours == raw hours
         let effective_5h = effective_hours_remaining_from(start, reset, &promos, "five_hour");
@@ -472,7 +479,11 @@ mod tests {
         let effective = effective_hours_remaining_from(start, reset, &promos, "seven_day_sonnet");
 
         // 0.5h peak * 1x + 1.5h off-peak * 2x = 0.5 + 3.0 = 3.5
-        assert!((effective - 3.5).abs() < 0.1, "expected ~3.5, got {}", effective);
+        assert!(
+            (effective - 3.5).abs() < 0.1,
+            "expected ~3.5, got {}",
+            effective
+        );
     }
 
     #[test]
@@ -685,7 +696,10 @@ mod tests {
 
         let t = transition.unwrap();
         // Transition is losing the 2x bonus (off-peak -> peak)
-        assert!(t.multiplier_after < t.multiplier_before, "should be losing bonus");
+        assert!(
+            t.multiplier_after < t.multiplier_before,
+            "should be losing bonus"
+        );
         assert_eq!(t.minutes_until, 25); // 25 minutes until 08:00
     }
 
@@ -704,7 +718,10 @@ mod tests {
 
         let t = transition.unwrap();
         // Transition is gaining the 2x bonus (peak -> off-peak)
-        assert!(t.multiplier_after > t.multiplier_before, "should be gaining bonus");
+        assert!(
+            t.multiplier_after > t.multiplier_before,
+            "should be gaining bonus"
+        );
         assert_eq!(t.minutes_until, 30); // 30 minutes until 14:00
     }
 }
