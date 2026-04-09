@@ -145,7 +145,7 @@ pub fn is_any_promo_active_at(t: DateTime<Utc>, promotions: &[Promotion]) -> boo
 }
 
 /// Check if a promotion is active at a specific time
-fn is_promo_active_at(t: DateTime<Utc>, promo: &Promotion) -> bool {
+pub fn is_promo_active_at(t: DateTime<Utc>, promo: &Promotion) -> bool {
     // Parse dates as ET dates (start of day in ET)
     let et = to_eastern(t);
     let et_date = et.date_naive();

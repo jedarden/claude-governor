@@ -81,6 +81,7 @@ impl std::fmt::Display for AlertType {
             AlertType::PromotionNotApplying => write!(f, "promotion_not_applying"),
             AlertType::CollectorOffline => write!(f, "collector_offline"),
             AlertType::LowCacheEfficiency => write!(f, "low_cache_efficiency"),
+            AlertType::PromotionRatioAnomaly => write!(f, "promotion_ratio_anomaly"),
         }
     }
 }
@@ -493,6 +494,36 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
         });
     }
 
+    // Check PromotionRatioAnomaly: observed ratio is outside expected range.
+    // Anomaly when observed > 2.5 (possible miscalibration) or observed < 0.8 (inverse anomaly).
+    // Require sufficient samples and a valid expected ratio to avoid false positives.
+    if state.burn_rate.promotion_peak_samples >= MIN_VALIDATION_SAMPLES
+        && state.burn_rate.promotion_offpeak_samples >= MIN_VALIDATION_SAMPLES
+        && state.burn_rate.offpeak_ratio_expected > 0.0
+    {
+        let observed = state.burn_rate.offpeak_ratio_observed;
+        // Anomaly thresholds: > 2.5 or < 0.8
+        if observed > 2.5 || observed < 0.8 {
+            let msg = if observed > 2.5 {
+                format!(
+                    "Promotion ratio anomaly: observed ratio {:.2} exceeds 2.5 threshold (expected {:.2}). Possible miscalibration.",
+                    observed, state.burn_rate.offpeak_ratio_expected
+                )
+            } else {
+                format!(
+                    "Promotion ratio anomaly: observed ratio {:.2} below 0.8 threshold (expected {:.2}). Inverse anomaly detected.",
+                    observed, state.burn_rate.offpeak_ratio_expected
+                )
+            };
+            alerts.push(AlertCondition {
+                alert_type: AlertType::PromotionRatioAnomaly,
+                message: msg,
+                severity: AlertSeverity::Warning,
+                detected_at: now,
+            });
+        }
+    }
+
     // Check CollectorOffline: last fleet aggregate too old
     let collector_age = (now - state.last_fleet_aggregate.t1).num_seconds();
     if collector_age > 300 {
@@ -734,6 +765,10 @@ mod tests {
         );
         assert_eq!(AlertType::BurnRateSpike.to_string(), "burn_rate_spike");
         assert_eq!(AlertType::Underutilization.to_string(), "underutilization");
+        assert_eq!(
+            AlertType::PromotionRatioAnomaly.to_string(),
+            "promotion_ratio_anomaly"
+        );
     }
 
     // --- Cooldown tests ---
@@ -1073,6 +1108,142 @@ mod tests {
         assert!(
             promo.is_none(),
             "Should NOT fire PromotionNotApplying when expected_ratio is 0.0"
+        );
+    }
+
+    // --- PromotionRatioAnomaly tests ---
+
+    #[test]
+    fn promotion_ratio_anomaly_triggers_when_above_2_5() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 2.8; // Above 2.5 threshold
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(anomaly.is_some(), "Should have PromotionRatioAnomaly alert");
+        assert!(anomaly.unwrap().message.contains("2.80"));
+        assert!(anomaly.unwrap().message.contains("exceeds 2.5"));
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_triggers_when_below_0_8() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 0.5; // Below 0.8 threshold
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(anomaly.is_some(), "Should have PromotionRatioAnomaly alert");
+        assert!(anomaly.unwrap().message.contains("0.50"));
+        assert!(anomaly.unwrap().message.contains("below 0.8"));
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_does_not_trigger_in_range() {
+        // Ratio of 2.1 is within [0.8, 2.5] - should not trigger
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 2.1;
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(
+            anomaly.is_none(),
+            "Should NOT fire PromotionRatioAnomaly when ratio is in range [0.8, 2.5]"
+        );
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_boundary_at_2_5() {
+        // Exactly at threshold should not trigger
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 2.5; // Exactly at threshold
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(
+            anomaly.is_none(),
+            "Should NOT fire PromotionRatioAnomaly when ratio is exactly 2.5"
+        );
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_boundary_at_0_8() {
+        // Exactly at threshold should not trigger
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 0.8; // Exactly at threshold
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(
+            anomaly.is_none(),
+            "Should NOT fire PromotionRatioAnomaly when ratio is exactly 0.8"
+        );
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_suppressed_with_insufficient_samples() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES - 1; // Insufficient
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 3.0; // Would normally trigger
+        state.burn_rate.offpeak_ratio_expected = 2.0;
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(
+            anomaly.is_none(),
+            "Should NOT fire PromotionRatioAnomaly when peak samples < MIN_VALIDATION_SAMPLES"
+        );
+    }
+
+    #[test]
+    fn promotion_ratio_anomaly_suppressed_when_expected_ratio_zero() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
+        state.burn_rate.offpeak_ratio_observed = 3.0;
+        state.burn_rate.offpeak_ratio_expected = 0.0; // Zero expected ratio
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let anomaly = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::PromotionRatioAnomaly);
+        assert!(
+            anomaly.is_none(),
+            "Should NOT fire PromotionRatioAnomaly when expected_ratio is 0.0"
         );
     }
 

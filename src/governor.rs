@@ -20,7 +20,8 @@ use crate::alerts::{
     SprintTrigger,
 };
 use crate::burn_rate::{
-    compute_composite_safe_workers, generate_window_forecast, log_capacity_forecast,
+    compute_composite_safe_workers, effective_multiplier, generate_window_forecast,
+    log_capacity_forecast, validate_promotion_from_db, PromotionValidationResult,
 };
 use crate::calibrator;
 use crate::collector;
@@ -1583,9 +1584,80 @@ pub fn run_governor_cycle(
     // Update schedule state with per-window multipliers and effective hours.
     // Each window's multiplier respects the promotion's applies_to list —
     // only windows listed there get > 1.0; all others stay 1.0.
-    let mult_five_hour = schedule::get_multiplier_at(now, promotions, "five_hour");
-    let mult_seven_day = schedule::get_multiplier_at(now, promotions, "seven_day");
-    let mult_seven_day_sonnet = schedule::get_multiplier_at(now, promotions, "seven_day_sonnet");
+
+    // Empirically validate promotion multiplier from token-history DB.
+    // If validation fails (insufficient data or ratio out of range), fall back to 1x.
+    let db_path = collector::default_db_path();
+    let promo_validation: PromotionValidationResult = if let Some(promo) = promotions.first() {
+        // Only validate if there's an active promotion with offpeak_multiplier > 1.0
+        if promo.offpeak_multiplier > 1.0 && schedule::is_promo_active_at(now, promo) {
+            validate_promotion_from_db(&db_path, promo.offpeak_multiplier)
+        } else {
+            PromotionValidationResult {
+                validated: true,
+                observed_ratio: 1.0,
+                declared_multiplier: promo.offpeak_multiplier,
+                median_peak: 0.0,
+                median_offpeak: 0.0,
+                peak_samples: 0,
+                offpeak_samples: 0,
+                reason: None,
+            }
+        }
+    } else {
+        PromotionValidationResult {
+            validated: true,
+            observed_ratio: 1.0,
+            declared_multiplier: 1.0,
+            median_peak: 0.0,
+            median_offpeak: 0.0,
+            peak_samples: 0,
+            offpeak_samples: 0,
+            reason: None,
+        }
+    };
+
+    // Update burn_rate state with validation results
+    state.burn_rate.tokens_per_pct_peak = promo_validation.median_peak as u64;
+    state.burn_rate.tokens_per_pct_offpeak = promo_validation.median_offpeak as u64;
+    state.burn_rate.offpeak_ratio_observed = promo_validation.observed_ratio;
+    state.burn_rate.offpeak_ratio_expected = promo_validation.declared_multiplier;
+    state.burn_rate.promotion_validated = promo_validation.validated;
+    state.burn_rate.promotion_peak_samples = promo_validation.peak_samples;
+    state.burn_rate.promotion_offpeak_samples = promo_validation.offpeak_samples;
+
+    // Get the effective multiplier based on validation result
+    let effective_promo_multiplier = effective_multiplier(&promo_validation);
+
+    // For each window, determine the multiplier to use:
+    // - During peak hours: always 1.0
+    // - During off-peak: use effective multiplier if promotion applies to window, else 1.0
+    let is_peak = schedule::is_peak_at(now);
+    let mult_five_hour = if is_peak {
+        1.0
+    } else {
+        // Check if any promotion applies to five_hour window
+        let applies = promotions.iter().any(|p| {
+            p.applies_to.iter().any(|w| w == "five_hour") && schedule::is_promo_active_at(now, p)
+        });
+        if applies { effective_promo_multiplier } else { 1.0 }
+    };
+    let mult_seven_day = if is_peak {
+        1.0
+    } else {
+        let applies = promotions.iter().any(|p| {
+            p.applies_to.iter().any(|w| w == "seven_day") && schedule::is_promo_active_at(now, p)
+        });
+        if applies { effective_promo_multiplier } else { 1.0 }
+    };
+    let mult_seven_day_sonnet = if is_peak {
+        1.0
+    } else {
+        let applies = promotions.iter().any(|p| {
+            p.applies_to.iter().any(|w| w == "seven_day_sonnet") && schedule::is_promo_active_at(now, p)
+        });
+        if applies { effective_promo_multiplier } else { 1.0 }
+    };
     let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
     let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);
     let eff_seven_day_sonnet = hours_remaining
