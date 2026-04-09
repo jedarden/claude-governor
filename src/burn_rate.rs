@@ -1294,18 +1294,20 @@ pub fn estimate_burn_rates(
         );
     }
 
-    // Identify binding window (soonest to exhaust)
+    // Identify binding window (highest risk_score)
+    // The risk_score combines margin urgency, duration weight, and volatility (cone_ratio).
+    // Higher risk_score = more urgent window that should drive scaling decisions.
     let binding_window = WINDOWS
         .iter()
-        .min_by(|&a, &b| {
+        .max_by(|&a, &b| {
             let fa = forecasts
                 .get(*a)
-                .map(|f| f.margin_hrs)
-                .unwrap_or(f64::INFINITY);
+                .map(|f| f.risk_score)
+                .unwrap_or(0.0);
             let fb = forecasts
                 .get(*b)
-                .map(|f| f.margin_hrs)
-                .unwrap_or(f64::INFINITY);
+                .map(|f| f.risk_score)
+                .unwrap_or(0.0);
             fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|w| w.to_string())
