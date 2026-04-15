@@ -1128,14 +1128,34 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
 
     if session_usage.is_empty() {
         log::info!("[collector] no new usage data found");
-        // Still save cursors even if no data
+        // Write a zero-usage heartbeat fleet record so the governor knows the
+        // collector is alive. Without this, idle periods longer than 5 minutes
+        // trigger a false collector_offline alert because the last fleet record's
+        // t1 timestamp goes stale.
+        let fleet = aggregate_to_fleet(&[], now, t0, t1, &all_models);
+        let fleet_json = fleet.to_json_value();
+        if let Err(e) = append_jsonl(&history_path, &[fleet_json.clone()]) {
+            log::warn!("[collector] failed to write heartbeat fleet record: {}", e);
+        }
+        match crate::db::open_db(&db_path) {
+            Ok(conn) => {
+                if let Err(e) = crate::db::create_schema(&conn) {
+                    log::warn!("[collector] failed to create SQLite schema: {}", e);
+                } else if let Err(e) = crate::db::insert_record(&conn, &fleet_json) {
+                    log::warn!("[collector] failed to insert heartbeat fleet record: {}", e);
+                }
+            }
+            Err(e) => {
+                log::warn!("[collector] failed to open SQLite for heartbeat: {}", e);
+            }
+        }
         cursors
             .save(&cursor_path)
             .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
         return Ok(CollectionResult {
             lines_processed: total_lines,
             instance_records: 0,
-            fleet_records: 0,
+            fleet_records: 1,
             window_records: 0,
             total_usd: 0.0,
         });
