@@ -602,7 +602,7 @@ fn check_cutoff_imminent(
     }
 }
 
-/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND margin_hrs < 0
+/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND margin_hrs < 0 AND utilization >= 50%
 ///
 /// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
 /// - Positive margin_hrs = safe (exhaustion after reset)
@@ -610,13 +610,20 @@ fn check_cutoff_imminent(
 ///
 /// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
 /// corrupted state or sign convention mismatches between modules.
+///
+/// Requires utilization >= 50% to prevent false positives from stale EMA burn rates.
+/// The fleet_pct_hr EMA only updates on positive deltas, so during seven-day window
+/// rollover periods (when old high-usage data drops off), the EMA can stay inflated
+/// while actual utilization is declining. At 40% utilization with 50% headroom to the
+/// 90% ceiling, a stale EMA predicting imminent exhaustion is not a real crisis.
 fn check_sonnet_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
+    const UTILIZATION_THRESHOLD: f64 = 50.0;
     let win = &forecast.seven_day_sonnet;
-    if win.cutoff_risk && win.margin_hrs < 0.0 {
+    if win.cutoff_risk && win.margin_hrs < 0.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
         let msg = format!(
             "Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
             win.current_utilization, win.hours_remaining, win.margin_hrs
@@ -1105,6 +1112,35 @@ mod tests {
         assert!(
             sonnet.is_none(),
             "Should NOT have SonnetCutoffRisk when margin_hrs is positive (safe)"
+        );
+    }
+
+    #[test]
+    fn sonnet_cutoff_risk_false_positive_when_low_utilization() {
+        // Regression test for bead docs-amvn:
+        // 40% utilization with margin_hrs=-108h but stale EMA (12.47%/hr vs actual 0.47%/hr).
+        // During seven-day window rollover, old high-usage data drops off causing net-negative
+        // deltas. The EMA only updates on positive deltas, so it stays inflated while actual
+        // utilization declines. At 40% utilization with 50% headroom to the 90% ceiling, this
+        // is not a real capacity crisis.
+        let forecast = CapacityForecast {
+            five_hour: make_window(false, 5.0, 2.0),
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window_with_util_and_margin(40.0, true, -108.0, 112.0), // cutoff_risk=1, util=40% < 50%
+            binding_window: "seven_day_sonnet".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let sonnet = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SonnetCutoffRisk);
+        assert!(
+            sonnet.is_none(),
+            "Should NOT have SonnetCutoffRisk when utilization is below 50%"
         );
     }
 

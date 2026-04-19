@@ -25,7 +25,7 @@ Any window has `cutoff_risk=1` **and** either:
   - The 80% threshold prevents false positives from transient spikes with small negative margins
   - The 50% threshold with -24h margin catches genuine crises where moderate utilization masks imminent exhaustion
 - **Deep margin risk examples:** seven_day at 56-60% utilization with margin_hrs=-47 to -55h predicts exhaustion in ~2-3 hours despite 34-40% headroom to the 90% ceiling. This IS a capacity crisis — the deep negative margin indicates sustained elevated burn rate that will exhaust the window before reset.
-- **Resolved false positive (docs-uqq8):** seven_day at 60% utilization, margin_hrs=-45.1h, hrs_left=47.5h. Same transient burn rate spike pattern as prior alerts (~12.5%/hr). Alert created 2026-04-16 from pre-fix binary; the seven_day window reset without incident, confirming the spike was transient.
+- **Resolved false positives (docs-uqq8, docs-i592):** Multiple seven_day alerts at 60% utilization, margin_hrs=-43.1 to -45.1h, hrs_left=45.5 to 47.5h. Same transient burn rate spike pattern as prior alerts (~12.5%/hr). Alerts created 2026-04-16 from pre-fix binary; the seven_day window reset without incident, confirming the spike was transient.
 
 #### `emergency_brake_activated`
 
@@ -57,6 +57,7 @@ Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 - **Message:** `Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Consider scaling down Sonnet workers; monitor seven_day all-models window
 - **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules. The `utilization >= 50%` guard prevents false positives from stale EMA burn rates — the fleet_pct_hr EMA only updates on positive deltas, so during seven-day window rollover periods (when old high-usage data drops off), the EMA can stay inflated while actual utilization is declining. At 40% utilization with 50% headroom to the 90% ceiling, a stale EMA predicting imminent exhaustion is not a real crisis.
+- **Resolved false positive (docs-amvn):** seven_day_sonnet at 40% utilized, margin_hrs=-108h, hrs_left=112h. The EMA was stuck at 12.47%/hr (from prior heavy usage) while actual burn was ~0.47%/hr. During window rollover, net deltas went negative (old data dropping off faster than new usage accumulating), preventing the EMA from updating. The 50% utilization threshold now suppresses this pattern automatically.
 
 #### `session_cutoff_risk`
 
