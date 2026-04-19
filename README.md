@@ -84,10 +84,13 @@ The governor tracks three parallel usage windows:
 
 ## Alerting
 
-The governor creates HUMAN-type beads via NEEDLE when:
-- Any window is at cutoff risk (< 5% margin)
-- Cache efficiency drops below threshold
-- Collector is offline
+The governor creates HUMAN-type beads via NEEDLE when specific conditions are detected.
+
+See `docs/research/alerts.md` for complete alert documentation including:
+- All alert types (cutoff_imminent, sonnet_cutoff_risk, session_cutoff_risk, collector_offline, etc.)
+- Severity levels and thresholds
+- Cooldown deduplication
+- Troubleshooting steps
 
 ## Project Structure
 
