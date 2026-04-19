@@ -32,7 +32,7 @@ const USAGE_ENDPOINT: &str = "/api/oauth/usage";
 const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
 /// User-Agent header (mimics Claude Code)
-const USER_AGENT: &str = "claude-code/2.1.78";
+const USER_AGENT: &str = "claude-code/2.1.114";
 
 /// Poller errors
 #[derive(Error, Debug)]
