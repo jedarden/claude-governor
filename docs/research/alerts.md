@@ -28,12 +28,13 @@ Emergency brake was triggered (98%+ utilization detected).
 
 #### `token_refresh_failing`
 
-OAuth token refresh failing for 3+ consecutive cycles.
+OAuth token refresh failing — governor is using stale cached usage data because live API polling cannot authenticate.
 
-- **Trigger:** `token_refresh_failing=true` in state
+- **Trigger:** `token_refresh_failing=true` in state (set when poller returns stale data due to token refresh failure)
 - **Severity:** Critical
 - **Message:** `OAuth token refresh failing — Claude Code sessions may be unable to make API calls. Run: claude login`
 - **Action:** Re-authenticate with `claude login`
+- **False positive prevention:** The flag is cleared when `poll()` returns `Err` from non-auth errors (e.g., 429 rate limits from `fetch_usage`). Only auth-related errors (token refresh, credentials) preserve the flag across cycles. This prevents the alert from persisting when the token is valid but the API is temporarily rate-limiting.
 
 ### Warning Severity
 

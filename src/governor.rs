@@ -1008,6 +1008,21 @@ pub fn run_governor_cycle(
             state.token_refresh_failing = usage_data.stale;
         }
         Err(e) => {
+            // If the error is from the API call (not token refresh), the token is fine.
+            // Reset token_refresh_failing to prevent false positives from transient API
+            // errors (e.g., 429 rate limits) that persist the stale flag from a previous cycle.
+            if let Some(pe) = e.downcast_ref::<crate::poller::PollerError>() {
+                match pe {
+                    crate::poller::PollerError::ApiRequestFailed(_)
+                    | crate::poller::PollerError::ApiError(_)
+                    | crate::poller::PollerError::ParseError(_) => {
+                        state.token_refresh_failing = false;
+                    }
+                    _ => {} // Auth errors: keep token_refresh_failing unchanged
+                }
+            } else {
+                state.token_refresh_failing = false;
+            }
             log::warn!("[governor] poll failed, keeping previous usage data: {}", e);
         }
     }
