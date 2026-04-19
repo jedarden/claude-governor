@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn multiple_simultaneous_alerts() {
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -3.0, 2.0), // CutoffImminent + SessionCutoffRisk
+            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent + SessionCutoffRisk
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(true, -5.0, 30.0), // SonnetCutoffRisk
             binding_window: "seven_day_sonnet".to_string(),
@@ -2045,7 +2045,7 @@ mod tests {
     #[test]
     fn process_alerts_filters_and_fires() {
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -3.0, 2.0), // CutoffImminent
+            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -2075,7 +2075,7 @@ mod tests {
     #[test]
     fn process_alerts_respects_cooldown() {
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -3.0, 2.0), // CutoffImminent
+            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
