@@ -48,6 +48,7 @@ OAuth token refresh failing — governor is using stale cached usage data becaus
 - **Action:** Re-authenticate with `claude login`
 - **False positive prevention:** The flag is cleared when `poll()` returns `Err` from non-auth errors (e.g., 429 rate limits from `fetch_usage`). Only auth-related errors (token refresh, credentials) preserve the flag across cycles. This prevents the alert from persisting when the token is valid but the API is temporarily rate-limiting.
 - **Resolved transient failure (docs-az7r):** Token refresh failed with HTTP 400 at 2026-04-18 15:16 EDT on two consecutive attempts, triggering the alert. The token self-recovered within ~10 minutes — successful (non-stale) polls resumed at 15:26 and continued uninterrupted. Subsequent poll failures were all HTTP 429 rate limits on the usage endpoint (not auth errors), confirming the token remained valid. The HTTP 400 was a transient OAuth platform error, not an expired or revoked token. No `claude login` was needed.
+- **Resolved transient failure (docs-p1x1):** Token refresh failed at 2026-04-18 19:16 UTC, triggering the alert. The token self-recovered — subsequent polls succeeded with fresh data (stale=false) and token_refresh_failing cleared to false. This was a transient OAuth platform error that resolved without intervention. No `claude login` was needed.
 
 ### Warning Severity
 
