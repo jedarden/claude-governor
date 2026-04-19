@@ -637,12 +637,14 @@ pub fn query_promotion_samples(
     conn: &Connection,
 ) -> Result<Vec<crate::burn_rate::PromotionSample>> {
     let mut stmt = conn.prepare(
-        "SELECT pk, hr_et, dow,
-                input_n + output_n + r_cache_n + w_cache_n + w_cache_1h_n AS total_tokens,
-                p7ds, total_usd
+        "SELECT i.pk, i.hr_et, i.dow,
+                i.input_n + i.output_n + i.r_cache_n + i.w_cache_n + i.w_cache_1h_n AS total_tokens,
+                i.p7ds, i.total_usd,
+                COALESCE(f.workers, 1) AS worker_count
          FROM i
-         WHERE p7ds IS NOT NULL AND p7ds > 0
-         ORDER BY t1 DESC
+         LEFT JOIN f ON i.t0 = f.t0 AND i.t1 = f.t1
+         WHERE i.p7ds IS NOT NULL AND i.p7ds > 0
+         ORDER BY i.t1 DESC
          LIMIT 500",
     )?;
 
@@ -652,7 +654,8 @@ pub fn query_promotion_samples(
         let dow: i64 = row.get(2)?;
         let total_tokens: i64 = row.get(3)?;
         let p7ds: f64 = row.get(4)?;
-        let total_usd: f64 = row.get(5)?;
+        let _total_usd: f64 = row.get(5)?;
+        let worker_count: i64 = row.get(6)?;
 
         // Determine if peak: pk=1 AND weekday (dow 0-4) AND hr_et in [8, 13]
         // This matches the schedule.rs is_peak_at logic
@@ -665,18 +668,16 @@ pub fn query_promotion_samples(
             0.0
         };
 
-        Ok((is_peak, total_tokens, tokens_per_pct, total_usd))
+        Ok((is_peak, total_tokens, tokens_per_pct, worker_count as u32))
     })?;
 
     let mut results = Vec::new();
     for row in rows {
-        let (is_peak, _total_tokens, tokens_per_pct, _total_usd) = row?;
-        // Use a constant worker_count for now - in practice this should come from fleet records
-        // For accurate results, we'd need to join with fleet records to get actual worker counts
+        let (is_peak, _total_tokens, tokens_per_pct, worker_count) = row?;
         results.push(crate::burn_rate::PromotionSample {
             tokens_per_pct,
             is_peak,
-            worker_count: 1, // TODO: join with fleet records for actual worker count
+            worker_count,
             timestamp: Utc::now(),
         });
     }
