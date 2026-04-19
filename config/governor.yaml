@@ -101,6 +101,13 @@ pricing:
       cache_write_1h_per_mtok: 6.0
       cache_read_per_mtok: 0.30
 
+    glm-5.1:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.30
+
     glm-4.7:
       input_per_mtok: 3.0
       output_per_mtok: 15.0
