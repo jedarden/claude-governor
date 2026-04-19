@@ -184,7 +184,7 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
     let mut launched = 0;
 
     for i in 0..n {
-        let worker_id = format!("{}-{}-{}", config.session_prefix, timestamp, i);
+        let worker_id = format!("{}-{}", timestamp, i);
         let workspace = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .to_string_lossy()

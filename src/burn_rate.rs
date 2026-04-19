@@ -1087,7 +1087,8 @@ pub fn generate_window_forecast(
     };
 
     let cutoff_risk = predicted_exhaustion_hours < hours_remaining;
-    let margin_hrs = hours_remaining - predicted_exhaustion_hours;
+    // margin_hrs: positive = safe (exhaustion after reset), negative = risky (exhaustion before reset)
+    let margin_hrs = predicted_exhaustion_hours - hours_remaining;
 
     // p50 safe workers: uses the mean per-worker burn rate.
     let safe_worker_count = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 {
@@ -2373,10 +2374,12 @@ mod tests {
             &hrs_left,
         );
 
-        // seven_day: fleet_pct_hr=0.5, remain=29.5, exh=59, margin=3-59=-56 (most negative)
-        assert_eq!(forecast.binding_window, "seven_day");
-        assert!(!forecast.five_hour.binding);
-        assert!(forecast.seven_day.binding);
+        // five_hour: fleet_pct_hr=5.0, remain=45, exh=9, margin=9-100=-91 (most negative, highest risk)
+        // seven_day: fleet_pct_hr=0.5, remain=29.5, exh=59, margin=59-3=+56 (positive=safe, lowest risk)
+        // seven_day_sonnet: fleet_pct_hr=2.0, remain=18, exh=9, margin=9-37.5=-28.5
+        assert_eq!(forecast.binding_window, "five_hour");
+        assert!(forecast.five_hour.binding);
+        assert!(!forecast.seven_day.binding);
         assert!(!forecast.seven_day_sonnet.binding);
     }
 
@@ -2717,7 +2720,7 @@ mod tests {
         assert!((f.fleet_pct_per_hour - 2.0).abs() < 1e-9);
         assert!((f.predicted_exhaustion_hours - 9.0).abs() < 1e-9);
         assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
-        assert!((f.margin_hrs - 28.5).abs() < 1e-9); // 37.5 - 9
+        assert!((f.margin_hrs + 28.5).abs() < 1e-9); // 9 - 37.5 = -28.5 (negative = risky)
         assert_eq!(f.safe_worker_count, Some(0)); // floor(18 / (1.0 * 37.5)) = 0
                                                   // With zero stddev, all cone values equal the p50
         assert!((f.exh_hrs_p25 - 9.0).abs() < 1e-9);
@@ -2796,7 +2799,7 @@ mod tests {
                 fleet_pct_per_hour: 7.92,
                 predicted_exhaustion_hours: 6.82,
                 cutoff_risk: false,
-                margin_hrs: -5.32,
+                margin_hrs: 5.32, // 6.82 - 1.5 = 5.32 (positive = safe, exhaustion after reset)
                 binding: false,
                 safe_worker_count: None,
                 ..Default::default()
@@ -2809,7 +2812,7 @@ mod tests {
                 fleet_pct_per_hour: 6.48,
                 predicted_exhaustion_hours: 2.69,
                 cutoff_risk: true,
-                margin_hrs: 34.81,
+                margin_hrs: -34.81, // 2.69 - 37.5 = -34.81 (negative = risky, exhaustion before reset)
                 binding: false,
                 safe_worker_count: None,
                 ..Default::default()
@@ -2822,7 +2825,7 @@ mod tests {
                 fleet_pct_per_hour: 9.0,
                 predicted_exhaustion_hours: 2.94,
                 cutoff_risk: true,
-                margin_hrs: 34.56,
+                margin_hrs: -34.56, // 2.94 - 37.5 = -34.56 (negative = risky, exhaustion before reset)
                 binding: true,
                 safe_worker_count: Some(2),
                 ..Default::default()

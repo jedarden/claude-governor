@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::alerts::{
     check_alert_conditions, check_low_cache_efficiency, fire_alert, should_fire, update_cooldown,
-    SprintTrigger,
+    AlertType, SprintTrigger,
 };
 use crate::burn_rate::{
     compute_composite_safe_workers, effective_multiplier, generate_window_forecast,
@@ -1029,6 +1029,9 @@ pub fn run_governor_cycle(
 
     // 3. Read latest fleet record from database and update last_fleet_aggregate
     let db_path = collector::default_db_path();
+    // Snapshot whether collector was offline before this update, so we can detect recovery.
+    let collector_was_offline =
+        (now - state.last_fleet_aggregate.t1).num_seconds() > 300;
     if let Ok(conn) = db::open_db(&db_path) {
         if let Ok(fleet_records) = db::query_last_fleets(&conn, 1) {
             if let Some(fleet_json) = fleet_records.first() {
@@ -1108,6 +1111,21 @@ pub fn run_governor_cycle(
                         "[governor] fleet aggregate: {} workers, ${:.2}/hr p75, deltas 5h={:.2}% 7d={:.2}% 7ds={:.2}%, cache_eff={:.2} (consecutive_low={})",
                         workers, p75_usd_hr, p5h, p7d, p7ds, fleet_cache_eff, state.low_cache_eff_consecutive
                     );
+
+                    // If the collector just recovered from an offline state, clear the
+                    // collector_offline cooldown so a future outage fires immediately
+                    // instead of waiting out the remaining cooldown window.
+                    let collector_now_online = (now - t1).num_seconds() <= 300;
+                    if collector_was_offline && collector_now_online {
+                        let age_s = (now - t1).num_seconds();
+                        log::info!(
+                            "[governor] collector recovered — last record {}s old, clearing offline alert cooldown",
+                            age_s
+                        );
+                        state
+                            .alert_cooldown
+                            .clear(&AlertType::CollectorOffline.to_string());
+                    }
                 }
             }
         }
