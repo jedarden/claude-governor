@@ -619,7 +619,7 @@ fn check_sonnet_cutoff_risk(
     }
 }
 
-/// Check for SessionCutoffRisk: five_hour cutoff_risk=1 AND margin_hrs < 0
+/// Check for SessionCutoffRisk: five_hour cutoff_risk=1 AND margin_hrs < 0 AND utilization >= 50%
 ///
 /// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
 /// - Positive margin_hrs = safe (exhaustion after reset)
@@ -627,13 +627,19 @@ fn check_sonnet_cutoff_risk(
 ///
 /// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
 /// corrupted state or sign convention mismatches between modules.
+///
+/// Requires utilization >= 50% to prevent false positives from transient burn rate spikes.
+/// With low utilization (e.g., 26%), the governor has ample headroom to scale down workers
+/// before exhaustion. A negative margin at low utilization indicates a temporary spike in
+/// fleet_pct_per_hour, not an actual capacity crisis.
 fn check_session_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
+    const UTILIZATION_THRESHOLD: f64 = 50.0;
     let win = &forecast.five_hour;
-    if win.cutoff_risk && win.margin_hrs < 0.0 {
+    if win.cutoff_risk && win.margin_hrs < 0.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
         let msg = format!(
             "Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
             win.current_utilization, win.hours_remaining, win.margin_hrs
