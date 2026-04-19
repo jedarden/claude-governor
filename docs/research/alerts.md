@@ -10,15 +10,21 @@ The governor creates HUMAN-type beads via NEEDLE when specific conditions are de
 
 #### `cutoff_imminent`
 
-Any window has `cutoff_risk=1` **and** `margin_hrs < -2` **and** `utilization >= 80%`.
+Any window has `cutoff_risk=1` **and** either:
 
-- **Trigger:** Window is at cutoff risk with exhaustion predicted more than 2 hours before reset AND utilization is at 80% or higher
+1. **High utilization risk:** `margin_hrs < -2` **and** `utilization >= 80%`, OR
+2. **Deep margin risk:** `margin_hrs < -24` **and** `utilization >= 50%`
+
+- **Trigger:** Window is at cutoff risk with tiered thresholds
+  - High utilization risk: Exhaustion predicted >2 hours before reset AND utilization at 80%+ OR
+  - Deep margin risk: Exhaustion predicted >24 hours before reset AND utilization at 50%+
 - **Severity:** Critical
 - **Message:** `Window {name} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h`
 - **Action:** Immediate manual intervention required — scale down workers immediately
-- **Why the utilization guard:** A low utilization window (e.g., 52%) with negative margin_hrs indicates a transient burn rate spike, not an actual capacity crisis. The 80% threshold ensures the alert only fires when we're genuinely near the ceiling, preventing false positives from temporary fleet_pct_per_hour inflation
-- **Resolved false positive (docs-jj81):** seven_day at 59% utilization, margin_hrs=-50h, hrs_left=52.5h. The 31% headroom to the 90% ceiling meant this was never a capacity crisis — the -50h margin came from a transient burn rate spike (~12.4%/hr). The 80% utilization guard now suppresses this pattern automatically.
-- **Resolved false positive (docs-aujt):** seven_day at 60% utilization, margin_hrs=-47.1h, hrs_left=49.5h. Same pattern as docs-jj81 — 30% headroom to ceiling, transient burn rate spike produced large negative margin. Alert fired from pre-fix binary (created 2026-04-16); the 80% guard deployed 2026-04-18 now suppresses this.
+- **Why tiered thresholds:** A low-utilization window (e.g., 52%) with small negative margin (-3h) is a transient burn rate spike. However, a moderate-utilization window (50-60%) with deeply negative margin (<-24h) is a real crisis — exhaustion is predicted in hours despite modest utilization. The two-tier system catches both patterns:
+  - The 80% threshold prevents false positives from transient spikes with small negative margins
+  - The 50% threshold with -24h margin catches genuine crises where moderate utilization masks imminent exhaustion
+- **Deep margin risk examples:** seven_day at 56-60% utilization with margin_hrs=-47 to -55h predicts exhaustion in ~2-3 hours despite 34-40% headroom to the 90% ceiling. This IS a capacity crisis — the deep negative margin indicates sustained elevated burn rate that will exhaust the window before reset.
 
 #### `emergency_brake_activated`
 
