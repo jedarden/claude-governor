@@ -776,8 +776,8 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 | Condition | Alert Type | Action |
 |---|---|---|
 | Any window `cutoff_risk=1` with `margin_hrs < -2` | `cutoff_imminent` | Create HUMAN bead: "Window `{win}` will exhaust in `{exh_hrs:.1f}h`, resets in `{hrs_left:.1f}h` — workers will be stopped" |
-| `seven_day_sonnet.cutoff_risk=1` (any margin) | `sonnet_cutoff_risk` | Scale to `safe_worker_count`; log prediction |
-| `five_hour.cutoff_risk=1` | `session_cutoff_risk` | Scale to `safe_worker_count` for session window; log prediction |
+| `seven_day_sonnet.cutoff_risk=1` with `margin_hrs < 0` | `sonnet_cutoff_risk` | Scale to `safe_worker_count`; log prediction |
+| `five_hour.cutoff_risk=1` with `margin_hrs < 0` | `session_cutoff_risk` | Scale to `safe_worker_count` for session window; log prediction |
 | `burn_rate_sample > baseline * 2` | `burn_rate_spike` | Log anomaly; increase polling rate to recalibrate faster |
 | All windows `margin_hrs > hrs_left * 0.5` | `underutilization` | Scale up toward max_workers; headroom is ample |
 
