@@ -67,6 +67,8 @@ Five-hour session window at cutoff risk (`cutoff_risk=1`).
 - **Action:** Reduce worker count or pause work until session resets
 - **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). The `utilization >= 50%` guard prevents false positives from transient spikes in `fleet_pct_per_hour` — with low utilization (e.g., 26%), the governor has ample headroom to scale down workers before exhaustion. A negative margin at low utilization indicates a temporary burn rate spike, not an actual capacity crisis.
 
+**False positive example (docs-e0rm):** An alert fired with 0.0% utilization, 4.4h remaining, and margin_hrs=-1.1h. This is a false positive — if utilization is truly 0%, the window cannot be at cutoff risk. The negative margin at near-zero utilization indicates a measurement anomaly or corrupted state, not a real capacity crisis. The `>= 50%` utilization guard was added to prevent these false positives.
+
 #### `burn_rate_spike`
 
 Burn rate significantly higher than baseline (not yet implemented).
