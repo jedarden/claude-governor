@@ -1134,9 +1134,15 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
         // t1 timestamp goes stale.
         let fleet = aggregate_to_fleet(&[], now, t0, t1, &all_models);
         let fleet_json = fleet.to_json_value();
-        if let Err(e) = append_jsonl(&history_path, &[fleet_json.clone()]) {
-            log::warn!("[collector] failed to write heartbeat fleet record: {}", e);
-        }
+
+        // Critical: heartbeat must succeed to avoid false collector_offline alerts
+        // Return error if write fails so governor can detect the issue
+        append_jsonl(&history_path, &[fleet_json.clone()]).map_err(|e| {
+            log::error!("[collector] CRITICAL: failed to write heartbeat fleet record: {}", e);
+            anyhow::anyhow!("Failed to write heartbeat fleet record: {}", e)
+        })?;
+
+        // Try to write to SQLite, but don't fail if it fails (JSONL is the primary source)
         match crate::db::open_db(&db_path) {
             Ok(conn) => {
                 if let Err(e) = crate::db::create_schema(&conn) {
@@ -1149,6 +1155,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
                 log::warn!("[collector] failed to open SQLite for heartbeat: {}", e);
             }
         }
+
         cursors
             .save(&cursor_path)
             .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
