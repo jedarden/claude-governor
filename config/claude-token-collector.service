@@ -8,7 +8,7 @@ PartOf=claude-governor.service
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cgov _token-collector
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 # Logging
