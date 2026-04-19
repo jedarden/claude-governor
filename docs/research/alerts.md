@@ -41,7 +41,7 @@ OAuth token refresh failing for 3+ consecutive cycles.
 
 Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 
-- **Trigger:** `seven_day_sonnet.cutoff_risk=true`
+- **Trigger:** `seven_day_sonnet.cutoff_risk=true` **and** `margin_hrs < 0` (negative margin indicates exhaustion before reset)
 - **Severity:** Warning
 - **Message:** `Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Consider scaling down Sonnet workers; monitor seven_day all-models window
@@ -50,7 +50,7 @@ Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 
 Five-hour session window at cutoff risk (`cutoff_risk=1`).
 
-- **Trigger:** `five_hour.cutoff_risk=true`
+- **Trigger:** `five_hour.cutoff_risk=true` **and** `margin_hrs < 0` (negative margin indicates exhaustion before reset)
 - **Severity:** Warning
 - **Message:** `Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Reduce worker count or pause work until session resets
