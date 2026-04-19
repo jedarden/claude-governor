@@ -10,12 +10,13 @@ The governor creates HUMAN-type beads via NEEDLE when specific conditions are de
 
 #### `cutoff_imminent`
 
-Any window has `cutoff_risk=1` **and** `margin_hrs < -2`.
+Any window has `cutoff_risk=1` **and** `margin_hrs < -2` **and** `utilization >= 80%`.
 
-- **Trigger:** Window is at cutoff risk and the predicted exhaustion is more than 2 hours before reset
+- **Trigger:** Window is at cutoff risk with exhaustion predicted more than 2 hours before reset AND utilization is at 80% or higher
 - **Severity:** Critical
 - **Message:** `Window {name} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h`
 - **Action:** Immediate manual intervention required — scale down workers immediately
+- **Why the utilization guard:** A low utilization window (e.g., 52%) with negative margin_hrs indicates a transient burn rate spike, not an actual capacity crisis. The 80% threshold ensures the alert only fires when we're genuinely near the ceiling, preventing false positives from temporary fleet_pct_per_hour inflation
 
 #### `emergency_brake_activated`
 

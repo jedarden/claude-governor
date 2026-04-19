@@ -555,12 +555,18 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
     alerts
 }
 
-/// Check for CutoffImminent: any window with cutoff_risk=1 and margin_hrs < -2
+/// Check for CutoffImminent: any window with cutoff_risk=1, margin_hrs < -2, AND high utilization
+///
+/// Requires utilization >= 80% to prevent false positives from temporary burn rate spikes.
+/// A low utilization window (e.g., 52%) with negative margin_hrs indicates a transient
+/// spike in fleet_pct_per_hour, not an actual capacity crisis.
 fn check_cutoff_imminent(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
+    const UTILIZATION_THRESHOLD: f64 = 80.0; // 80% utilization required for cutoff_imminent
+
     let windows = [
         ("five_hour", &forecast.five_hour),
         ("seven_day", &forecast.seven_day),
@@ -568,7 +574,7 @@ fn check_cutoff_imminent(
     ];
 
     for (name, win) in windows {
-        if win.cutoff_risk && win.margin_hrs < -2.0 {
+        if win.cutoff_risk && win.margin_hrs < -2.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
             let msg = format!(
                 "Window {} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h",
                 name, win.margin_hrs, win.current_utilization, win.hours_remaining
@@ -720,10 +726,14 @@ mod tests {
     }
 
     fn make_window(cutoff_risk: bool, margin_hrs: f64, hrs_left: f64) -> WindowForecast {
+        make_window_with_util_and_margin(50.0, cutoff_risk, margin_hrs, hrs_left)
+    }
+
+    fn make_window_with_util_and_margin(util: f64, cutoff_risk: bool, margin_hrs: f64, hrs_left: f64) -> WindowForecast {
         WindowForecast {
             target_ceiling: 90.0,
-            current_utilization: 50.0,
-            remaining_pct: 40.0,
+            current_utilization: util,
+            remaining_pct: 90.0 - util,
             hours_remaining: hrs_left,
             fleet_pct_per_hour: 5.0,
             predicted_exhaustion_hours: hrs_left - margin_hrs,
@@ -885,7 +895,7 @@ mod tests {
     #[test]
     fn cutoff_imminent_triggers_on_negative_margin() {
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -3.0, 2.0), // cutoff_risk=1, margin_hrs=-3
+            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // cutoff_risk=1, margin_hrs=-3, util=85%
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -908,9 +918,9 @@ mod tests {
 
     #[test]
     fn cutoff_imminent_requires_margin_less_than_minus_2() {
-        // margin_hrs = -1.9 should NOT trigger
+        // margin_hrs = -1.9 should NOT trigger (even with high util)
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -1.9, 2.0),
+            five_hour: make_window_with_util_and_margin(85.0, true, -1.9, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -927,6 +937,31 @@ mod tests {
         assert!(
             imminent.is_none(),
             "Should NOT have CutoffImminent when margin_hrs > -2"
+        );
+    }
+
+    #[test]
+    fn cutoff_imminent_requires_high_utilization() {
+        // Low utilization (52%) with negative margin should NOT trigger
+        // This is the false positive case that triggered this fix
+        let forecast = CapacityForecast {
+            seven_day: make_window_with_util_and_margin(52.0, true, -58.0, 60.5),
+            five_hour: make_window(false, 10.0, 2.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent);
+        assert!(
+            imminent.is_none(),
+            "Should NOT have CutoffImminent when utilization < 80% even with negative margin"
         );
     }
 
@@ -1367,8 +1402,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: WindowForecast {
                 target_ceiling: 90.0,
-                current_utilization: 75.5,
-                remaining_pct: 14.5,
+                current_utilization: 85.0,
+                remaining_pct: 5.0,
                 hours_remaining: 1.5,
                 fleet_pct_per_hour: 10.0,
                 predicted_exhaustion_hours: 1.45,
@@ -1395,7 +1430,7 @@ mod tests {
 
         // Message should contain window name, percentages, and hours
         assert!(imminent.message.contains("five_hour"));
-        assert!(imminent.message.contains("75"));
+        assert!(imminent.message.contains("85"));
         assert!(imminent.message.contains("1.5"));
         assert!(imminent.message.contains("-2"));
     }
