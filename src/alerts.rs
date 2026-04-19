@@ -555,17 +555,22 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
     alerts
 }
 
-/// Check for CutoffImminent: any window with cutoff_risk=1, margin_hrs < -2, AND high utilization
+/// Check for CutoffImminent: any window with cutoff_risk=1 AND either:
+/// - margin_hrs < -2 AND utilization >= 80% (high utilization risk), OR
+/// - margin_hrs < -24 AND utilization >= 50% (deep margin risk)
 ///
-/// Requires utilization >= 80% to prevent false positives from temporary burn rate spikes.
-/// A low utilization window (e.g., 52%) with negative margin_hrs indicates a transient
-/// spike in fleet_pct_per_hour, not an actual capacity crisis.
+/// Tiered thresholds prevent false positives from transient burn rate spikes:
+/// - A low-utilization window (e.g., 52%) with small negative margin (-3h) is a transient spike
+/// - A moderate-utilization window (60%) with deeply negative margin (-48h) is a real crisis
+///   (exhaustion predicted in ~2.4 hours despite only 60% utilization)
 fn check_cutoff_imminent(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
-    const UTILIZATION_THRESHOLD: f64 = 80.0; // 80% utilization required for cutoff_imminent
+    const HIGH_UTIL_THRESHOLD: f64 = 80.0;
+    const DEEP_MARGIN_THRESHOLD: f64 = -24.0;
+    const DEEP_MARGIN_UTIL_THRESHOLD: f64 = 50.0;
 
     let windows = [
         ("five_hour", &forecast.five_hour),
@@ -574,7 +579,14 @@ fn check_cutoff_imminent(
     ];
 
     for (name, win) in windows {
-        if win.cutoff_risk && win.margin_hrs < -2.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
+        let high_util_risk = win.cutoff_risk
+            && win.margin_hrs < -2.0
+            && win.current_utilization >= HIGH_UTIL_THRESHOLD;
+        let deep_margin_risk = win.cutoff_risk
+            && win.margin_hrs < DEEP_MARGIN_THRESHOLD
+            && win.current_utilization >= DEEP_MARGIN_UTIL_THRESHOLD;
+
+        if high_util_risk || deep_margin_risk {
             let msg = format!(
                 "Window {} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h",
                 name, win.margin_hrs, win.current_utilization, win.hours_remaining
@@ -585,7 +597,6 @@ fn check_cutoff_imminent(
                 severity: AlertSeverity::Critical,
                 detected_at: now,
             });
-            // Only report once (any window triggers it)
             return;
         }
     }
@@ -947,11 +958,12 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_imminent_requires_high_utilization() {
-        // Low utilization (52%) with negative margin should NOT trigger
-        // This is the false positive case that triggered this fix
+    fn cutoff_imminent_requires_high_utilization_for_moderate_margin() {
+        // Low utilization (52%) with small negative margin (-3h) should NOT trigger.
+        // This is the transient burn rate spike false positive case.
+        // The 80% threshold prevents firing for moderate negative margins at low utilization.
         let forecast = CapacityForecast {
-            seven_day: make_window_with_util_and_margin(52.0, true, -58.0, 60.5),
+            seven_day: make_window_with_util_and_margin(52.0, true, -3.0, 60.5),
             five_hour: make_window(false, 10.0, 2.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
@@ -967,7 +979,63 @@ mod tests {
             .find(|a| a.alert_type == AlertType::CutoffImminent);
         assert!(
             imminent.is_none(),
-            "Should NOT have CutoffImminent when utilization < 80% even with negative margin"
+            "Should NOT have CutoffImminent when utilization < 80% AND margin > -24"
+        );
+    }
+
+    #[test]
+    fn cutoff_imminent_fires_on_deep_margin_with_moderate_utilization() {
+        // Regression test: 60% utilization with -48.1h margin IS a real crisis.
+        // Exhaustion predicted in ~2.4 hours despite only 60% utilization.
+        // The deep_margin_risk tier (margin < -24 AND util >= 50%) catches this.
+        let forecast = CapacityForecast {
+            seven_day: make_window_with_util_and_margin(60.0, true, -48.1, 50.5),
+            five_hour: make_window(false, 10.0, 2.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent);
+        assert!(
+            imminent.is_some(),
+            "Should have CutoffImminent when margin < -24 AND utilization >= 50%"
+        );
+        let alert = imminent.unwrap();
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert!(alert.message.contains("seven_day"));
+        assert!(alert.message.contains("-48.1"));
+        assert!(alert.message.contains("60"));
+    }
+
+    #[test]
+    fn cutoff_imminent_no_deep_margin_fire_below_50_pct_utilization() {
+        // Deep margin (-48h) but utilization below 50% should NOT fire.
+        // Very low utilization with negative margin is likely a measurement anomaly.
+        let forecast = CapacityForecast {
+            seven_day: make_window_with_util_and_margin(40.0, true, -48.0, 50.5),
+            five_hour: make_window(false, 10.0, 2.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let imminent = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::CutoffImminent);
+        assert!(
+            imminent.is_none(),
+            "Should NOT fire deep_margin_risk when utilization < 50%"
         );
     }
 
