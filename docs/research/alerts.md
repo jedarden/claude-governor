@@ -45,6 +45,7 @@ Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 - **Severity:** Warning
 - **Message:** `Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Consider scaling down Sonnet workers; monitor seven_day all-models window
+- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules.
 
 #### `session_cutoff_risk`
 
@@ -54,6 +55,7 @@ Five-hour session window at cutoff risk (`cutoff_risk=1`).
 - **Severity:** Warning
 - **Message:** `Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Reduce worker count or pause work until session resets
+- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules.
 
 #### `burn_rate_spike`
 
