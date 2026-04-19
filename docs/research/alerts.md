@@ -52,11 +52,11 @@ OAuth token refresh failing — governor is using stale cached usage data becaus
 
 Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 
-- **Trigger:** `seven_day_sonnet.cutoff_risk=true` **and** `margin_hrs < 0` (negative margin indicates exhaustion before reset)
+- **Trigger:** `seven_day_sonnet.cutoff_risk=true` **and** `margin_hrs < 0` **and** `current_utilization >= 50%` (negative margin indicates exhaustion before reset; utilization guard prevents false positives from stale EMA burn rates)
 - **Severity:** Warning
 - **Message:** `Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Consider scaling down Sonnet workers; monitor seven_day all-models window
-- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules.
+- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules. The `utilization >= 50%` guard prevents false positives from stale EMA burn rates — the fleet_pct_hr EMA only updates on positive deltas, so during seven-day window rollover periods (when old high-usage data drops off), the EMA can stay inflated while actual utilization is declining. At 40% utilization with 50% headroom to the 90% ceiling, a stale EMA predicting imminent exhaustion is not a real crisis.
 
 #### `session_cutoff_risk`
 
