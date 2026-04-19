@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn session_cutoff_risk_triggers() {
         let forecast = CapacityForecast {
-            five_hour: make_window(true, -1.0, 2.0), // cutoff_risk=1
+            five_hour: make_window_with_util_and_margin(60.0, true, -1.0, 2.0), // cutoff_risk=1, util >= 50%
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -1061,6 +1061,32 @@ mod tests {
         assert!(
             session.is_none(),
             "Should NOT have SessionCutoffRisk when margin_hrs is positive (safe)"
+        );
+    }
+
+    #[test]
+    fn session_cutoff_risk_false_positive_when_low_utilization() {
+        // Regression test: 26% utilization with negative margin_hrs is a false positive.
+        // Low utilization means the governor has ample headroom to scale down workers.
+        // The negative margin comes from a transient spike in fleet_pct_per_hour, not a real crisis.
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util_and_margin(26.0, true, -1.0, 3.1), // cutoff_risk=1, util=26% < 50%
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let session = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SessionCutoffRisk);
+        assert!(
+            session.is_none(),
+            "Should NOT have SessionCutoffRisk when utilization is below 50%"
         );
     }
 
