@@ -17,6 +17,7 @@ Any window has `cutoff_risk=1` **and** `margin_hrs < -2` **and** `utilization >=
 - **Message:** `Window {name} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h`
 - **Action:** Immediate manual intervention required — scale down workers immediately
 - **Why the utilization guard:** A low utilization window (e.g., 52%) with negative margin_hrs indicates a transient burn rate spike, not an actual capacity crisis. The 80% threshold ensures the alert only fires when we're genuinely near the ceiling, preventing false positives from temporary fleet_pct_per_hour inflation
+- **Resolved false positive (docs-jj81):** seven_day at 59% utilization, margin_hrs=-50h, hrs_left=52.5h. The 31% headroom to the 90% ceiling meant this was never a capacity crisis — the -50h margin came from a transient burn rate spike (~12.4%/hr). The 80% utilization guard now suppresses this pattern automatically.
 
 #### `emergency_brake_activated`
 
