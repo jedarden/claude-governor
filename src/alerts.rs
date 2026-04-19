@@ -585,14 +585,21 @@ fn check_cutoff_imminent(
     }
 }
 
-/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1
+/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND margin_hrs < 0
+///
+/// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
+/// - Positive margin_hrs = safe (exhaustion after reset)
+/// - Negative margin_hrs = risky (exhaustion before reset)
+///
+/// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
+/// corrupted state or sign convention mismatches between modules.
 fn check_sonnet_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
     let win = &forecast.seven_day_sonnet;
-    if win.cutoff_risk {
+    if win.cutoff_risk && win.margin_hrs < 0.0 {
         let msg = format!(
             "Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
             win.current_utilization, win.hours_remaining, win.margin_hrs
@@ -606,14 +613,21 @@ fn check_sonnet_cutoff_risk(
     }
 }
 
-/// Check for SessionCutoffRisk: five_hour cutoff_risk=1
+/// Check for SessionCutoffRisk: five_hour cutoff_risk=1 AND margin_hrs < 0
+///
+/// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
+/// - Positive margin_hrs = safe (exhaustion after reset)
+/// - Negative margin_hrs = risky (exhaustion before reset)
+///
+/// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
+/// corrupted state or sign convention mismatches between modules.
 fn check_session_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
     let win = &forecast.five_hour;
-    if win.cutoff_risk {
+    if win.cutoff_risk && win.margin_hrs < 0.0 {
         let msg = format!(
             "Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
             win.current_utilization, win.hours_remaining, win.margin_hrs
@@ -956,6 +970,57 @@ mod tests {
             .find(|a| a.alert_type == AlertType::SessionCutoffRisk);
         assert!(session.is_some(), "Should have SessionCutoffRisk alert");
         assert!(session.unwrap().message.contains("Five-hour"));
+    }
+
+    #[test]
+    fn sonnet_cutoff_risk_false_positive_when_margin_positive() {
+        // Regression test for bead docs-c7il:
+        // Alert should NOT fire when cutoff_risk=true but margin_hrs is positive.
+        // Positive margin_hrs means SAFE (exhaustion after reset), not at risk.
+        // This catches corrupted state or sign convention mismatches between modules.
+        let forecast = CapacityForecast {
+            five_hour: make_window(false, 5.0, 2.0),
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window(true, 84.0, 87.7), // cutoff_risk=1 BUT margin=84h (safe!)
+            binding_window: "seven_day_sonnet".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let sonnet = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SonnetCutoffRisk);
+        assert!(
+            sonnet.is_none(),
+            "Should NOT have SonnetCutoffRisk when margin_hrs is positive (safe)"
+        );
+    }
+
+    #[test]
+    fn session_cutoff_risk_false_positive_when_margin_positive() {
+        // Same false positive check for session window
+        let forecast = CapacityForecast {
+            five_hour: make_window(true, 5.0, 2.0), // cutoff_risk=1 BUT margin=5h (safe!)
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        let session = alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::SessionCutoffRisk);
+        assert!(
+            session.is_none(),
+            "Should NOT have SessionCutoffRisk when margin_hrs is positive (safe)"
+        );
     }
 
     #[test]
