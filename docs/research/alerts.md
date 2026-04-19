@@ -53,11 +53,11 @@ Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 
 Five-hour session window at cutoff risk (`cutoff_risk=1`).
 
-- **Trigger:** `five_hour.cutoff_risk=true` **and** `margin_hrs < 0` (negative margin indicates exhaustion before reset)
+- **Trigger:** `five_hour.cutoff_risk=true` **and** `margin_hrs < 0` **and** `current_utilization >= 50%` (negative margin indicates exhaustion before reset; utilization guard prevents false positives from transient burn rate spikes)
 - **Severity:** Warning
 - **Message:** `Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h`
 - **Action:** Reduce worker count or pause work until session resets
-- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). Positive margin means exhaustion will occur **after** reset, so no alert should fire. This catches corrupted state or sign convention mismatches between modules.
+- **Why both conditions:** The `margin_hrs < 0` guard prevents false positives when `cutoff_risk=true` but the margin is actually positive (safe). The `utilization >= 50%` guard prevents false positives from transient spikes in `fleet_pct_per_hour` — with low utilization (e.g., 26%), the governor has ample headroom to scale down workers before exhaustion. A negative margin at low utilization indicates a temporary burn rate spike, not an actual capacity crisis.
 
 #### `burn_rate_spike`
 
