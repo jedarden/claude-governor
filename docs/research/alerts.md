@@ -79,7 +79,7 @@ Token collector has stopped reporting (last update > 5 minutes ago).
 - **Trigger:** `now - last_fleet_aggregate.t1 > 300` seconds
 - **Severity:** Warning
 - **Message:** `Token collector offline: last update {N} minutes ago`
-- **Context:** The collector writes a "heartbeat" fleet record every 5 minutes even when idle (no new token usage), so this alert should only fire when the collector daemon has actually stopped or cannot write to the database.
+- **Context:** The collector writes a "heartbeat" fleet record every 2 minutes (120s interval) even when idle (no new token usage), so this alert should only fire when the collector daemon has actually stopped or cannot write to the database. The collector service is independent of the governor (no `PartOf`), so governor restarts should not trigger this alert.
 - **Action:**
   1. Check if the collector daemon is running: `ps aux | grep cgov`
   2. Check for collection errors in governor logs: `tail -100 ~/.needle/logs/governor.log | grep collector`

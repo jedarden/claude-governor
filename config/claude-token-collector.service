@@ -3,7 +3,6 @@ Description=Claude Token Collector - collects token usage data for Claude Govern
 Documentation=https://github.com/anthropics/claude-governor
 After=network-online.target
 Wants=network-online.target
-PartOf=claude-governor.service
 
 [Service]
 Type=simple
