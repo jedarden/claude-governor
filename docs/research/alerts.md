@@ -25,6 +25,7 @@ Any window has `cutoff_risk=1` **and** either:
   - The 80% threshold prevents false positives from transient spikes with small negative margins
   - The 50% threshold with -24h margin catches genuine crises where moderate utilization masks imminent exhaustion
 - **Deep margin risk examples:** seven_day at 56-60% utilization with margin_hrs=-47 to -55h predicts exhaustion in ~2-3 hours despite 34-40% headroom to the 90% ceiling. This IS a capacity crisis — the deep negative margin indicates sustained elevated burn rate that will exhaust the window before reset.
+- **Resolved false positive (docs-uqq8):** seven_day at 60% utilization, margin_hrs=-45.1h, hrs_left=47.5h. Same transient burn rate spike pattern as prior alerts (~12.5%/hr). Alert created 2026-04-16 from pre-fix binary; the seven_day window reset without incident, confirming the spike was transient.
 
 #### `emergency_brake_activated`
 
