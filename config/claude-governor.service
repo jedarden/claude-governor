@@ -9,6 +9,7 @@ Type=simple
 ExecStart=%h/.local/bin/cgov _daemon
 Restart=always
 RestartSec=10
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Logging
 StandardOutput=journal
