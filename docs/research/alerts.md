@@ -127,6 +127,8 @@ Five-hour session window at cutoff risk (`cutoff_risk=1`).
 
 **False positive (docs-78hv):** An alert fired with 15.0% utilization, 2.8h remaining, and margin_hrs=-0.6h. At 15% utilization with 2.8 hours remaining, the window has 85% headroom to the 90% ceiling — this cannot be a real cutoff risk. The negative margin at low utilization indicates a transient measurement anomaly or stale burn rate, not an actual capacity crisis. The `>= 50%` utilization guard should have suppressed this alert automatically.
 
+**False positive (docs-2cfo):** An alert fired with 20.0% utilization, 2.9h remaining, and margin_hrs=-0.9h. At 20% utilization with 2.9 hours remaining, the window has 80% headroom to the 90% ceiling — this cannot be a real cutoff risk. The negative margin at low utilization indicates a transient burn rate spike, not an actual capacity crisis. The `>= 50%` utilization guard should have suppressed this alert automatically.
+
 #### `burn_rate_spike`
 
 Burn rate significantly higher than baseline (not yet implemented).
