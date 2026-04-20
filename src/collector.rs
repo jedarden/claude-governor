@@ -264,6 +264,12 @@ pub fn parse_usage_block(line: &JsonlLine, jsonl_path: &Path) -> Option<UsageRec
         infer_model_from_path(jsonl_path).unwrap_or_else(|| "unknown".to_string())
     });
 
+    // Only count Anthropic-native models toward utilization.
+    // ZAI/GLM proxy models (glm-*, etc.) don't consume Anthropic quota — skip them.
+    if !model.starts_with("claude-") {
+        return None;
+    }
+
     // Extract session ID from file path
     let session = extract_session_id(jsonl_path);
 
