@@ -743,7 +743,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use tempfile::TempDir;
 
     fn base_now() -> DateTime<Utc> {
         "2026-03-20T10:00:00Z".parse().unwrap()
@@ -753,7 +752,12 @@ mod tests {
         make_window_with_util_and_margin(50.0, cutoff_risk, margin_hrs, hrs_left)
     }
 
-    fn make_window_with_util_and_margin(util: f64, cutoff_risk: bool, margin_hrs: f64, hrs_left: f64) -> WindowForecast {
+    fn make_window_with_util_and_margin(
+        util: f64,
+        cutoff_risk: bool,
+        margin_hrs: f64,
+        hrs_left: f64,
+    ) -> WindowForecast {
         WindowForecast {
             target_ceiling: 90.0,
             current_utilization: util,

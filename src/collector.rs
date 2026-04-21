@@ -1144,7 +1144,10 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
         // Critical: heartbeat must succeed to avoid false collector_offline alerts
         // Return error if write fails so governor can detect the issue
         append_jsonl(&history_path, &[fleet_json.clone()]).map_err(|e| {
-            log::error!("[collector] CRITICAL: failed to write heartbeat fleet record: {}", e);
+            log::error!(
+                "[collector] CRITICAL: failed to write heartbeat fleet record: {}",
+                e
+            );
             anyhow::anyhow!("Failed to write heartbeat fleet record: {}", e)
         })?;
 

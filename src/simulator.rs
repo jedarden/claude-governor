@@ -21,9 +21,6 @@ use crate::state::GovernorState;
 /// Default output resolution in minutes
 const DEFAULT_RESOLUTION_MINUTES: i64 = 15;
 
-/// Simulation step size in minutes (internal simulation granularity)
-const SIMULATION_STEP_MINUTES: i64 = 1;
-
 /// Window names we track
 const WINDOWS: [&str; 3] = ["five_hour", "seven_day", "seven_day_sonnet"];
 

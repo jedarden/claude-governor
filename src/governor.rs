@@ -1045,8 +1045,7 @@ pub fn run_governor_cycle(
     // 3. Read latest fleet record from database and update last_fleet_aggregate
     let db_path = collector::default_db_path();
     // Snapshot whether collector was offline before this update, so we can detect recovery.
-    let collector_was_offline =
-        (now - state.last_fleet_aggregate.t1).num_seconds() > 300;
+    let collector_was_offline = (now - state.last_fleet_aggregate.t1).num_seconds() > 300;
     if let Ok(conn) = db::open_db(&db_path) {
         if let Ok(fleet_records) = db::query_last_fleets(&conn, 1) {
             if let Some(fleet_json) = fleet_records.first() {
@@ -1673,7 +1672,11 @@ pub fn run_governor_cycle(
         let applies = promotions.iter().any(|p| {
             p.applies_to.iter().any(|w| w == "five_hour") && schedule::is_promo_active_at(now, p)
         });
-        if applies { effective_promo_multiplier } else { 1.0 }
+        if applies {
+            effective_promo_multiplier
+        } else {
+            1.0
+        }
     };
     let mult_seven_day = if is_peak {
         1.0
@@ -1681,15 +1684,24 @@ pub fn run_governor_cycle(
         let applies = promotions.iter().any(|p| {
             p.applies_to.iter().any(|w| w == "seven_day") && schedule::is_promo_active_at(now, p)
         });
-        if applies { effective_promo_multiplier } else { 1.0 }
+        if applies {
+            effective_promo_multiplier
+        } else {
+            1.0
+        }
     };
     let mult_seven_day_sonnet = if is_peak {
         1.0
     } else {
         let applies = promotions.iter().any(|p| {
-            p.applies_to.iter().any(|w| w == "seven_day_sonnet") && schedule::is_promo_active_at(now, p)
+            p.applies_to.iter().any(|w| w == "seven_day_sonnet")
+                && schedule::is_promo_active_at(now, p)
         });
-        if applies { effective_promo_multiplier } else { 1.0 }
+        if applies {
+            effective_promo_multiplier
+        } else {
+            1.0
+        }
     };
     let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
     let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);

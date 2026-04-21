@@ -827,9 +827,6 @@ pub fn compute_composite_safe_workers(
 /// EMA smoothing factor (alpha = 0.2 per plan)
 const EMA_ALPHA: f64 = 0.2;
 
-/// Minimum valid samples per window before EMA is used instead of baseline
-const MIN_SAMPLES_FOR_EMA: u32 = 3;
-
 /// Known window names
 const WINDOWS: &[&str] = &["five_hour", "seven_day", "seven_day_sonnet"];
 
@@ -1301,14 +1298,8 @@ pub fn estimate_burn_rates(
     let binding_window = WINDOWS
         .iter()
         .max_by(|&a, &b| {
-            let fa = forecasts
-                .get(*a)
-                .map(|f| f.risk_score)
-                .unwrap_or(0.0);
-            let fb = forecasts
-                .get(*b)
-                .map(|f| f.risk_score)
-                .unwrap_or(0.0);
+            let fa = forecasts.get(*a).map(|f| f.risk_score).unwrap_or(0.0);
+            let fb = forecasts.get(*b).map(|f| f.risk_score).unwrap_or(0.0);
             fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|w| w.to_string())

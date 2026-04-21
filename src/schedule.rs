@@ -5,7 +5,7 @@
 //! - Promotion loading and multiplier calculation
 //! - Effective hours remaining accounting for off-peak multipliers
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
