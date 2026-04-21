@@ -2410,7 +2410,7 @@ mod tests {
 
     mod peak {
         use super::*;
-        use chrono::{Duration, Utc};
+        use chrono::Utc;
 
         fn ts(s: &str) -> DateTime<Utc> {
             s.parse().unwrap()

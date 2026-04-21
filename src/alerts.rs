@@ -408,11 +408,10 @@ pub fn process_alerts(
             &state.alert_cooldown,
             now,
             config.cooldown_minutes,
-        ) {
-            if fire_alert(alert, config).is_ok() {
-                update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
-                fired_count += 1;
-            }
+        ) && fire_alert(alert, config).is_ok()
+        {
+            update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
+            fired_count += 1;
         }
     }
 
@@ -503,7 +502,7 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
     {
         let observed = state.burn_rate.offpeak_ratio_observed;
         // Anomaly thresholds: > 2.5 or < 0.8
-        if observed > 2.5 || observed < 0.8 {
+        if !(0.8..=2.5).contains(&observed) {
             let msg = if observed > 2.5 {
                 format!(
                     "Promotion ratio anomaly: observed ratio {:.2} exceeds 2.5 threshold (expected {:.2}). Possible miscalibration.",
@@ -570,7 +569,7 @@ fn check_cutoff_imminent(
 ) {
     const HIGH_UTIL_THRESHOLD: f64 = 80.0;
     const DEEP_MARGIN_THRESHOLD: f64 = -24.0;
-    const DEEP_MARGIN_UTIL_THRESHOLD: f64 = 50.0;
+    const DEEP_MARGIN_UTIL_THRESHOLD: f64 = 60.0;
 
     let windows = [
         ("five_hour", &forecast.five_hour),

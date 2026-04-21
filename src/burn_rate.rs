@@ -144,6 +144,9 @@ const MIN_ELAPSED_MINUTES: f64 = 2.0;
 /// Utilization drop threshold for window reset detection (1 percentage point)
 const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 
+/// Minimum samples required before EMA is considered reliable
+const MIN_SAMPLES_FOR_EMA: usize = 3;
+
 /// Compute per-instance per-window burn rates from an interval record
 ///
 /// Returns a burn rate entry for each window that passes all guard conditions:
@@ -262,7 +265,7 @@ fn median(values: &[f64]) -> f64 {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let len = sorted.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
     } else {
         sorted[len / 2]
@@ -792,7 +795,7 @@ pub fn compute_composite_safe_workers(
 
         // Only consider non-binding windows with cost above threshold
         if !window_cost(forecast.margin_hrs, forecast.hours_remaining)
-            .map_or(false, |c| c > cost_threshold)
+            .is_some_and(|c| c > cost_threshold)
         {
             continue;
         }
@@ -1165,6 +1168,7 @@ pub fn generate_window_forecast(
 /// fleet stats, updates EMA state, and generates capacity forecasts.
 ///
 /// Returns updated EMA state and fleet stats for persisting in GovernorState.
+#[allow(clippy::too_many_arguments)]
 pub fn estimate_burn_rates(
     instance_records: &[InstanceRecord],
     elapsed_hours: f64,
@@ -2221,7 +2225,7 @@ mod tests {
         hrs_left.insert("seven_day".to_string(), 37.5);
         hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
 
-        let (estimate, forecast) = estimate_burn_rates(
+        let (estimate, _forecast) = estimate_burn_rates(
             &instances,
             elapsed,
             current_workers,

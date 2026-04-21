@@ -425,7 +425,6 @@ mod tests {
         BurnRateState, CalibrationState, FleetAggregate, ModelBurnRate, SafeModeState,
         ScheduleState, UsageState, WindowForecast, WorkerState,
     };
-    use chrono::TimeZone;
 
     fn make_test_state() -> GovernorState {
         let mut workers = HashMap::new();
