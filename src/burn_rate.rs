@@ -145,7 +145,7 @@ const MIN_ELAPSED_MINUTES: f64 = 2.0;
 const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 
 /// Minimum samples required before EMA is considered reliable
-const MIN_SAMPLES_FOR_EMA: usize = 3;
+const MIN_SAMPLES_FOR_EMA: u32 = 3;
 
 /// Compute per-instance per-window burn rates from an interval record
 ///
@@ -2273,7 +2273,7 @@ mod tests {
             70.0,
         )];
 
-        let (estimate, forecast) = estimate_burn_rates(
+        let (estimate, _forecast) = estimate_burn_rates(
             &instances,
             1.0,
             2, // current

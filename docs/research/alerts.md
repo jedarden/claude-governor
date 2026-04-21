@@ -17,7 +17,7 @@ Any window has `cutoff_risk=1` **and** either:
 
 - **Trigger:** Window is at cutoff risk with tiered thresholds
   - High utilization risk: Exhaustion predicted >2 hours before reset AND utilization at 80%+ OR
-  - Deep margin risk: Exhaustion predicted >24 hours before reset AND utilization at 50%+
+  - Deep margin risk: Exhaustion predicted >24 hours before reset AND utilization at 60%+
 - **Severity:** Critical
 - **Message:** `Window {name} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h`
 - **Action:** Immediate manual intervention required — scale down workers immediately
@@ -174,6 +174,7 @@ Seven-day Sonnet window at cutoff risk (`cutoff_risk=1`).
 - **Resolved false positive (docs-9zll):** seven_day at 51.0% utilized, margin_hrs=-62.5h, hrs_left=65.7h. Same extreme false positive pattern as docs-pdko, docs-sv7o, docs-ouwl, docs-ibnf, docs-enfn and predecessors — at 51% utilization with 39% headroom to the 90% ceiling, the window cannot be at cutoff risk. The deeply negative margin at moderate utilization indicates a stale EMA burn rate persisting from prior heavy usage during a window rollover or idle period, not an actual capacity crisis. Alert created 2026-04-21.
 - **Resolved false positive (docs-5dwm):** seven_day at 52.0% utilized, margin_hrs=-62.0h, hrs_left=64.7h. Same extreme false positive pattern as docs-9zll and predecessors — at 52% utilization with 38% headroom to the 90% ceiling, the window cannot be at cutoff risk. The deeply negative margin at moderate utilization indicates a stale EMA burn rate persisting from prior heavy usage during a window rollover or idle period, not an actual capacity crisis. Alert created 2026-04-21.
 - **Resolved false positive (docs-t664):** seven_day_sonnet at 55.0% utilized, margin_hrs=-62.8h, hrs_left=65.7h. Same extreme false positive pattern as docs-5dwm and predecessors — at 55% utilization with 35% headroom to the 90% ceiling, the window cannot be at cutoff risk. The deeply negative margin at moderate utilization indicates a stale EMA burn rate persisting from prior heavy usage during a window rollover or idle period, not an actual capacity crisis. Alert created 2026-04-21.
+- **Resolved false positive (docs-nq8q):** seven_day at 51.0% utilized, margin_hrs=-63.5h, hrs_left=66.7h. Same extreme false positive pattern as docs-t664, docs-5dwm, docs-9zll and predecessors — at 51% utilization with 39% headroom to the 90% ceiling, the window cannot be at cutoff risk. The deeply negative margin at moderate utilization indicates a stale EMA burn rate persisting from prior heavy usage during a window rollover or idle period, not an actual capacity crisis. Alert created 2026-04-21.
 #### `session_cutoff_risk`
 
 Five-hour session window at cutoff risk (`cutoff_risk=1`).
