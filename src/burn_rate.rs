@@ -145,6 +145,7 @@ const MIN_ELAPSED_MINUTES: f64 = 2.0;
 const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 
 /// Minimum samples required before EMA is considered reliable
+#[allow(dead_code)]
 const MIN_SAMPLES_FOR_EMA: u32 = 3;
 
 /// Compute per-instance per-window burn rates from an interval record
