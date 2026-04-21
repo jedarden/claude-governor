@@ -234,6 +234,8 @@ Five-hour session window at cutoff risk (`cutoff_risk=1`).
 
 **False positive (docs-bd9i):** An alert fired with 13.0% utilization, 4.0h remaining, and margin_hrs=-1.3h. At 13% utilization with 4.0 hours remaining, the window has 87% headroom to the 90% ceiling — this cannot be a real cutoff risk. The negative margin at low utilization indicates a transient burn rate spike or stale burn rate, not an actual capacity crisis. The `>= 50%` utilization guard should have suppressed this alert automatically. Alert created 2026-04-19.
 
+**False positive (docs-290i):** An alert fired with 51.0% utilization, 3.0h remaining, and margin_hrs=-2.7h. At 51% utilization (barely above the 50% threshold), the window has 39% headroom to the 90% ceiling — with 3.0 hours remaining, actual exhaustion would require a sustained burn rate of ~13%/hr, which is unrealistically high. The -2.7h margin indicates a stale EMA burn rate persisting from prior heavy usage, not an actual capacity crisis. This is the same transient burn rate spike pattern as docs-25sp, docs-bd9i and predecessors. Alert created 2026-04-21.
+
 #### `burn_rate_spike`
 
 Burn rate significantly higher than baseline (not yet implemented).
