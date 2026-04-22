@@ -275,6 +275,8 @@ Five-hour session window at cutoff risk (`cutoff_risk=1`).
 
 **False positive (docs-hezt):** An alert fired with 51.0% utilization, 1.4h remaining, and margin_hrs=-0.5h. At 51% utilization (barely above the 50% threshold), the window had 39% headroom to the 90% ceiling — with 1.4 hours remaining, the negative margin indicates a stale EMA burn rate persisting from prior heavy usage, not an actual capacity crisis. The 5h window subsequently dropped to 20% utilization with 70% remaining, confirming the alert was spurious. Same false positive pattern as docs-290i and predecessors. Alert created 2026-04-22.
 
+**False positive (docs-1rji):** An alert fired with 50.0% utilization, 3.0h remaining, and margin_hrs=-2.5h. At exactly 50% utilization (the threshold boundary), the window has 40% headroom to the 90% ceiling — with 3.0 hours remaining, actual exhaustion would require a sustained burn rate of ~13%/hr, which is unrealistically high. The -2.5h margin indicates a stale EMA burn rate persisting from prior heavy usage, not an actual capacity crisis. Same false positive pattern as docs-hezt, docs-290i and predecessors. Alert created 2026-04-22.
+
 #### `burn_rate_spike`
 
 Burn rate significantly higher than baseline (not yet implemented).
