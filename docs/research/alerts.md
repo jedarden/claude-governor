@@ -63,6 +63,7 @@ Emergency brake was triggered (98%+ utilization detected).
 - **Severity:** Critical
 - **Message:** `Emergency brake active since {timestamp}`
 - **Action:** Workers have been scaled to minimum; investigate why prediction failed
+- **Resolved false positive (docs-tdp2):** seven_day at 99.0% utilization, margin_hrs=-15.3h, hrs_left=15.3h. Same false positive pattern as cutoff_imminent alerts — at 99% utilization (past the 90% target ceiling) and 15.3 hours remaining, the negative margin indicates a stale EMA burn rate persisting from prior heavy usage, not an actual capacity crisis. The emergency brake threshold (98%) is purely reactive to observed utilization and does not account for the time remaining until reset. Alert created 2026-04-23.
 
 #### `token_refresh_failing`
 
