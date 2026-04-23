@@ -394,6 +394,13 @@ pub struct AlertConfig {
     /// (default: 5 — roughly 25 minutes at 5-minute collection intervals)
     #[serde(default = "default_low_cache_eff_intervals")]
     pub low_cache_eff_intervals: u32,
+
+    /// Whether to auto-create beads (execute the alert command) when an alert fires.
+    /// When false, alerts are logged but no external command is executed.
+    /// Set to false when alert predicates have high false-positive rates to prevent
+    /// fleet waste on documenting false positives.
+    #[serde(default = "default_auto_bead")]
+    pub auto_bead: bool,
 }
 
 fn default_alert_command() -> Vec<String> {
@@ -425,6 +432,10 @@ fn default_low_cache_eff_intervals() -> u32 {
     5
 }
 
+fn default_auto_bead() -> bool {
+    true
+}
+
 impl Default for AlertConfig {
     fn default() -> Self {
         Self {
@@ -434,6 +445,7 @@ impl Default for AlertConfig {
             min_severity: default_min_severity(),
             low_cache_eff_threshold: default_low_cache_eff_threshold(),
             low_cache_eff_intervals: default_low_cache_eff_intervals(),
+            auto_bead: default_auto_bead(),
         }
     }
 }
