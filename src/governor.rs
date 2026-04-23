@@ -967,7 +967,7 @@ pub fn update_safe_mode_from_calibration(
 /// Cutoff-related alerts are true positives only when utilization is genuinely near
 /// the hard limit (>= 95%). Alerts that fire at lower utilization are false positives
 /// because the governor's scaling logic handles those cases without human intervention.
-fn is_true_positive_alert(alert_type: &AlertType, state: &GovernorState) -> bool {
+fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) -> bool {
     match alert_type {
         AlertType::CutoffImminent | AlertType::SonnetCutoffRisk | AlertType::SessionCutoffRisk => {
             // True positive only if hard limit margin is genuinely negative AND utilization >= 95%

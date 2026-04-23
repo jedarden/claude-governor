@@ -585,7 +585,8 @@ const MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT: f64 = 5.0;
 /// This is the consistency guard that eliminates the "negative margin at sub-100% util"
 /// false-positive pattern.
 fn is_cutoff_alert_consistent(win: &crate::state::WindowForecast) -> bool {
-    win.hard_limit_remaining_pct <= MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT
+    win.hard_limit_remaining_pct > 0.0
+        && win.hard_limit_remaining_pct <= MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT
         && win.hard_limit_margin_hrs < 0.0
 }
 
@@ -1159,6 +1160,96 @@ mod tests {
             .find(|a| a.alert_type == AlertType::SessionCutoffRisk);
         assert!(session.is_some(), "Should have SessionCutoffRisk alert");
         assert!(session.unwrap().message.contains("Five-hour"));
+    }
+
+    #[test]
+    fn consistency_guard_suppresses_cutoff_at_100_pct_utilization() {
+        // Regression test for bead docs-iqqe: cutoff_imminent false positive at 100% utilization.
+        // At 100% utilization, hard_limit_remaining_pct = 0.0 — the window is fully consumed.
+        // The emergency brake (98%) already scaled workers to 0, so this alert is post-hoc.
+        // If the platform hasn't cut off workers at 100%, the alert is wrong; if it has,
+        // the alert is too late. Either way, it's unactionable.
+        //
+        // The consistency guard now requires hard_limit_remaining_pct > 0.0 (not just <= 5.0)
+        // to exclude this degenerate case. The pattern is always: margin = -hrs_left because
+        // hard_limit_margin_hrs = 0.0/fleet_pct_hr - hrs_left = -hrs_left.
+        let forecast = CapacityForecast {
+            five_hour: make_window(false, 5.0, 2.0),
+            seven_day: make_window_with_util_and_margin(100.0, true, -9.2, 9.2),
+            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        assert!(
+            alerts.iter().all(|a| !matches!(
+                a.alert_type,
+                AlertType::CutoffImminent | AlertType::SonnetCutoffRisk | AlertType::SessionCutoffRisk
+            )),
+            "Consistency guard should suppress all cutoff alerts at 100% util (hard_limit_remaining_pct=0.0), got: {:?}",
+            alerts.iter().map(|a| a.alert_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn consistency_guard_suppresses_negative_margin_at_sub_100_util() {
+        // Regression test for the root cause of the 100% FP rate (docs-878a):
+        // A negative hard_limit_margin_hrs at sub-100% utilization is the canonical false positive.
+        // At 86% utilization, hard_limit_remaining_pct = 14.0 which is > 5.0, so the consistency
+        // guard suppresses the alert regardless of how negative the margin is. The fleet is far
+        // enough from the platform hard limit that burn-rate extrapolation is unreliable.
+        //
+        // This is the exact pattern that produced 50/50 false positives:
+        //   util=86%, margin=-16.2h, hard_limit_remaining_pct=14.0
+        //   util=99%, margin=-10.2h, hard_limit_remaining_pct=1.0  ← this would pass the guard
+        let forecast = CapacityForecast {
+            five_hour: make_window(false, 5.0, 2.0),
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window_with_util_and_margin(86.0, true, -16.2, 26.2),
+            binding_window: "seven_day_sonnet".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        // None of the cutoff-related alerts should fire
+        assert!(
+            alerts.iter().all(|a| !matches!(
+                a.alert_type,
+                AlertType::CutoffImminent | AlertType::SonnetCutoffRisk | AlertType::SessionCutoffRisk
+            )),
+            "Consistency guard should suppress all cutoff alerts at 86% util (hard_limit_remaining_pct=14.0 > 5.0), got: {:?}",
+            alerts.iter().map(|a| a.alert_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn consistency_guard_allows_alert_when_near_hard_limit() {
+        // Complement to the suppression test: at 96% utilization, hard_limit_remaining_pct = 4.0
+        // which is <= 5.0, so the consistency guard passes and the alert fires.
+        let forecast = CapacityForecast {
+            five_hour: make_window(false, 5.0, 2.0),
+            seven_day: make_window(false, 10.0, 30.0),
+            seven_day_sonnet: make_window_with_util_and_margin(96.0, true, -26.2, 27.0),
+            binding_window: "seven_day_sonnet".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        let state = make_state_with_forecast(forecast);
+
+        let alerts = check_alert_conditions(&state, base_now());
+
+        assert!(
+            alerts.iter().any(|a| matches!(a.alert_type, AlertType::SonnetCutoffRisk | AlertType::CutoffImminent)),
+            "Consistency guard should allow alerts at 96% util (hard_limit_remaining_pct=4.0 <= 5.0), got: {:?}",
+            alerts.iter().map(|a| a.alert_type).collect::<Vec<_>>()
+        );
     }
 
     #[test]
