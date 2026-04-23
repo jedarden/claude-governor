@@ -397,8 +397,9 @@ pub struct AlertConfig {
 
     /// Whether to auto-create beads (execute the alert command) when an alert fires.
     /// When false, alerts are logged but no external command is executed.
-    /// Set to false when alert predicates have high false-positive rates to prevent
-    /// fleet waste on documenting false positives.
+    /// Default is false — alert predicates must achieve <5% FP rate measured over
+    /// a 100-alert rolling window before enabling auto_bead. Until then, alerts are
+    /// logged to governor.log for manual review without burning fleet cycles.
     #[serde(default = "default_auto_bead")]
     pub auto_bead: bool,
 }
@@ -433,7 +434,7 @@ fn default_low_cache_eff_intervals() -> u32 {
 }
 
 fn default_auto_bead() -> bool {
-    true
+    false
 }
 
 impl Default for AlertConfig {
@@ -445,7 +446,7 @@ impl Default for AlertConfig {
             min_severity: default_min_severity(),
             low_cache_eff_threshold: default_low_cache_eff_threshold(),
             low_cache_eff_intervals: default_low_cache_eff_intervals(),
-            auto_bead: default_auto_bead(),
+            auto_bead: false,
         }
     }
 }

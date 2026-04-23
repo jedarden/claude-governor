@@ -573,6 +573,30 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
     alerts
 }
 
+/// Minimum remaining headroom to the 100% hard limit before cutoff alerts fire.
+///
+/// When hard_limit_remaining_pct exceeds this, the fleet is far enough from the platform
+/// cutoff that burn-rate extrapolation is unreliable — producing negative margins that
+/// almost never result in actual cutoffs (observed 100% FP rate over 50 consecutive alerts).
+/// The governor's scaling logic (safe_worker_count, emergency brake at 98%) handles the
+/// sub-threshold case without human-alert beads.
+const MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT: f64 = 5.0;
+
+/// Check whether a cutoff alert is consistent: utilization must be close enough to the
+/// hard limit that the burn-rate extrapolation is reliable.
+///
+/// Returns false (suppress) when:
+/// - hard_limit_remaining_pct > MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT
+///   (fleet is far from 100%, so negative margin is speculative), OR
+/// - hard_limit_margin_hrs >= 0 (no risk — margin is positive)
+///
+/// This is the consistency guard that eliminates the "negative margin at sub-100% util"
+/// false-positive pattern.
+fn is_cutoff_alert_consistent(win: &crate::state::WindowForecast) -> bool {
+    win.hard_limit_remaining_pct <= MIN_HARD_LIMIT_REMAINING_PCT_FOR_CUTOFF_ALERT
+        && win.hard_limit_margin_hrs < 0.0
+}
+
 /// Check for CutoffImminent: any window with cutoff_risk=1 AND either:
 /// - hard_limit_margin_hrs < -2 AND utilization >= 95% (high utilization risk), OR
 /// - hard_limit_margin_hrs < -24 AND utilization >= 90% (deep margin risk)
@@ -584,6 +608,10 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
 /// The higher utilization thresholds (95%/90%) compared to the old values (80%/60%) reflect that
 /// this alert signals genuine risk of platform-forced worker stoppage, not just exceeding a
 /// self-imposed safety reserve. The governor's scaling logic handles the safety reserve case.
+///
+/// Additionally, the consistency guard (`is_cutoff_alert_consistent`) suppresses alerts when
+/// hard_limit_remaining_pct > 5%, because burn-rate extrapolation beyond that range produces
+/// deeply negative margins that don't correspond to actual cutoffs (100% FP rate observed).
 fn check_cutoff_imminent(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
@@ -600,6 +628,11 @@ fn check_cutoff_imminent(
     ];
 
     for (name, win) in windows {
+        // Consistency guard: suppress when burn-rate extrapolation is unreliable
+        if !is_cutoff_alert_consistent(win) {
+            continue;
+        }
+
         let high_util_risk = win.cutoff_risk
             && win.hard_limit_margin_hrs < -2.0
             && win.current_utilization >= HIGH_UTIL_THRESHOLD;
@@ -640,6 +673,12 @@ fn check_sonnet_cutoff_risk(
 ) {
     const UTILIZATION_THRESHOLD: f64 = 85.0;
     let win = &forecast.seven_day_sonnet;
+
+    // Consistency guard: suppress when burn-rate extrapolation is unreliable
+    if !is_cutoff_alert_consistent(win) {
+        return;
+    }
+
     if win.cutoff_risk
         && win.hard_limit_margin_hrs < 0.0
         && win.current_utilization >= UTILIZATION_THRESHOLD
@@ -669,6 +708,12 @@ fn check_session_cutoff_risk(
 ) {
     const UTILIZATION_THRESHOLD: f64 = 85.0;
     let win = &forecast.five_hour;
+
+    // Consistency guard: suppress when burn-rate extrapolation is unreliable
+    if !is_cutoff_alert_consistent(win) {
+        return;
+    }
+
     if win.cutoff_risk
         && win.hard_limit_margin_hrs < 0.0
         && win.current_utilization >= UTILIZATION_THRESHOLD

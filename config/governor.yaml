@@ -131,3 +131,6 @@ alerts:
   min_severity: warning             # Minimum severity level: info, warning, critical
   low_cache_eff_threshold: 0.30     # Fleet cache efficiency below this fraction triggers alert (30%)
   low_cache_eff_intervals: 5        # Number of consecutive intervals below threshold before alerting
+  auto_bead: false                  # Disabled: alert predicates have 100% FP rate (docs-878a)
+                                    # Alerts are logged to governor.log but do not spawn beads.
+                                    # Re-enable only after FP rate < 5% over 100-alert window.
