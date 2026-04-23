@@ -1160,6 +1160,12 @@ pub fn generate_window_forecast(
         exh_hrs_p75,
         cone_ratio,
         risk_score,
+        hard_limit_remaining_pct: (100.0 - current_utilization).max(0.0),
+        hard_limit_margin_hrs: if fleet_pct_hr > 0.0 {
+            (100.0 - current_utilization).max(0.0) / fleet_pct_hr - hours_remaining
+        } else {
+            f64::INFINITY
+        },
     }
 }
 

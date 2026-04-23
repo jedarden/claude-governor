@@ -189,6 +189,16 @@ pub struct WindowForecast {
     /// Used for binding window selection.
     #[serde(default)]
     pub risk_score: f64,
+    /// Remaining headroom to the hard platform limit (100% - current_utilization).
+    /// Unlike remaining_pct (which uses the target ceiling), this measures distance to the
+    /// platform-enforced cutoff at 100%.
+    #[serde(default)]
+    pub hard_limit_remaining_pct: f64,
+    /// Margin in hours against the hard platform limit (100%).
+    /// positive = safe (won't hit 100% before reset), negative = will hit 100% before reset.
+    /// Alert predicates use this instead of margin_hrs (which is against the target ceiling).
+    #[serde(default)]
+    pub hard_limit_margin_hrs: f64,
 }
 
 impl Default for WindowForecast {
@@ -210,6 +220,8 @@ impl Default for WindowForecast {
             exh_hrs_p75: 0.0,
             cone_ratio: 0.0,
             risk_score: 0.0,
+            hard_limit_remaining_pct: 0.0,
+            hard_limit_margin_hrs: 0.0,
         }
     }
 }

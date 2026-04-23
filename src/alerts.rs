@@ -298,6 +298,22 @@ pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), St
         alert.message
     );
 
+    // Log to alert log file regardless of auto_bead setting
+    if let Err(e) = log_alert_to_file(alert) {
+        log::debug!("[alert] could not write to alert log: {}", e);
+    }
+
+    // When auto_bead is disabled, log but do not execute the bead-creation command.
+    // This prevents fleet waste on documenting false-positive alerts while still
+    // maintaining alert telemetry in the log file.
+    if !config.auto_bead {
+        log::info!(
+            "[alert] auto_bead disabled — logged but did not execute command for {}",
+            alert.alert_type
+        );
+        return Ok(());
+    }
+
     // Build the command with the alert message as the final argument
     if config.command.is_empty() {
         log::warn!("[alert] no command configured, skipping alert execution");
@@ -523,10 +539,13 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
         }
     }
 
-    // Check CollectorOffline: last fleet aggregate too old
+    // Check CollectorOffline: last fleet aggregate too old.
+    // Threshold is 30 minutes (matching the governor's fallback-to-baseline staleness tier).
+    // The 5-minute threshold produced 100% false positives because normal collection intervals
+    // (5 min) plus processing latency routinely exceeded it.
     let collector_age = (now - state.last_fleet_aggregate.t1).num_seconds();
-    if collector_age > 300 {
-        // 5 minutes
+    if collector_age > 1800 {
+        // 30 minutes
         let age_minutes = collector_age / 60;
         let msg = format!(
             "Token collector offline: last update {} minutes ago",
@@ -555,21 +574,24 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
 }
 
 /// Check for CutoffImminent: any window with cutoff_risk=1 AND either:
-/// - margin_hrs < -2 AND utilization >= 80% (high utilization risk), OR
-/// - margin_hrs < -24 AND utilization >= 50% (deep margin risk)
+/// - hard_limit_margin_hrs < -2 AND utilization >= 95% (high utilization risk), OR
+/// - hard_limit_margin_hrs < -24 AND utilization >= 90% (deep margin risk)
 ///
-/// Tiered thresholds prevent false positives from transient burn rate spikes:
-/// - A low-utilization window (e.g., 52%) with small negative margin (-3h) is a transient spike
-/// - A moderate-utilization window (60%) with deeply negative margin (-48h) is a real crisis
-///   (exhaustion predicted in ~2.4 hours despite only 60% utilization)
+/// Uses hard_limit_margin_hrs (margin against the 100% platform limit) rather than margin_hrs
+/// (margin against the target ceiling). This prevents false positives when utilization exceeds
+/// the target ceiling (e.g. 92% with a 90% ceiling) but is far from the platform hard limit.
+///
+/// The higher utilization thresholds (95%/90%) compared to the old values (80%/60%) reflect that
+/// this alert signals genuine risk of platform-forced worker stoppage, not just exceeding a
+/// self-imposed safety reserve. The governor's scaling logic handles the safety reserve case.
 fn check_cutoff_imminent(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
-    const HIGH_UTIL_THRESHOLD: f64 = 80.0;
+    const HIGH_UTIL_THRESHOLD: f64 = 95.0;
     const DEEP_MARGIN_THRESHOLD: f64 = -24.0;
-    const DEEP_MARGIN_UTIL_THRESHOLD: f64 = 60.0;
+    const DEEP_MARGIN_UTIL_THRESHOLD: f64 = 90.0;
 
     let windows = [
         ("five_hour", &forecast.five_hour),
@@ -579,16 +601,16 @@ fn check_cutoff_imminent(
 
     for (name, win) in windows {
         let high_util_risk = win.cutoff_risk
-            && win.margin_hrs < -2.0
+            && win.hard_limit_margin_hrs < -2.0
             && win.current_utilization >= HIGH_UTIL_THRESHOLD;
         let deep_margin_risk = win.cutoff_risk
-            && win.margin_hrs < DEEP_MARGIN_THRESHOLD
+            && win.hard_limit_margin_hrs < DEEP_MARGIN_THRESHOLD
             && win.current_utilization >= DEEP_MARGIN_UTIL_THRESHOLD;
 
         if high_util_risk || deep_margin_risk {
             let msg = format!(
-                "Window {} at cutoff risk: margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h",
-                name, win.margin_hrs, win.current_utilization, win.hours_remaining
+                "Window {} at cutoff risk: hard_limit_margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h, remaining_to_100={:.1}%",
+                name, win.hard_limit_margin_hrs, win.current_utilization, win.hours_remaining, win.hard_limit_remaining_pct
             );
             alerts.push(AlertCondition {
                 alert_type: AlertType::CutoffImminent,
@@ -601,31 +623,30 @@ fn check_cutoff_imminent(
     }
 }
 
-/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND margin_hrs < 0 AND utilization >= 50%
+/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND hard_limit_margin_hrs < 0 AND utilization >= 85%
 ///
-/// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
-/// - Positive margin_hrs = safe (exhaustion after reset)
-/// - Negative margin_hrs = risky (exhaustion before reset)
+/// Uses hard_limit_margin_hrs (against 100% platform limit) instead of margin_hrs (against target
+/// ceiling). The higher utilization threshold (85% vs old 50%) ensures this alert only fires when
+/// utilization is genuinely close to the platform hard limit, not just above the self-imposed
+/// safety reserve.
 ///
-/// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
-/// corrupted state or sign convention mismatches between modules.
-///
-/// Requires utilization >= 50% to prevent false positives from stale EMA burn rates.
-/// The fleet_pct_hr EMA only updates on positive deltas, so during seven-day window
-/// rollover periods (when old high-usage data drops off), the EMA can stay inflated
-/// while actual utilization is declining. At 40% utilization with 50% headroom to the
-/// 90% ceiling, a stale EMA predicting imminent exhaustion is not a real crisis.
+/// At 85%+ utilization, the fleet has at most 15% headroom to the hard limit. Combined with
+/// hard_limit_margin_hrs < 0, this indicates the fleet is on track to hit 100% before the
+/// window resets — a genuine cutoff risk requiring attention.
 fn check_sonnet_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
-    const UTILIZATION_THRESHOLD: f64 = 50.0;
+    const UTILIZATION_THRESHOLD: f64 = 85.0;
     let win = &forecast.seven_day_sonnet;
-    if win.cutoff_risk && win.margin_hrs < 0.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
+    if win.cutoff_risk
+        && win.hard_limit_margin_hrs < 0.0
+        && win.current_utilization >= UTILIZATION_THRESHOLD
+    {
         let msg = format!(
-            "Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
-            win.current_utilization, win.hours_remaining, win.margin_hrs
+            "Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, hard_limit_margin_hrs={:.1}h, remaining_to_100={:.1}%",
+            win.current_utilization, win.hours_remaining, win.hard_limit_margin_hrs, win.hard_limit_remaining_pct
         );
         alerts.push(AlertCondition {
             alert_type: AlertType::SonnetCutoffRisk,
@@ -636,30 +657,25 @@ fn check_sonnet_cutoff_risk(
     }
 }
 
-/// Check for SessionCutoffRisk: five_hour cutoff_risk=1 AND margin_hrs < 0 AND utilization >= 50%
+/// Check for SessionCutoffRisk: five_hour cutoff_risk=1 AND hard_limit_margin_hrs < 0 AND utilization >= 85%
 ///
-/// Per burn_rate.rs formula: margin_hrs = predicted_exhaustion_hours - hours_remaining
-/// - Positive margin_hrs = safe (exhaustion after reset)
-/// - Negative margin_hrs = risky (exhaustion before reset)
-///
-/// We check both cutoff_risk flag AND margin_hrs < 0 to avoid false positives from
-/// corrupted state or sign convention mismatches between modules.
-///
-/// Requires utilization >= 50% to prevent false positives from transient burn rate spikes.
-/// With low utilization (e.g., 26%), the governor has ample headroom to scale down workers
-/// before exhaustion. A negative margin at low utilization indicates a temporary spike in
-/// fleet_pct_per_hour, not an actual capacity crisis.
+/// Uses hard_limit_margin_hrs (against 100% platform limit) instead of margin_hrs (against target
+/// ceiling). The higher utilization threshold (85% vs old 50%) ensures this alert only fires when
+/// the session window is genuinely close to the hard limit.
 fn check_session_cutoff_risk(
     forecast: &CapacityForecast,
     now: DateTime<Utc>,
     alerts: &mut Vec<AlertCondition>,
 ) {
-    const UTILIZATION_THRESHOLD: f64 = 50.0;
+    const UTILIZATION_THRESHOLD: f64 = 85.0;
     let win = &forecast.five_hour;
-    if win.cutoff_risk && win.margin_hrs < 0.0 && win.current_utilization >= UTILIZATION_THRESHOLD {
+    if win.cutoff_risk
+        && win.hard_limit_margin_hrs < 0.0
+        && win.current_utilization >= UTILIZATION_THRESHOLD
+    {
         let msg = format!(
-            "Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, margin_hrs={:.1}h",
-            win.current_utilization, win.hours_remaining, win.margin_hrs
+            "Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, hard_limit_margin_hrs={:.1}h, remaining_to_100={:.1}%",
+            win.current_utilization, win.hours_remaining, win.hard_limit_margin_hrs, win.hard_limit_remaining_pct
         );
         alerts.push(AlertCondition {
             alert_type: AlertType::SessionCutoffRisk,
