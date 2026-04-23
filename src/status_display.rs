@@ -317,6 +317,53 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         ));
     }
 
+    // Alert FP rate telemetry
+    if state.alert_fp_telemetry.total_recorded > 0 {
+        output.push_str("\n");
+        output.push_str("Alert Quality\n");
+        output.push_str("-------------\n");
+
+        if let Some(fp_rate) = state.alert_fp_telemetry.aggregate_fp_rate() {
+            let fp_pct = fp_rate * 100.0;
+            let status = if fp_pct < 5.0 {
+                "OK"
+            } else if fp_pct < 20.0 {
+                "WARN"
+            } else {
+                "POOR"
+            };
+            output.push_str(&format!(
+                "FP rate: {:.1}% ({} alerts tracked) [{}]\n",
+                fp_pct, state.alert_fp_telemetry.total_recorded, status
+            ));
+
+            // Per-type breakdown
+            let types = [
+                "cutoff_imminent",
+                "sonnet_cutoff_risk",
+                "session_cutoff_risk",
+                "emergency_brake_activated",
+                "collector_offline",
+            ];
+            for at in &types {
+                if let Some(rate) = state.alert_fp_telemetry.fp_rate(at) {
+                    let count = state
+                        .alert_fp_telemetry
+                        .outcomes
+                        .get(*at)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    output.push_str(&format!(
+                        "  {}: {:.0}% FP ({})\n",
+                        at,
+                        rate * 100.0,
+                        count
+                    ));
+                }
+            }
+        }
+    }
+
     // Emergency brake / cutoff risk summary
     let exit_code = StatusExitCode::from_state(state);
     if exit_code != StatusExitCode::Safe {
@@ -413,6 +460,19 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
         "safe_mode": {
             "active": state.safe_mode.active,
             "trigger": state.safe_mode.trigger,
+        },
+        "alert_fp_telemetry": {
+            "total_recorded": state.alert_fp_telemetry.total_recorded,
+            "total_false_positives": state.alert_fp_telemetry.total_false_positives,
+            "aggregate_fp_rate": state.alert_fp_telemetry.aggregate_fp_rate(),
+            "by_type": state.alert_fp_telemetry.outcomes.iter().map(|(k, v)| {
+                let fp_count = v.iter().filter(|&&tp| !tp).count();
+                (k.clone(), serde_json::json!({
+                    "total": v.len(),
+                    "false_positives": fp_count,
+                    "fp_rate": if v.is_empty() { None } else { Some(fp_count as f64 / v.len() as f64) },
+                }))
+            }).collect::<std::collections::HashMap<String, serde_json::Value>>(),
         },
         "updated_at": state.updated_at.to_rfc3339(),
     })
@@ -542,6 +602,7 @@ mod tests {
             alert_cooldown: Default::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
+            alert_fp_telemetry: Default::default(),
         }
     }
 

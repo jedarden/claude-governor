@@ -268,6 +268,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
+            alert_fp_telemetry: Default::default(),
         }
     }
 

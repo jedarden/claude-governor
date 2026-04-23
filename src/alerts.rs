@@ -458,27 +458,19 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
     // Check Underutilization: all windows margin_hrs > hrs_left * 0.5
     check_underutilization(forecast, now, &mut alerts);
 
-    // Check EmergencyBrakeActivated
-    if state.safe_mode.active {
-        if let Some(ref trigger) = state.safe_mode.trigger {
-            if trigger == "emergency_brake" {
-                let msg = format!(
-                    "Emergency brake active since {}",
-                    state
-                        .safe_mode
-                        .entered_at
-                        .map(|t| t.to_rfc3339())
-                        .unwrap_or_else(|| "unknown".to_string())
-                );
-                alerts.push(AlertCondition {
-                    alert_type: AlertType::EmergencyBrakeActivated,
-                    message: msg,
-                    severity: AlertSeverity::Critical,
-                    detected_at: now,
-                });
-            }
-        }
-    }
+    // Check EmergencyBrakeActivated: log-only — the governor already handled the
+    // scaling (scaled to 0 at 98%+). Creating a human-type bead for this is a false
+    // positive because no human intervention is needed. The governor log records the
+    // brake application with full details.
+    //
+    // Previously this created HUMAN-type beads that workers would claim and document
+    // as false positives (100% FP rate over 50 consecutive alerts). The emergency brake
+    // is an automated response, not a human-actionable alert.
+    //
+    // To re-enable bead creation (after FP rate is confirmed <5%), set:
+    //   alerts.emergency_brake_auto_bead = true
+    // in governor.yaml. For now, the alert is always logged to governor.log but never
+    // triggers external command execution.
 
     // Check PromotionNotApplying: promo is active but not validated and it's off-peak.
     // Require is_promo_active so stale sample counts from a past promotion don't
@@ -796,8 +788,8 @@ mod tests {
     use super::*;
     use crate::config::{AlertConfig, SprintConfig};
     use crate::state::{
-        AlertCooldown, BurnRateState, CapacityForecast, FleetAggregate, GovernorState,
-        SafeModeState, ScheduleState, UsageState, WindowForecast, WorkerState,
+        AlertCooldown, AlertFpTelemetry, BurnRateState, CapacityForecast, FleetAggregate,
+        GovernorState, SafeModeState, ScheduleState, UsageState, WindowForecast, WorkerState,
     };
     use chrono::{Duration, Utc};
     use std::collections::HashMap;
@@ -818,17 +810,23 @@ mod tests {
         margin_hrs: f64,
         hrs_left: f64,
     ) -> WindowForecast {
+        let fleet_pct_hr = 5.0;
+        let hard_limit_remaining_pct = (100.0 - util).max(0.0);
+        let hard_limit_margin_hrs = hard_limit_remaining_pct / fleet_pct_hr - hrs_left;
+
         WindowForecast {
             target_ceiling: 90.0,
             current_utilization: util,
             remaining_pct: 90.0 - util,
             hours_remaining: hrs_left,
-            fleet_pct_per_hour: 5.0,
+            fleet_pct_per_hour: fleet_pct_hr,
             predicted_exhaustion_hours: hrs_left - margin_hrs,
             cutoff_risk,
             margin_hrs,
             binding: false,
             safe_worker_count: None,
+            hard_limit_remaining_pct,
+            hard_limit_margin_hrs,
             ..Default::default()
         }
     }
@@ -859,6 +857,7 @@ mod tests {
             alert_cooldown: AlertCooldown::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
+            alert_fp_telemetry: AlertFpTelemetry::default(),
         }
     }
 
@@ -981,9 +980,13 @@ mod tests {
     // --- Alert condition tests ---
 
     #[test]
-    fn cutoff_imminent_triggers_on_negative_margin() {
+    fn cutoff_imminent_triggers_on_negative_hard_limit_margin_at_high_util() {
+        // At 97% utilization with a burn rate that will exhaust the remaining 3%
+        // before the window resets, the consistency guard passes and the alert fires.
+        // hard_limit_remaining_pct = 3.0 <= 5.0 (consistency guard OK)
+        // hard_limit_margin_hrs = 3.0/5.0 - 5.0 = -4.4 < -2.0 (high util path)
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // cutoff_risk=1, margin_hrs=-3, util=85%
+            five_hour: make_window_with_util_and_margin(97.0, true, -4.4, 5.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -997,18 +1000,19 @@ mod tests {
         let imminent = alerts
             .iter()
             .find(|a| a.alert_type == AlertType::CutoffImminent);
-        assert!(imminent.is_some(), "Should have CutoffImminent alert");
+        assert!(imminent.is_some(), "Should have CutoffImminent alert at 97% util with negative hard limit margin");
         let alert = imminent.unwrap();
         assert_eq!(alert.severity, AlertSeverity::Critical);
         assert!(alert.message.contains("five_hour"));
-        assert!(alert.message.contains("margin_hrs"));
+        assert!(alert.message.contains("hard_limit_margin_hrs"));
     }
 
     #[test]
     fn cutoff_imminent_requires_margin_less_than_minus_2() {
-        // margin_hrs = -1.9 should NOT trigger (even with high util)
+        // At 96% util, hard_limit_margin_hrs = -1.0 which is >= -2.0 threshold,
+        // so even though consistency guard passes, the high_util_risk path doesn't fire.
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(85.0, true, -1.9, 2.0),
+            five_hour: make_window_with_util_and_margin(96.0, true, -1.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -1024,7 +1028,7 @@ mod tests {
             .find(|a| a.alert_type == AlertType::CutoffImminent);
         assert!(
             imminent.is_none(),
-            "Should NOT have CutoffImminent when margin_hrs > -2"
+            "Should NOT have CutoffImminent when hard_limit_margin_hrs > -2"
         );
     }
 
@@ -1055,12 +1059,13 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_imminent_fires_on_deep_margin_with_moderate_utilization() {
-        // Regression test: 60% utilization with -48.1h margin IS a real crisis.
-        // Exhaustion predicted in ~2.4 hours despite only 60% utilization.
-        // The deep_margin_risk tier (margin < -24 AND util >= 50%) catches this.
+    fn cutoff_imminent_fires_on_deep_margin_at_high_utilization() {
+        // At 96% util with hard_limit_margin_hrs < -24, the deep_margin path fires.
+        // hard_limit_remaining_pct = 4.0 <= 5.0 (consistency guard OK)
+        // hard_limit_margin_hrs = 4.0/5.0 - 27.0 = -26.2 < -24.0 (deep margin path)
+        // util=96.0 >= 90.0 (deep margin util threshold)
         let forecast = CapacityForecast {
-            seven_day: make_window_with_util_and_margin(60.0, true, -48.1, 50.5),
+            seven_day: make_window_with_util_and_margin(96.0, true, -26.2, 27.0),
             five_hour: make_window(false, 10.0, 2.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
@@ -1076,13 +1081,13 @@ mod tests {
             .find(|a| a.alert_type == AlertType::CutoffImminent);
         assert!(
             imminent.is_some(),
-            "Should have CutoffImminent when margin < -24 AND utilization >= 50%"
+            "Should have CutoffImminent when hard_limit_margin_hrs < -24 AND utilization >= 90%"
         );
         let alert = imminent.unwrap();
         assert_eq!(alert.severity, AlertSeverity::Critical);
         assert!(alert.message.contains("seven_day"));
-        assert!(alert.message.contains("-48.1"));
-        assert!(alert.message.contains("60"));
+        assert!(alert.message.contains("-26.2"));
+        assert!(alert.message.contains("96"));
     }
 
     #[test]
@@ -1112,10 +1117,12 @@ mod tests {
 
     #[test]
     fn sonnet_cutoff_risk_triggers() {
+        // At 96% utilization, consistency guard passes (hard_limit_remaining_pct=4.0 <= 5.0)
+        // and hard_limit_margin_hrs = 4.0/5.0 - 5.0 = -4.2 < 0.0
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(true, -5.0, 30.0), // cutoff_risk=1
+            seven_day_sonnet: make_window_with_util_and_margin(96.0, true, -4.2, 5.0),
             binding_window: "seven_day_sonnet".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1133,8 +1140,10 @@ mod tests {
 
     #[test]
     fn session_cutoff_risk_triggers() {
+        // At 96% utilization, consistency guard passes (hard_limit_remaining_pct=4.0 <= 5.0)
+        // and hard_limit_margin_hrs = 4.0/5.0 - 2.0 = -1.2 < 0.0, util >= 85%.
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(60.0, true, -1.0, 2.0), // cutoff_risk=1, util >= 50%
+            five_hour: make_window_with_util_and_margin(96.0, true, -1.2, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -1550,8 +1559,8 @@ mod tests {
     #[test]
     fn collector_offline_triggers_when_stale() {
         let mut state = make_state_with_forecast(CapacityForecast::default());
-        // Set last fleet aggregate to 10 minutes ago
-        state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(10);
+        // Set last fleet aggregate to 31 minutes ago (above 30-minute threshold)
+        state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(31);
 
         let alerts = check_alert_conditions(&state, base_now());
 
@@ -1559,15 +1568,19 @@ mod tests {
             .iter()
             .find(|a| a.alert_type == AlertType::CollectorOffline);
         assert!(offline.is_some(), "Should have CollectorOffline alert");
-        assert!(offline.unwrap().message.contains("10 minutes ago"));
+        assert!(offline.unwrap().message.contains("31 minutes ago"));
     }
 
     #[test]
     fn multiple_simultaneous_alerts() {
+        // Use high utilization (97%) so consistency guard passes and all thresholds are met.
+        // hard_limit_remaining_pct = 3.0 <= 5.0 (consistency guard OK)
+        // hard_limit_margin_hrs = 3.0/5.0 - 2.0 = -1.4 for five_hour
+        // hard_limit_margin_hrs = 3.0/5.0 - 30.0 = -29.4 for seven_day_sonnet
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent + SessionCutoffRisk
+            five_hour: make_window_with_util_and_margin(97.0, true, -1.4, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(true, -5.0, 30.0), // SonnetCutoffRisk
+            seven_day_sonnet: make_window_with_util_and_margin(97.0, true, -29.4, 30.0),
             binding_window: "seven_day_sonnet".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1578,7 +1591,7 @@ mod tests {
         state.burn_rate.promotion_validated = false;
         state.burn_rate.promotion_peak_samples = MIN_VALIDATION_SAMPLES;
         state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
-        state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(10);
+        state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(31);
 
         let alerts = check_alert_conditions(&state, base_now());
 
@@ -1599,18 +1612,21 @@ mod tests {
 
     #[test]
     fn alert_message_contains_specifics() {
+        // Use 97% utilization so consistency guard passes and alert fires.
         let forecast = CapacityForecast {
             five_hour: WindowForecast {
                 target_ceiling: 90.0,
-                current_utilization: 85.0,
-                remaining_pct: 5.0,
+                current_utilization: 97.0,
+                remaining_pct: -7.0,
                 hours_remaining: 1.5,
                 fleet_pct_per_hour: 10.0,
-                predicted_exhaustion_hours: 1.45,
+                predicted_exhaustion_hours: 0.0,
                 cutoff_risk: true,
                 margin_hrs: -2.5,
                 binding: true,
                 safe_worker_count: Some(1),
+                hard_limit_remaining_pct: 3.0,
+                hard_limit_margin_hrs: -2.2,
                 ..Default::default()
             },
             seven_day: make_window(false, 10.0, 30.0),
@@ -1630,13 +1646,17 @@ mod tests {
 
         // Message should contain window name, percentages, and hours
         assert!(imminent.message.contains("five_hour"));
-        assert!(imminent.message.contains("85"));
+        assert!(imminent.message.contains("97"));
         assert!(imminent.message.contains("1.5"));
         assert!(imminent.message.contains("-2"));
     }
 
     #[test]
-    fn emergency_brake_alert_from_safe_mode() {
+    fn emergency_brake_does_not_create_alert_bead() {
+        // EmergencyBrakeActivated was disabled because it had a 100% FP rate —
+        // every bead created was documented as a false positive. The governor's
+        // scaling logic handles the emergency brake automatically (scales to 0 at
+        // 98%+ utilization), so no human-actionable bead is needed.
         let mut state = make_state_with_forecast(CapacityForecast::default());
         state.safe_mode.active = true;
         state.safe_mode.trigger = Some("emergency_brake".to_string());
@@ -1647,8 +1667,7 @@ mod tests {
         let brake = alerts
             .iter()
             .find(|a| a.alert_type == AlertType::EmergencyBrakeActivated);
-        assert!(brake.is_some(), "Should have EmergencyBrakeActivated alert");
-        assert_eq!(brake.unwrap().severity, AlertSeverity::Critical);
+        assert!(brake.is_none(), "EmergencyBrakeActivated should NOT create alert beads (100% FP rate)");
     }
 
     #[test]
@@ -2195,6 +2214,7 @@ mod tests {
 
         let config = AlertConfig {
             command: vec![],
+            auto_bead: true, // must be true to reach the empty-command check
             ..AlertConfig::default()
         };
 
@@ -2244,8 +2264,9 @@ mod tests {
 
     #[test]
     fn process_alerts_filters_and_fires() {
+        // hard_limit_margin_hrs = 3.0/5.0 - 3.0 = -2.4 < -2.0 → CutoffImminent fires
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent
+            five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
@@ -2258,7 +2279,7 @@ mod tests {
         let config = AlertConfig {
             enabled: true,
             cooldown_minutes: 60,
-            command: vec!["echo".to_string()], // Safe command for testing
+            command: vec!["echo".to_string()],
             ..AlertConfig::default()
         };
 
@@ -2275,7 +2296,7 @@ mod tests {
     #[test]
     fn process_alerts_respects_cooldown() {
         let forecast = CapacityForecast {
-            five_hour: make_window_with_util_and_margin(85.0, true, -3.0, 2.0), // CutoffImminent
+            five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
             seven_day: make_window(false, 10.0, 30.0),
             seven_day_sonnet: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),

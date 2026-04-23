@@ -959,6 +959,45 @@ pub fn update_safe_mode_from_calibration(
 }
 
 // ---------------------------------------------------------------------------
+// Alert FP telemetry helpers
+// ---------------------------------------------------------------------------
+
+/// Classify an alert as true positive or false positive for telemetry tracking.
+///
+/// Cutoff-related alerts are true positives only when utilization is genuinely near
+/// the hard limit (>= 95%). Alerts that fire at lower utilization are false positives
+/// because the governor's scaling logic handles those cases without human intervention.
+fn is_true_positive_alert(alert_type: &AlertType, state: &GovernorState) -> bool {
+    match alert_type {
+        AlertType::CutoffImminent | AlertType::SonnetCutoffRisk | AlertType::SessionCutoffRisk => {
+            // True positive only if hard limit margin is genuinely negative AND utilization >= 95%
+            let forecast = &state.capacity_forecast;
+            let any_window_genuine = [
+                &forecast.five_hour,
+                &forecast.seven_day,
+                &forecast.seven_day_sonnet,
+            ]
+            .iter()
+            .any(|w| w.hard_limit_margin_hrs < 0.0 && w.hard_limit_remaining_pct <= 5.0);
+            any_window_genuine
+        }
+        AlertType::EmergencyBrakeActivated => {
+            // True positive if any window is actually at 98%+
+            let forecast = &state.capacity_forecast;
+            [&forecast.five_hour, &forecast.seven_day, &forecast.seven_day_sonnet]
+                .iter()
+                .any(|w| w.current_utilization >= 98.0)
+        }
+        AlertType::CollectorOffline => {
+            // Collector offline is a true positive if data is genuinely stale (> 30 min)
+            let age = (Utc::now() - state.last_fleet_aggregate.t1).num_seconds();
+            age > 1800
+        }
+        _ => true, // Other alerts are assumed true positives by default
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Governor daemon loop
 // ---------------------------------------------------------------------------
 
@@ -1915,6 +1954,12 @@ pub fn run_governor_cycle(
             now,
             alert_config.cooldown_minutes,
         ) {
+            // Record alert outcome in FP telemetry. A cutoff alert at sub-100% utilization
+            // is classified as a false positive (the consistency guard should suppress these,
+            // but telemetry catches any that slip through).
+            let is_true_positive = is_true_positive_alert(&alert.alert_type, &state);
+            state.alert_fp_telemetry.record(&alert.alert_type.to_string(), is_true_positive);
+
             // Fire the alert: execute configured command (e.g. br create --type human)
             // and log to governor.log
             if let Err(e) = fire_alert(alert, alert_config) {
@@ -1926,8 +1971,18 @@ pub fn run_governor_cycle(
                 "message": alert.message,
                 "severity": format!("{:?}", alert.severity),
                 "detected_at": alert.detected_at.to_rfc3339(),
+                "is_true_positive": is_true_positive,
             }));
         }
+    }
+
+    // Log aggregate FP rate each cycle for observability
+    if let Some(fp_rate) = state.alert_fp_telemetry.aggregate_fp_rate() {
+        log::info!(
+            "[governor] alert FP rate: {:.1}% ({} total recorded)",
+            fp_rate * 100.0,
+            state.alert_fp_telemetry.total_recorded,
+        );
     }
 
     // 9. Write state

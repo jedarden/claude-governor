@@ -502,6 +502,72 @@ impl AlertCooldown {
     }
 }
 
+/// Alert FP rate telemetry — rolling window tracking for false-positive regression detection.
+///
+/// Each alert type tracks the last N outcomes (true positive vs false positive).
+/// The rolling window size is configurable (default 100). FP rate is computed as
+/// false_positives / total in the window. This is written to governor-state.json
+/// each cycle so `cgov status` and external dashboards can surface it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertFpTelemetry {
+    /// Per-type rolling window of alert outcomes.
+    /// Key is alert type string, value is a deque of bools (true = TP, false = FP).
+    /// Only the last `window_size` entries are retained.
+    pub outcomes: HashMap<String, Vec<bool>>,
+    /// Rolling window size (default 100)
+    pub window_size: usize,
+    /// Total alerts recorded across all types
+    pub total_recorded: u64,
+    /// Total false positives across all types
+    pub total_false_positives: u64,
+}
+
+impl Default for AlertFpTelemetry {
+    fn default() -> Self {
+        Self {
+            outcomes: HashMap::new(),
+            window_size: 100,
+            total_recorded: 0,
+            total_false_positives: 0,
+        }
+    }
+}
+
+impl AlertFpTelemetry {
+    /// Record an alert outcome.
+    pub fn record(&mut self, alert_type: &str, is_true_positive: bool) {
+        let entries = self.outcomes.entry(alert_type.to_string()).or_default();
+        entries.push(is_true_positive);
+        if entries.len() > self.window_size {
+            entries.remove(0);
+        }
+        self.total_recorded += 1;
+        if !is_true_positive {
+            self.total_false_positives += 1;
+        }
+    }
+
+    /// Compute FP rate for a specific alert type over the rolling window.
+    /// Returns None if no outcomes have been recorded.
+    pub fn fp_rate(&self, alert_type: &str) -> Option<f64> {
+        let entries = self.outcomes.get(alert_type)?;
+        if entries.is_empty() {
+            return None;
+        }
+        let fp_count = entries.iter().filter(|&&tp| !tp).count();
+        Some(fp_count as f64 / entries.len() as f64)
+    }
+
+    /// Compute aggregate FP rate across all alert types over the rolling window.
+    pub fn aggregate_fp_rate(&self) -> Option<f64> {
+        if self.total_recorded == 0 {
+            return None;
+        }
+        Some(self.total_false_positives as f64 / self.total_recorded as f64)
+    }
+}
+
 /// Complete governor state
 ///
 /// This struct matches the governor-state.json schema from the plan.
@@ -528,6 +594,10 @@ pub struct GovernorState {
     /// Reset to 0 when efficiency recovers. Used by LowCacheEfficiency alert.
     #[serde(default)]
     pub low_cache_eff_consecutive: u32,
+    /// Alert FP rate telemetry for regression detection.
+    /// Exposed in `cgov status` so dashboards can track alert quality over time.
+    #[serde(default)]
+    pub alert_fp_telemetry: AlertFpTelemetry,
 }
 
 impl Default for GovernorState {
@@ -545,6 +615,7 @@ impl Default for GovernorState {
             alert_cooldown: AlertCooldown::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
+            alert_fp_telemetry: AlertFpTelemetry::default(),
         }
     }
 }
@@ -867,6 +938,7 @@ mod tests {
             },
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
+            alert_fp_telemetry: AlertFpTelemetry::default(),
         }
     }
 
