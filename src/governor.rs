@@ -1066,6 +1066,31 @@ pub fn run_governor_cycle(
         }
     }
 
+    // 1b. Clear emergency-brake-triggered safe_mode when utilization drops below threshold.
+    //     The emergency brake sets safe_mode with trigger="emergency_brake" when any window
+    //     hits 98%+. Once utilization drops (e.g. after a window reset), safe_mode should
+    //     clear because the condition that triggered it no longer exists. Calibration-based
+    //     safe_mode is NOT cleared here — that uses update_safe_mode_from_calibration().
+    if state.safe_mode.active
+        && state.safe_mode.trigger.as_deref() == Some("emergency_brake")
+    {
+        let max_util = [
+            state.capacity_forecast.five_hour.current_utilization,
+            state.capacity_forecast.seven_day.current_utilization,
+            state.capacity_forecast.seven_day_sonnet.current_utilization,
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max);
+        if max_util < EMERGENCY_BRAKE_THRESHOLD {
+            log::info!(
+                "[governor] clearing emergency_brake safe_mode — max utilization {:.1}% < {:.0}% threshold",
+                max_util,
+                EMERGENCY_BRAKE_THRESHOLD
+            );
+            state.safe_mode = state::SafeModeState::default();
+        }
+    }
+
     // 2. Run token collector pass to gather usage data from JSONL files
     match collector::run_collection_pass() {
         Ok(result) => {
