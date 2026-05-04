@@ -369,7 +369,7 @@ Token collector has stopped reporting (last update > 5 minutes ago).
 - **Context:** The collector writes a "heartbeat" fleet record every 2 minutes (120s interval) even when idle (no new token usage), so this alert should only fire when the collector daemon has actually stopped or cannot write to the database. The collector service is independent of the governor (no `PartOf`), so governor restarts should not trigger this alert.
 - **Action:**
   1. Check if the collector daemon is running: `ps aux | grep cgov`
-  2. Check for collection errors in governor logs: `tail -100 ~/.needle/logs/governor.log | grep collector`
+  2. Check for collection errors in governor logs: `tail -100 ~/.local/share/claude-governor/governor.log | grep collector`
   3. Verify database is writable: `ls -la ~/.needle/state/token-history.*`
   4. If collector is not running, restart it; if running but failing, check disk space or database corruption
   5. After recovery, the alert cooldown is automatically cleared to enable immediate re-notification if the issue recurs
@@ -433,7 +433,7 @@ Each alert type has an independent cooldown timer. When an alert fires:
 
 ## Alert Logs
 
-All fired alerts are logged to `~/.needle/logs/governor.log` with format:
+All fired alerts are logged to `~/.local/share/claude-governor/governor.log` with format:
 ```
 2026-03-20T10:00:00Z [WARNING] sonnet_cutoff_risk: Seven-day Sonnet window at cutoff risk: 75.0% utilized, 45.2h remaining, margin_hrs=-5.8h
 ```

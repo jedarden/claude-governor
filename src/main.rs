@@ -1514,17 +1514,19 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
         }
     }
 
-    // 3. Create ~/.needle/logs/ and ~/.needle/state/ directories
+    // 3. Create ~/.local/share/claude-governor/ (log directory) and ~/.needle/state/ directories
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("claude-governor");
     let needle_dir = home.join(".needle");
-    let logs_dir = needle_dir.join("logs");
     let state_dir = needle_dir.join("state");
 
-    if !logs_dir.exists() {
-        fs::create_dir_all(&logs_dir)
-            .with_context(|| format!("Failed to create logs directory: {}", logs_dir.display()))?;
-        actions_taken.push(format!("Created logs directory: {}", logs_dir.display()));
+    if !log_dir.exists() {
+        fs::create_dir_all(&log_dir)
+            .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+        actions_taken.push(format!("Created log directory: {}", log_dir.display()));
     } else {
-        actions_skipped.push(format!("Logs directory exists: {}", logs_dir.display()));
+        actions_skipped.push(format!("Log directory exists: {}", log_dir.display()));
     }
 
     if !state_dir.exists() {

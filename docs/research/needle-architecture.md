@@ -214,7 +214,7 @@ attached=$(tmux display-message -t "$session" -p '#{session_attached}')
 | `~/.needle/state/workers.json.lock` | flock mutex for workers.json | empty |
 | `~/.needle/state/heartbeats/{session}.json` | Per-worker liveness heartbeat | JSON |
 | `~/.needle/state/rate_limits/{provider}.json` | Sliding-window request counter | JSON |
-| `~/.needle/logs/capacity-governor.log` | Governor execution log | line-oriented |
+| `~/.local/share/claude-governor/governor.log` | Governor execution log | line-oriented |
 
 ---
 

@@ -1308,7 +1308,7 @@ The range `2.0–3.8h` replaces the single `2.9h`, immediately communicating unc
 # Governor configuration
 loop_interval: 300          # seconds between cycles (5 minutes)
 hysteresis_band: 1          # workers deviation before acting
-log_file: ~/.needle/logs/governor.log
+log_file: ~/.local/share/claude-governor/governor.log
 log_level: INFO             # DEBUG, INFO, WARN, ERROR
 log_max_bytes: 104857600    # 100 MB — rotate when exceeded
 log_backup_count: 3         # keep 3 rotated log files (.1, .2, .3)
@@ -1745,10 +1745,17 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cgov _daemon
-Restart=on-failure
-RestartSec=60
-StandardOutput=append:%h/.needle/logs/governor.log
-StandardError=append:%h/.needle/logs/governor.log
+Restart=always
+RestartSec=10
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
 
 [Install]
 WantedBy=default.target
@@ -1805,8 +1812,8 @@ cgov init
 
 **`cgov init` steps:**
 1. No prerequisites to check — `cgov` is a static binary with everything compiled in. Warn if `tmux` absent (needed for worker management)
-2. Copy default configs → `~/.needle/config/` (skip existing files — never clobber user config)
-3. Create `~/.needle/logs/` and `~/.needle/state/` if absent
+2. Copy default configs → `~/.config/claude-governor/` (skip existing files — never clobber user config)
+3. Create `~/.local/share/claude-governor/` (log directory) and `~/.needle/state/` if absent
 4. Detect systemd availability; install units if present, print tmux fallback note otherwise
 5. Print quickstart message:
    ```
@@ -1814,7 +1821,7 @@ cgov init
      cgov enable    → start daemon (survives reboot)
      cgov start     → start now, this session only
      cgov status    → check state
-   Config: ~/.needle/config/governor.yaml
+   Config: ~/.config/claude-governor/governor.yaml
    ```
 6. Migration note: if `capacity-governor.sh` is detected, print the key config differences
 
