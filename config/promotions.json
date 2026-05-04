@@ -1,11 +1,1 @@
-[
-  {
-    "name": "Claude March 2026 Usage Promotion",
-    "start_date": "2026-03-13",
-    "end_date": "2026-03-29",
-    "peak_start_hour_et": 8,
-    "peak_end_hour_et": 14,
-    "offpeak_multiplier": 2.0,
-    "applies_to": ["five_hour"]
-  }
-]
+[]
