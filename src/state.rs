@@ -138,6 +138,33 @@ impl Default for PrevUsageSnapshot {
     }
 }
 
+/// Pending prediction for a window — used to score predictions when windows reset.
+///
+/// When a window starts (or at each cycle), we predict the final utilization
+/// percentage that will be reached when the window resets. When a reset is
+/// detected (utilization drops), we compare the predicted value to the actual
+/// final value and score the prediction for calibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PendingPrediction {
+    /// When this prediction was made
+    pub prediction_time: DateTime<Utc>,
+    /// Predicted final utilization percentage when window resets
+    pub predicted_final_pct: f64,
+    /// Utilization percentage when the prediction was made
+    pub starting_pct: f64,
+}
+
+impl Default for PendingPrediction {
+    fn default() -> Self {
+        Self {
+            prediction_time: Utc::now(),
+            predicted_final_pct: 0.0,
+            starting_pct: 0.0,
+        }
+    }
+}
+
 /// Deserializes an f64 field, treating JSON null as f64::INFINITY.
 /// serde_json serializes f64::INFINITY as null (JSON has no infinity literal),
 /// so we need to round-trip null → infinity on deserialization.
@@ -598,6 +625,10 @@ pub struct GovernorState {
     /// Exposed in `cgov status` so dashboards can track alert quality over time.
     #[serde(default)]
     pub alert_fp_telemetry: AlertFpTelemetry,
+    /// Pending predictions for each window, used to score predictions when windows reset.
+    /// Key is window name ("five_hour", "seven_day", "seven_day_sonnet").
+    #[serde(default)]
+    pub pending_predictions: HashMap<String, PendingPrediction>,
 }
 
 impl Default for GovernorState {
@@ -616,6 +647,7 @@ impl Default for GovernorState {
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
+            pending_predictions: HashMap::new(),
         }
     }
 }
@@ -939,6 +971,7 @@ mod tests {
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
+            pending_predictions: HashMap::new(),
         }
     }
 

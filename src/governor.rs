@@ -1287,6 +1287,9 @@ pub fn run_governor_cycle(
     // applying an EMA that is only updated on positive deltas — zero-delta cycles
     // (when the API percentage hasn't moved in the past N seconds) are skipped so
     // they can't drive the EMA down to zero.
+    //
+    // Save the old snapshot BEFORE updating it — we need it for reset detection later.
+    let old_snapshot = state.burn_rate.prev_usage_snapshot.clone();
     {
         const EMA_ALPHA: f64 = 0.2;
         // Require at least 60 s between delta samples to avoid noise from very short windows
@@ -1299,7 +1302,7 @@ pub fn run_governor_cycle(
         let new_seven_day_sonnet = state.usage.sonnet_pct;
 
         if !state.usage.stale {
-            if let Some(snap) = state.burn_rate.prev_usage_snapshot.clone() {
+            if let Some(snap) = old_snapshot.clone() {
                 let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
 
@@ -1422,6 +1425,96 @@ pub fn run_governor_cycle(
     current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
     current_utilization.insert("seven_day_sonnet".to_string(), state.usage.sonnet_pct);
 
+    // 5a-pre. Detect window resets and score predictions for calibration.
+    //
+    // A window reset is detected when utilization drops > 1% compared to the
+    // previous cycle (stored in old_snapshot, captured before the update).
+    // When a reset is detected, we score any pending prediction for that window
+    // by comparing the predicted final utilization (made at window start) against
+    // the actual final utilization (observed just before reset).
+    const WINDOW_RESET_THRESHOLD: f64 = 1.0;
+    if let Some(ref prev_snap) = old_snapshot {
+        // Current utilizations for comparison
+        let cur_5h = state.usage.five_hour_pct;
+        let cur_7d = state.usage.all_models_pct;
+        let cur_7ds = state.usage.sonnet_pct;
+
+        // Previous utilizations (from before the snapshot update)
+        let prev_5h = prev_snap.five_hour_pct;
+        let prev_7d = prev_snap.seven_day_pct;
+        let prev_7ds = prev_snap.seven_day_sonnet_pct;
+
+        // Check for resets in each window
+        let windows_to_check = [
+            ("five_hour", cur_5h, prev_5h),
+            ("seven_day", cur_7d, prev_7d),
+            ("seven_day_sonnet", cur_7ds, prev_7ds),
+        ];
+
+        for (window_name, current, previous) in windows_to_check {
+            // Detect reset: utilization dropped > threshold
+            if current < previous - WINDOW_RESET_THRESHOLD {
+                // We have a window reset - check for pending prediction
+                if let Some(pred) = state.pending_predictions.get(window_name) {
+                    // Score the prediction: predicted change vs actual change
+                    // Predicted change = predicted_final_pct - starting_pct
+                    // Actual change = previous (just before reset) - starting_pct
+                    let predicted_change = pred.predicted_final_pct - pred.starting_pct;
+                    let actual_change = previous - pred.starting_pct;
+
+                    let score = calibrator::score_prediction(
+                        window_name,
+                        predicted_change,
+                        actual_change,
+                        pred.prediction_time,
+                    );
+
+                    log::info!(
+                        "[governor] window reset detected in {}: utilization {:.1}% → {:.1}% (drop {:.1}%), \
+                         scoring prediction: predicted_change={:+.2}%, actual_change={:+.2}%, error={:+.2}%",
+                        window_name,
+                        previous,
+                        current,
+                        previous - current,
+                        predicted_change,
+                        actual_change,
+                        score.error,
+                    );
+
+                    // Append score to accuracy log
+                    if let Err(e) = calibrator::append_score(&score) {
+                        log::warn!(
+                            "[governor] failed to append prediction score for {}: {}",
+                            window_name,
+                            e
+                        );
+                    } else {
+                        log::debug!(
+                            "[governor] scored prediction for {}: predicted={:.2}%, actual={:.2}%, error={:+.2}%",
+                            window_name,
+                            predicted_change,
+                            actual_change,
+                            score.error
+                        );
+                    }
+
+                    // Remove the pending prediction after scoring
+                    state.pending_predictions.remove(window_name);
+                }
+            }
+        }
+    }
+
+    // 5a-pre-b. Store new predictions for all windows.
+    //
+    // For each window, predict the final utilization percentage when the window resets.
+    // The prediction is: current_utilization + (fleet_pct_per_hour * hours_remaining).
+    // We need the fleet_pct_per_hour values which are computed later, so we'll do this
+    // in two parts: detect resets now, store predictions after pct/hr is computed.
+    // For now, just mark that we need to store predictions later.
+    //
+    // The actual prediction storage happens after fleet_pct_per_hour is computed.
+
     // Build effective hours remaining map from poller data
     // Uses effective_hours_remaining_from so only windows in applies_to get the promo boost.
     let mut hours_remaining = HashMap::new();
@@ -1517,6 +1610,40 @@ pub fn run_governor_cycle(
 
         map
     };
+
+    // 5a-pre-b. Store new predictions for all windows.
+    //
+    // For each window, predict the final utilization percentage when the window resets.
+    // The prediction is: current_utilization + (fleet_pct_per_hour * hours_remaining).
+    // This prediction will be scored when the window resets (utilization drops).
+    for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
+        let util = current_utilization.get(*window).copied().unwrap_or(0.0);
+        let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
+        let pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
+
+        // Predict final utilization: current + (rate * time)
+        // Clamp to 0-100% range
+        let predicted_final_pct = (util + pct_hr * hrs_left).clamp(0.0, 100.0);
+
+        // Store the prediction
+        state.pending_predictions.insert(
+            window.to_string(),
+            state::PendingPrediction {
+                prediction_time: now,
+                predicted_final_pct,
+                starting_pct: util,
+            },
+        );
+
+        log::debug!(
+            "[governor] stored prediction for {}: current={:.1}%, rate={:.3}%/hr, hrs_left={:.1}, predicted_final={:.1}%",
+            window,
+            util,
+            pct_hr,
+            hrs_left,
+            predicted_final_pct
+        );
+    }
 
     // 5a. Check calibration accuracy and update safe mode state.
     //
