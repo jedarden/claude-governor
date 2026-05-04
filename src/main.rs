@@ -114,6 +114,10 @@ enum Commands {
         /// Output capacity summary for NEEDLE prompt injection
         #[arg(long)]
         summary: bool,
+
+        /// Watch mode: clear and re-render on 30s interval
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Tail governor.log
@@ -929,8 +933,29 @@ fn main() -> Result<()> {
         } => {
             run_simulate_command(&workers, hours, resolution, json)?;
         }
-        Commands::Status { json, summary } => {
+        Commands::Status { json, summary, watch } => {
             let state_path = default_state_path();
+
+            // --watch is incompatible with --json and --summary
+            if watch && (json || summary) {
+                anyhow::bail!("--watch cannot be used with --json or --summary");
+            }
+
+            // --watch mode: loop and re-render every 30s
+            if watch {
+                loop {
+                    // Clear terminal using ANSI escape sequence
+                    print!("\x1b[2J\x1b[H");
+
+                    let state = state::load_state(&state_path)?;
+                    let dashboard = format_status_dashboard(&state, chrono::Utc::now());
+                    print!("{}", dashboard);
+
+                    // Sleep for 30 seconds
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+            }
+
             let state = state::load_state(&state_path)?;
             let exit_code = StatusExitCode::from_state(&state);
 

@@ -20,14 +20,39 @@ This system replaces the fragile `capacity-governor.sh` (TUI screen-scraping, st
 
 ## Installation
 
+### Option 1: Pre-built binary (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh | bash
+```
+
+### Option 2: Build from source
+
 ```bash
 cargo build --release
-sudo cp target/release/cgov /usr/local/bin/
+cp target/release/cgov ~/.local/bin/
+chmod +x ~/.local/bin/cgov
+```
+
+## Quickstart
+
+```bash
+# Initialize configuration and directories
+cgov init
+
+# Edit configuration (set agents, pricing, etc.)
+cgov config --edit
+
+# Run health check
+cgov doctor
+
+# Enable and start daemon services (systemd or tmux)
+cgov enable
 ```
 
 ## Configuration
 
-The governor reads configuration from `~/.config/claude-governor/config.yaml`:
+The governor reads configuration from `~/.config/claude-governor/governor.yaml`:
 
 ```yaml
 agents:
@@ -65,11 +90,48 @@ cgov workers
 # Manually set target worker count
 cgov scale 3
 
-# Run governor daemon
-cgov daemon
+# Show capacity status (with --watch for live updates)
+cgov status
+cgov status --watch
 
-# Show recent scaling decisions
+# Run health diagnostic checks
+cgov doctor
+
+# Simulate future capacity trajectory
+cgov simulate --workers 4 --hours 24
+
+# View recent scaling decisions
 cgov explain
+
+# Tail governor logs
+cgov logs --follow
+
+# Print or edit configuration
+cgov config
+cgov config --edit
+```
+
+## Daemon Management
+
+```bash
+# Initialize (create config, directories, install systemd units)
+cgov init
+
+# Enable services (install + start systemd/tmux)
+cgov enable
+
+# Start services
+cgov start
+
+# Stop services
+cgov stop
+
+# Restart services
+cgov restart
+
+# Disable services (stop + remove systemd units)
+cgov disable
+cgov disable --purge
 ```
 
 ## Usage Windows
