@@ -50,6 +50,19 @@ cgov doctor
 cgov enable
 ```
 
+## Directory Structure
+
+```
+~/.config/claude-governor/
+├── governor.yaml        # Main configuration file
+~/.local/share/claude-governor/
+├── governor.log         # Governor daemon logs
+└── collector.log        # Token collector logs
+~/.needle/state/
+├── heartbeats/          # Worker heartbeat files (managed by NEEDLE)
+└── ...                  # Other state files
+```
+
 ## Configuration
 
 The governor reads configuration from `~/.config/claude-governor/governor.yaml`:
