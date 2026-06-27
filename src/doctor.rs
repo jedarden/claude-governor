@@ -1358,6 +1358,128 @@ fn check_log_file() -> CheckResult {
     }
 }
 
+/// Check if claude binary is installed (required for claude-print)
+fn check_claude_binary_installed() -> CheckResult {
+    // Check for claude binary using 'which'
+    match Command::new("which").arg("claude").output() {
+        Ok(output) => {
+            if output.status.success() {
+                // claude found, get version
+                match Command::new("claude").arg("--version").output() {
+                    Ok(ver_output) => {
+                        if ver_output.status.success() {
+                            let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                            CheckResult::pass("claude_binary", version)
+                        } else {
+                            // Binary exists but --version failed
+                            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            CheckResult::warn(
+                                "claude_binary",
+                                format!("found at {} but --version failed", path),
+                                "claude binary may be corrupted; reinstall",
+                            )
+                        }
+                    }
+                    Err(_) => {
+                        // which succeeded but claude --version failed
+                        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        CheckResult::warn(
+                            "claude_binary",
+                            format!("found at {} but cannot execute", path),
+                            "Check file permissions or reinstall claude CLI",
+                        )
+                    }
+                }
+            } else {
+                CheckResult::fail(
+                    "claude_binary",
+                    "claude binary not found in PATH",
+                    "Install claude CLI: npm install -g @anthropic-ai/claude-code",
+                )
+            }
+        }
+        Err(_) => CheckResult::fail(
+            "claude_binary",
+            "cannot locate claude binary",
+            "Install claude CLI: npm install -g @anthropic-ai/claude-code",
+        ),
+    }
+}
+
+/// Check if claude-print is installed (default NEEDLE adapter for Anthropic subscriptions)
+fn check_claude_print_installed() -> CheckResult {
+    // First check ~/.local/bin/claude-print (preferred install location)
+    let local_bin_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("bin")
+        .join("claude-print");
+
+    if local_bin_path.exists() {
+        // claude-print found, get version
+        match Command::new(&local_bin_path).arg("--version").output() {
+            Ok(ver_output) => {
+                if ver_output.status.success() {
+                    let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                    CheckResult::pass("claude_print", version)
+                } else {
+                    CheckResult::warn(
+                        "claude_print",
+                        format!("found at {} but --version failed", local_bin_path.display()),
+                        "claude-print may be corrupted; reinstall",
+                    )
+                }
+            }
+            Err(_) => CheckResult::warn(
+                "claude_print",
+                format!("found at {} but cannot execute", local_bin_path.display()),
+                "Check file permissions on claude-print",
+            ),
+        }
+    } else {
+        // Fallback to 'which claude-print'
+        match Command::new("which").arg("claude-print").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    // Verify it's executable by running --version
+                    match Command::new("claude-print").arg("--version").output() {
+                        Ok(ver_output) => {
+                            if ver_output.status.success() {
+                                let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                                CheckResult::pass("claude_print", version)
+                            } else {
+                                CheckResult::warn(
+                                    "claude_print",
+                                    format!("found at {} but --version failed", path),
+                                    "claude-print may be corrupted; reinstall",
+                                )
+                            }
+                        }
+                        Err(_) => CheckResult::warn(
+                            "claude_print",
+                            format!("found at {} but cannot execute", path),
+                            "Check file permissions on claude-print",
+                        ),
+                    }
+                } else {
+                    // claude-print not found in PATH or ~/.local/bin
+                    CheckResult::warn(
+                        "claude_print",
+                        "claude-print not found",
+                        "Install claude-print: cd ~/claude-print && sh install.sh OR cargo install --git https://github.com/jedarden/claude-print",
+                    )
+                }
+            }
+            Err(_) => CheckResult::warn(
+                "claude_print",
+                "cannot locate claude-print",
+                "Install claude-print: cd ~/claude-print && sh install.sh OR cargo install --git https://github.com/jedarden/claude-print",
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -1384,6 +1506,8 @@ pub fn run_doctor() -> DoctorReport {
         check_tmux_available(),
         check_alert_cooldown(),
         check_disk_space(),
+        check_claude_binary_installed(),
+        check_claude_print_installed(),
     ];
 
     DoctorReport::new(checks)
