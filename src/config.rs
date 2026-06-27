@@ -167,6 +167,15 @@ pub struct DaemonConfig {
     /// Conservative-only: pre-scales down before losing bonus, never pre-scales up.
     #[serde(default = "default_pre_scale_minutes")]
     pub pre_scale_minutes: u64,
+
+    /// Maximum log file size in bytes before rotation (default: 104857600 = 100MB)
+    #[serde(default = "default_log_max_bytes")]
+    pub log_max_bytes: u64,
+
+    /// Number of rotated log files to keep (default: 3)
+    /// Rotated logs are named governor.log.1, governor.log.2, governor.log.3
+    #[serde(default = "default_log_backup_count")]
+    pub log_backup_count: u32,
 }
 
 fn default_loop_interval_secs() -> u64 {
@@ -191,6 +200,14 @@ fn default_pre_scale_minutes() -> u64 {
     30
 }
 
+fn default_log_max_bytes() -> u64 {
+    104857600 // 100 MB
+}
+
+fn default_log_backup_count() -> u32 {
+    3
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +219,8 @@ impl Default for DaemonConfig {
             target_ceiling: default_target_ceiling(),
             mode: DaemonMode::Auto,
             pre_scale_minutes: default_pre_scale_minutes(),
+            log_max_bytes: default_log_max_bytes(),
+            log_backup_count: default_log_backup_count(),
         }
     }
 }

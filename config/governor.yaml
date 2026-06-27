@@ -146,6 +146,8 @@ daemon:
   min_scale_interval_secs: 60       # Minimum time between scale operations
   target_ceiling: 90.0              # Target utilization ceiling percentage
   mode: auto                        # Daemon mode: auto, systemd, or tmux
+  log_max_bytes: 104857600         # Maximum log file size before rotation (100 MB)
+  log_backup_count: 3               # Number of rotated log files to keep (.1, .2, .3)
 
 # Alert configuration
 # Controls alert firing and cooldown behavior

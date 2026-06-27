@@ -23,7 +23,7 @@ use log::LevelFilter;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use claude_governor::capacity_summary::{generate_capacity_summary, StatusExitCode};
@@ -53,6 +53,129 @@ fn default_log_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("claude-governor")
         .join("governor.log")
+}
+
+/// Rotate log files at the given path with the specified backup count.
+///
+/// This function performs the actual rotation without checking size first.
+/// The caller should check if rotation is needed before calling this.
+///
+/// Rotation scheme:
+/// - .backup_count is deleted
+/// - .backup_count-1 -> .backup_count
+/// - ...
+/// - .1 -> .2
+/// - original -> .1
+/// - New empty file is created
+fn rotate_log_file(log_path: &Path, backup_count: u32) -> Result<()> {
+    log::info!(
+        "[governor] Log file size exceeds limit, rotating (keeping {} backup(s))",
+        backup_count
+    );
+
+    // Perform rotation starting from the highest backup number down to 1
+    for i in (1..backup_count).rev() {
+        let old_file = log_path.with_extension(&format!("log.{}", i));
+        let new_file = log_path.with_extension(&format!("log.{}", i + 1));
+
+        if old_file.exists() {
+            fs::rename(&old_file, &new_file).with_context(|| {
+                format!(
+                    "Failed to rotate log file: {} -> {}",
+                    old_file.display(),
+                    new_file.display()
+                )
+            })?;
+        }
+    }
+
+    // Rename current log to .1
+    let backup_1 = log_path.with_extension("log.1");
+    if log_path.exists() {
+        fs::rename(log_path, &backup_1).with_context(|| {
+            format!(
+                "Failed to rotate log file: {} -> {}",
+                log_path.display(),
+                backup_1.display()
+            )
+        })?;
+    }
+
+    // Create new empty log file
+    fs::File::create(log_path).with_context(|| {
+        format!(
+            "Failed to create new log file after rotation: {}",
+            log_path.display()
+        )
+    })?;
+
+    // Clean up oldest backup if we have more than backup_count
+    let oldest_backup = log_path.with_extension(&format!("log.{}", backup_count + 1));
+    if oldest_backup.exists() {
+        fs::remove_file(&oldest_backup).with_context(|| {
+            format!(
+                "Failed to remove oldest backup: {}",
+                oldest_backup.display()
+            )
+        })?;
+    }
+
+    log::info!(
+        "[governor] Log rotation complete, keeping {} backup(s)",
+        backup_count
+    );
+
+    Ok(())
+}
+
+/// Check if log rotation is needed based on file size, and rotate if so.
+///
+/// This function checks the current log file size against max_bytes.
+/// If the size exceeds the threshold, it performs log rotation.
+fn rotate_log_file_if_needed(log_path: &Path, max_bytes: u64, backup_count: u32) -> Result<()> {
+    // Check if rotation is needed
+    if let Ok(metadata) = fs::metadata(log_path) {
+        if metadata.len() >= max_bytes {
+            rotate_log_file(log_path, backup_count)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Append a log message to the governor.log file, rotating if needed
+fn append_to_governor_log(message: &str, config: &GovernorConfig) -> Result<()> {
+    let log_path = default_log_path();
+
+    // Ensure log directory exists
+    if let Some(parent) = log_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create log directory: {}", parent.display())
+            })?;
+        }
+    }
+
+    // Rotate if needed before writing
+    let max_bytes = config.daemon.log_max_bytes;
+    let backup_count = config.daemon.log_backup_count;
+
+    if let Err(e) = rotate_log_file_if_needed(&log_path, max_bytes, backup_count) {
+        // Log rotation failure shouldn't prevent the write, but log it
+        log::warn!("[governor] Log rotation failed: {}", e);
+    }
+
+    // Append the message
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+
+    file.write_all(message.as_bytes())
+        .with_context(|| format!("Failed to write to log file: {}", log_path.display()))?;
+
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -542,6 +665,9 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     let state_path = default_state_path();
     let mut state = state::load_state(&state_path)?;
 
+    // Load config for log rotation settings
+    let config = GovernorConfig::load()?;
+
     // Track safe mode status for user messaging
     let safe_mode_was_active = state.safe_mode.active;
 
@@ -549,19 +675,12 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     if state.safe_mode.active {
         log::warn!("[governor] WARN: manual scale override during safe mode");
 
-        // Also write directly to log file for persistence
-        let log_path = default_log_path();
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            let log_line = format!(
-                "{} [governor] WARN: manual scale override during safe mode\n",
-                Utc::now().to_rfc3339()
-            );
-            let _ = file.write_all(log_line.as_bytes());
-        }
+        // Also write directly to log file for persistence (with rotation support)
+        let log_line = format!(
+            "{} [governor] WARN: manual scale override during safe mode\n",
+            Utc::now().to_rfc3339()
+        );
+        let _ = append_to_governor_log(&log_line, &config);
     }
 
     // Validate count against worker limits
@@ -1938,5 +2057,130 @@ mod tests {
             "Log file should NOT contain warning when safe mode is inactive. Got: {}",
             log_contents
         );
+    }
+
+    /// Test that verifies log rotation works correctly when log file exceeds max_bytes.
+    ///
+    /// This test creates a log file that exceeds the rotation threshold, triggers rotation,
+    /// and verifies that:
+    /// 1. The original log file is rotated to .1
+    /// 2. A new empty log file is created
+    /// 3. Older backups are properly shifted (.1 -> .2, etc.)
+    /// 4. Oldest backup beyond backup_count is removed
+    #[test]
+    fn test_log_rotation() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory for test files
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let log_path = temp_dir.path().join("governor.log");
+
+        // Create a log file that exceeds the rotation threshold (100 bytes for testing)
+        let large_content = "x".repeat(200); // 200 bytes
+        fs::write(&log_path, &large_content).expect("Failed to write test log file");
+
+        // Verify initial file size exceeds threshold
+        let metadata = fs::metadata(&log_path).expect("Failed to get metadata");
+        assert!(metadata.len() > 100, "Log file should exceed threshold");
+
+        // Trigger rotation with max_bytes=100 and backup_count=3
+        let result = rotate_log_file_if_needed(&log_path, 100, 3);
+        assert!(result.is_ok(), "Log rotation should succeed");
+
+        // Verify .1 backup was created
+        let backup_1 = log_path.with_extension("log.1");
+        assert!(backup_1.exists(), "Backup .1 should exist");
+        let backup_1_contents = fs::read_to_string(&backup_1).expect("Failed to read backup");
+        assert_eq!(backup_1_contents, large_content, "Backup should contain original content");
+
+        // Verify new log file exists and is empty
+        assert!(log_path.exists(), "New log file should exist");
+        let new_contents = fs::read_to_string(&log_path).expect("Failed to read new log");
+        assert_eq!(new_contents.len(), 0, "New log file should be empty after rotation");
+
+        // Test multiple rotations: create another large file
+        fs::write(&log_path, &large_content).expect("Failed to write second log file");
+        let result = rotate_log_file_if_needed(&log_path, 100, 3);
+        assert!(result.is_ok(), "Second rotation should succeed");
+
+        // Verify .2 backup was created (previous .1 shifted to .2)
+        let backup_2 = log_path.with_extension("log.2");
+        assert!(backup_2.exists(), "Backup .2 should exist after second rotation");
+        let backup_2_contents = fs::read_to_string(&backup_2).expect("Failed to read backup .2");
+        assert_eq!(backup_2_contents, large_content, "Backup .2 should contain first content");
+
+        // Verify .1 contains the second content
+        let backup_1_contents = fs::read_to_string(&backup_1).expect("Failed to read backup .1");
+        assert_eq!(backup_1_contents, large_content, "Backup .1 should contain second content");
+    }
+
+    /// Test that verifies log rotation is NOT triggered when file size is below threshold.
+    ///
+    /// This test ensures that rotation only happens when necessary.
+    #[test]
+    fn test_log_rotation_not_needed() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory for test files
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let log_path = temp_dir.path().join("governor.log");
+
+        // Create a small log file (50 bytes, below threshold of 100)
+        let small_content = "x".repeat(50);
+        fs::write(&log_path, &small_content).expect("Failed to write test log file");
+
+        // Verify initial file size is below threshold
+        let metadata = fs::metadata(&log_path).expect("Failed to get metadata");
+        assert!(metadata.len() < 100, "Log file should be below threshold");
+
+        // Try to trigger rotation (should not happen)
+        let result = rotate_log_file_if_needed(&log_path, 100, 3);
+        assert!(result.is_ok(), "Rotation check should succeed even if no rotation needed");
+
+        // Verify no backups were created
+        let backup_1 = log_path.with_extension("log.1");
+        assert!(!backup_1.exists(), "No backup should be created when file is below threshold");
+
+        // Verify original file is unchanged
+        let contents = fs::read_to_string(&log_path).expect("Failed to read log file");
+        assert_eq!(contents, small_content, "Original file should be unchanged");
+    }
+
+    /// Test that verifies oldest backups are removed when backup_count is exceeded.
+    ///
+    /// This test creates more backups than backup_count and verifies that
+    /// backups beyond the limit are removed.
+    #[test]
+    fn test_log_rotation_backup_count_limit() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory for test files
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let log_path = temp_dir.path().join("governor.log");
+
+        // Set backup_count to 2 (keep only .1 and .2)
+        let backup_count = 2;
+
+        // Create initial log and rotate it 3 times to create .1, .2, .3
+        for i in 1..=3 {
+            let content = format!("Log content {}\n", i);
+            fs::write(&log_path, &content).expect("Failed to write log file");
+            let result = rotate_log_file(&log_path, backup_count);
+            assert!(result.is_ok(), "Rotation should succeed");
+        }
+
+        // Verify .1 and .2 exist
+        let backup_1 = log_path.with_extension("log.1");
+        let backup_2 = log_path.with_extension("log.2");
+        assert!(backup_1.exists(), "Backup .1 should exist");
+        assert!(backup_2.exists(), "Backup .2 should exist");
+
+        // Verify .3 does NOT exist (should have been cleaned up)
+        let backup_3 = log_path.with_extension("log.3");
+        assert!(!backup_3.exists(), "Backup .3 should NOT exist (exceeds backup_count)");
+
+        // Verify .4 does NOT exist (should never be created)
+        let backup_4 = log_path.with_extension("log.4");
+        assert!(!backup_4.exists(), "Backup .4 should NOT exist");
     }
 }

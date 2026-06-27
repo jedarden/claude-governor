@@ -273,10 +273,17 @@ pub fn default_alert_log_path() -> PathBuf {
 /// 1. Checks if alerts are enabled in config
 /// 2. Checks if the alert severity meets the minimum threshold
 /// 3. Executes the configured command (default: br create --type human "...")
-/// 4. Logs the alert to governor.log
+/// 4. Logs the alert to governor.log (with log rotation if config provided)
 ///
 /// Returns Ok(()) if the alert was fired successfully, or an error message.
-pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), String> {
+///
+/// The optional (log_max_bytes, log_backup_count) tuple enables log rotation.
+/// If None, logs are written without rotation (legacy behavior).
+pub fn fire_alert(
+    alert: &AlertCondition,
+    config: &AlertConfig,
+    log_rotation_config: Option<(u64, u32)>,
+) -> Result<(), String> {
     // Check if alerts are enabled
     if !config.enabled {
         log::debug!("[alert] alerts disabled, skipping {}", alert.alert_type);
@@ -302,7 +309,7 @@ pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), St
     );
 
     // Log to alert log file regardless of auto_bead setting
-    if let Err(e) = log_alert_to_file(alert) {
+    if let Err(e) = log_alert_to_file(alert, log_rotation_config) {
         log::debug!("[alert] could not write to alert log: {}", e);
     }
 
@@ -350,7 +357,7 @@ pub fn fire_alert(alert: &AlertCondition, config: &AlertConfig) -> Result<(), St
     }
 
     // Log to governor.log
-    if let Err(e) = log_alert_to_file(alert) {
+    if let Err(e) = log_alert_to_file(alert, log_rotation_config) {
         log::warn!("[alert] failed to write to governor.log: {}", e);
     }
 
@@ -379,12 +386,29 @@ fn meets_severity_threshold(severity: AlertSeverity, min_severity: &str) -> bool
 ///
 /// Creates the log directory if it doesn't exist.
 /// Appends a single line with timestamp, severity, type, and message.
-fn log_alert_to_file(alert: &AlertCondition) -> std::io::Result<()> {
+///
+/// If log_rotation_config is Some((max_bytes, backup_count)), performs log rotation
+/// before writing if the current log file exceeds max_bytes.
+fn log_alert_to_file(
+    alert: &AlertCondition,
+    log_rotation_config: Option<(u64, u32)>,
+) -> std::io::Result<()> {
     let path = default_alert_log_path();
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // Perform log rotation if config is provided
+    if let Some((max_bytes, backup_count)) = log_rotation_config {
+        // Check if rotation is needed
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if metadata.len() >= max_bytes {
+                // Rotate logs
+                rotate_log_file(&path, backup_count)?;
+            }
+        }
     }
 
     // Open file for append
@@ -400,6 +424,49 @@ fn log_alert_to_file(alert: &AlertCondition) -> std::io::Result<()> {
     );
 
     file.write_all(log_line.as_bytes())?;
+
+    Ok(())
+}
+
+/// Rotate log files at the given path.
+///
+/// Rotation scheme:
+/// - .backup_count is deleted
+/// - .backup_count-1 -> .backup_count
+/// - ...
+/// - .1 -> .2
+/// - original -> .1
+/// - New empty file is created
+fn rotate_log_file(path: &std::path::PathBuf, backup_count: u32) -> std::io::Result<()> {
+    log::warn!(
+        "[alert] Log file size exceeds limit, rotating (keeping {} backup(s))",
+        backup_count
+    );
+
+    // Perform rotation starting from the highest backup number down to 1
+    for i in (1..backup_count).rev() {
+        let old_file = path.with_extension(&format!("log.{}", i));
+        let new_file = path.with_extension(&format!("log.{}", i + 1));
+
+        if old_file.exists() {
+            std::fs::rename(&old_file, &new_file)?;
+        }
+    }
+
+    // Rename current log to .1
+    let backup_1 = path.with_extension("log.1");
+    if path.exists() {
+        std::fs::rename(path, &backup_1)?;
+    }
+
+    // Create new empty log file
+    std::fs::File::create(path)?;
+
+    // Clean up oldest backup if we have more than backup_count
+    let oldest_backup = path.with_extension(&format!("log.{}", backup_count + 1));
+    if oldest_backup.exists() {
+        std::fs::remove_file(&oldest_backup)?;
+    }
 
     Ok(())
 }
@@ -428,7 +495,7 @@ pub fn process_alerts(
             &state.alert_cooldown,
             now,
             config.cooldown_minutes,
-        ) && fire_alert(alert, config).is_ok()
+        ) && fire_alert(alert, config, None).is_ok()
         {
             update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
             fired_count += 1;
@@ -2401,7 +2468,7 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let result = fire_alert(&alert, &config);
+        let result = fire_alert(&alert, &config, None);
         assert!(result.is_ok());
     }
 
@@ -2419,7 +2486,7 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let result = fire_alert(&alert, &config);
+        let result = fire_alert(&alert, &config, None);
         assert!(result.is_ok());
     }
 
@@ -2438,7 +2505,7 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let result = fire_alert(&alert, &config);
+        let result = fire_alert(&alert, &config, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no alert command"));
     }

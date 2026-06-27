@@ -2464,7 +2464,11 @@ pub fn run_governor_cycle(
 
             // Fire the alert: execute configured command (e.g. br create --type human)
             // and log to governor.log
-            if let Err(e) = fire_alert(alert, alert_config) {
+            let log_rotation_config = Some((
+                pricing_config.daemon.log_max_bytes,
+                pricing_config.daemon.log_backup_count,
+            ));
+            if let Err(e) = fire_alert(alert, alert_config, log_rotation_config) {
                 log::warn!("[governor] alert fire failed: {}", e);
             }
             update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
