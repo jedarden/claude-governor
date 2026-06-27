@@ -603,6 +603,203 @@ fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent cost priority helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the model name from an agent's launch command.
+///
+/// Looks for --agent flag in the launch_cmd and extracts the model identifier.
+/// Returns None if the model cannot be determined.
+///
+/// # Examples
+/// - "needle run --agent claude-code-glm-5 --workspace ..." -> Some("claude-code-glm-5")
+/// - "needle run --agent claude-opus --workspace ..." -> Some("claude-opus")
+fn extract_model_from_launch_cmd(launch_cmd: &str) -> Option<String> {
+    // Look for --agent flag
+    let args: Vec<&str> = launch_cmd.split_whitespace().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if *arg == "--agent" && i + 1 < args.len() {
+            return Some(args[i + 1].to_string());
+        }
+    }
+    None
+}
+
+/// Get the per-worker dollar cost for an agent.
+///
+/// Uses the pricing configuration to estimate the hourly cost per worker for this agent.
+/// The cost is derived from the model's pricing assuming typical usage patterns.
+///
+/// Priority order:
+/// 1. Use burn_rate.by_model if available (empirically measured)
+/// 2. Use pricing config to estimate from model name
+/// 3. Return default Sonnet cost as fallback
+///
+/// Returns cost in USD per worker per hour.
+fn get_agent_cost_per_worker(
+    agent_name: &str,
+    agent_config: &AgentConfig,
+    burn_rate_by_model: &HashMap<String, state::ModelBurnRate>,
+    pricing_config: &crate::config::GovernorConfig,
+) -> f64 {
+    // Try burn rate data first (empirical)
+    let model = extract_model_from_launch_cmd(&agent_config.launch_cmd);
+
+    if let Some(model_name) = &model {
+        // Look for burn rate data by model name
+        if let Some(burn_rate) = burn_rate_by_model.get(model_name) {
+            if burn_rate.dollars_per_worker_per_hour > 0.0 {
+                log::debug!(
+                    "[governor] agent {}: using burn rate ${:.2}/hr from {} samples",
+                    agent_name,
+                    burn_rate.dollars_per_worker_per_hour,
+                    burn_rate.samples
+                );
+                return burn_rate.dollars_per_worker_per_hour;
+            }
+        }
+
+        // Fall back to pricing config
+        if let Some(model_pricing) = pricing_config.get_pricing(model_name) {
+            // Estimate hourly cost: assume average 1M input + 500K output tokens/hour
+            // This is a rough heuristic for prioritization
+            let input_cost = model_pricing.input_per_mtok * 1.0; // 1M input tokens
+            let output_cost = model_pricing.output_per_mtok * 0.5; // 500K output tokens
+            let estimated_hourly_cost = input_cost + output_cost;
+
+            log::debug!(
+                "[governor] agent {}: using pricing estimate ${:.2}/hr for model {}",
+                agent_name,
+                estimated_hourly_cost,
+                model_name
+            );
+            return estimated_hourly_cost;
+        }
+    }
+
+    // Ultimate fallback: default Sonnet cost ($3 + $7.50 = $10.50/hr heuristic)
+    log::debug!(
+        "[governor] agent {}: using default Sonnet cost $10.50/hr (no pricing data found)",
+        agent_name
+    );
+    10.50
+}
+
+/// Distribute workers across agents by cost priority.
+///
+/// When scaling down (new_total < current_total): prioritize high-cost agents first.
+/// When scaling up (new_total > current_total): prioritize low-cost agents first.
+///
+/// # Arguments
+/// - `agents`: HashMap of agent name -> AgentConfig
+/// - `current_workers`: HashMap of agent name -> current worker count
+/// - `target_total`: The new total worker count to achieve
+/// - `burn_rate_by_model`: Per-model burn rate data for cost lookup
+/// - `pricing_config`: Pricing configuration for cost estimation
+/// - `cutoff_risk`: Whether we're in cutoff_risk mode (affects scale-down priority)
+///
+/// # Returns
+/// HashMap of agent name -> target worker count
+fn distribute_workers_by_cost_priority(
+    agents: &HashMap<String, AgentConfig>,
+    current_workers: &HashMap<String, u32>,
+    target_total: u32,
+    burn_rate_by_model: &HashMap<String, state::ModelBurnRate>,
+    pricing_config: &crate::config::GovernorConfig,
+    _cutoff_risk: bool,  // Reserved for future scale-down priority adjustments
+) -> HashMap<String, u32> {
+    let mut result = HashMap::new();
+
+    // Calculate current total and delta
+    let current_total: u32 = current_workers.values().sum();
+    let delta = target_total as i32 - current_total as i32;
+
+    if delta == 0 {
+        // No change, return current distribution
+        for (agent, &count) in current_workers {
+            result.insert(agent.clone(), count);
+        }
+        return result;
+    }
+
+    // Build list of agents with their costs and constraints
+    let mut agent_costs: Vec<(String, f64, u32, u32)> = Vec::new();
+    for (name, config) in agents {
+        let cost = get_agent_cost_per_worker(name, config, burn_rate_by_model, pricing_config);
+        let current = *current_workers.get(name).unwrap_or(&0);
+        let max = config.max_workers;
+        agent_costs.push((name.clone(), cost, current, max));
+    }
+
+    if delta < 0 {
+        // Scaling down: prioritize high-cost agents first
+        let scale_down = delta.abs() as u32;
+
+        // Sort by cost descending (highest first)
+        agent_costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut remaining_to_remove = scale_down;
+
+        for (name, cost, current, _max) in agent_costs {
+            if remaining_to_remove == 0 {
+                result.insert(name, current);
+                continue;
+            }
+
+            let can_remove = current.min(remaining_to_remove);
+            result.insert(name.clone(), current.saturating_sub(can_remove));
+            remaining_to_remove -= can_remove;
+
+            if can_remove > 0 {
+                log::info!(
+                    "[governor] scale-down priority: removing {} workers from {} (cost ${:.2}/hr)",
+                    can_remove,
+                    name,
+                    cost
+                );
+            }
+        }
+    } else {
+        // Scaling up: prioritize low-cost agents first
+        let scale_up = delta as u32;
+
+        // Sort by cost ascending (lowest first), then by remaining capacity
+        agent_costs.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.3 - b.2).cmp(&(a.3 - a.2))) // Prefer agents with more capacity
+        });
+
+        let mut remaining_to_add = scale_up;
+
+        for (name, cost, current, max) in agent_costs {
+            if remaining_to_add == 0 {
+                result.insert(name, current);
+                continue;
+            }
+
+            let capacity = max.saturating_sub(current);
+            let can_add = capacity.min(remaining_to_add);
+            result.insert(name.clone(), current.saturating_add(can_add));
+            remaining_to_add -= can_add;
+
+            if can_add > 0 {
+                log::info!(
+                    "[governor] scale-up priority: adding {} workers to {} (cost ${:.2}/hr, capacity {}/{})",
+                    can_add,
+                    name,
+                    cost,
+                    current + can_add,
+                    max
+                );
+            }
+        }
+    }
+
+    result
+}
+
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
@@ -1019,6 +1216,7 @@ pub fn run_governor_cycle(
     promotions: &[Promotion],
     composite_risk_config: &CompositeRiskConfig,
     cone_scaling_config: &ConeScalingConfig,
+    pricing_config: &crate::config::GovernorConfig,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
@@ -1267,14 +1465,15 @@ pub fn run_governor_cycle(
     );
 
     // Update worker state with current count
-    // Distribute evenly across configured agents
-    let agent_count = state.workers.len().max(1);
-    let per_agent = current_total / agent_count as u32;
-    let remainder = current_total % agent_count as u32;
+    // Count current workers per agent from heartbeat/tmux data
+    let mut current_workers_per_agent: HashMap<String, u32> = HashMap::new();
+    for (name, wc) in &worker_configs {
+        let wc_count = worker::count_workers(wc);
+        current_workers_per_agent.insert(name.clone(), wc_count.tmux_count as u32);
+    }
 
-    for (i, ws) in state.workers.values_mut().enumerate() {
-        let extra = if (i as u32) < remainder { 1 } else { 0 };
-        ws.current = per_agent + extra;
+    for (name, ws) in state.workers.iter_mut() {
+        ws.current = *current_workers_per_agent.get(name).unwrap_or(&0);
     }
 
     // 5. Compute burn rates and update capacity forecast using fleet aggregate data
@@ -2012,8 +2211,10 @@ pub fn run_governor_cycle(
     );
 
     // 6. Execute scaling (unless dry-run or no change)
-    // Use the first configured agent's WorkerConfig for scaling operations
-    let primary_worker_config = &worker_configs[0].1;
+    //
+    // Use priority-based distribution when scaling multiple agents:
+    // - Scale down: reduce highest-cost agents first (Opus -> Sonnet -> Haiku)
+    // - Scale up: add to lowest-cost agents first with capacity
     match &decision {
         ScalingDecision::NoChange => {
             log::info!("[governor] no scaling action this cycle");
@@ -2021,8 +2222,53 @@ pub fn run_governor_cycle(
         ScalingDecision::ScaleUp(n) => {
             log::info!("[governor] scaling up by {} workers", n);
             if !dry_run {
-                let launched = worker::scale_up(*n, primary_worker_config, false);
-                log::info!("[governor] launched {} workers", launched);
+                // Determine cutoff_risk from binding window
+                let binding_window = &state.capacity_forecast.binding_window;
+                let cutoff_risk = match binding_window.as_str() {
+                    WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+                    WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                };
+
+                // Build current workers map
+                let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+                for (name, ws) in &state.workers {
+                    current_workers_map.insert(name.clone(), ws.current);
+                }
+
+                // Calculate new target total
+                let new_total = current_total.saturating_add(*n);
+
+                // Distribute workers by cost priority
+                let target_distribution = distribute_workers_by_cost_priority(
+                    agents,
+                    &current_workers_map,
+                    new_total,
+                    &state.burn_rate.by_model,
+                    pricing_config,
+                    cutoff_risk,
+                );
+
+                // Scale up each agent individually based on distribution
+                let mut total_launched = 0;
+                for (agent_name, &target_count) in &target_distribution {
+                    if let Some(worker_config) = worker_configs.iter().find(|(name, _)| name == agent_name) {
+                        let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                        if target_count > current {
+                            let to_add = target_count - current;
+                            let launched = worker::scale_up(to_add, &worker_config.1, false);
+                            total_launched += launched;
+                            log::info!(
+                                "[governor] scaled up {} agent: {} -> {} workers (launched {})",
+                                agent_name,
+                                current,
+                                target_count,
+                                launched
+                            );
+                        }
+                    }
+                }
+                log::info!("[governor] total workers launched: {}", total_launched);
             } else {
                 log::info!("[governor] DRY RUN: would scale up by {}", n);
             }
@@ -2030,11 +2276,60 @@ pub fn run_governor_cycle(
         ScalingDecision::ScaleDown(n) => {
             log::info!("[governor] gracefully scaling down by {} workers", n);
             if !dry_run {
-                let result = worker::scale_down_graceful(*n, primary_worker_config, false);
+                // Determine cutoff_risk from binding window
+                let binding_window = &state.capacity_forecast.binding_window;
+                let cutoff_risk = match binding_window.as_str() {
+                    WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+                    WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                };
+
+                // Build current workers map
+                let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+                for (name, ws) in &state.workers {
+                    current_workers_map.insert(name.clone(), ws.current);
+                }
+
+                // Calculate new target total
+                let new_total = current_total.saturating_sub(*n);
+
+                // Distribute workers by cost priority (highest cost first when scaling down)
+                let target_distribution = distribute_workers_by_cost_priority(
+                    agents,
+                    &current_workers_map,
+                    new_total,
+                    &state.burn_rate.by_model,
+                    pricing_config,
+                    cutoff_risk,
+                );
+
+                // Scale down each agent individually based on distribution
+                let mut total_graceful = 0;
+                let mut total_forced = 0;
+                for (agent_name, &target_count) in &target_distribution {
+                    if let Some(worker_config) = worker_configs.iter().find(|(name, _)| name == agent_name) {
+                        let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                        if target_count < current {
+                            let to_remove = current - target_count;
+                            let result = worker::scale_down_graceful(to_remove, &worker_config.1, false);
+                            total_graceful += result.graceful;
+                            total_forced += result.force_killed;
+                            log::info!(
+                                "[governor] scaled down {} agent: {} -> {} workers (removed: {}, graceful={}, forced={})",
+                                agent_name,
+                                current,
+                                target_count,
+                                to_remove,
+                                result.graceful,
+                                result.force_killed
+                            );
+                        }
+                    }
+                }
                 log::info!(
-                    "[governor] scaled down: {} graceful, {} force-killed",
-                    result.graceful,
-                    result.force_killed
+                    "[governor] total scaled down: {} graceful, {} force-killed",
+                    total_graceful,
+                    total_forced
                 );
             } else {
                 log::info!("[governor] DRY RUN: would scale down by {}", n);
@@ -2065,33 +2360,68 @@ pub fn run_governor_cycle(
         }
     }
 
-    // 7. Update target in state
+    // 7. Update target in state using priority-based distribution
+    //
+    // Build current workers map for distribution
+    let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+    for (name, ws) in &state.workers {
+        current_workers_map.insert(name.clone(), ws.current);
+    }
+
+    // Determine cutoff_risk from binding window
+    let binding_window = &state.capacity_forecast.binding_window;
+    let cutoff_risk = match binding_window.as_str() {
+        WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+        WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+        _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+    };
+
     match &decision {
         ScalingDecision::EmergencyBrake => {
             for ws in state.workers.values_mut() {
                 ws.target = 0;
             }
         }
-        ScalingDecision::ScaleUp(_n) | ScalingDecision::ScaleDown(_n) => {
-            let new_total = match &decision {
-                ScalingDecision::ScaleUp(n) => current_total.saturating_add(*n),
-                ScalingDecision::ScaleDown(n) => current_total.saturating_sub(*n),
-                _ => current_total,
-            };
-            let per_agent = new_total / agent_count as u32;
-            let remainder = new_total % agent_count as u32;
-            for (i, ws) in state.workers.values_mut().enumerate() {
-                let extra = if (i as u32) < remainder { 1 } else { 0 };
-                ws.target = per_agent + extra;
+        ScalingDecision::ScaleUp(n) => {
+            let new_total = current_total.saturating_add(*n);
+            let target_distribution = distribute_workers_by_cost_priority(
+                agents,
+                &current_workers_map,
+                new_total,
+                &state.burn_rate.by_model,
+                pricing_config,
+                cutoff_risk,
+            );
+            for (agent_name, ws) in state.workers.iter_mut() {
+                ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
+            }
+        }
+        ScalingDecision::ScaleDown(n) => {
+            let new_total = current_total.saturating_sub(*n);
+            let target_distribution = distribute_workers_by_cost_priority(
+                agents,
+                &current_workers_map,
+                new_total,
+                &state.burn_rate.by_model,
+                pricing_config,
+                cutoff_risk,
+            );
+            for (agent_name, ws) in state.workers.iter_mut() {
+                ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
             }
         }
         ScalingDecision::NoChange => {
-            // Still update target to reflect current desired state
-            let per_agent = effective_target / agent_count as u32;
-            let remainder = effective_target % agent_count as u32;
-            for (i, ws) in state.workers.values_mut().enumerate() {
-                let extra = if (i as u32) < remainder { 1 } else { 0 };
-                ws.target = per_agent + extra;
+            // Still update target to reflect current desired state using priority distribution
+            let target_distribution = distribute_workers_by_cost_priority(
+                agents,
+                &current_workers_map,
+                effective_target,
+                &state.burn_rate.by_model,
+                pricing_config,
+                cutoff_risk,
+            );
+            for (agent_name, ws) in state.workers.iter_mut() {
+                ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
             }
         }
     }
@@ -2169,6 +2499,7 @@ pub fn run_daemon(
     promotions: &[Promotion],
     composite_risk_config: &CompositeRiskConfig,
     cone_scaling_config: &ConeScalingConfig,
+    pricing_config: &crate::config::GovernorConfig,
 ) -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -2211,6 +2542,7 @@ pub fn run_daemon(
         promotions,
         composite_risk_config,
         cone_scaling_config,
+        pricing_config,
     ) {
         log::error!("[governor] initial cycle failed: {}", e);
     }
@@ -2243,6 +2575,7 @@ pub fn run_daemon(
             promotions,
             composite_risk_config,
             cone_scaling_config,
+            pricing_config,
         ) {
             log::error!("[governor] cycle failed: {}", e);
             // Continue running despite cycle failures
@@ -3070,5 +3403,342 @@ mod tests {
             target, 6,
             "expected fallback to max_workers=6 when safe_worker_count is None"
         );
+    }
+
+    // --- Cost priority distribution tests ---
+
+    use crate::config::{GovernorConfig, PricingConfig, ModelPricing};
+
+    #[test]
+    fn distribute_scale_down_reduces_highest_cost_first() {
+        // Test that when scaling down, the highest-cost agent is reduced first
+        // Setup: Opus @ $9/hr with 5 workers, Sonnet @ $5/hr with 5 workers
+        // Scale down by 2 workers → should reduce Opus by 2, Sonnet by 0
+
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-opus --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "opus-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+        agents.insert(
+            "sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-sonnet --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "sonnet-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+
+        let mut current_workers = std::collections::HashMap::new();
+        current_workers.insert("opus".to_string(), 5);
+        current_workers.insert("sonnet".to_string(), 5);
+
+        let burn_rate_by_model = std::collections::HashMap::new();
+        let mut pricing_models = std::collections::HashMap::new();
+        pricing_models.insert(
+            "claude-opus".to_string(),
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 75.0,
+                cache_write_5m_per_mtok: 18.75,
+                cache_write_1h_per_mtok: 30.0,
+                cache_read_per_mtok: 1.50,
+            },
+        );
+        pricing_models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_write_5m_per_mtok: 3.75,
+                cache_write_1h_per_mtok: 6.0,
+                cache_read_per_mtok: 0.30,
+            },
+        );
+        let pricing_config = GovernorConfig {
+            pricing: PricingConfig {
+                models: pricing_models,
+            },
+            sprint: Default::default(),
+            daemon: Default::default(),
+            alerts: Default::default(),
+            composite_risk: Default::default(),
+            cone_scaling: Default::default(),
+            agents: Default::default(),
+        };
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            8, // target 8 total (down from 10)
+            &burn_rate_by_model,
+            &pricing_config,
+            false, // cutoff_risk doesn't affect scale-down priority
+        );
+
+        // Opus should be reduced from 5 to 3 (highest cost first)
+        assert_eq!(result.get("opus"), Some(&3), "Opus should be reduced first");
+        // Sonnet should stay at 5
+        assert_eq!(result.get("sonnet"), Some(&5), "Sonnet should not be reduced");
+        // Total should be 8
+        assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
+    }
+
+    #[test]
+    fn distribute_scale_up_adds_lowest_cost_first() {
+        // Test that when scaling up, the lowest-cost agent is expanded first
+        // Setup: Opus @ $9/hr with 2 workers (max 10), Sonnet @ $5/hr with 2 workers (max 10)
+        // Scale up by 4 workers → should add to Sonnet first, then Opus
+
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-opus --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "opus-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+        agents.insert(
+            "sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-sonnet --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "sonnet-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+
+        let mut current_workers = std::collections::HashMap::new();
+        current_workers.insert("opus".to_string(), 2);
+        current_workers.insert("sonnet".to_string(), 2);
+
+        let burn_rate_by_model = std::collections::HashMap::new();
+        let mut pricing_models = std::collections::HashMap::new();
+        pricing_models.insert(
+            "claude-opus".to_string(),
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 75.0,
+                cache_write_5m_per_mtok: 18.75,
+                cache_write_1h_per_mtok: 30.0,
+                cache_read_per_mtok: 1.50,
+            },
+        );
+        pricing_models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_write_5m_per_mtok: 3.75,
+                cache_write_1h_per_mtok: 6.0,
+                cache_read_per_mtok: 0.30,
+            },
+        );
+        let pricing_config = GovernorConfig {
+            pricing: PricingConfig {
+                models: pricing_models,
+            },
+            sprint: Default::default(),
+            daemon: Default::default(),
+            alerts: Default::default(),
+            composite_risk: Default::default(),
+            cone_scaling: Default::default(),
+            agents: Default::default(),
+        };
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            8, // target 8 total (up from 4)
+            &burn_rate_by_model,
+            &pricing_config,
+            false,
+        );
+
+        // Sonnet should be filled first (lowest cost), from 2 to 6 (all 4 new workers)
+        assert_eq!(result.get("sonnet"), Some(&6), "Sonnet should be expanded first");
+        // Opus should stay at 2 (no capacity needed yet)
+        assert_eq!(result.get("opus"), Some(&2), "Opus should not be expanded yet");
+        // Total should be 8
+        assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
+    }
+
+    #[test]
+    fn distribute_respects_max_workers_constraint() {
+        // Test that scale-up respects max_workers constraint
+        // Setup: Sonnet @ $5/hr with 8 workers (max 10), Haiku @ $1/hr with 2 workers (max 3)
+        // Scale up by 5 workers → should fill Haiku to max (3), then add remaining 2 to Sonnet
+
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-sonnet --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "sonnet-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+        agents.insert(
+            "haiku".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-haiku --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "haiku-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 3, // Limited capacity
+                subscription: false,
+            },
+        );
+
+        let mut current_workers = std::collections::HashMap::new();
+        current_workers.insert("sonnet".to_string(), 8);
+        current_workers.insert("haiku".to_string(), 2);
+
+        let burn_rate_by_model = std::collections::HashMap::new();
+        let mut pricing_models = std::collections::HashMap::new();
+        pricing_models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_write_5m_per_mtok: 3.75,
+                cache_write_1h_per_mtok: 6.0,
+                cache_read_per_mtok: 0.30,
+            },
+        );
+        pricing_models.insert(
+            "claude-haiku".to_string(),
+            ModelPricing {
+                input_per_mtok: 0.25,
+                output_per_mtok: 1.25,
+                cache_write_5m_per_mtok: 0.31,
+                cache_write_1h_per_mtok: 0.50,
+                cache_read_per_mtok: 0.025,
+            },
+        );
+        let pricing_config = GovernorConfig {
+            pricing: PricingConfig {
+                models: pricing_models,
+            },
+            sprint: Default::default(),
+            daemon: Default::default(),
+            alerts: Default::default(),
+            composite_risk: Default::default(),
+            cone_scaling: Default::default(),
+            agents: Default::default(),
+        };
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            15, // target 15 total (up from 10)
+            &burn_rate_by_model,
+            &pricing_config,
+            false,
+        );
+
+        // Haiku should be filled to max (3)
+        assert_eq!(result.get("haiku"), Some(&3), "Haiku should be filled to max");
+        // Sonnet should get remaining 2 workers (8 + 2 = 10)
+        assert_eq!(result.get("sonnet"), Some(&10), "Sonnet should get remaining workers");
+        // Total should be 13 (capped by capacity constraints)
+        assert_eq!(result.values().sum::<u32>(), 13, "Total should be 13 (capped by max_workers)");
+    }
+
+    #[test]
+    fn distribute_uses_burn_rate_when_available() {
+        // Test that burn rate data is used for cost when available
+        // Setup: Opus and Sonnet with empirical burn rate data
+
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-opus --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "opus-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+        agents.insert(
+            "sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-sonnet --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "sonnet-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 10,
+                subscription: false,
+            },
+        );
+
+        let mut current_workers = std::collections::HashMap::new();
+        current_workers.insert("opus".to_string(), 5);
+        current_workers.insert("sonnet".to_string(), 5);
+
+        let mut burn_rate_by_model = std::collections::HashMap::new();
+        burn_rate_by_model.insert(
+            "claude-opus".to_string(),
+            state::ModelBurnRate {
+                pct_per_worker_per_hour: 0.0,
+                dollars_per_worker_per_hour: 12.0, // Empirical: higher than pricing estimate
+                samples: 100,
+            },
+        );
+        burn_rate_by_model.insert(
+            "claude-sonnet".to_string(),
+            state::ModelBurnRate {
+                pct_per_worker_per_hour: 0.0,
+                dollars_per_worker_per_hour: 4.0, // Empirical: lower than pricing estimate
+                samples: 100,
+            },
+        );
+
+        let pricing_config = GovernorConfig {
+            pricing: PricingConfig {
+                models: std::collections::HashMap::new(),
+            },
+            sprint: Default::default(),
+            daemon: Default::default(),
+            alerts: Default::default(),
+            composite_risk: Default::default(),
+            cone_scaling: Default::default(),
+            agents: Default::default(),
+        };
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            8, // target 8 total (down from 10)
+            &burn_rate_by_model,
+            &pricing_config,
+            false,
+        );
+
+        // Opus should be reduced first based on empirical burn rate ($12 > $4)
+        assert_eq!(result.get("opus"), Some(&3), "Opus should be reduced first based on empirical burn rate");
+        assert_eq!(result.get("sonnet"), Some(&5), "Sonnet should not be reduced");
+        assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
     }
 }
