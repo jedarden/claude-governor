@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+use glob;
+
 /// Check result status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1480,6 +1482,139 @@ fn check_claude_print_installed() -> CheckResult {
     }
 }
 
+/// Check subscription session presence - verify cli-entrypoint JSONL sessions exist
+///
+/// This check ensures that subscription-flagged agents are actually using subscription
+/// billing (cli-entrypoint sessions) rather than falling back to sdk-cli billing.
+fn check_subscription_session_presence() -> CheckResult {
+    // Check if any agents are configured as subscription agents
+    let config_path = default_config_path();
+
+    // If config doesn't exist, skip the check (no subscription agents configured)
+    if !config_path.exists() {
+        return CheckResult::pass(
+            "subscription_session_presence",
+            "No config file (skipped - no subscription agents configured)",
+        );
+    }
+
+    let config = match crate::config::GovernorConfig::load_from_path(&config_path) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            return CheckResult::warn(
+                "subscription_session_presence",
+                "Cannot load config (check skipped)",
+                "Fix configuration file syntax",
+            );
+        }
+    };
+
+    // Check if any agents are marked as subscription agents
+    let has_subscription_agents = config
+        .agents
+        .values()
+        .any(|agent| agent.subscription);
+
+    // If no subscription agents are configured, skip the check
+    if !has_subscription_agents {
+        return CheckResult::pass(
+            "subscription_session_presence",
+            "No subscription agents configured (check skipped)",
+        );
+    }
+
+    // Scan ~/.claude/projects/**/*.jsonl for cli-entrypoint sessions
+    let projects_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects");
+
+    if !projects_dir.exists() {
+        return CheckResult::warn(
+            "subscription_session_presence",
+            "Claude projects directory not found",
+            "Run claude-code to create projects",
+        );
+    }
+
+    // Use glob to find all JSONL files
+    let pattern = projects_dir
+        .join("**")
+        .join("*.jsonl")
+        .to_string_lossy()
+        .into_owned();
+
+    let jsonl_files = match glob::glob(&pattern) {
+        Ok(paths) => paths.filter_map(|entry| entry.ok()).collect::<Vec<_>>(),
+        Err(_) => {
+            return CheckResult::warn(
+                "subscription_session_presence",
+                "Cannot scan projects directory",
+                "Check ~/.claude/projects directory structure",
+            );
+        }
+    };
+
+    // Filter to files modified in the last 24 hours
+    let now = Utc::now();
+    let twenty_four_hours_ago = now - chrono::Duration::hours(24);
+
+    let recent_cli_entrypoint_files = jsonl_files
+        .into_iter()
+        .filter_map(|path| {
+            // Check file modification time
+            let metadata = fs::metadata(&path).ok()?;
+            let modified = metadata.modified().ok()?;
+            let modified_dt: DateTime<Utc> = modified.into();
+
+            // Skip files older than 24 hours
+            if modified_dt < twenty_four_hours_ago {
+                return None;
+            }
+
+            // Read the file to check for cli entrypoint
+            let content = fs::read_to_string(&path).ok()?;
+
+            // Parse JSONL lines to find first user-type line with entrypoint
+            for line in content.lines() {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                    // Check if this is a user message (type=user)
+                    let msg_type = json.get("type").and_then(|t| t.as_str());
+
+                    if msg_type == Some("user") {
+                        // Check if this line has entrypoint=cli
+                        let entrypoint = json.get("entrypoint").and_then(|e| e.as_str());
+                        if entrypoint == Some("cli") {
+                            return Some(());
+                        }
+                        // If no entrypoint field, assume cli (default)
+                        if entrypoint.is_none() {
+                            return Some(());
+                        }
+                    }
+                }
+            }
+
+            None
+        })
+        .count();
+
+    // If we found recent cli-entrypoint files, pass with count
+    if recent_cli_entrypoint_files > 0 {
+        CheckResult::pass(
+            "subscription_session_presence",
+            format!("{} cli-entrypoint sessions in last 24h", recent_cli_entrypoint_files),
+        )
+    } else {
+        // No cli-entrypoint sessions found - warn about potential sdk-cli fallback
+        CheckResult::warn(
+            "subscription_session_presence",
+            "No cli-entrypoint sessions in last 24h",
+            "Workers may be using sdk-cli billing instead of subscription; check claude-print configuration and trust dialog",
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -1508,6 +1643,7 @@ pub fn run_doctor() -> DoctorReport {
         check_disk_space(),
         check_claude_binary_installed(),
         check_claude_print_installed(),
+        check_subscription_session_presence(),
     ];
 
     DoctorReport::new(checks)

@@ -63,6 +63,11 @@ pub struct AgentConfig {
     /// Maximum workers for this agent (default: 8)
     #[serde(default = "default_max_workers")]
     pub max_workers: u32,
+
+    /// Whether this agent uses subscription billing (default: false)
+    /// Subscription agents use cli-entrypoint sessions; false implies sdk-cli (credits billing)
+    #[serde(default)]
+    pub subscription: bool,
 }
 
 fn default_max_workers() -> u32 {
@@ -756,6 +761,7 @@ agents:
             heartbeat_dir: "~/.needle/heartbeats".to_string(),
             min_workers: 0,
             max_workers: 8,
+            subscription: false,
         };
         let expanded = agent.heartbeat_dir_expanded();
         assert!(expanded.to_string_lossy().contains(".needle"));
@@ -768,6 +774,7 @@ agents:
             heartbeat_dir: "/var/lib/heartbeats".to_string(),
             min_workers: 0,
             max_workers: 8,
+            subscription: false,
         };
         let expanded_abs = agent_abs.heartbeat_dir_expanded();
         assert_eq!(expanded_abs.to_string_lossy(), "/var/lib/heartbeats");
@@ -781,6 +788,7 @@ agents:
             heartbeat_dir: "/tmp".to_string(),
             min_workers: 0,
             max_workers: 8,
+            subscription: false,
         };
         assert_eq!(agent.session_prefix(), "needle-claude");
 
@@ -791,6 +799,7 @@ agents:
             heartbeat_dir: "/tmp".to_string(),
             min_workers: 0,
             max_workers: 8,
+            subscription: false,
         };
         assert_eq!(agent2.session_prefix(), "worker");
     }
