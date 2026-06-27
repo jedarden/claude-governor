@@ -542,11 +542,12 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     let state_path = default_state_path();
     let mut state = state::load_state(&state_path)?;
 
+    // Track safe mode status for user messaging
+    let safe_mode_was_active = state.safe_mode.active;
+
     // Check if safe mode is active
     if state.safe_mode.active {
-        log::warn!(
-            "Scale command issued during safe mode - this may be overridden by emergency brake"
-        );
+        log::warn!("[governor] WARN: manual scale override during safe mode");
     }
 
     // Validate count against worker limits
@@ -579,6 +580,12 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     state::save_state(&state, &state_path)?;
 
     println!("Target worker count set to {} for all agents", count);
+
+    // Warn user that safe mode will reassert on next cycle
+    if safe_mode_was_active {
+        println!("NOTE: Safe mode remains active and will reassert its target on the next cycle");
+    }
+
     Ok(())
 }
 
