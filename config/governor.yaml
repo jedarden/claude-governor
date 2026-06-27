@@ -5,6 +5,12 @@
 #
 # Source: https://docs.anthropic.com/en/docs/about-claude/models
 
+# OAuth credentials path (optional, supports ~ expansion)
+# Default: ~/.claude/.credentials.json
+# Use this to specify a non-default credentials file for multi-account setups
+# Example: credentials_path: "~/.claude/.credentials.json"
+# credentials_path: "~/.claude-work/.credentials.json"
+
 pricing:
   models:
     # Claude Sonnet 4.6 (claude-sonnet-4-20250514)

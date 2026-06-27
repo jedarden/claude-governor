@@ -2539,7 +2539,8 @@ pub fn run_daemon(
     );
 
     // Create poller for live usage data (persists across cycles for stale-data fallback)
-    let mut poller = match Poller::new() {
+    let credentials_path = pricing_config.credentials_path.clone();
+    let mut poller = match Poller::with_credentials_path(credentials_path) {
         Ok(p) => p,
         Err(e) => {
             return Err(anyhow::anyhow!("Failed to create poller: {}", e));

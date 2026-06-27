@@ -39,6 +39,12 @@ pub struct GovernorConfig {
     /// Agent configurations (worker pools that can be scaled by the governor)
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentConfig>,
+
+    /// OAuth credentials path (optional, supports ~ expansion)
+    /// Default: ~/.claude/.credentials.json
+    /// Use this to specify a non-default credentials file for multi-account setups
+    #[serde(default)]
+    pub credentials_path: Option<String>,
 }
 
 /// Per-agent configuration for worker pool scaling

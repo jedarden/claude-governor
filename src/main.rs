@@ -375,7 +375,14 @@ fn format_json(data: &UsageData) -> String {
 }
 
 fn run_poll_command(format: &str, fail_on_stale: bool) -> Result<()> {
-    let mut poller = Poller::new()?;
+    // Try to load config for credentials path, fall back to default if not found
+    let credentials_path = if let Ok(config) = GovernorConfig::load() {
+        config.credentials_path
+    } else {
+        None
+    };
+
+    let mut poller = Poller::with_credentials_path(credentials_path)?;
 
     log::debug!("Polling usage data from API...");
     let data = poller.poll()?;

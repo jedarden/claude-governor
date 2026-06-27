@@ -157,11 +157,36 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// Create a new poller instance
+    /// Create a new poller instance with the default credentials path
     pub fn new() -> Result<Self> {
-        let home_dir =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-        let credentials_path = home_dir.join(CREDENTIALS_PATH);
+        Self::with_credentials_path(None)
+    }
+
+    /// Create a new poller instance with a custom credentials path
+    ///
+    /// If `path` is None, uses the default ~/.claude/.credentials.json
+    /// If `path` is Some, expands ~ to home directory if present
+    pub fn with_credentials_path(path: Option<String>) -> Result<Self> {
+        let credentials_path = if let Some(path_str) = path {
+            // Expand ~ to home directory if present
+            if path_str.starts_with('~') {
+                let home_dir =
+                    dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+                home_dir.join(
+                    path_str
+                        .strip_prefix('~')
+                        .unwrap_or("")
+                        .trim_start_matches('/'),
+                )
+            } else {
+                PathBuf::from(path_str)
+            }
+        } else {
+            // Use default path
+            let home_dir =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+            home_dir.join(CREDENTIALS_PATH)
+        };
 
         // Build ureq agent with rustls TLS
         let agent = Agent::new();
