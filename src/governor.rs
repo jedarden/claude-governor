@@ -1356,6 +1356,22 @@ pub fn run_governor_cycle(
                         .get("cache-eff-p25")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
+                    let cli_tokens = fleet_json
+                        .get("cli-tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cli_cost = fleet_json
+                        .get("cli-cost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let sdk_tokens = fleet_json
+                        .get("sdk-tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let sdk_cost = fleet_json
+                        .get("sdk-cost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
 
                     state.last_fleet_aggregate = state::FleetAggregate {
                         t0,
@@ -1371,6 +1387,10 @@ pub fn run_governor_cycle(
                         },
                         fleet_cache_eff,
                         cache_eff_p25,
+                        cli_tokens,
+                        cli_cost,
+                        sdk_tokens,
+                        sdk_cost,
                     };
 
                     // Update consecutive low-cache-eff counter for alert tracking.

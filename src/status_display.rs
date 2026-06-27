@@ -237,6 +237,39 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
 
     output.push_str("\n");
 
+    // Billing breakdown section
+    output.push_str("Billing Breakdown\n");
+    output.push_str("-----------------\n");
+
+    let fleet = &state.last_fleet_aggregate;
+    if fleet.cli_tokens == 0 && fleet.sdk_tokens == 0 {
+        output.push_str("No billing data yet (collecting...)\n");
+    } else {
+        // Calculate CLI burn rate (tokens per 5 hours)
+        // Using elapsed time since last fleet aggregate
+        let fleet_age_hrs = if fleet.t0 != fleet.t1 {
+            (fleet.t1 - fleet.t0).num_seconds() as f64 / 3600.0
+        } else {
+            0.083 // Default to ~5 minutes if not available
+        };
+        let cli_burn_rate = if fleet_age_hrs > 0.0 {
+            (fleet.cli_tokens as f64 / fleet_age_hrs) * 5.0 // tokens per 5h
+        } else {
+            0.0
+        };
+
+        output.push_str(&format!(
+            "Subscription (cli): {} tokens burned, burn rate {:.0} tok/5h\n",
+            fleet.cli_tokens, cli_burn_rate
+        ));
+        output.push_str(&format!(
+            "Credits (sdk-cli): {} tokens (informational - not in quota windows)\n",
+            fleet.sdk_tokens
+        ));
+    }
+
+    output.push_str("\n");
+
     // Schedule / Promotion section
     output.push_str("Schedule\n");
     output.push_str("--------\n");
@@ -451,6 +484,10 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
             "workers": state.last_fleet_aggregate.sonnet_workers,
             "usd_per_hr_total": state.last_fleet_aggregate.sonnet_usd_total,
             "usd_per_hr_p75": state.last_fleet_aggregate.sonnet_p75_usd_hr,
+            "cli_tokens": state.last_fleet_aggregate.cli_tokens,
+            "cli_cost": state.last_fleet_aggregate.cli_cost,
+            "sdk_tokens": state.last_fleet_aggregate.sdk_tokens,
+            "sdk_cost": state.last_fleet_aggregate.sdk_cost,
         },
         "schedule": {
             "is_peak_hour": state.schedule.is_peak_hour,
@@ -528,6 +565,10 @@ mod tests {
                 window_pct_deltas: Default::default(),
                 fleet_cache_eff: 0.0,
                 cache_eff_p25: 0.0,
+                cli_tokens: 85000,
+                cli_cost: 0.25,
+                sdk_tokens: 12000,
+                sdk_cost: 0.03,
             },
             capacity_forecast: CapacityForecast {
                 five_hour: WindowForecast {

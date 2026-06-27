@@ -76,6 +76,14 @@ pub struct FleetAggregate {
     pub fleet_cache_eff: f64,
     /// 25th percentile of per-instance cache efficiency
     pub cache_eff_p25: f64,
+    /// CLI (subscription) tokens burned this interval
+    pub cli_tokens: u64,
+    /// CLI (subscription) USD cost this interval
+    pub cli_cost: f64,
+    /// SDK-CLI (credits) tokens burned this interval (informational only, not in quota windows)
+    pub sdk_tokens: u64,
+    /// SDK-CLI (credits) USD cost this interval (informational only, not in quota windows)
+    pub sdk_cost: f64,
 }
 
 impl Default for FleetAggregate {
@@ -90,6 +98,10 @@ impl Default for FleetAggregate {
             window_pct_deltas: WindowPctDeltas::default(),
             fleet_cache_eff: 0.0,
             cache_eff_p25: 0.0,
+            cli_tokens: 0,
+            cli_cost: 0.0,
+            sdk_tokens: 0,
+            sdk_cost: 0.0,
         }
     }
 }
@@ -867,6 +879,10 @@ mod tests {
                 },
                 fleet_cache_eff: 0.0,
                 cache_eff_p25: 0.0,
+                cli_tokens: 125000,
+                cli_cost: 0.28,
+                sdk_tokens: 45000,
+                sdk_cost: 0.04,
             },
             capacity_forecast: CapacityForecast {
                 five_hour: WindowForecast {

@@ -260,19 +260,15 @@ pub fn infer_model_from_path(jsonl_path: &Path) -> Option<String> {
 /// Parse a usage block from a JSONL line into a UsageRecord
 ///
 /// Extracts token counts, model, and session from the JSON structure.
-/// Returns None for sdk-cli sessions (headless API, credits billing) since
-/// the governor only protects subscription quota (cli sessions).
+/// Returns records for both cli (subscription billing) and sdk-cli (credits billing).
+/// The governor protects subscription quota (cli sessions), but tracks both for visibility.
 pub fn parse_usage_block(line: &JsonlLine, jsonl_path: &Path) -> Option<UsageRecord> {
     // Only process assistant messages with usage data
     let message = line.message.as_ref()?;
     let usage = message.usage.as_ref()?;
 
-    // Extract entrypoint: filter out sdk-cli sessions (headless API, credits billing)
-    // The governor protects subscription quota, which only applies to cli sessions.
+    // Extract entrypoint: cli (subscription) or sdk-cli (credits)
     let entrypoint = line.entrypoint.clone().unwrap_or_else(|| "cli".to_string());
-    if entrypoint == "sdk-cli" {
-        return None;
-    }
 
     // Extract model: prefer message-level model, fallback to path inference, then "unknown"
     let model = message.model.clone().unwrap_or_else(|| {
@@ -671,6 +667,10 @@ pub struct InstanceRecord {
     /// 7-day Sonnet window utilization % delta — `null` until governor annotates
     #[serde(rename = "p7ds", skip_serializing_if = "Option::is_none")]
     pub p7ds: Option<f64>,
+
+    /// Session entry point (cli=subscription, sdk-cli=credits)
+    #[serde(rename = "entry")]
+    pub entrypoint: String,
 }
 
 impl InstanceRecord {
@@ -684,6 +684,7 @@ impl InstanceRecord {
         model: String,
         usage: &UsageRecord,
         dollars: &crate::pricing::DollarBreakdown,
+        entrypoint: String,
     ) -> Self {
         let total_input = usage.input_tokens + usage.cache_read_tokens;
         let cache_eff = if total_input > 0 {
@@ -717,6 +718,7 @@ impl InstanceRecord {
             p5h: None,
             p7d: None,
             p7ds: None,
+            entrypoint,
         }
     }
 }
@@ -797,6 +799,18 @@ pub struct FleetRecord {
     /// 25th percentile of per-instance cache efficiency values (nearest-rank method).
     /// 0.0 when no instances reported this interval.
     pub cache_eff_p25: f64,
+
+    /// CLI (subscription) tokens burned this interval
+    pub cli_tokens: u64,
+
+    /// CLI (subscription) USD cost this interval
+    pub cli_cost: f64,
+
+    /// SDK-CLI (credits) tokens burned this interval (informational only, not in quota windows)
+    pub sdk_tokens: u64,
+
+    /// SDK-CLI (credits) USD cost this interval (informational only, not in quota windows)
+    pub sdk_cost: f64,
 }
 
 /// Token-type suffixes used in fleet record column names, in schema order.
@@ -872,6 +886,12 @@ impl FleetRecord {
         insert_f64(&mut map, "fleet-cache-eff", self.fleet_cache_eff);
         insert_f64(&mut map, "cache-eff-p25", self.cache_eff_p25);
 
+        // Billing breakdown: subscription (cli) vs credits (sdk-cli)
+        map.insert("cli-tokens".into(), Value::Number(self.cli_tokens.into()));
+        insert_f64(&mut map, "cli-cost", self.cli_cost);
+        map.insert("sdk-tokens".into(), Value::Number(self.sdk_tokens.into()));
+        insert_f64(&mut map, "sdk-cost", self.sdk_cost);
+
         // Window snapshots (null until annotated)
         let opt_val = |v: Option<f64>| {
             v.and_then(Number::from_f64)
@@ -907,7 +927,12 @@ pub fn aggregate_to_fleet(
         .map(|m| (m.clone(), ModelTokens::default()))
         .collect();
 
-    // Sum token data from all instances
+    // Sum token data from all instances, separating cli (subscription) from sdk-cli (credits)
+    let mut cli_tokens: u64 = 0;
+    let mut cli_cost: f64 = 0.0;
+    let mut sdk_tokens: u64 = 0;
+    let mut sdk_cost: f64 = 0.0;
+
     for inst in instances {
         let entry = model_map.entry(inst.model.clone()).or_default();
         entry.input_n += inst.input_n;
@@ -920,6 +945,16 @@ pub fn aggregate_to_fleet(
         entry.w_cache_usd += inst.w_cache_usd;
         entry.w_cache_1h_n += inst.w_cache_1h_n;
         entry.w_cache_1h_usd += inst.w_cache_1h_usd;
+
+        // Track cli vs sdk-cli usage for billing breakdown
+        if inst.entrypoint == "sdk-cli" {
+            sdk_tokens += inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
+            sdk_cost += inst.total_usd;
+        } else {
+            // cli or any other entrypoint counts as subscription usage
+            cli_tokens += inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
+            cli_cost += inst.total_usd;
+        }
     }
 
     let total_usd: f64 = instances.iter().map(|i| i.total_usd).sum();
@@ -1017,6 +1052,10 @@ pub fn aggregate_to_fleet(
         usd_per_pct_7ds: None,
         fleet_cache_eff,
         cache_eff_p25,
+        cli_tokens,
+        cli_cost,
+        sdk_tokens,
+        sdk_cost,
     }
 }
 
@@ -1211,6 +1250,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
             model.clone(),
             usage,
             &dollars,
+            usage.session_entrypoint.clone(),
         );
 
         let json = serde_json::to_value(&rec)?;
@@ -1671,15 +1711,19 @@ mod tests {
         }
 
         #[test]
-        fn parse_usage_block_filters_sdk_cli_sessions() {
+        fn parse_usage_block_accepts_sdk_cli_sessions() {
             let path = Path::new("/sessions/sdk-session.jsonl");
 
-            // SDK-cli session should be filtered out
+            // SDK-cli session should be accepted (tracked for visibility, not in quota windows)
             let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}},"entrypoint":"sdk-cli"}"#;
             let line: JsonlLine = serde_json::from_str(json).unwrap();
 
             let result = parse_usage_block(&line, path);
-            assert!(result.is_none(), "sdk-cli sessions should be filtered out");
+            assert!(result.is_some(), "sdk-cli sessions should be accepted for visibility");
+
+            let record = result.unwrap();
+            assert_eq!(record.session_entrypoint, "sdk-cli");
+            assert_eq!(record.input_tokens, 1000);
         }
 
         #[test]
@@ -2197,6 +2241,7 @@ mod tests {
                 p5h: None,
                 p7d: None,
                 p7ds: None,
+                entrypoint: "cli".to_string(),
             }
         }
 
@@ -2273,6 +2318,7 @@ mod tests {
                 "claude-sonnet-4-20250514".to_string(),
                 &usage,
                 &dollars,
+                "cli".to_string(),
             );
 
             assert_eq!(rec.r, "i");
@@ -2326,6 +2372,7 @@ mod tests {
                 p5h: None,
                 p7d: None,
                 p7ds: None,
+                entrypoint: "cli".to_string(),
             }
         }
 
