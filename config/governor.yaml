@@ -118,6 +118,17 @@ agents:
     min_workers: 0
     max_workers: 8
 
+  # claude-print workers (Anthropic subscription billing, cc_entrypoint=cli)
+  # Requires: claude-print installed (needle run --agent claude-anthropic-sonnet)
+  # Session pattern: NEEDLE names sessions as needle-claude-anthropic-sonnet-<workspace>-<N>
+  # claude-print-sonnet:
+  #   launch_cmd: needle run --agent claude-anthropic-sonnet --workspace {workspace}
+  #   session_pattern: needle-claude-anthropic-sonnet-*
+  #   heartbeat_dir: ~/.needle/state/heartbeats
+  #   min_workers: 0
+  #   max_workers: 8
+  #   subscription: true   # marks workers as subscription-billed (see entrypoint filtering)
+
 # Daemon configuration
 # Controls the governor's scaling behavior
 daemon:
