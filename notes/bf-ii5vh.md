@@ -90,6 +90,17 @@ The codebase also includes:
 - Integration test script: `test_safe_mode_warnings.sh`
 - Related tests in other modules (sprint inhibition, display formatting)
 
+## Verification
+
+Verified on 2026-06-27: Both tests pass successfully.
+```
+running 2 tests
+test tests::test_scale_without_safe_mode_no_warning ... ok
+test tests::test_scale_safe_mode_warning_log_message ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+```
+
 ## Conclusion
 
 The requested tests were already implemented and pass successfully. No additional code changes were required.
