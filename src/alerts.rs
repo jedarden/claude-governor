@@ -66,6 +66,8 @@ pub enum AlertType {
     LowCacheEfficiency,
     /// Off-peak promotion ratio anomaly (observed > 2.5 or < 0.8)
     PromotionRatioAnomaly,
+    /// Subscription-flagged agent using sdk-cli billing instead of cli
+    SubscriptionBillingDrift,
 }
 
 impl std::fmt::Display for AlertType {
@@ -82,6 +84,7 @@ impl std::fmt::Display for AlertType {
             AlertType::CollectorOffline => write!(f, "collector_offline"),
             AlertType::LowCacheEfficiency => write!(f, "low_cache_efficiency"),
             AlertType::PromotionRatioAnomaly => write!(f, "promotion_ratio_anomaly"),
+            AlertType::SubscriptionBillingDrift => write!(f, "subscription_billing_drift"),
         }
     }
 }
@@ -414,8 +417,9 @@ pub fn process_alerts(
     state: &mut GovernorState,
     config: &AlertConfig,
     now: DateTime<Utc>,
+    agents: &std::collections::HashMap<String, crate::config::AgentConfig>,
 ) -> usize {
-    let conditions = check_alert_conditions(state, now);
+    let conditions = check_alert_conditions(state, now, agents);
     let mut fired_count = 0;
 
     for alert in &conditions {
@@ -434,11 +438,132 @@ pub fn process_alerts(
     fired_count
 }
 
+/// Check for subscription billing drift: subscription agents using sdk-cli instead of cli
+///
+/// This detects when a subscription-flagged agent (subscription: true) has workers
+/// using sdk-cli billing instead of the expected cli billing. This is a P1 operational
+/// problem because workers are burning SDK credits instead of free subscription quota.
+///
+/// Detection logic:
+/// 1. For each subscription-flagged agent
+/// 2. Read heartbeat files to identify active worker sessions
+/// 3. Check if those sessions have recent JSONL files with sdk-cli entrypoint
+/// 4. Fire alert if any subscription agent has sdk-cli sessions
+fn check_subscription_billing_drift(
+    _state: &GovernorState,
+    agents: &std::collections::HashMap<String, crate::config::AgentConfig>,
+    now: DateTime<Utc>,
+    alerts: &mut Vec<AlertCondition>,
+) {
+    use std::fs;
+
+    for (agent_name, agent_config) in agents {
+        // Only check subscription-flagged agents
+        if !agent_config.subscription {
+            continue;
+        }
+
+        // Get heartbeat directory path
+        let heartbeat_dir = agent_config.heartbeat_dir_expanded();
+
+        // Check if heartbeat directory exists
+        if !heartbeat_dir.exists() {
+            continue;
+        }
+
+        // Read heartbeat files to find active worker sessions
+        let mut sdk_cli_sessions = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&heartbeat_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+
+                // Read heartbeat JSON to get session ID
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(heartbeat) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(session_id) = heartbeat.get("session").and_then(|v| v.as_str()) {
+                            // Check if this session has sdk-cli entrypoint
+                            if let Some(entrypoint) = get_session_entrypoint(session_id) {
+                                if entrypoint == "sdk-cli" {
+                                    sdk_cli_sessions.push(session_id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fire alert if any subscription agent workers are using sdk-cli
+        if !sdk_cli_sessions.is_empty() {
+            let msg = format!(
+                "Agent {} workers using sdk-cli billing (expected cli). claude-print may be misconfigured or missing. Check: claude-print --check. Affected sessions: {}",
+                agent_name,
+                sdk_cli_sessions.join(", ")
+            );
+            alerts.push(AlertCondition {
+                alert_type: AlertType::SubscriptionBillingDrift,
+                message: msg,
+                severity: AlertSeverity::Critical,
+                detected_at: now,
+            });
+        }
+    }
+}
+
+/// Get the entrypoint for a session by reading its JSONL file
+///
+/// Returns the entrypoint type ("cli" or "sdk-cli") if found, None otherwise
+fn get_session_entrypoint(session_id: &str) -> Option<String> {
+    use std::fs;
+
+    // Construct path to JSONL file in ~/.claude/projects/**/<session_id>.jsonl
+    let home_dir = dirs::home_dir()?;
+    let projects_dir = home_dir.join(".claude").join("projects");
+
+    // Search for the JSONL file in subdirectories
+    if let Ok(entries) = fs::read_dir(&projects_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().is_dir() {
+                let jsonl_path = entry.path().join(format!("{}.jsonl", session_id));
+                if jsonl_path.exists() {
+                    // Read the JSONL file to find entrypoint
+                    if let Ok(content) = fs::read_to_string(&jsonl_path) {
+                        // Parse lines to find entrypoint field
+                        for line in content.lines() {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                                if let Some(entrypoint) = json.get("entrypoint").and_then(|v| v.as_str()) {
+                                    return Some(entrypoint.to_string());
+                                }
+                                // Also check for promptSource field (another indicator of sdk-cli)
+                                if let Some(prompt_source) = json.get("promptSource").and_then(|v| v.as_str()) {
+                                    if prompt_source == "sdk" {
+                                        return Some("sdk-cli".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Check all alert conditions from governor state
 ///
 /// Returns a list of all currently active alert conditions (before cooldown filtering).
 /// Callers should use `should_fire` to filter based on cooldown state.
-pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<AlertCondition> {
+pub fn check_alert_conditions(
+    state: &GovernorState,
+    now: DateTime<Utc>,
+    agents: &std::collections::HashMap<String, crate::config::AgentConfig>,
+) -> Vec<AlertCondition> {
     let mut alerts = Vec::new();
     let forecast = &state.capacity_forecast;
 
@@ -561,6 +686,9 @@ pub fn check_alert_conditions(state: &GovernorState, now: DateTime<Utc>) -> Vec<
             detected_at: now,
         });
     }
+
+    // Check SubscriptionBillingDrift: subscription agents using sdk-cli instead of cli
+    check_subscription_billing_drift(state, agents, now, &mut alerts);
 
     alerts
 }
@@ -997,7 +1125,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1023,7 +1151,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1049,7 +1177,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1076,7 +1204,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1106,7 +1234,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1131,7 +1259,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let sonnet = alerts
             .iter()
@@ -1154,7 +1282,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let session = alerts
             .iter()
@@ -1184,7 +1312,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         assert!(
             alerts.iter().all(|a| !matches!(
@@ -1217,7 +1345,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         // None of the cutoff-related alerts should fire
         assert!(
@@ -1244,7 +1372,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         assert!(
             alerts.iter().any(|a| matches!(a.alert_type, AlertType::SonnetCutoffRisk | AlertType::CutoffImminent)),
@@ -1269,7 +1397,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let sonnet = alerts
             .iter()
@@ -1298,7 +1426,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let sonnet = alerts
             .iter()
@@ -1322,7 +1450,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let session = alerts
             .iter()
@@ -1348,7 +1476,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let session = alerts
             .iter()
@@ -1371,7 +1499,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let underutil = alerts
             .iter()
@@ -1392,7 +1520,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let underutil = alerts
             .iter()
@@ -1414,7 +1542,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 1.5;
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let promo = alerts
             .iter()
@@ -1434,7 +1562,7 @@ mod tests {
         // peak/offpeak samples default to 0
         // offpeak_ratio_observed/expected default to 0.0
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let promo = alerts
             .iter()
@@ -1456,7 +1584,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 1.5;
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let promo = alerts
             .iter()
@@ -1478,7 +1606,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 1.5;
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let promo = alerts
             .iter()
@@ -1501,7 +1629,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 0.0;
         state.burn_rate.offpeak_ratio_expected = 0.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let promo = alerts
             .iter()
@@ -1522,7 +1650,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 2.8; // Above 2.5 threshold
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1540,7 +1668,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 0.5; // Below 0.8 threshold
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1559,7 +1687,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 2.1;
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1579,7 +1707,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 2.5; // Exactly at threshold
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1599,7 +1727,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 0.8; // Exactly at threshold
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1618,7 +1746,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 3.0; // Would normally trigger
         state.burn_rate.offpeak_ratio_expected = 2.0;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1637,7 +1765,7 @@ mod tests {
         state.burn_rate.offpeak_ratio_observed = 3.0;
         state.burn_rate.offpeak_ratio_expected = 0.0; // Zero expected ratio
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let anomaly = alerts
             .iter()
@@ -1654,7 +1782,7 @@ mod tests {
         // Set last fleet aggregate to 31 minutes ago (above 30-minute threshold)
         state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(31);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let offline = alerts
             .iter()
@@ -1685,7 +1813,7 @@ mod tests {
         state.burn_rate.promotion_offpeak_samples = MIN_VALIDATION_SAMPLES;
         state.last_fleet_aggregate.t1 = base_now() - Duration::minutes(31);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         // Should have: CutoffImminent, SessionCutoffRisk, SonnetCutoffRisk, PromotionNotApplying, CollectorOffline
         assert!(
@@ -1729,7 +1857,7 @@ mod tests {
         };
         let state = make_state_with_forecast(forecast);
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let imminent = alerts
             .iter()
@@ -1754,7 +1882,7 @@ mod tests {
         state.safe_mode.trigger = Some("emergency_brake".to_string());
         state.safe_mode.entered_at = Some(base_now() - Duration::minutes(5));
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let brake = alerts
             .iter()
@@ -1767,7 +1895,7 @@ mod tests {
         let mut state = make_state_with_forecast(CapacityForecast::default());
         state.token_refresh_failing = true;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let trf = alerts
             .iter()
@@ -1782,7 +1910,7 @@ mod tests {
         let mut state = make_state_with_forecast(CapacityForecast::default());
         state.token_refresh_failing = false;
 
-        let alerts = check_alert_conditions(&state, base_now());
+        let alerts = check_alert_conditions(&state, base_now(), &std::collections::HashMap::new());
 
         let trf = alerts
             .iter()
@@ -2375,7 +2503,7 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let fired = process_alerts(&mut state, &config, base_now());
+        let fired = process_alerts(&mut state, &config, base_now(), &std::collections::HashMap::new());
         assert!(fired >= 1, "Should have fired at least one alert");
 
         // Cooldown should now be set
@@ -2412,7 +2540,7 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let fired = process_alerts(&mut state, &config, base_now());
+        let fired = process_alerts(&mut state, &config, base_now(), &std::collections::HashMap::new());
         // Both CutoffImminent and SessionCutoffRisk should be skipped due to cooldown
         assert_eq!(fired, 0, "Should have fired zero alerts due to cooldown");
     }

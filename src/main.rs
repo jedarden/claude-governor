@@ -1083,6 +1083,7 @@ fn run_daemon_command(
         &promotions,
         &config.composite_risk,
         &config.cone_scaling,
+        &config,
     )
 }
 

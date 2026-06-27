@@ -2427,7 +2427,7 @@ pub fn run_governor_cycle(
     }
 
     // 8. Check alerts and fire via configured command
-    let mut alert_conditions = check_alert_conditions(&state, now);
+    let mut alert_conditions = check_alert_conditions(&state, now, agents);
     alert_conditions.extend(check_low_cache_efficiency(&state, alert_config, now));
     for alert in &alert_conditions {
         if should_fire(
