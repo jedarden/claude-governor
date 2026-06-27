@@ -803,4 +803,42 @@ agents:
         };
         assert_eq!(agent2.session_prefix(), "worker");
     }
+
+    #[test]
+    fn test_agent_config_subscription_default() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  default-agent:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("default-agent").unwrap();
+        // subscription should default to false
+        assert_eq!(agent.subscription, false);
+    }
+
+    #[test]
+    fn test_agent_config_subscription_true() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  claude-print-sonnet:
+    launch_cmd: "needle run --agent claude-anthropic-sonnet --workspace /home/coding/project"
+    session_pattern: "needle-claude-anthropic-sonnet-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+    min_workers: 0
+    max_workers: 8
+    subscription: true
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("claude-print-sonnet").unwrap();
+        assert_eq!(agent.subscription, true);
+        assert_eq!(agent.min_workers, 0);
+        assert_eq!(agent.max_workers, 8);
+    }
 }
