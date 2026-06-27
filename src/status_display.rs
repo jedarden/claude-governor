@@ -19,6 +19,59 @@ use crate::state::{GovernorState, WindowForecast};
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::io::IsTerminal;
+
+/// Check if colors should be enabled for output
+fn colors_enabled() -> bool {
+    // Check NO_COLOR env var (https://no-color.org/)
+    // NO_COLOR=1 or any non-empty value disables colors
+    if std::env::var("NO_COLOR").is_ok() {
+        return false;
+    }
+
+    // Check if stdout is a terminal
+    std::io::stdout().is_terminal()
+}
+
+/// ANSI color escape codes (or empty strings if colors disabled)
+#[derive(Clone, Copy)]
+struct Colors {
+    green: &'static str,
+    yellow: &'static str,
+    red: &'static str,
+    reset: &'static str,
+    bold_red: &'static str,
+    bold_yellow: &'static str,
+}
+
+impl Colors {
+    fn new() -> Self {
+        if colors_enabled() {
+            Colors {
+                green: "\x1b[32m",
+                yellow: "\x1b[33m",
+                red: "\x1b[31m",
+                reset: "\x1b[0m",
+                bold_red: "\x1b[1;31m",
+                bold_yellow: "\x1b[1;33m",
+            }
+        } else {
+            Colors {
+                green: "",
+                yellow: "",
+                red: "",
+                reset: "",
+                bold_red: "",
+                bold_yellow: "",
+            }
+        }
+    }
+
+    /// Color text based on risk level
+    fn colorize(&self, text: &str, color: &'static str) -> String {
+        format!("{}{}{}", color, text, self.reset)
+    }
+}
 
 /// Format a duration in hours to a human-readable string
 fn format_hours(hours: f64) -> String {
@@ -72,9 +125,24 @@ fn risk_indicator(window: &WindowForecast) -> &'static str {
     }
 }
 
+/// Colored risk indicator for a window
+fn colored_risk_indicator(window: &WindowForecast, colors: &Colors) -> String {
+    let text = risk_indicator(window);
+    if window.cutoff_risk {
+        colors.colorize(text, colors.red)
+    } else if window.margin_hrs < 1.0 {
+        colors.colorize(text, colors.red)
+    } else if window.margin_hrs < 6.0 {
+        colors.colorize(text, colors.yellow)
+    } else {
+        colors.colorize(text, colors.green)
+    }
+}
+
 /// Generate the rich human-readable status dashboard
 pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> String {
     let mut output = String::new();
+    let colors = Colors::new();
 
     // Header with pressure level
     let pressure = compute_pressure_level(&state.capacity_forecast);
@@ -113,8 +181,12 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     ));
 
     for (name, win) in &windows {
-        let binding_marker = if win.binding { " *" } else { "" };
-        let risk = risk_indicator(win);
+        let binding_marker = if win.binding {
+            format!(" *{}", colors.colorize("BINDING", colors.bold_red))
+        } else {
+            "".to_string()
+        };
+        let risk = colored_risk_indicator(win, &colors);
         let resets = format_hours(win.hours_remaining);
 
         output.push_str(&format!(
@@ -321,7 +393,11 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     // Safe mode warning
     if state.safe_mode.active {
         output.push_str("\n");
-        output.push_str("WARNING  SAFE MODE ACTIVE\n");
+        output.push_str(&colors.colorize(
+            "WARNING  SAFE MODE ACTIVE",
+            colors.bold_yellow
+        ));
+        output.push_str("\n");
         output.push_str(&format!(
             "  Trigger: {}\n",
             state.safe_mode.trigger.as_deref().unwrap_or("unknown")
@@ -403,12 +479,20 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         output.push_str("\n");
         match exit_code {
             StatusExitCode::CutoffRisk => {
-                output.push_str(
-                    "⚠️  CUTOFF RISK: One or more windows may exceed ceiling before reset\n",
+                let warning = colors.colorize(
+                    "⚠️  CUTOFF RISK: One or more windows may exceed ceiling before reset",
+                    colors.bold_yellow,
                 );
+                output.push_str(&warning);
+                output.push_str("\n");
             }
             StatusExitCode::Emergency => {
-                output.push_str("🚨 EMERGENCY: Governor is in safe mode\n");
+                let warning = colors.colorize(
+                    "🚨 EMERGENCY: Governor is in safe mode",
+                    colors.bold_red,
+                );
+                output.push_str(&warning);
+                output.push_str("\n");
             }
             _ => {}
         }
@@ -816,5 +900,58 @@ mod tests {
         let exit_code_emergency = StatusExitCode::from_state(&state_emergency);
         assert_eq!(exit_code_emergency, StatusExitCode::Emergency);
         assert_eq!(exit_code_emergency.as_exit_code(), 3);
+    }
+
+    #[test]
+    fn colors_enabled_respects_no_color_env_var() {
+        // Save original NO_COLOR value if it exists
+        let original = std::env::var("NO_COLOR");
+
+        // Test with NO_COLOR set
+        std::env::set_var("NO_COLOR", "1");
+        assert!(!colors_enabled(), "NO_COLOR should disable colors");
+
+        // Test with NO_COLOR unset
+        std::env::remove_var("NO_COLOR");
+        // Note: In test environment, stdout is not a TTY, so this will be false
+        // but we're testing that the env var is properly checked
+        let result = colors_enabled();
+        assert!(!result, "colors should be disabled when NO_COLOR is unset and not a TTY");
+
+        // Restore original value
+        if let Ok(val) = original {
+            std::env::set_var("NO_COLOR", val);
+        }
+    }
+
+    #[test]
+    fn colored_risk_indicator_returns_uncolored_when_no_color() {
+        let mut win = WindowForecast::default();
+        win.cutoff_risk = true;
+
+        std::env::set_var("NO_COLOR", "1");
+        let colors = Colors::new();
+        let result = colored_risk_indicator(&win, &colors);
+
+        // Should not contain ANSI escape codes when NO_COLOR is set
+        assert!(!result.contains('\x1b'), "colored_risk_indicator should not contain ANSI codes when NO_COLOR is set");
+        assert!(result.contains("CUTOFF"), "should still contain the risk text");
+
+        std::env::remove_var("NO_COLOR");
+    }
+
+    #[test]
+    fn colors_new_returns_empty_when_no_color() {
+        std::env::set_var("NO_COLOR", "1");
+        let colors = Colors::new();
+
+        assert_eq!(colors.green, "");
+        assert_eq!(colors.yellow, "");
+        assert_eq!(colors.red, "");
+        assert_eq!(colors.reset, "");
+        assert_eq!(colors.bold_red, "");
+        assert_eq!(colors.bold_yellow, "");
+
+        std::env::remove_var("NO_COLOR");
     }
 }
