@@ -225,6 +225,7 @@ mod tests {
             cache_write_1h_tokens: 50_000,
             model: model.to_string(),
             session: "test-session".to_string(),
+            session_entrypoint: "cli".to_string(),
         }
     }
 
@@ -350,6 +351,7 @@ mod tests {
             cache_write_1h_tokens: 0,
             model: "test".to_string(),
             session: "session".to_string(),
+            session_entrypoint: "cli".to_string(),
         };
 
         let pricing = ModelPricing {

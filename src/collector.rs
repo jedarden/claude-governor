@@ -61,6 +61,9 @@ pub struct UsageRecord {
 
     /// Session identifier (extracted from JSONL file path)
     pub session: String,
+
+    /// Session entry point (cli or sdk-cli) for traceability
+    pub session_entrypoint: String,
 }
 
 impl UsageRecord {
@@ -74,6 +77,7 @@ impl UsageRecord {
             cache_write_1h_tokens: 0,
             model,
             session,
+            session_entrypoint: "unknown".to_string(),
         }
     }
 
@@ -122,6 +126,8 @@ pub struct JsonlLine {
     #[serde(rename = "type")]
     pub msg_type: Option<String>,
     pub message: Option<AssistantMessage>,
+    /// Entry point type: "cli" (interactive TUI, subscription billing) or "sdk-cli" (headless API, credits billing)
+    pub entrypoint: Option<String>,
 }
 
 /// Discover all JSONL files under a base directory
@@ -254,10 +260,19 @@ pub fn infer_model_from_path(jsonl_path: &Path) -> Option<String> {
 /// Parse a usage block from a JSONL line into a UsageRecord
 ///
 /// Extracts token counts, model, and session from the JSON structure.
+/// Returns None for sdk-cli sessions (headless API, credits billing) since
+/// the governor only protects subscription quota (cli sessions).
 pub fn parse_usage_block(line: &JsonlLine, jsonl_path: &Path) -> Option<UsageRecord> {
     // Only process assistant messages with usage data
     let message = line.message.as_ref()?;
     let usage = message.usage.as_ref()?;
+
+    // Extract entrypoint: filter out sdk-cli sessions (headless API, credits billing)
+    // The governor protects subscription quota, which only applies to cli sessions.
+    let entrypoint = line.entrypoint.clone().unwrap_or_else(|| "cli".to_string());
+    if entrypoint == "sdk-cli" {
+        return None;
+    }
 
     // Extract model: prefer message-level model, fallback to path inference, then "unknown"
     let model = message.model.clone().unwrap_or_else(|| {
@@ -294,6 +309,7 @@ pub fn parse_usage_block(line: &JsonlLine, jsonl_path: &Path) -> Option<UsageRec
         cache_write_1h_tokens: cache_write_1h,
         model,
         session,
+        session_entrypoint: entrypoint,
     })
 }
 
@@ -1360,6 +1376,7 @@ mod tests {
             cache_write_1h_tokens: 50,
             model: "test".to_string(),
             session: "session".to_string(),
+            session_entrypoint: "cli".to_string(),
         };
         assert_eq!(record.total_tokens(), 1850);
         assert!(!record.is_zero());
@@ -1582,7 +1599,7 @@ mod tests {
 
         #[test]
         fn parse_usage_block_extracts_all_fields() {
-            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":60,"ephemeral_1h_input_tokens":40}}}}"#;
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":60,"ephemeral_1h_input_tokens":40}}},"entrypoint":"cli"}"#;
             let line: JsonlLine = serde_json::from_str(json).unwrap();
             let path = Path::new("/sessions/test-session.jsonl");
 
@@ -1595,6 +1612,7 @@ mod tests {
             assert_eq!(record.cache_write_1h_tokens, 40);
             assert_eq!(record.model, "claude-sonnet-4-20250514");
             assert_eq!(record.session, "test-session");
+            assert_eq!(record.session_entrypoint, "cli");
         }
 
         #[test]
@@ -1609,14 +1627,16 @@ mod tests {
         }
 
         #[test]
-        fn parse_usage_block_returns_unknown_when_no_model_hints() {
+        fn parse_usage_block_returns_none_for_unknown_model() {
             let json = r#"{"type":"message","message":{"role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
             let line: JsonlLine = serde_json::from_str(json).unwrap();
             let path = Path::new("/sessions/test.jsonl");
 
-            let record = parse_usage_block(&line, path).unwrap();
+            let result = parse_usage_block(&line, path);
 
-            assert_eq!(record.model, "unknown");
+            // Should return None because "unknown" model doesn't start with "claude-"
+            // (non-Anthropic models don't consume subscription quota)
+            assert!(result.is_none(), "unknown/non-Claude models should be filtered out");
         }
 
         #[test]
@@ -1633,12 +1653,12 @@ mod tests {
             let path = Path::new("/sessions/multi-session.jsonl");
 
             // First line with Sonnet
-            let json1 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}}}"#;
+            let json1 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}},"entrypoint":"cli"}"#;
             let line1: JsonlLine = serde_json::from_str(json1).unwrap();
             let record1 = parse_usage_block(&line1, path).unwrap();
 
             // Second line with Opus
-            let json2 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-opus-4-20250514","usage":{"input_tokens":2000,"output_tokens":800}}}"#;
+            let json2 = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-opus-4-20250514","usage":{"input_tokens":2000,"output_tokens":800}},"entrypoint":"cli"}"#;
             let line2: JsonlLine = serde_json::from_str(json2).unwrap();
             let record2 = parse_usage_block(&line2, path).unwrap();
 
@@ -1648,6 +1668,49 @@ mod tests {
             assert_eq!(record1.model, "claude-sonnet-4-20250514");
             assert_eq!(record2.model, "claude-opus-4-20250514");
             assert_ne!(record1.model, record2.model);
+        }
+
+        #[test]
+        fn parse_usage_block_filters_sdk_cli_sessions() {
+            let path = Path::new("/sessions/sdk-session.jsonl");
+
+            // SDK-cli session should be filtered out
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}},"entrypoint":"sdk-cli"}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+
+            let result = parse_usage_block(&line, path);
+            assert!(result.is_none(), "sdk-cli sessions should be filtered out");
+        }
+
+        #[test]
+        fn parse_usage_block_accepts_cli_sessions() {
+            let path = Path::new("/sessions/cli-session.jsonl");
+
+            // CLI session should be accepted
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}},"entrypoint":"cli"}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+
+            let result = parse_usage_block(&line, path);
+            assert!(result.is_some(), "cli sessions should be accepted");
+
+            let record = result.unwrap();
+            assert_eq!(record.session_entrypoint, "cli");
+            assert_eq!(record.input_tokens, 1000);
+        }
+
+        #[test]
+        fn parse_usage_block_defaults_to_cli_when_no_entrypoint() {
+            let path = Path::new("/sessions/legacy-session.jsonl");
+
+            // Legacy session without entrypoint field should default to "cli"
+            let json = r#"{"type":"message","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":500}}}"#;
+            let line: JsonlLine = serde_json::from_str(json).unwrap();
+
+            let result = parse_usage_block(&line, path);
+            assert!(result.is_some(), "legacy sessions without entrypoint should default to cli");
+
+            let record = result.unwrap();
+            assert_eq!(record.session_entrypoint, "cli");
         }
     }
 
@@ -2190,6 +2253,7 @@ mod tests {
                 cache_write_1h_tokens: 50,
                 model: "claude-sonnet-4-20250514".to_string(),
                 session: "test-session".to_string(),
+                session_entrypoint: "cli".to_string(),
             };
             let dollars = crate::pricing::DollarBreakdown {
                 input_usd: 3.0,
