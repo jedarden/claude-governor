@@ -1,33 +1,45 @@
 # Bead bf-3xthw: Safe Mode Reassertion Notification
 
-## Task Verification
+## Status
+**Already Implemented**
 
-Verified that the safe mode reassertion notification is already implemented in the codebase.
+## Implementation Details
 
-## Implementation Location
+The safe mode reassertion notification was already fully implemented in the codebase at commit `e74188e`. The implementation is in `src/main.rs` in the `run_scale_command` function:
 
-File: `src/main.rs`, function `run_scale_command`, lines 584-587
+### Code Location: Lines 541-590
 
-## Code
+1. **Safe mode tracking** (line 546):
+   ```rust
+   let safe_mode_was_active = state.safe_mode.active;
+   ```
 
-```rust
-// Warn user that safe mode will reassert on next cycle
-if safe_mode_was_active {
-    println!("NOTE: Safe mode remains active and will reassert its target on the next cycle");
-}
-```
+2. **Log warning** (line 550):
+   ```rust
+   log::warn!("[governor] WARN: manual scale override during safe mode");
+   ```
+
+3. **Human-visible stdout notification** (lines 585-587):
+   ```rust
+   if safe_mode_was_active {
+       println!("NOTE: Safe mode remains active and will reassert its target on the next cycle");
+   }
+   ```
 
 ## Acceptance Criteria Met
 
-- ✅ Added a `println!` stdout notification explaining safe mode will reassert on next cycle
-- ✅ Message is human-readable and clear (not just a log message)
-- ✅ Message appears alongside the log warning (line 550: `log::warn!`) without replacing it
-- ✅ Code compiles successfully (verified with `cargo check`)
+✅ Added a println! stdout notification explaining safe mode will reassert on next cycle  
+✅ Message is human-readable and clear  
+✅ Message appears alongside the log warning, not replacing it  
+✅ Code compiles successfully  
 
-## Behavior
+## Verification
 
-When a user manually sets a worker target via `cgov scale <count>` while safe mode is active:
-1. A log warning is emitted: `[governor] WARN: manual scale override during safe mode`
-2. A human-visible stdout message is printed: `NOTE: Safe mode remains active and will reassert its target on the next cycle`
+The implementation was verified by:
+- Code review showing all required components present
+- Compilation check passing with `cargo check`
+- Matching the exact message specified in the bead: "Safe mode remains active and will reassert its target on the next cycle"
 
-This correctly informs the user that their manual override is temporary and safe mode will restore its conservative target on the next governor cycle.
+## Related
+
+This notification appears when users run `cgov scale` while safe mode is active, warning them that their manual override will only last for one cycle before safe mode reasserts its conservative target.
