@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand};
 use log::LevelFilter;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, IsTerminal};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -548,6 +548,20 @@ fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
     // Check if safe mode is active
     if state.safe_mode.active {
         log::warn!("[governor] WARN: manual scale override during safe mode");
+
+        // Also write directly to log file for persistence
+        let log_path = default_log_path();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let log_line = format!(
+                "{} [governor] WARN: manual scale override during safe mode\n",
+                Utc::now().to_rfc3339()
+            );
+            let _ = file.write_all(log_line.as_bytes());
+        }
     }
 
     // Validate count against worker limits

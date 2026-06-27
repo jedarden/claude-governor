@@ -3496,6 +3496,7 @@ mod tests {
             composite_risk: Default::default(),
             cone_scaling: Default::default(),
             agents: Default::default(),
+            credentials_path: None,
         };
 
         let result = distribute_workers_by_cost_priority(
@@ -3581,6 +3582,7 @@ mod tests {
             composite_risk: Default::default(),
             cone_scaling: Default::default(),
             agents: Default::default(),
+            credentials_path: None,
         };
 
         let result = distribute_workers_by_cost_priority(
@@ -3666,6 +3668,7 @@ mod tests {
             composite_risk: Default::default(),
             cone_scaling: Default::default(),
             agents: Default::default(),
+            credentials_path: None,
         };
 
         let result = distribute_workers_by_cost_priority(
@@ -3746,6 +3749,7 @@ mod tests {
             composite_risk: Default::default(),
             cone_scaling: Default::default(),
             agents: Default::default(),
+            credentials_path: None,
         };
 
         let result = distribute_workers_by_cost_priority(
