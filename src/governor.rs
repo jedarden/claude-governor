@@ -1068,6 +1068,148 @@ mod window_delta_tests {
         assert!((delta_7d - 0.05).abs() < TOL, "7d: 60.05 - 60.0 = 0.05");
         assert!((delta_7ds - 0.001).abs() < TOL, "7ds: 55.001 - 55.0 = 0.001");
     }
+
+    // ---------------------------------------------------------------------------
+    // Test helper functions
+    // ---------------------------------------------------------------------------
+
+    /// Create a WindowPctSnapshot with specified utilization percentages.
+    ///
+    /// Helper function to create WindowPctSnapshot instances with custom values
+    /// for testing delta calculations and other window percentage operations.
+    ///
+    /// # Arguments
+    /// - `five_hour`: 5-hour window utilization percentage
+    /// - `seven_day`: 7-day window utilization percentage (all models)
+    /// - `seven_day_sonnet`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// # Returns
+    /// A WindowPctSnapshot struct with the specified values.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::window_delta_tests::make_window_pct_snapshot;
+    ///
+    /// let snapshot = make_window_pct_snapshot(25.5, 45.0, 38.2);
+    /// assert_eq!(snapshot.five_hour, 25.5);
+    /// assert_eq!(snapshot.seven_day, 45.0);
+    /// assert_eq!(snapshot.seven_day_sonnet, 38.2);
+    /// ```
+    pub fn make_window_pct_snapshot(
+        five_hour: f64,
+        seven_day: f64,
+        seven_day_sonnet: f64,
+    ) -> crate::db::WindowPctSnapshot {
+        crate::db::WindowPctSnapshot {
+            five_hour,
+            seven_day,
+            seven_day_sonnet,
+        }
+    }
+
+    /// Create a PrevUsageSnapshot with specified values and current timestamp.
+    ///
+    /// Helper function to create PrevUsageSnapshot instances for testing
+    /// consecutive API poll scenarios and delta calculations.
+    ///
+    /// # Arguments
+    /// - `five_hour_pct`: 5-hour window utilization percentage
+    /// - `seven_day_pct`: 7-day window utilization percentage (all models)
+    /// - `seven_day_sonnet_pct`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// # Returns
+    /// A PrevUsageSnapshot struct with the specified values and current timestamp.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::window_delta_tests::make_usage_snapshot;
+    ///
+    /// let snapshot = make_usage_snapshot(12.5, 35.0, 28.5);
+    /// assert_eq!(snapshot.five_hour_pct, 12.5);
+    /// assert_eq!(snapshot.seven_day_pct, 35.0);
+    /// assert_eq!(snapshot.seven_day_sonnet_pct, 28.5);
+    /// // timestamp is set to Utc::now()
+    /// ```
+    pub fn make_usage_snapshot(
+        five_hour_pct: f64,
+        seven_day_pct: f64,
+        seven_day_sonnet_pct: f64,
+    ) -> crate::state::PrevUsageSnapshot {
+        crate::state::PrevUsageSnapshot {
+            taken_at: chrono::Utc::now(),
+            five_hour_pct,
+            seven_day_pct,
+            seven_day_sonnet_pct,
+        }
+    }
+
+    /// Create a PrevUsageSnapshot with a custom timestamp.
+    ///
+    /// Helper function to create PrevUsageSnapshot instances with a specific
+    /// timestamp for testing time-sensitive scenarios (e.g., elapsed time calculations).
+    ///
+    /// # Arguments
+    /// - `taken_at`: The timestamp when the snapshot was taken
+    /// - `five_hour_pct`: 5-hour window utilization percentage
+    /// - `seven_day_pct`: 7-day window utilization percentage (all models)
+    /// - `seven_day_sonnet_pct`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// # Returns
+    /// A PrevUsageSnapshot struct with the specified values and custom timestamp.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::window_delta_tests::make_usage_snapshot_with_time;
+    /// use chrono::Utc;
+    ///
+    /// let earlier_time = Utc::now() - chrono::Duration::seconds(120);
+    /// let snapshot = make_usage_snapshot_with_time(earlier_time, 15.0, 40.0, 32.0);
+    /// assert_eq!(snapshot.five_hour_pct, 15.0);
+    /// assert_eq!(snapshot.taken_at, earlier_time);
+    /// ```
+    pub fn make_usage_snapshot_with_time(
+        taken_at: chrono::DateTime<chrono::Utc>,
+        five_hour_pct: f64,
+        seven_day_pct: f64,
+        seven_day_sonnet_pct: f64,
+    ) -> crate::state::PrevUsageSnapshot {
+        crate::state::PrevUsageSnapshot {
+            taken_at,
+            five_hour_pct,
+            seven_day_pct,
+            seven_day_sonnet_pct,
+        }
+    }
+
+    /// Test that snapshot helper functions create valid structs.
+    ///
+    /// Demonstrates the usage of the helper functions and verifies they
+    /// produce correctly constructed snapshots.
+    #[test]
+    fn test_snapshot_helpers_create_valid_structs() {
+        // Test make_window_pct_snapshot
+        let window_snap = make_window_pct_snapshot(10.5, 25.0, 18.75);
+        assert!((window_snap.five_hour - 10.5).abs() < f64::EPSILON);
+        assert!((window_snap.seven_day - 25.0).abs() < f64::EPSILON);
+        assert!((window_snap.seven_day_sonnet - 18.75).abs() < f64::EPSILON);
+
+        // Test make_usage_snapshot (with current timestamp)
+        let usage_snap = make_usage_snapshot(12.5, 30.0, 22.5);
+        assert!((usage_snap.five_hour_pct - 12.5).abs() < f64::EPSILON);
+        assert!((usage_snap.seven_day_pct - 30.0).abs() < f64::EPSILON);
+        assert!((usage_snap.seven_day_sonnet_pct - 22.5).abs() < f64::EPSILON);
+        // Timestamp should be recent (within last second)
+        let age = (chrono::Utc::now() - usage_snap.taken_at).num_seconds();
+        assert!(age >= 0 && age <= 1, "timestamp should be current");
+
+        // Test make_usage_snapshot_with_time (with custom timestamp)
+        let custom_time = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let custom_snap = make_usage_snapshot_with_time(custom_time, 8.0, 20.0, 15.0);
+        assert!((custom_snap.five_hour_pct - 8.0).abs() < f64::EPSILON);
+        assert!((custom_snap.seven_day_pct - 20.0).abs() < f64::EPSILON);
+        assert!((custom_snap.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON);
+        assert_eq!(custom_snap.taken_at, custom_time);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3175,13 +3317,89 @@ pub fn run_daemon(
 mod tests {
     use super::*;
 
-    /// Helper: create a usage snapshot with given utilizations
-    fn snap(five_hour: f64, seven_day: f64, seven_day_sonnet: f64) -> UsageSnapshot {
+    // ---------------------------------------------------------------------------
+    // Test helper functions
+    // ---------------------------------------------------------------------------
+
+    /// Create a UsageSnapshot with specified utilization percentages.
+    ///
+    /// Helper function to create UsageSnapshot instances with custom values
+    /// for testing governor behavior across different utilization scenarios.
+    ///
+    /// # Arguments
+    /// - `five_hour`: 5-hour window utilization percentage
+    /// - `seven_day`: 7-day window utilization percentage (all models)
+    /// - `seven_day_sonnet`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// # Returns
+    /// A UsageSnapshot struct with the specified window values.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::tests::make_usage_snapshot;
+    ///
+    /// let snapshot = make_usage_snapshot(75.5, 45.0, 38.2);
+    /// assert_eq!(snapshot.get("five_hour"), Some(75.5));
+    /// assert_eq!(snapshot.get("seven_day"), Some(45.0));
+    /// assert_eq!(snapshot.get("seven_day_sonnet"), Some(38.2));
+    /// ```
+    pub fn make_usage_snapshot(
+        five_hour: f64,
+        seven_day: f64,
+        seven_day_sonnet: f64,
+    ) -> UsageSnapshot {
         UsageSnapshot::from_windows(five_hour, seven_day, seven_day_sonnet)
     }
 
-    /// Helper: create a governor with some agents
-    fn governor_with_agents() -> GovernorState {
+    /// Create a UsageSnapshot with custom window values.
+    ///
+    /// Helper function to create UsageSnapshot instances with arbitrary
+    /// window names and values for testing custom scenarios.
+    ///
+    /// # Arguments
+    /// - `windows`: HashMap of window name -> utilization percentage
+    ///
+    /// # Returns
+    /// A UsageSnapshot struct with the specified window values.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::tests::make_usage_snapshot_from_map;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut windows = HashMap::new();
+    /// windows.insert("five_hour".to_string(), 80.0);
+    /// windows.insert("seven_day".to_string(), 50.0);
+    /// windows.insert("seven_day_sonnet".to_string(), 45.0);
+    ///
+    /// let snapshot = make_usage_snapshot_from_map(windows);
+    /// assert_eq!(snapshot.get("five_hour"), Some(80.0));
+    /// ```
+    pub fn make_usage_snapshot_from_map(windows: std::collections::HashMap<String, f64>) -> UsageSnapshot {
+        UsageSnapshot { windows }
+    }
+
+    /// Create a GovernorState with a standard set of test agents.
+    ///
+    /// Helper function to create a GovernorState instance with three
+    /// pre-configured agents for testing governor behavior.
+    ///
+    /// # Returns
+    /// A GovernorState with three agents:
+    /// - "agent-1": 5 workers, not idle
+    /// - "agent-2": 3 workers, idle
+    /// - "agent-3": 10 workers, not idle
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::governor::tests::governor_with_agents;
+    ///
+    /// let state = governor_with_agents();
+    /// assert_eq!(state.agents.len(), 3);
+    /// assert_eq!(state.agents["agent-1"].workers, 5);
+    /// assert_eq!(state.agents["agent-2"].is_idle, true);
+    /// ```
+    pub fn governor_with_agents() -> GovernorState {
         let mut state = GovernorState::new();
         state.add_agent("agent-1", 5, false);
         state.add_agent("agent-2", 3, true);
@@ -3189,12 +3407,36 @@ mod tests {
         state
     }
 
+    /// Test that snapshot helper functions create valid structs.
+    ///
+    /// Demonstrates the usage of the helper functions and verifies they
+    /// produce correctly constructed snapshots.
+    #[test]
+    fn test_usage_snapshot_helpers_create_valid_structs() {
+        // Test make_usage_snapshot
+        let snapshot = make_usage_snapshot(75.5, 45.0, 38.2);
+        assert_eq!(snapshot.get("five_hour"), Some(75.5));
+        assert_eq!(snapshot.get("seven_day"), Some(45.0));
+        assert_eq!(snapshot.get("seven_day_sonnet"), Some(38.2));
+
+        // Test make_usage_snapshot_from_map
+        let mut windows = std::collections::HashMap::new();
+        windows.insert("five_hour".to_string(), 80.0);
+        windows.insert("seven_day".to_string(), 50.0);
+        windows.insert("seven_day_sonnet".to_string(), 45.0);
+
+        let custom_snapshot = make_usage_snapshot_from_map(windows);
+        assert_eq!(custom_snapshot.get("five_hour"), Some(80.0));
+        assert_eq!(custom_snapshot.get("seven_day"), Some(50.0));
+        assert_eq!(custom_snapshot.get("seven_day_sonnet"), Some(45.0));
+    }
+
     // --- Core emergency brake tests ---
 
     #[test]
     fn test_97_9_pct_no_brake() {
         let mut state = governor_with_agents();
-        let usage = snap(97.9, 50.0, 50.0);
+        let usage = make_usage_snapshot(97.9, 50.0, 50.0);
 
         let result = state.check_emergency_brake(&usage);
 
@@ -3210,7 +3452,7 @@ mod tests {
     #[test]
     fn test_98_0_pct_brake_triggers() {
         let mut state = governor_with_agents();
-        let usage = snap(98.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(98.0, 50.0, 50.0);
 
         let result = state.check_emergency_brake(&usage);
 
@@ -3226,7 +3468,7 @@ mod tests {
     #[test]
     fn test_brake_scales_all_agents_to_zero() {
         let mut state = governor_with_agents();
-        let usage = snap(50.0, 98.5, 50.0); // seven_day triggers
+        let usage = make_usage_snapshot(50.0, 98.5, 50.0); // seven_day triggers
 
         let _ = state.check_emergency_brake(&usage);
 
@@ -3243,7 +3485,7 @@ mod tests {
         state.add_agent("idle-agent", 5, true); // idle agent with workers
         state.add_agent("busy-agent", 5, false);
 
-        let usage = snap(99.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(99.0, 50.0, 50.0);
 
         let _ = state.check_emergency_brake(&usage);
 
@@ -3257,12 +3499,12 @@ mod tests {
         let mut state = governor_with_agents();
 
         // Trigger brake
-        let usage_high = snap(98.5, 50.0, 50.0);
+        let usage_high = make_usage_snapshot(98.5, 50.0, 50.0);
         let _ = state.check_emergency_brake(&usage_high);
         assert!(state.emergency_brake_active);
 
         // Now drop below threshold
-        let usage_low = snap(97.0, 50.0, 50.0);
+        let usage_low = make_usage_snapshot(97.0, 50.0, 50.0);
         let cleared = state.clear_emergency_brake(&usage_low);
 
         assert!(cleared);
@@ -3276,12 +3518,12 @@ mod tests {
         let mut state = governor_with_agents();
 
         // Trigger brake at 99%
-        let usage_high = snap(99.0, 50.0, 50.0);
+        let usage_high = make_usage_snapshot(99.0, 50.0, 50.0);
         let _ = state.check_emergency_brake(&usage_high);
         assert!(state.emergency_brake_active);
 
         // Simulate window reset (utilization drops significantly)
-        let usage_reset = snap(10.0, 50.0, 50.0);
+        let usage_reset = make_usage_snapshot(10.0, 50.0, 50.0);
         let cleared = state.clear_emergency_brake(&usage_reset);
 
         assert!(cleared);
@@ -3294,14 +3536,14 @@ mod tests {
     fn test_brake_triggers_on_any_window() {
         // Test seven_day_sonnet window
         let mut state = governor_with_agents();
-        let usage = snap(50.0, 50.0, 98.0);
+        let usage = make_usage_snapshot(50.0, 50.0, 98.0);
         let result = state.check_emergency_brake(&usage);
         assert!(result.is_some());
         assert_eq!(result.unwrap().triggered_window, WINDOW_SEVEN_DAY_SONNET);
 
         // Test seven_day window
         let mut state2 = governor_with_agents();
-        let usage2 = snap(50.0, 99.0, 50.0);
+        let usage2 = make_usage_snapshot(50.0, 99.0, 50.0);
         let result2 = state2.check_emergency_brake(&usage2);
         assert!(result2.is_some());
         assert_eq!(result2.unwrap().triggered_window, WINDOW_SEVEN_DAY);
@@ -3312,12 +3554,12 @@ mod tests {
         let mut state = governor_with_agents();
 
         // Trigger on five_hour
-        let usage_high = snap(99.0, 98.5, 50.0);
+        let usage_high = make_usage_snapshot(99.0, 98.5, 50.0);
         let _ = state.check_emergency_brake(&usage_high);
         assert!(state.emergency_brake_active);
 
         // Drop five_hour but seven_day still above
-        let usage_still_high = snap(50.0, 98.5, 50.0);
+        let usage_still_high = make_usage_snapshot(50.0, 98.5, 50.0);
         let cleared = state.clear_emergency_brake(&usage_still_high);
 
         assert!(!cleared);
@@ -3329,19 +3571,19 @@ mod tests {
         let mut state = governor_with_agents();
 
         // Initial trigger
-        let usage1 = snap(98.5, 50.0, 50.0);
+        let usage1 = make_usage_snapshot(98.5, 50.0, 50.0);
         let result1 = state.update_emergency_brake(&usage1);
         assert!(result1.is_some());
         assert!(state.emergency_brake_active);
 
         // Still high - should return existing brake
-        let usage2 = snap(99.0, 50.0, 50.0);
+        let usage2 = make_usage_snapshot(99.0, 50.0, 50.0);
         let result2 = state.update_emergency_brake(&usage2);
         assert!(result2.is_some());
         assert!(state.emergency_brake_active);
 
         // Drops below - should clear and not retrigger
-        let usage3 = snap(97.0, 50.0, 50.0);
+        let usage3 = make_usage_snapshot(97.0, 50.0, 50.0);
         let result3 = state.update_emergency_brake(&usage3);
         assert!(result3.is_none());
         assert!(!state.emergency_brake_active);
@@ -3350,7 +3592,7 @@ mod tests {
     #[test]
     fn test_empty_agents_still_sets_flag() {
         let mut state = GovernorState::new(); // no agents
-        let usage = snap(98.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(98.0, 50.0, 50.0);
 
         let result = state.check_emergency_brake(&usage);
 
@@ -3432,7 +3674,7 @@ mod tests {
         let mut state = governor_with_agents();
 
         // Activate emergency brake
-        let usage = snap(99.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(99.0, 50.0, 50.0);
         let _ = state.check_emergency_brake(&usage);
         assert!(state.emergency_brake_active);
 
@@ -3468,7 +3710,7 @@ mod tests {
         assert!(state.is_sprint_active());
 
         // Utilization now exceeds 50% threshold
-        let usage = snap(55.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(55.0, 50.0, 50.0);
         let config = default_sprint_config();
         let ended = state.check_sprint_end(&usage, &config);
 
@@ -3485,7 +3727,7 @@ mod tests {
         state.apply_sprint(&trigger);
 
         // Utilization still below threshold
-        let usage = snap(45.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(45.0, 50.0, 50.0);
         let config = default_sprint_config();
         let ended = state.check_sprint_end(&usage, &config);
 
@@ -3497,7 +3739,7 @@ mod tests {
     #[test]
     fn sprint_end_noop_when_no_sprint() {
         let mut state = governor_with_agents();
-        let usage = snap(55.0, 50.0, 50.0);
+        let usage = make_usage_snapshot(55.0, 50.0, 50.0);
         let config = default_sprint_config();
 
         let ended = state.check_sprint_end(&usage, &config);
