@@ -641,6 +641,14 @@ pub struct GovernorState {
     /// Key is window name ("five_hour", "seven_day", "seven_day_sonnet").
     #[serde(default)]
     pub pending_predictions: HashMap<String, PendingPrediction>,
+    /// Previous API snapshot taken at the last poll() cycle.
+    /// Used to compute window percentage deltas between consecutive cycles.
+    #[serde(default)]
+    pub previous_api_snapshot: Option<PrevUsageSnapshot>,
+    /// Current API snapshot taken at the most recent poll() call.
+    /// Updated after each successful poll completes.
+    #[serde(default)]
+    pub current_api_snapshot: Option<PrevUsageSnapshot>,
 }
 
 impl Default for GovernorState {
@@ -660,6 +668,8 @@ impl Default for GovernorState {
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
             pending_predictions: HashMap::new(),
+            previous_api_snapshot: None,
+            current_api_snapshot: None,
         }
     }
 }
@@ -988,6 +998,8 @@ mod tests {
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
             pending_predictions: HashMap::new(),
+            previous_api_snapshot: None,
+            current_api_snapshot: None,
         }
     }
 

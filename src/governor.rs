@@ -1394,6 +1394,10 @@ pub fn run_governor_cycle(
     // 1. Load current state
     let mut state = state::load_state(state_path)?;
 
+    // 1a-pre. Shift snapshot state before poll: current becomes previous.
+    // On first poll, current_api_snapshot is None, so previous becomes None too.
+    state.previous_api_snapshot = state.current_api_snapshot.take();
+
     // 1a. Poll Anthropic API for live usage data
     match poller.poll() {
         Ok(usage_data) => {
@@ -1413,6 +1417,14 @@ pub fn run_governor_cycle(
                 stale: usage_data.stale,
             };
             state.token_refresh_failing = usage_data.stale;
+
+            // Update current_api_snapshot with the new snapshot data
+            state.current_api_snapshot = Some(state::PrevUsageSnapshot {
+                taken_at: now,
+                five_hour_pct: usage_data.five_hour_utilization,
+                seven_day_pct: usage_data.seven_day_utilization,
+                seven_day_sonnet_pct: usage_data.seven_day_sonnet_utilization,
+            });
         }
         Err(e) => {
             // If the error is from the API call (not token refresh), the token is fine.
