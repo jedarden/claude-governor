@@ -587,6 +587,9 @@ mod tests {
             pending_predictions: Default::default(),
             current_api_snapshot: Default::default(),
             previous_api_snapshot: Default::default(),
+            p5h_delta: None,
+            p7d_delta: None,
+            p7ds_delta: None,
         }
     }
 

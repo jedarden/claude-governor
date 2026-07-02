@@ -649,6 +649,18 @@ pub struct GovernorState {
     /// Updated after each successful poll completes.
     #[serde(default)]
     pub current_api_snapshot: Option<PrevUsageSnapshot>,
+    /// 5-hour window percentage delta (current - previous).
+    /// Computed from consecutive API readings across governor cycles.
+    #[serde(default)]
+    pub p5h_delta: Option<f64>,
+    /// 7-day window percentage delta (current - previous).
+    /// Computed from consecutive API readings across governor cycles.
+    #[serde(default)]
+    pub p7d_delta: Option<f64>,
+    /// 7-day Sonnet window percentage delta (current - previous).
+    /// Computed from consecutive API readings across governor cycles.
+    #[serde(default)]
+    pub p7ds_delta: Option<f64>,
 }
 
 impl Default for GovernorState {
@@ -670,6 +682,9 @@ impl Default for GovernorState {
             pending_predictions: HashMap::new(),
             previous_api_snapshot: None,
             current_api_snapshot: None,
+            p5h_delta: None,
+            p7d_delta: None,
+            p7ds_delta: None,
         }
     }
 }
@@ -1046,6 +1061,9 @@ mod tests {
             pending_predictions: HashMap::new(),
             previous_api_snapshot: None,
             current_api_snapshot: None,
+            p5h_delta: None,
+            p7d_delta: None,
+            p7ds_delta: None,
         }
     }
 
