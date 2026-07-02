@@ -1447,8 +1447,9 @@ pub fn run_governor_cycle(
                     seven_day_sonnet: delta_7ds,
                 };
 
-                log::debug!(
-                    "[governor] API window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
+                log::info!(
+                    "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
+                    now.to_rfc3339(),
                     delta_5h, delta_7d, delta_7ds
                 );
             }
@@ -1825,8 +1826,9 @@ pub fn run_governor_cycle(
                     }
 
                     log::info!(
-                        "[governor] API delta in {:.0}s: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
+                        "[governor] {} computed window deltas (in {:.0}s): 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
                          → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
+                        now.to_rfc3339(),
                         elapsed_secs,
                         delta_5h,
                         delta_7d,
