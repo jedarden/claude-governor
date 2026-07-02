@@ -567,6 +567,148 @@ impl Default for GovernorState {
     }
 }
 
+#[cfg(test)]
+mod governor_state_tests {
+    use super::*;
+
+    /// Test that a new GovernorState starts with no emergency brake and no sprint.
+    #[test]
+    fn test_governor_state_new() {
+        let state = GovernorState::new();
+        assert!(!state.emergency_brake_active);
+        assert!(state.emergency_brake.is_none());
+        assert!(state.sprint.is_none());
+        assert!(state.agents.is_empty());
+    }
+
+    /// Test that add_agent correctly inserts or updates an agent.
+    #[test]
+    fn test_governor_state_add_agent() {
+        let mut state = GovernorState::new();
+
+        state.add_agent("agent-1", 5, false);
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents["agent-1"].workers, 5);
+        assert!(!state.agents["agent-1"].is_idle);
+
+        // Update existing agent
+        state.add_agent("agent-1", 10, true);
+        assert_eq!(state.agents["agent-1"].workers, 10);
+        assert!(state.agents["agent-1"].is_idle);
+    }
+
+    /// Test that scale_all_to_zero sets all agent workers to 0.
+    #[test]
+    fn test_governor_state_scale_all_to_zero() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+        state.add_agent("agent-2", 3, false);
+
+        state.scale_all_to_zero();
+
+        assert_eq!(state.agents["agent-1"].workers, 0);
+        assert_eq!(state.agents["agent-2"].workers, 0);
+    }
+
+    /// Test emergency brake triggers at 98% utilization.
+    #[test]
+    fn test_emergency_brake_triggers_at_threshold() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+
+        let usage = UsageSnapshot::from_windows(99.0, 50.0, 50.0);
+
+        let brake = state.check_emergency_brake(&usage);
+
+        assert!(brake.is_some());
+        assert_eq!(brake.as_ref().unwrap().triggered_window, WINDOW_FIVE_HOUR);
+        assert_eq!(brake.as_ref().unwrap().utilization_pct, 99.0);
+        assert!(state.emergency_brake_active);
+        assert_eq!(state.agents["agent-1"].workers, 0);
+    }
+
+    /// Test emergency brake does not trigger below 98%.
+    #[test]
+    fn test_emergency_brake_no_trigger_below_threshold() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+
+        let usage = UsageSnapshot::from_windows(97.0, 50.0, 50.0);
+
+        let brake = state.check_emergency_brake(&usage);
+
+        assert!(brake.is_none());
+        assert!(!state.emergency_brake_active);
+        assert_eq!(state.agents["agent-1"].workers, 5);
+    }
+
+    /// Test clearing emergency brake when utilization drops.
+    #[test]
+    fn test_clear_emergency_brake() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+        state.emergency_brake_active = true;
+
+        let usage = UsageSnapshot::from_windows(50.0, 50.0, 50.0);
+
+        let cleared = state.clear_emergency_brake(&usage);
+
+        assert!(cleared);
+        assert!(!state.emergency_brake_active);
+        assert!(state.emergency_brake.is_none());
+    }
+
+    /// Test sprint application boosts agent workers.
+    #[test]
+    fn test_apply_sprint() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+
+        let trigger = crate::alerts::SprintTrigger {
+            worker_id: "agent-1".to_string(),
+            target_workers: 10,
+            window: WINDOW_FIVE_HOUR.to_string(),
+            utilization_pct: 25.0,
+            hours_remaining: 1.5,
+            reason: "underutilization sprint".to_string(),
+            triggered_at: Utc::now(),
+        };
+
+        state.apply_sprint(&trigger);
+
+        assert!(state.sprint.is_some());
+        assert_eq!(state.sprint.as_ref().unwrap().target_workers, 10);
+        assert_eq!(state.sprint.as_ref().unwrap().original_workers, 5);
+        assert_eq!(state.agents["agent-1"].workers, 10);
+    }
+
+    /// Test clearing sprint restores original worker count.
+    #[test]
+    fn test_clear_sprint() {
+        let mut state = GovernorState::new();
+        state.add_agent("agent-1", 5, false);
+
+        let trigger = crate::alerts::SprintTrigger {
+            worker_id: "agent-1".to_string(),
+            target_workers: 10,
+            window: WINDOW_FIVE_HOUR.to_string(),
+            utilization_pct: 25.0,
+            hours_remaining: 1.5,
+            reason: "underutilization sprint".to_string(),
+            triggered_at: Utc::now(),
+        };
+
+        state.apply_sprint(&trigger);
+        assert_eq!(state.agents["agent-1"].workers, 10);
+
+        let cleared = state.clear_sprint();
+
+        assert!(cleared);
+        assert!(state.sprint.is_none());
+        assert_eq!(state.agents["agent-1"].workers, 5);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scaling decision
 // ---------------------------------------------------------------------------
