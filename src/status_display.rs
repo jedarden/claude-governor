@@ -729,6 +729,8 @@ mod tests {
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: Default::default(),
             pending_predictions: Default::default(),
+            current_api_snapshot: Default::default(),
+            previous_api_snapshot: Default::default(),
         }
     }
 

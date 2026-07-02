@@ -1425,6 +1425,33 @@ pub fn run_governor_cycle(
                 seven_day_pct: usage_data.seven_day_utilization,
                 seven_day_sonnet_pct: usage_data.seven_day_sonnet_utilization,
             });
+
+            // Calculate window deltas from consecutive API snapshots
+            if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+                // Store computed deltas in governor state
+                state.last_fleet_aggregate.window_pct_deltas = state::WindowPctDeltas {
+                    five_hour: delta_5h,
+                    seven_day: delta_7d,
+                    seven_day_sonnet: delta_7ds,
+                };
+
+                log::debug!(
+                    "[governor] API window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
+                    delta_5h, delta_7d, delta_7ds
+                );
+            }
         }
         Err(e) => {
             // If the error is from the API call (not token refresh), the token is fine.
