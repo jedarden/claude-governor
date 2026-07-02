@@ -4330,4 +4330,217 @@ mod tests {
         assert_eq!(result.get("sonnet"), Some(&5), "Sonnet should not be reduced");
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
     }
+
+    // -----------------------------------------------------------------------
+    // Consecutive snapshot delta computation tests
+    // -----------------------------------------------------------------------
+
+    /// Test consecutive snapshot delta computation with governor state integration.
+    ///
+    /// This test demonstrates the full flow of delta computation from consecutive
+    /// API snapshots as it occurs in the governor cycle:
+    /// 1. Two consecutive snapshots are created with known values
+    /// 2. Deltas are computed from the snapshot difference
+    /// 3. Delta values are verified to match expected computation
+    /// 4. Delta fields are populated in governor state structure
+    ///
+    /// This simulates the behavior in `run_governor_cycle` where
+    /// `state.previous_api_snapshot` and `state.current_api_snapshot` are used
+    /// to compute percentage changes across polling intervals.
+    #[test]
+    fn test_consecutive_snapshot_delta_computation() {
+        use chrono::Utc;
+        use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+
+        // Setup: Create two consecutive API snapshots with known values
+        // These represent the API readings from two consecutive poll cycles
+        let previous_snapshot = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,    // 5-hour window at 10%
+            seven_day_pct: 20.0,    // 7-day window at 20%
+            seven_day_sonnet_pct: 15.0,  // 7-day-sonnet window at 15%
+        };
+
+        let current_snapshot = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 12.5,    // 5-hour window increased by 2.5%
+            seven_day_pct: 22.0,    // 7-day window increased by 2.0%
+            seven_day_sonnet_pct: 18.0,  // 7-day-sonnet window increased by 3.0%
+        };
+
+        // Step 1: Convert snapshots to WindowPctSnapshot format for delta calculation
+        // This matches the conversion in run_governor_cycle (lines 1728-1737)
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: previous_snapshot.five_hour_pct,
+            seven_day: previous_snapshot.seven_day_pct,
+            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: current_snapshot.five_hour_pct,
+            seven_day: current_snapshot.seven_day_pct,
+            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+        };
+
+        // Step 2: Compute deltas from consecutive snapshots
+        // This is the core delta computation from run_governor_cycle (line 1738)
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Step 3: Verify delta values match expected computation
+        // Expected: current - previous for each window
+        assert!((delta_5h - 2.5).abs() < f64::EPSILON,
+            "5-hour delta should be 12.5 - 10.0 = 2.5, got {}", delta_5h);
+        assert!((delta_7d - 2.0).abs() < f64::EPSILON,
+            "7-day delta should be 22.0 - 20.0 = 2.0, got {}", delta_7d);
+        assert!((delta_7ds - 3.0).abs() < f64::EPSILON,
+            "7-day-sonnet delta should be 18.0 - 15.0 = 3.0, got {}", delta_7ds);
+
+        // Step 4: Populate delta fields in governor state structure
+        // This simulates storing deltas in state.last_fleet_aggregate.window_pct_deltas
+        // (as done in run_governor_cycle lines 1741-1745)
+        let window_pct_deltas = WindowPctDeltas {
+            five_hour: delta_5h,
+            seven_day: delta_7d,
+            seven_day_sonnet: delta_7ds,
+        };
+
+        // Step 5: Assert that delta fields are correctly populated
+        assert!((window_pct_deltas.five_hour - 2.5).abs() < f64::EPSILON,
+            "State five_hour delta should be 2.5");
+        assert!((window_pct_deltas.seven_day - 2.0).abs() < f64::EPSILON,
+            "State seven_day delta should be 2.0");
+        assert!((window_pct_deltas.seven_day_sonnet - 3.0).abs() < f64::EPSILON,
+            "State seven_day_sonnet delta should be 3.0");
+
+        // Verify all deltas are non-zero (indicating active consumption)
+        assert!(delta_5h > 0.0, "5-hour delta should be positive (increasing)");
+        assert!(delta_7d > 0.0, "7-day delta should be positive (increasing)");
+        assert!(delta_7ds > 0.0, "7-day-sonnet delta should be positive (increasing)");
+    }
+
+    /// Test consecutive snapshot delta computation with window reset (negative deltas).
+    ///
+    /// Verifies that when a window resets (utilization drops), the delta computation
+    /// correctly produces negative values, which is expected behavior during window
+    /// boundary transitions.
+    #[test]
+    fn test_consecutive_snapshot_delta_with_window_reset() {
+        use chrono::Utc;
+        use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+
+        // Setup: Previous snapshot shows high utilization (near window limit)
+        let previous_snapshot = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 80.0,     // 5-hour window at 80% (near exhaustion)
+            seven_day_pct: 90.0,     // 7-day window at 90% (near exhaustion)
+            seven_day_sonnet_pct: 85.0,  // 7-day-sonnet at 85%
+        };
+
+        // Current snapshot shows window reset (utilization dropped)
+        let current_snapshot = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 5.0,      // Window reset: 80% -> 5% (delta: -75.0)
+            seven_day_pct: 15.0,     // Window reset: 90% -> 15% (delta: -75.0)
+            seven_day_sonnet_pct: 8.0,  // Window reset: 85% -> 8% (delta: -77.0)
+        };
+
+        // Compute deltas
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: previous_snapshot.five_hour_pct,
+            seven_day: previous_snapshot.seven_day_pct,
+            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: current_snapshot.five_hour_pct,
+            seven_day: current_snapshot.seven_day_pct,
+            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Verify negative deltas (window reset)
+        assert!((delta_5h - (-75.0)).abs() < f64::EPSILON,
+            "5-hour delta should be 5.0 - 80.0 = -75.0 (window reset)");
+        assert!((delta_7d - (-75.0)).abs() < f64::EPSILON,
+            "7-day delta should be 15.0 - 90.0 = -75.0 (window reset)");
+        assert!((delta_7ds - (-77.0)).abs() < f64::EPSILON,
+            "7-day-sonnet delta should be 8.0 - 85.0 = -77.0 (window reset)");
+
+        // Populate in state structure
+        let window_pct_deltas = WindowPctDeltas {
+            five_hour: delta_5h,
+            seven_day: delta_7d,
+            seven_day_sonnet: delta_7ds,
+        };
+
+        // Verify state correctly captures negative deltas
+        assert!(window_pct_deltas.five_hour < 0.0,
+            "State five_hour delta should be negative (window reset)");
+        assert!(window_pct_deltas.seven_day < 0.0,
+            "State seven_day delta should be negative (window reset)");
+        assert!(window_pct_deltas.seven_day_sonnet < 0.0,
+            "State seven_day_sonnet delta should be negative (window reset)");
+    }
+
+    /// Test consecutive snapshot delta computation with identical values (zero deltas).
+    ///
+    /// Verifies that when consecutive snapshots have identical values (no consumption
+    /// occurred between polls), all deltas are zero. This is expected behavior during
+    /// idle periods or when the API percentage hasn't changed.
+    #[test]
+    fn test_consecutive_snapshot_delta_identical_snapshots() {
+        use chrono::Utc;
+        use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+
+        // Setup: Both snapshots have identical values (no consumption)
+        let snapshot_values = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 25.0,
+            seven_day_pct: 35.0,
+            seven_day_sonnet_pct: 28.0,
+        };
+
+        // Previous and current are identical
+        let previous_snapshot = snapshot_values.clone();
+        let current_snapshot = snapshot_values;
+
+        // Compute deltas
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: previous_snapshot.five_hour_pct,
+            seven_day: previous_snapshot.seven_day_pct,
+            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: current_snapshot.five_hour_pct,
+            seven_day: current_snapshot.seven_day_pct,
+            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Verify all deltas are exactly zero
+        assert_eq!(delta_5h, 0.0,
+            "5-hour delta should be 0.0 for identical snapshots");
+        assert_eq!(delta_7d, 0.0,
+            "7-day delta should be 0.0 for identical snapshots");
+        assert_eq!(delta_7ds, 0.0,
+            "7-day-sonnet delta should be 0.0 for identical snapshots");
+
+        // Populate in state structure
+        let window_pct_deltas = WindowPctDeltas {
+            five_hour: delta_5h,
+            seven_day: delta_7d,
+            seven_day_sonnet: delta_7ds,
+        };
+
+        // Verify state correctly shows zero deltas
+        assert_eq!(window_pct_deltas.five_hour, 0.0,
+            "State five_hour delta should be 0.0");
+        assert_eq!(window_pct_deltas.seven_day, 0.0,
+            "State seven_day delta should be 0.0");
+        assert_eq!(window_pct_deltas.seven_day_sonnet, 0.0,
+            "State seven_day_sonnet delta should be 0.0");
+    }
 }
