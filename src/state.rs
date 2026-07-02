@@ -679,6 +679,52 @@ impl GovernorState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Update API snapshots after a poll.
+    ///
+    /// This method shifts the snapshot state: the current snapshot becomes the previous,
+    /// and a new snapshot is set as current.
+    ///
+    /// # Arguments
+    /// - `now`: The current timestamp when the snapshot was taken
+    /// - `five_hour_pct`: The 5-hour window utilization percentage
+    /// - `seven_day_pct`: The 7-day window utilization percentage
+    /// - `seven_day_sonnet_pct`: The 7-day Sonnet window utilization percentage
+    ///
+    /// # Example
+    /// ```no_run
+    /// use chrono::Utc;
+    /// # use claude_governor::state::GovernorState;
+    /// let mut state = GovernorState::new();
+    ///
+    /// // After first poll, current is set, previous is None
+    /// state.update_api_snapshot(Utc::now(), 10.0, 20.0, 15.0);
+    /// assert!(state.previous_api_snapshot.is_none());
+    /// assert!(state.current_api_snapshot.is_some());
+    ///
+    /// // After second poll, previous is set to old current, current is updated
+    /// state.update_api_snapshot(Utc::now(), 12.0, 22.0, 18.0);
+    /// assert!(state.previous_api_snapshot.is_some());
+    /// assert!(state.current_api_snapshot.is_some());
+    /// ```
+    pub fn update_api_snapshot(
+        &mut self,
+        now: DateTime<Utc>,
+        five_hour_pct: f64,
+        seven_day_pct: f64,
+        seven_day_sonnet_pct: f64,
+    ) {
+        // Shift: current becomes previous
+        self.previous_api_snapshot = self.current_api_snapshot.take();
+
+        // Set new current snapshot
+        self.current_api_snapshot = Some(PrevUsageSnapshot {
+            taken_at: now,
+            five_hour_pct,
+            seven_day_pct,
+            seven_day_sonnet_pct,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,6 +1480,127 @@ mod tests {
         assert!(parsed.is_object());
         assert!(parsed.get("usage").is_some());
         assert!(parsed.get("capacity_forecast").is_some());
+    }
+
+    // --- Snapshot state tracking ---
+
+    #[test]
+    fn update_api_snapshot_first_poll_sets_current_only() {
+        let mut state = GovernorState::new();
+        let now = Utc::now();
+
+        // First poll: only current should be set, previous should remain None
+        state.update_api_snapshot(now, 10.0, 20.0, 15.0);
+
+        assert!(state.previous_api_snapshot.is_none(),
+                "On first poll, previous_api_snapshot should be None");
+        assert!(state.current_api_snapshot.is_some(),
+                "On first poll, current_api_snapshot should be Some");
+
+        let curr = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(curr.five_hour_pct, 10.0);
+        assert_eq!(curr.seven_day_pct, 20.0);
+        assert_eq!(curr.seven_day_sonnet_pct, 15.0);
+        assert_eq!(curr.taken_at, now);
+    }
+
+    #[test]
+    fn update_api_snapshot_second_poll_shifts_snapshots() {
+        let mut state = GovernorState::new();
+        let now1 = Utc::now();
+        let now2 = now1 + chrono::Duration::seconds(60);
+
+        // First poll
+        state.update_api_snapshot(now1, 10.0, 20.0, 15.0);
+
+        // Second poll: should shift current to previous, then set new current
+        state.update_api_snapshot(now2, 12.5, 22.0, 18.0);
+
+        assert!(state.previous_api_snapshot.is_some(),
+                "On second poll, previous_api_snapshot should be Some");
+        assert!(state.current_api_snapshot.is_some(),
+                "On second poll, current_api_snapshot should be Some");
+
+        // Verify previous holds the first poll's data
+        let prev = state.previous_api_snapshot.as_ref().unwrap();
+        assert_eq!(prev.five_hour_pct, 10.0, "previous should hold first poll data");
+        assert_eq!(prev.seven_day_pct, 20.0);
+        assert_eq!(prev.seven_day_sonnet_pct, 15.0);
+        assert_eq!(prev.taken_at, now1);
+
+        // Verify current holds the second poll's data
+        let curr = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(curr.five_hour_pct, 12.5, "current should hold second poll data");
+        assert_eq!(curr.seven_day_pct, 22.0);
+        assert_eq!(curr.seven_day_sonnet_pct, 18.0);
+        assert_eq!(curr.taken_at, now2);
+    }
+
+    #[test]
+    fn update_api_snapshot_consecutive_polls_maintains_chain() {
+        let mut state = GovernorState::new();
+
+        // Simulate multiple polls
+        let mut prev_values = Vec::new();
+        for i in 0..5 {
+            let now = Utc::now() + chrono::Duration::seconds(i as i64 * 60);
+            let five_hr = 10.0 + i as f64 * 2.5;  // 10.0, 12.5, 15.0, 17.5, 20.0
+            let seven_day = 20.0 + i as f64 * 2.0;  // 20.0, 22.0, 24.0, 26.0, 28.0
+            let seven_day_sonnet = 15.0 + i as f64 * 3.0;  // 15.0, 18.0, 21.0, 24.0, 27.0
+
+            state.update_api_snapshot(now, five_hr, seven_day, seven_day_sonnet);
+            prev_values.push((five_hr, seven_day, seven_day_sonnet));
+
+            // After the first poll, verify the chain
+            if i > 0 {
+                assert!(state.previous_api_snapshot.is_some());
+                assert!(state.current_api_snapshot.is_some());
+
+                let prev = state.previous_api_snapshot.as_ref().unwrap();
+                let curr = state.current_api_snapshot.as_ref().unwrap();
+
+                // Previous should hold the previous iteration's values
+                let (p5h, p7d, p7ds) = prev_values[i - 1];
+                assert_eq!(prev.five_hour_pct, p5h);
+                assert_eq!(prev.seven_day_pct, p7d);
+                assert_eq!(prev.seven_day_sonnet_pct, p7ds);
+
+                // Current should hold the current iteration's values
+                let (c5h, c7d, c7ds) = prev_values[i];
+                assert_eq!(curr.five_hour_pct, c5h);
+                assert_eq!(curr.seven_day_pct, c7d);
+                assert_eq!(curr.seven_day_sonnet_pct, c7ds);
+            }
+        }
+    }
+
+    #[test]
+    fn update_api_snapshot_handles_negative_deltas() {
+        let mut state = GovernorState::new();
+        let now1 = Utc::now();
+        let now2 = now1 + chrono::Duration::seconds(60);
+
+        // First poll with high utilization
+        state.update_api_snapshot(now1, 80.0, 90.0, 85.0);
+
+        // Second poll with low utilization (simulating window reset)
+        state.update_api_snapshot(now2, 5.0, 15.0, 8.0);
+
+        assert!(state.previous_api_snapshot.is_some());
+        assert!(state.current_api_snapshot.is_some());
+
+        // Verify the negative delta is correctly captured
+        let prev = state.previous_api_snapshot.as_ref().unwrap();
+        let curr = state.current_api_snapshot.as_ref().unwrap();
+
+        assert_eq!(prev.five_hour_pct, 80.0);
+        assert_eq!(curr.five_hour_pct, 5.0);  // Window reset: 80.0 -> 5.0
+
+        assert_eq!(prev.seven_day_pct, 90.0);
+        assert_eq!(curr.seven_day_pct, 15.0);  // Window reset: 90.0 -> 15.0
+
+        assert_eq!(prev.seven_day_sonnet_pct, 85.0);
+        assert_eq!(curr.seven_day_sonnet_pct, 8.0);  // Window reset: 85.0 -> 8.0
     }
 }
 
