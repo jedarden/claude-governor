@@ -1749,6 +1749,12 @@ pub fn run_governor_cycle(
                     now.to_rfc3339(),
                     delta_5h, delta_7d, delta_7ds
                 );
+            } else {
+                // First poll: prev_snapshot is None, cannot compute delta
+                // Ensure delta fields remain at default (0.0) - no update needed
+                log::debug!(
+                    "[governor] first poll detected (no previous snapshot), skipping delta computation"
+                );
             }
         }
         Err(e) => {
