@@ -4785,4 +4785,218 @@ mod tests {
         assert_eq!(window_pct_deltas.seven_day_sonnet, 0.0,
             "State seven_day_sonnet delta should be 0.0");
     }
+
+    // ---------------------------------------------------------------------------
+    // Basic governor cycle tests
+    // ---------------------------------------------------------------------------
+
+    /// Test basic governor cycle flow without external dependencies.
+    ///
+    /// This test establishes the basic testing infrastructure for governor cycles
+    /// by testing the core decision-making logic: target computation and scaling decisions.
+    /// It verifies that a governor cycle can execute without panicking using a single
+    /// usage snapshot.
+    ///
+    /// This serves as the foundation for more complex integration tests that can
+    /// add external dependencies (poller, database, worker management) as needed.
+    #[test]
+    fn test_governor_cycle_basic_flow() {
+        // 1. Create a minimal governor state
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "test-agent".to_string(),
+            state::WorkerState {
+                current: 5,
+                target: 5,
+                min: 1,
+                max: 10,
+            },
+        );
+
+        // 2. Create a usage snapshot with moderate utilization
+        let usage = make_usage_snapshot(50.0, 40.0, 35.0);
+
+        // 3. Build capacity forecast from the snapshot
+        let snapshot = crate::db::WindowPctSnapshot {
+            five_hour: usage.get(WINDOW_FIVE_HOUR).unwrap_or(0.0),
+            seven_day: usage.get(WINDOW_SEVEN_DAY).unwrap_or(0.0),
+            seven_day_sonnet: usage.get(WINDOW_SEVEN_DAY_SONNET).unwrap_or(0.0),
+        };
+
+        // Simulate minimal capacity forecast
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                current_utilization: snapshot.five_hour,
+                safe_worker_count: Some(5),
+                safe_worker_count_p75: Some(4),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                current_utilization: snapshot.seven_day,
+                safe_worker_count: Some(6),
+                safe_worker_count_p75: Some(5),
+                ..Default::default()
+            },
+            seven_day_sonnet: state::WindowForecast {
+                current_utilization: snapshot.seven_day_sonnet,
+                safe_worker_count: Some(7),
+                safe_worker_count_p75: Some(6),
+                ..Default::default()
+            },
+            binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+            ..Default::default()
+        };
+
+        // 4. Compute target workers
+        let target = compute_target_workers(
+            &state,
+            90.0, // target_ceiling
+            &CompositeRiskConfig::default(),
+            &ConeScalingConfig::default(),
+        );
+
+        // 5. Apply scaling decision
+        let current_total = 5;
+        let decision = apply_scaling(
+            target,
+            current_total,
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+        );
+
+        // 6. Verify the cycle completed without panic
+        // (The fact we reached here means no panic occurred)
+        match decision {
+            ScalingDecision::NoChange => {
+                // Expected: target and current are within hysteresis band
+                assert!(target >= current_total - 2 && target <= current_total + 2,
+                    "NoChange decision should be within hysteresis band");
+            }
+            ScalingDecision::ScaleUp(n) => {
+                // Verify scale-up is reasonable
+                assert!(n > 0 && n <= 3, "ScaleUp should be 1-3 workers");
+            }
+            ScalingDecision::ScaleDown(n) => {
+                // Verify scale-down is reasonable
+                assert!(n > 0 && n <= 2, "ScaleDown should be 1-2 workers");
+            }
+            ScalingDecision::EmergencyBrake => {
+                // Should not trigger at moderate utilization
+                panic!("EmergencyBrake should not trigger at 50% utilization");
+            }
+        }
+
+        // 7. Verify state is consistent after the cycle
+        assert!(!state.workers.is_empty(), "State should retain workers after cycle");
+        assert_eq!(state.workers["test-agent"].current, 5, "Current workers unchanged");
+        assert!(!state.safe_mode.active, "Safe mode should not be active");
+    }
+
+    /// Test governor cycle with high utilization triggers emergency brake.
+    ///
+    /// This test verifies that when utilization exceeds the emergency brake threshold,
+    /// the governor correctly responds with an EmergencyBrake decision.
+    #[test]
+    fn test_governor_cycle_emergency_brake() {
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "test-agent".to_string(),
+            state::WorkerState {
+                current: 10,
+                target: 10,
+                min: 1,
+                max: 10,
+            },
+        );
+
+        // High utilization above emergency brake threshold (98%)
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                current_utilization: 99.0,
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            seven_day_sonnet: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            binding_window: WINDOW_FIVE_HOUR.to_string(),
+            ..Default::default()
+        };
+
+        let target = compute_target_workers(
+            &state,
+            90.0,
+            &CompositeRiskConfig::default(),
+            &ConeScalingConfig::default(),
+        );
+
+        // At 99% utilization, target should be 0 (emergency brake)
+        assert_eq!(target, 0, "Target should be 0 at 99% utilization");
+
+        let decision = apply_scaling(target, 10, 2.0, 3, 2);
+
+        assert!(matches!(decision, ScalingDecision::EmergencyBrake),
+            "Should trigger EmergencyBrake decision at 99% utilization");
+    }
+
+    /// Test governor cycle with scaling decision within hysteresis band.
+    ///
+    /// Verifies that when the target is within the hysteresis band of current,
+    /// the governor correctly decides to make no change.
+    #[test]
+    fn test_governor_cycle_hysteresis_no_change() {
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "test-agent".to_string(),
+            state::WorkerState {
+                current: 5,
+                target: 5,
+                min: 1,
+                max: 10,
+            },
+        );
+
+        // Target exactly equals current
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            seven_day_sonnet: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+            ..Default::default()
+        };
+
+        let target = compute_target_workers(
+            &state,
+            90.0,
+            &CompositeRiskConfig::default(),
+            &ConeScalingConfig::default(),
+        );
+
+        assert_eq!(target, 5, "Target should equal current at moderate utilization");
+
+        let decision = apply_scaling(target, 5, 2.0, 3, 2);
+
+        assert!(matches!(decision, ScalingDecision::NoChange),
+            "Should decide NoChange when target equals current");
+    }
 }
