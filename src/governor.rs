@@ -622,6 +622,8 @@ fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: 
 ///
 /// # Example
 /// ```
+/// use claude_governor::db::WindowPctSnapshot;
+/// use claude_governor::governor::calculate_window_pct_delta;
 /// let prev = WindowPctSnapshot { five_hour: 10.0, seven_day: 20.0, seven_day_sonnet: 15.0 };
 /// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, seven_day_sonnet: 18.0 };
 /// let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -655,6 +657,7 @@ pub fn calculate_window_pct_delta(
 ///
 /// # Example
 /// ```
+/// use claude_governor::governor::apportion_delta;
 /// // Fleet burned 2.5% of 7-day quota in an interval
 /// // Session A spent $10 out of fleet total $50
 /// let session_delta = apportion_delta(2.5, 50.0, 10.0);
@@ -1693,10 +1696,19 @@ pub fn run_governor_cycle(
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
 
                 if elapsed_secs >= MIN_ELAPSED_SECS && elapsed_secs <= MAX_ELAPSED_SECS {
-                    // Per-window deltas — positive only; negatives indicate a quota reset
-                    let delta_5h = new_five_hour - snap.five_hour_pct;
-                    let delta_7d = new_seven_day - snap.seven_day_pct;
-                    let delta_7ds = new_seven_day_sonnet - snap.seven_day_sonnet_pct;
+                    // Compute per-window deltas from consecutive API snapshots
+                    let old_pct = crate::db::WindowPctSnapshot {
+                        five_hour: snap.five_hour_pct,
+                        seven_day: snap.seven_day_pct,
+                        seven_day_sonnet: snap.seven_day_sonnet_pct,
+                    };
+                    let new_pct = crate::db::WindowPctSnapshot {
+                        five_hour: new_five_hour,
+                        seven_day: new_seven_day,
+                        seven_day_sonnet: new_seven_day_sonnet,
+                    };
+                    let (delta_5h, delta_7d, delta_7ds) =
+                        calculate_window_pct_delta(&old_pct, &new_pct);
 
                     // Fleet total USD/hr from the most recent fleet aggregate
                     let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
@@ -1773,7 +1785,7 @@ pub fn run_governor_cycle(
                             state.burn_rate.fleet_pct_ema_samples.saturating_add(1);
                     }
 
-                    log::debug!(
+                    log::info!(
                         "[governor] API delta in {:.0}s: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
                          → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
                         elapsed_secs,
