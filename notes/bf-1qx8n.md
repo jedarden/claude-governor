@@ -1,272 +1,219 @@
 # Governor Module Structure and Test Patterns
 
-## Governor Module Overview
+## Governor Module Types
 
-**File**: `src/governor.rs` (~5000 lines, 195KB)
+### Core Types
 
-The governor module is the core of the capacity management system, handling:
-- Emergency brake detection (98% hard stop)
-- Underutilization sprint triggering and management
-- End-of-window capacity sprint
-- Governor state management
-- Agent scaling decisions
-- Main daemon loop: poll → schedule → burn_rate → target → scale → alert → write_state
+1. **UsageSnapshot** - Snapshot of usage data for all windows
+   - Fields: `windows: HashMap<String, f64>` (utilization percentages per window)
+   - Key methods: `new()`, `from_windows()`, `get()`
+   - Purpose: Captures utilization state for three windows (5h, 7d, 7d-sonnet)
 
-## Core Types and Methods
+2. **EmergencyBrake** - Emergency brake event
+   - Fields: `triggered_window: String`, `utilization_pct: f64`
+   - Purpose: Tracks when any window hits 98% utilization
 
-### 1. Data Structures
+3. **Agent** - Agent representation for scaling
+   - Fields: `id: String`, `workers: u32`, `is_idle: bool`
+   - Purpose: Represents a worker pool/agent in the fleet
 
-#### `UsageSnapshot` (lines 64-97)
-- Holds utilization percentages for all tracked windows
-- **Key methods**: `new()`, `from_windows()`, `get()`
-- Stores data in `HashMap<String, f64>` with window names as keys
+4. **WindowContext** - Window context for sprint eligibility
+   - Fields: `name`, `hours_remaining`, `headroom_pct`, `cutoff_risk`, `safe_worker_count`, `has_backlog`, `cone_ratio`
+   - Purpose: Provides decision context for sprint triggers
 
-#### `EmergencyBrake` (lines 99-107)
-- Records which window triggered the emergency brake
-- Fields: `triggered_window`, `utilization_pct`
+5. **SprintState** - Active sprint state tracking
+   - Fields: `worker_id`, `target_workers`, `window`, `original_workers`, `sprint_expires_at`, `normal_max_workers`
+   - Purpose: Tracks underutilization recovery sprint state
 
-#### `Agent` (lines 109-120)
-- Represents a worker pool for scaling
-- Fields: `id`, `workers`, `is_idle`
+6. **GovernorState** - Main governor state container
+   - Fields: `emergency_brake_active`, `agents: HashMap<String, Agent>`, `emergency_brake: Option<EmergencyBrake>`, `sprint: Option<SprintState>`
+   - Key methods:
+     - `new()`, `add_agent()`, `scale_all_to_zero()`
+     - `check_emergency_brake()`, `clear_emergency_brake()`, `update_emergency_brake()`
+     - `apply_sprint()`, `clear_sprint()`, `check_sprint_end()`
+     - `sprint_eligible()`, `check_eow_sprint_end()`, `compute_sprint_max_workers()`
 
-#### `WindowContext` (lines 122-139)
-- Context for sprint eligibility evaluation
-- Fields: name, hours_remaining, headroom_pct, cutoff_risk, safe_worker_count, has_backlog, cone_ratio
+7. **ScalingDecision** - Result of scaling decision
+   - Variants: `NoChange`, `ScaleUp(u32)`, `ScaleDown(u32)`, `EmergencyBrake`
+   - Purpose: Represents the action to take each cycle
 
-#### `SprintState` (lines 141-156)
-- Active sprint state tracking
-- Fields: worker_id, target_workers, window, original_workers, sprint_expires_at, normal_max_workers
+### Key Public Functions
 
-#### `GovernorState` (lines 158-562)
-- Main state structure with comprehensive methods
-- **Key methods**:
-  - `new()` - Constructor
-  - `add_agent()` - Add/update agent tracking
-  - `scale_all_to_zero()` - Emergency brake action
-  - `check_emergency_brake()` - Detect 98% threshold breach
-  - `clear_emergency_brake()` - Reset when utilization drops
-  - `update_emergency_brake()` - Combined check + clear
-  - `apply_sprint()` - Boost workers for sprint
-  - `clear_sprint()` - Restore original workers
-  - `check_sprint_end()` - Test if sprint should end
-  - `sprint_eligible()` - Test end-of-window sprint conditions
-  - `compute_sprint_max_workers()` - Calculate effective max during sprint
+1. **Window Delta Calculation**
+   - `calculate_window_pct_delta()` - Computes percentage deltas between API poll snapshots
+   - `apportion_delta()` - Distributes total delta to specific session by USD weight
 
-### 2. Decision Types
+2. **Target Computation**
+   - `compute_target_workers()` - Main target worker count from capacity forecast and schedule
+   - `compute_pre_scale_target()` - Pre-scaling for upcoming multiplier transitions
 
-#### `ScalingDecision` (lines 574-585)
-Enum for scaling actions:
-- `NoChange` - Within hysteresis band
-- `ScaleUp(u32)` - Add N workers
-- `ScaleDown(u32)` - Remove N workers gracefully
-- `EmergencyBrake` - Scale all to zero immediately
+3. **Scaling Actions**
+   - `apply_scaling()` - Apply scaling decision with hysteresis band
 
-### 3. Key Functions
+4. **Safe Mode**
+   - `update_safe_mode_from_calibration()` - Update safe mode based on calibration accuracy
 
-#### Window Delta Calculation (lines 607-673)
-- `calculate_window_pct_delta()` - Compute percentage changes between API poll snapshots
-- `apportion_delta()` - Distribute fleet-wide delta to individual sessions by USD weight
+5. **Main Loop**
+   - `run_governor_cycle()` - Single governor daemon cycle (poll -> schedule -> burn_rate -> target -> scale -> alert -> write_state)
+   - `run_daemon()` - Main daemon loop
 
-#### Agent Cost Priority (lines 1217-1410)
-- `extract_model_from_launch_cmd()` - Parse --agent flag from command
-- `get_agent_cost_per_worker()` - Look up per-worker cost (burn_rate → pricing → default)
-- `distribute_workers_by_cost_priority()` - Scale up/down by cost (low→high, high→low)
+### Constants
 
-#### Target Computation (lines 1412-1559)
-- `compute_target_workers()` - Main target calculation with cone-based scaling
-- Uses binding window's safe_worker_count (p50 or p75 based on cone_ratio)
-- Supports composite risk optimization
-- Applies sprint boost if active
+- `EMERGENCY_BRAKE_THRESHOLD: f64 = 98.0` - 98% hard stop threshold
+- `SAFE_MODE_ENTRY_ERROR_THRESHOLD: f64 = 15.0` - Enter safe mode when median error exceeds this
+- `SAFE_MODE_EXIT_ERROR_THRESHOLD: f64 = 8.0` - Exit safe mode when median error drops below this (hysteresis)
+- `SAFE_MODE_MIN_SAMPLES: u32 = 5` - Minimum prediction samples before safe mode can trigger
+- `SAFE_MODE_CEILING_REDUCTION: f64 = 5.0` - Target ceiling reduction during safe mode
+- `SAFE_MODE_HYSTERESIS_MULTIPLIER: f64 = 2.0` - Hysteresis band multiplier during safe mode
 
-#### Scaling Decision (lines 1561-1616)
-- `apply_scaling()` - Apply hysteresis band and rate limits
-- Returns `ScalingDecision` based on delta vs hysteresis
+## Test Patterns in Codebase
 
-#### Pre-scale Logic (lines 1618-1691)
-- `compute_pre_scale_target()` - Conservative-only: pre-scale down before losing multiplier bonus
-- Never pre-scales up (only scales down before off-peak→peak transition)
+### Pattern 1: Unit Tests in `#[cfg(test)]` modules
 
-#### Safe Mode Calibration (lines 1693-1765)
-- `update_safe_mode_from_calibration()` - Enter/exit safe mode based on prediction error
-- Entry: median error > 15.0%
-- Exit: median error < 8.0% (hysteresis)
+Tests are organized in `#[cfg(test)]` modules at the bottom of files:
 
-#### Main Daemon Loop (lines 1807-3177)
-- `run_governor_cycle()` - Complete cycle: poll → schedule → burn_rate → target → scale → alert → write_state
-- Approximately 1300 lines of orchestration logic
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_name() {
+        // test implementation
+    }
+}
+```
+
+### Pattern 2: Helper Functions for Test Data Creation
+
+Common pattern of factory/helper functions to create test fixtures:
+
+```rust
+/// Create a test forecast with configurable values
+fn make_forecast(
+    margin_hrs: f64,
+    hours_remaining: f64,
+    cutoff_risk: bool,
+    binding: bool,
+) -> WindowForecast {
+    WindowForecast {
+        margin_hrs,
+        hours_remaining,
+        cutoff_risk,
+        // ...
+        ..WindowForecast::default()
+    }
+}
+
+/// Create a minimal governor state for testing
+fn make_state(forecast: CapacityForecast) -> GovernorState {
+    GovernorState {
+        capacity_forecast: forecast,
+        usage: UsageState::default(),
+        // ...
+    }
+}
+```
+
+### Pattern 3: Descriptive Test Names
+
+Tests use long, descriptive names following `test_<function>_<scenario>` pattern:
+
+- `test_calculate_window_pct_delta_basic`
+- `test_apportion_delta_zero_total_usd`
+- `test_governor_cycle_emergency_brake`
+- `test_governor_cycle_hysteresis_no_change`
+
+### Pattern 4: Documentation Comments
+
+Tests include doc comments explaining what they verify:
+
+```rust
+/// Test governor cycle with scaling decision within hysteresis band.
+///
+/// Verifies that when the target is within the hysteresis band of current,
+/// the governor correctly decides to make no change.
+#[test]
+fn test_governor_cycle_hysteresis_no_change() {
+```
+
+### Pattern 5: Assertion Style
+
+Uses standard assert macros with descriptive messages:
+
+```rust
+assert_eq!(target, 0, "Target should be 0 at 99% utilization");
+assert!(matches!(decision, ScalingDecision::EmergencyBrake),
+    "Should trigger EmergencyBrake decision at 99% utilization");
+```
 
 ## Existing Test Infrastructure in governor.rs
 
-### Test Module: `window_delta_tests` (lines 674-1213)
+### Test Module: `window_delta_tests`
 
-**Location**: Lines 674-1213 (540 lines of tests)
+Located at lines 674-1213, this module provides comprehensive testing for:
 
-**Test Pattern**: The module already contains comprehensive tests for window delta calculations:
+1. **Window percentage delta calculation** (`calculate_window_pct_delta`)
+   - Basic delta computation
+   - Negative deltas (window resets)
+   - Zero previous values (first poll)
+   - Mixed deltas (some windows increase, some decrease)
+   - Small changes precision testing
 
-#### Test Functions (18 tests):
-1. `test_calculate_window_pct_delta_basic` - Basic delta calculation
-2. `test_calculate_window_pct_delta_negative_deltas` - Window resets
-3. `test_calculate_window_pct_delta_zero_previous` - First poll handling
-4. `test_apportion_delta_basic` - Fleet delta apportionment
-5. `test_apportion_delta_zero_total_usd` - Edge case handling
-6. `test_apportion_delta_zero_session_usd` - Edge case handling
-7. `test_apportion_delta_equal_weights` - Equal distribution
-8. `test_apportion_delta_negative_total_delta` - Window reset case
-9. `test_apportion_delta_fractional_weights` - Fractional USD weights
-10. `test_consecutive_snapshots_non_zero_deltas` - Real poll cycle simulation
-11. `test_identical_snapshots_zero_deltas` - No-change scenario
-12. `test_first_poll_no_previous_snapshot` - First poll edge case
-13. `test_delta_uses_correct_window_fields` - Field mapping verification
-14. `test_negative_deltas_window_reset` - Reset detection
-15. `test_mixed_deltas_increase_and_decrease` - Realistic mixed behavior
-16. `test_delta_precision_small_changes` - Precision verification
-17. `test_snapshot_helpers_create_valid_structs` - Helper function validation
+2. **Delta apportionment** (`apportion_delta`)
+   - Basic apportionment by weight
+   - Zero total USD handling
+   - Zero session USD handling
+   - Equal weights
+   - Negative total deltas
+   - Fractional weights
 
-#### Helper Functions (documented with rustdoc):
-- `make_window_pct_snapshot(five_hour, seven_day, seven_day_sonnet)` - Create test snapshots
-- `make_usage_snapshot(five_hour_pct, seven_day_pct, seven_day_sonnet_pct)` - Create usage snapshots with current timestamp
-- `make_usage_snapshot_with_time(taken_at, ...)` - Create snapshots with custom timestamp
+3. **Consecutive API poll scenarios**
+   - Non-zero deltas from consecutive snapshots
+   - Zero deltas from identical snapshots
+   - First poll handling (no previous snapshot)
+   - Correct field mapping (five_hour_pct -> five_hour)
+   - Negative deltas (window resets)
+   - Mixed deltas
 
-**Pattern characteristics**:
-- Tests use `assert!` with floating-point tolerance (`f64::EPSILON` or custom `TOL`)
-- Helper functions are documented with `///` comments including examples
-- Tests cover normal cases, edge cases, and precision
-- Uses `chrono::Utc` for deterministic timestamps
+4. **Test helper functions**
+   - `make_window_pct_snapshot()` - Create WindowPctSnapshot with custom values
+   - `make_usage_snapshot()` - Create PrevUsageSnapshot with current timestamp
+   - `make_usage_snapshot_with_time()` - Create PrevUsageSnapshot with custom timestamp
 
-## Test Patterns Used Elsewhere in Codebase
+### Test Module: Main governor tests (lines 4895+)
 
-### From `src/state.rs`:
+Located near end of file, tests core governor cycle behavior:
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
+1. **`test_governor_cycle_emergency_brake`** (lines 4900-4948)
+   - Tests emergency brake activation at 99% utilization
+   - Verifies target becomes 0 and EmergencyBrake decision is returned
 
-    // Helper function to build fully populated test state
-    fn full_state() -> GovernorState {
-        // ... constructs complex test data
-    }
-}
-```
+2. **`test_governor_cycle_hysteresis_no_change`** (lines 4954-5001)
+   - Tests hysteresis band logic
+   - Verifies NoChange decision when target equals current
 
-**Pattern**:
-- Uses `#[cfg(test)]` module attribute
-- Uses `tempfile::TempDir` for file-based tests
-- Helper functions like `full_state()` to build complex test data
-- Tests focus on serialization/deserialization roundtrips
+### Key Test Infrastructure Features
 
-### From `src/alerts.rs`:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::{Duration, Utc};
-    use std::collections::HashMap;
-
-    fn base_now() -> DateTime<Utc> {
-        "2026-03-20T10:00:00Z".parse().unwrap()
-    }
-
-    fn make_window(cutoff_risk: bool, margin_hrs: f64, hrs_left: f64) -> WindowForecast {
-        // ... creates test window
-    }
-}
-```
-
-**Pattern**:
-- Uses `chrono::Utc` for deterministic time-based tests
-- Helper functions like `base_now()`, `make_window()` for consistent test data
-- Tests verify alert conditions, thresholds, and firing logic
-
-### From `src/burn_rate.rs`:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_safe_worker_count_basic() {
-        // Basic functionality
-    }
-
-    #[test]
-    fn test_safe_worker_count_no_burn_rate() {
-        // Edge case: no data
-    }
-}
-```
-
-**Pattern**:
-- Individual `#[test]` functions for specific scenarios
-- Tests use descriptive names: `test_<function>_<scenario>`
-- Focus on edge cases and boundary conditions
-
-## Key Governor Methods to Test
-
-Based on the module structure, these are the key methods that should have test coverage:
-
-### Emergency Brake
-- `GovernorState::check_emergency_brake()` - Already has implicit tests in main cycle
-- `GovernorState::clear_emergency_brake()` - Tests would verify 98% threshold behavior
-- `GovernorState::update_emergency_brake()` - Combined check + clear logic
-
-### Sprint Management
-- `GovernorState::apply_sprint()` - Worker boost application
-- `GovernorState::clear_sprint()` - Worker restoration
-- `GovernorState::check_sprint_end()` - Sprint termination conditions
-- `GovernorState::sprint_eligible()` - Eligibility logic (multiple conditions)
-- `GovernorState::compute_sprint_max_workers()` - Sprint ceiling calculation
-
-### Scaling Decisions
-- `compute_target_workers()` - Main target calculation (cone-based, composite risk)
-- `apply_scaling()` - Hysteresis and rate limiting
-- `compute_pre_scale_target()` - Conservative pre-scaling
-
-### Safe Mode
-- `update_safe_mode_from_calibration()` - Entry/exit thresholds
-
-### Agent Distribution
-- `distribute_workers_by_cost_priority()` - Cost-based worker distribution
-
-## Testing Strategy Recommendations
-
-1. **Follow existing patterns**: Use `#[cfg(test)]` modules with helper functions
-2. **Use deterministic time**: `chrono::Utc` with fixed timestamps like `base_now()`
-3. **Document helpers**: Use `///` comments with examples
-4. **Test edge cases**: Zero values, negative deltas, boundary conditions
-5. **Use floating-point tolerance**: `f64::EPSILON` or custom `TOL` for comparisons
-6. **Test realistic scenarios**: Consecutive polls, window resets, mixed behavior
-
-## Test Helper Patterns to Reuse
-
-```rust
-// From governor.rs window_delta_tests:
-fn make_window_pct_snapshot(five_hour: f64, seven_day: f64, seven_day_sonnet: f64) -> WindowPctSnapshot
-fn make_usage_snapshot(five_hour_pct: f64, seven_day_pct: f64, seven_day_sonnet_pct: f64) -> PrevUsageSnapshot
-
-// From alerts.rs:
-fn base_now() -> DateTime<Utc>
-fn make_window(cutoff_risk: bool, margin_hrs: f64, hrs_left: f64) -> WindowForecast
-
-// From state.rs:
-fn full_state() -> GovernorState
-```
+1. **Factory Functions**: Reusable functions to create test fixtures with defaults
+2. **Default Trait Usage**: Uses `..Default::default()` for unspecified fields
+3. **State Builders**: Pattern of building complex state incrementally
+4. **Snapshot Testing**: Tests snapshot state transitions (current -> previous)
+5. **Float Comparison**: Uses `f64::EPSILON` tolerance for floating point comparisons
+6. **Time Handling**: Uses `chrono::Utc::now()` and explicit time parameters for deterministic testing
 
 ## Summary
 
-The governor module is well-structured with clear separation of concerns:
-- **Data structures** capture state (UsageSnapshot, GovernorState, SprintState)
-- **Decision types** enumerate actions (ScalingDecision)
-- **Core functions** implement business logic (emergency brake, sprint, scaling)
-- **Helper functions** support operations (window delta, cost priority, pre-scale)
+The governor module is well-structured with:
+- Clear separation of concerns (emergency brake, sprint, scaling decision)
+- Comprehensive public API for state management and decision-making
+- Strong test coverage following consistent patterns
+- Good use of Rust idioms (defaults, builder pattern, Result types)
+- Thorough documentation of behavior in doc comments
 
-The existing `window_delta_tests` module demonstrates excellent test patterns:
-- Comprehensive coverage (18 tests for delta calculation)
-- Helper functions for test data construction
-- Edge case and precision testing
-- Realistic scenario simulation
-
-Other modules (`state.rs`, `alerts.rs`, `burn_rate.rs`) follow similar patterns with `#[cfg(test)]` modules, helper functions, and descriptive test names.
+Test patterns emphasize:
+- Factory functions for test fixture creation
+- Descriptive test names and documentation
+- Edge case coverage (zero values, negative values, resets)
+- Time-based scenario testing
+- Snapshot state transition testing
