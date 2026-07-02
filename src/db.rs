@@ -5,7 +5,7 @@
 //! `rebuild_from_jsonl()` reconstructs the DB from the authoritative JSONL.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::fs;
 use std::io::BufRead;
@@ -683,6 +683,189 @@ pub fn query_promotion_samples(
     }
 
     Ok(results)
+}
+
+/// Window percentage snapshot from the Anthropic API
+#[derive(Debug, Clone)]
+pub struct WindowPctSnapshot {
+    /// 5-hour window utilization percentage
+    pub five_hour: f64,
+    /// 7-day all-models window utilization percentage
+    pub seven_day: f64,
+    /// 7-day Sonnet window utilization percentage
+    pub seven_day_sonnet: f64,
+}
+
+/// Annotate instance and fleet records with window percentage deltas.
+///
+/// For the interval [t0, t1], computes the per-window percentage deltas from
+/// consecutive API snapshots (old_pct vs new_pct) and annotates:
+/// - Instance records (i): apportioned by total_usd weight
+/// - Fleet record (f): full (unapportioned) deltas
+///
+/// Guard conditions (returns early without error):
+/// - No records found for the interval
+/// - Interval spans a window reset (detected via negative deltas)
+/// - elapsed_seconds < 120 (too short for meaningful delta)
+/// - Worker count changed mid-interval
+pub fn annotate_window_pct_deltas(
+    conn: &Connection,
+    t0: DateTime<Utc>,
+    t1: DateTime<Utc>,
+    old_pct: &WindowPctSnapshot,
+    new_pct: &WindowPctSnapshot,
+    workers_at_start: u32,
+    workers_at_end: u32,
+) -> Result<()> {
+    // Compute elapsed time
+    let elapsed_seconds = (t1 - t0).num_seconds().abs() as i64;
+    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
+
+    // Guard: interval too short
+    if elapsed_seconds < 120 {
+        log::debug!(
+            "[annotate] skipping annotation: interval too short ({}s < 120s)",
+            elapsed_seconds
+        );
+        return Ok(());
+    }
+
+    // Guard: worker count changed mid-interval
+    if workers_at_start != workers_at_end {
+        log::debug!(
+            "[annotate] skipping annotation: worker count changed ({} -> {})",
+            workers_at_start,
+            workers_at_end
+        );
+        return Ok(());
+    }
+
+    // Compute per-window percentage deltas
+    let delta_5h = new_pct.five_hour - old_pct.five_hour;
+    let delta_7d = new_pct.seven_day - old_pct.seven_day;
+    let delta_7ds = new_pct.seven_day_sonnet - old_pct.seven_day_sonnet;
+
+    // Guard: skip if any window shows negative delta (window reset detected)
+    if delta_5h < 0.0 || delta_7d < 0.0 || delta_7ds < 0.0 {
+        log::debug!(
+            "[annotate] skipping annotation: window reset detected (d5h={:+.2}, d7d={:+.2}, d7ds={:+.2})",
+            delta_5h,
+            delta_7d,
+            delta_7ds
+        );
+        return Ok(());
+    }
+
+    // Query all instance records for this interval
+    let t0_str = t0.to_rfc3339();
+    let t1_str = t1.to_rfc3339();
+
+    let mut instance_stmt = conn.prepare(
+        "SELECT rowid, sess, total_usd FROM i WHERE t0 = ? AND t1 = ?"
+    )?;
+
+    let instances: Vec<(i64, String, f64)> = instance_stmt
+        .query_map(params![&t0_str, &t1_str], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Guard: no instance records found
+    if instances.is_empty() {
+        log::debug!(
+            "[annotate] skipping annotation: no instance records found for interval {} - {}",
+            t0_str,
+            t1_str
+        );
+        return Ok(());
+    }
+
+    // Compute total_usd sum for apportionment
+    let total_usd_sum: f64 = instances.iter().map(|(_, _, usd)| *usd).sum();
+
+    // Guard: no USD spent (all instances have zero total_usd)
+    if total_usd_sum <= 0.0 {
+        log::debug!(
+            "[annotate] skipping annotation: total_usd_sum = {} (no spend)",
+            total_usd_sum
+        );
+        return Ok(());
+    }
+
+    // Apportion and update each instance record
+    let tx = conn.unchecked_transaction()?;
+    for (rowid, sess, total_usd) in instances {
+        // Weight for this instance = its total_usd / fleet total_usd
+        let weight = total_usd / total_usd_sum;
+
+        // Apportioned deltas for this instance
+        let p5h = delta_5h * weight;
+        let p7d = delta_7d * weight;
+        let p7ds = delta_7ds * weight;
+
+        tx.execute(
+            "UPDATE i SET p5h = ?, p7d = ?, p7ds = ? WHERE rowid = ?",
+            params![p5h, p7d, p7ds, rowid],
+        )?;
+
+        log::trace!(
+            "[annotate] i row {}: sess={}, total_usd={:.4}, weight={:.3}, p5h={:.4}, p7d={:.4}, p7ds={:.4}",
+            rowid,
+            sess,
+            total_usd,
+            weight,
+            p5h,
+            p7d,
+            p7ds
+        );
+    }
+
+    // Update fleet record with full (unapportioned) deltas
+    let fleet_updated = tx.execute(
+        "UPDATE f SET p5h = ?, p7d = ?, p7ds = ?, usd_per_pct_7ds = CASE WHEN ? > 0 THEN total_usd / ? ELSE NULL END WHERE t0 = ? AND t1 = ?",
+        params![delta_5h, delta_7d, delta_7ds, delta_7ds, delta_7ds, &t0_str, &t1_str],
+    )?;
+
+    if fleet_updated > 0 {
+        // Compute usd_per_pct_7ds for the fleet record
+        let usd_per_pct_7ds = if delta_7ds > 0.0 {
+            // Query total_usd from the fleet record we just updated
+            let fleet_total_usd: f64 = tx.query_row(
+                "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
+                params![&t0_str, &t1_str],
+                |row| row.get(0)
+            ).unwrap_or(0.0);
+            fleet_total_usd / delta_7ds
+        } else {
+            0.0
+        };
+
+        tx.execute(
+            "UPDATE f SET usd_per_pct_7ds = ? WHERE t0 = ? AND t1 = ?",
+            params![usd_per_pct_7ds, &t0_str, &t1_str],
+        )?;
+
+        log::info!(
+            "[annotate] f row: t0={}, t1={}, p5h={:.4}, p7d={:.4}, p7ds={:.4}, usd_per_pct_7ds={:.4}, elapsed={:.1}s",
+            t0_str,
+            t1_str,
+            delta_5h,
+            delta_7d,
+            delta_7ds,
+            usd_per_pct_7ds,
+            elapsed_seconds
+        );
+    } else {
+        log::warn!(
+            "[annotate] no fleet record found for interval {} - {}",
+            t0_str,
+            t1_str
+        );
+    }
+
+    tx.commit()?;
+
+    Ok(())
 }
 
 #[cfg(test)]

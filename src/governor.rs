@@ -604,6 +604,173 @@ fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: 
 }
 
 // ---------------------------------------------------------------------------
+// Window delta calculation helpers
+// ---------------------------------------------------------------------------
+
+/// Calculate percentage deltas between consecutive API poll snapshots.
+///
+/// Computes the per-window percentage changes between two consecutive
+/// usage snapshots. Returns deltas for (5-hour, 7-day, 7-day-sonnet) windows.
+///
+/// # Arguments
+/// - `previous_snapshot`: Usage snapshot from the previous poll cycle
+/// - `current_snapshot`: Usage snapshot from the current poll cycle
+///
+/// # Returns
+/// A tuple of (delta_5h, delta_7d, delta_7ds) where each value is the
+/// percentage change (current - previous) for that window.
+///
+/// # Example
+/// ```
+/// let prev = WindowPctSnapshot { five_hour: 10.0, seven_day: 20.0, seven_day_sonnet: 15.0 };
+/// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, seven_day_sonnet: 18.0 };
+/// let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+/// assert_eq!(d5h, 2.5);  // 12.5 - 10.0
+/// assert_eq!(d7d, 2.0);   // 22.0 - 20.0
+/// assert_eq!(d7ds, 3.0); // 18.0 - 15.0
+/// ```
+pub fn calculate_window_pct_delta(
+    previous_snapshot: &crate::db::WindowPctSnapshot,
+    current_snapshot: &crate::db::WindowPctSnapshot,
+) -> (f64, f64, f64) {
+    let delta_5h = current_snapshot.five_hour - previous_snapshot.five_hour;
+    let delta_7d = current_snapshot.seven_day - previous_snapshot.seven_day;
+    let delta_7ds = current_snapshot.seven_day_sonnet - previous_snapshot.seven_day_sonnet;
+    (delta_5h, delta_7d, delta_7ds)
+}
+
+/// Apportion a total delta to a specific session based on USD weight.
+///
+/// When a fleet-wide percentage delta is observed, this function computes
+/// the portion attributable to a single session by weighting the session's
+/// USD spend against the total fleet spend for the interval.
+///
+/// # Arguments
+/// - `total_delta`: The total percentage delta for the entire fleet
+/// - `total_usd`: Total USD spent by the entire fleet in the interval
+/// - `session_total_usd`: USD spent by this specific session in the interval
+///
+/// # Returns
+/// The apportioned delta for this session (will be 0.0 if total_usd is 0.0).
+///
+/// # Example
+/// ```
+/// // Fleet burned 2.5% of 7-day quota in an interval
+/// // Session A spent $10 out of fleet total $50
+/// let session_delta = apportion_delta(2.5, 50.0, 10.0);
+/// assert!((session_delta - 0.5).abs() < 0.001);  // 2.5 * (10/50) = 0.5
+/// ```
+pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64) -> f64 {
+    if total_usd <= 0.0 {
+        return 0.0;
+    }
+    let weight = session_total_usd / total_usd;
+    total_delta * weight
+}
+
+#[cfg(test)]
+mod window_delta_tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_window_pct_delta_basic() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 20.0,
+            seven_day_sonnet: 15.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 22.0,
+            seven_day_sonnet: 18.0,
+        };
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+        assert!((d5h - 2.5).abs() < f64::EPSILON);
+        assert!((d7d - 2.0).abs() < f64::EPSILON);
+        assert!((d7ds - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_window_pct_delta_negative_deltas() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 30.0,
+            seven_day_sonnet: 25.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 15.0,
+            seven_day: 22.0,
+            seven_day_sonnet: 18.0,
+        };
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+        assert!((d5h - (-5.0)).abs() < f64::EPSILON);
+        assert!((d7d - (-8.0)).abs() < f64::EPSILON);
+        assert!((d7ds - (-7.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_window_pct_delta_zero_previous() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 0.0,
+            seven_day: 0.0,
+            seven_day_sonnet: 0.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 5.0,
+            seven_day: 10.0,
+            seven_day_sonnet: 7.5,
+        };
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+        assert!((d5h - 5.0).abs() < f64::EPSILON);
+        assert!((d7d - 10.0).abs() < f64::EPSILON);
+        assert!((d7ds - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apportion_delta_basic() {
+        // Fleet delta: 2.5%, fleet total: $50, session: $10
+        let result = apportion_delta(2.5, 50.0, 10.0);
+        assert!((result - 0.5).abs() < f64::EPSILON); // 2.5 * (10/50) = 0.5
+    }
+
+    #[test]
+    fn test_apportion_delta_zero_total_usd() {
+        let result = apportion_delta(2.5, 0.0, 10.0);
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn test_apportion_delta_zero_session_usd() {
+        let result = apportion_delta(2.5, 50.0, 0.0);
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn test_apportion_delta_equal_weights() {
+        // Two sessions with equal spend
+        let result1 = apportion_delta(3.0, 60.0, 30.0);  // Half of total
+        let result2 = apportion_delta(3.0, 60.0, 30.0);  // Half of total
+        assert!((result1 - 1.5).abs() < f64::EPSILON);
+        assert!((result2 - 1.5).abs() < f64::EPSILON);
+        assert!((result1 + result2 - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apportion_delta_negative_total_delta() {
+        // Window reset case: negative delta
+        let result = apportion_delta(-5.0, 50.0, 10.0);
+        assert!((result - (-1.0)).abs() < f64::EPSILON); // -5.0 * (10/50) = -1.0
+    }
+
+    #[test]
+    fn test_apportion_delta_fractional_weights() {
+        // Session spent 1/3 of total
+        let result = apportion_delta(6.0, 90.0, 30.0);
+        assert!((result - 2.0).abs() < f64::EPSILON); // 6.0 * (30/90) = 2.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent cost priority helpers
 // ---------------------------------------------------------------------------
 
@@ -1637,6 +1804,43 @@ pub fn run_governor_cycle(
     } else {
         0.0
     };
+
+    // 5-pre-b. Annotate window percentage deltas in the SQLite mirror.
+    //
+    // After computing API deltas, annotate the i and f records for the interval
+    // with the per-window percentage deltas, apportioning by total_usd weight.
+    // This unblocks empirical promotion validation and downstream analytics.
+    if !state.usage.stale {
+        if let (Some(ref prev_snap), Ok(conn)) = (&old_snapshot, db::open_db(&db_path)) {
+            let t0 = state.last_fleet_aggregate.t0;
+            let t1 = state.last_fleet_aggregate.t1;
+            let workers_at_start = state.last_fleet_aggregate.sonnet_workers;
+            let workers_at_end = current_total;
+
+            let old_pct = db::WindowPctSnapshot {
+                five_hour: prev_snap.five_hour_pct,
+                seven_day: prev_snap.seven_day_pct,
+                seven_day_sonnet: prev_snap.seven_day_sonnet_pct,
+            };
+            let new_pct = db::WindowPctSnapshot {
+                five_hour: state.usage.five_hour_pct,
+                seven_day: state.usage.all_models_pct,
+                seven_day_sonnet: state.usage.sonnet_pct,
+            };
+
+            if let Err(e) = db::annotate_window_pct_deltas(
+                &conn,
+                t0,
+                t1,
+                &old_pct,
+                &new_pct,
+                workers_at_start,
+                workers_at_end,
+            ) {
+                log::warn!("[governor] failed to annotate window pct deltas: {}", e);
+            }
+        }
+    }
 
     // Build current utilization map from polled usage
     let mut current_utilization = HashMap::new();
