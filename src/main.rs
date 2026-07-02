@@ -181,7 +181,7 @@ fn append_to_governor_log(message: &str, config: &GovernorConfig) -> Result<()> 
 #[derive(Parser)]
 #[command(name = "cgov")]
 #[command(about = "Claude Governor - automated capacity governor for Claude Code", long_about = None)]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -2182,5 +2182,20 @@ mod tests {
         // Verify .4 does NOT exist (should never be created)
         let backup_4 = log_path.with_extension("log.4");
         assert!(!backup_4.exists(), "Backup .4 should NOT exist");
+    }
+
+    #[test]
+    fn test_version_sync() {
+        // Regression test: ensure clap Cli version always matches Cargo.toml version
+        // This prevents the hardcoded version drift that occurred in v0.1.0 -> v0.1.1
+        use clap::CommandFactory;
+        let cargo_version = env!("CARGO_PKG_VERSION");
+        let cli = Cli::command();
+        let clap_version = cli.get_version().expect("Cli should have version set");
+
+        assert_eq!(
+            cargo_version, clap_version,
+            "Clap version must match CARGO_PKG_VERSION - do not hardcode #[command(version = \"X.Y.Z\")]"
+        );
     }
 }
