@@ -2582,52 +2582,30 @@ pub fn run_governor_cycle(
             });
 
             // Calculate window deltas from consecutive API snapshots
-            // Explicit pattern matching for all snapshot availability cases
-            match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-                (Some(prev), Some(curr)) => {
-                    // Both snapshots available: proceed with delta computation
-                    let prev_pct = crate::db::WindowPctSnapshot {
-                        five_hour: prev.five_hour_pct,
-                        seven_day: prev.seven_day_pct,
-                        seven_day_sonnet: prev.seven_day_sonnet_pct,
-                    };
-                    let curr_pct = crate::db::WindowPctSnapshot {
-                        five_hour: curr.five_hour_pct,
-                        seven_day: curr.seven_day_pct,
-                        seven_day_sonnet: curr.seven_day_sonnet_pct,
-                    };
-                    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+            if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
+                // Both snapshots available: proceed with delta computation
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-                    // Store computed deltas in governor state
-                    state.p5h_delta = Some(delta_5h);
-                    state.p7d_delta = Some(delta_7d);
-                    state.p7ds_delta = Some(delta_7ds);
+                // Store computed deltas in governor state
+                state.p5h_delta = Some(delta_5h);
+                state.p7d_delta = Some(delta_7d);
+                state.p7ds_delta = Some(delta_7ds);
 
-                    log::info!(
-                        "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
-                        now.to_rfc3339(),
-                        delta_5h, delta_7d, delta_7ds
-                    );
-                }
-                (None, Some(_curr)) => {
-                    // First poll: no previous snapshot available, cannot compute delta
-                    // Set delta fields to zero to indicate no change from initial state
-                    state.p5h_delta = Some(0.0);
-                    state.p7d_delta = Some(0.0);
-                    state.p7ds_delta = Some(0.0);
-                    log::info!(
-                        "[governor] first poll detected (no previous snapshot), skipping delta computation; deltas set to zero"
-                    );
-                }
-                (None, None) | (Some(_), None) => {
-                    // Neither snapshot available OR only previous available: handle gracefully
-                    // This case should not occur under normal operation since we just set current_api_snapshot above
-                    log::warn!(
-                        "[governor] unexpected snapshot state (prev={:?}, curr={:?}), skipping delta computation",
-                        state.previous_api_snapshot.is_some(),
-                        state.current_api_snapshot.is_some()
-                    );
-                }
+                log::info!(
+                    "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
+                    now.to_rfc3339(),
+                    delta_5h, delta_7d, delta_7ds
+                );
             }
         }
         Err(e) => {
