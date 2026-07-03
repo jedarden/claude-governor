@@ -473,7 +473,12 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 **Off-peak:** Everything else (all weekends, weekday evenings/nights)
 
 **Promotion detection:**
-- Governor ships with a `promotions.json` config file listing active promotions:
+- Governor reads a `promotions.json` config file listing active promotions.
+- When no active promotion is defined, `promotions.json` contains an empty array `[]`, which results in `offpeak_multiplier = 1.0` (flat model — this is the correct default when no promotion is running).
+- The schedule calculator returns the current effective multiplier at any moment.
+
+**Example — historical promotion entry:**
+The following configuration was used during the March 2026 Off-Peak 2x promotion (now expired):
 
 ```json
 [
@@ -489,8 +494,7 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 ]
 ```
 
-- When no active promotion, `offpeak_multiplier = 1.0` (flat model)
-- The schedule calculator returns the current effective multiplier at any moment
+After the promotion ends, `promotions.json` should be reverted to an empty array `[]` to return to the flat 1.0 multiplier model.
 
 **Effective capacity calculation:**
 ```python
@@ -914,7 +918,7 @@ Auto-tuning is opt-in via `calibration.auto_calibrate: true` in `governor.yaml`.
 
 **Purpose:** Anticipate upcoming promotion multiplier transitions and begin scaling changes *before* the boundary hits, preventing the burst of over-consumption when effective burn rate changes abruptly.
 
-**Problem:** At 08:00 ET on a weekday during the March 2026 promotion, the multiplier drops from 2x to 1x. If the governor is running 5 workers at an effective burn rate sustainable only at 2x, the burn rate against quota effectively doubles instantly. By the time the next governor cycle detects this (up to 5 minutes later), significant quota has been consumed at the higher effective rate.
+**Problem (historical example):** During the March 2026 Off-Peak 2x promotion, at 08:00 ET on a weekday the multiplier dropped from 2x to 1x. If the governor is running 5 workers at an effective burn rate sustainable only at 2x, the burn rate against quota effectively doubles instantly. By the time the next governor cycle detects this (up to 5 minutes later), significant quota has been consumed at the higher effective rate. Pre-scaling mitigates this by beginning the scale-down before the boundary is reached.
 
 **Mechanism:** The schedule calculator gains a `next_transition()` function:
 
@@ -1196,7 +1200,7 @@ cgov doctor — 2026-03-18 14:30 ET
 **Remediation hints:** Each failing check includes a specific fix command:
 - Credentials expired → `"Run: claude login"`
 - SQLite corrupt → `"Run: cgov token-history --rebuild-db"`
-- Pricing mismatch → `"Update pricing in ~/.needle/config/governor.yaml"`
+- Pricing mismatch → `"Update pricing in ~/.config/claude-governor/governor.yaml"`
 - Collector not running → `"Run: cgov start"`
 
 ---
@@ -1302,7 +1306,7 @@ The range `2.0–3.8h` replaces the single `2.9h`, immediately communicating unc
 
 ## Configuration File
 
-`~/.needle/config/governor.yaml`:
+`~/.config/claude-governor/governor.yaml`:
 
 ```yaml
 # Governor configuration
@@ -1361,7 +1365,7 @@ agents:
 # per-worker cost that has capacity (current < max_workers).
 
 # Promotion definitions
-promotions_file: ~/.needle/config/promotions.json
+promotions_file: ~/.config/claude-governor/promotions.json
 
 # API pricing (USD per million tokens) — used for dollar-equivalent burn rate
 # Source: https://platform.claude.com/docs/en/about-claude/pricing
@@ -1546,7 +1550,7 @@ safe_mode:
    - `effective_hours_remaining(reset_time)` → float
    - Reads from `promotions.json`
 
-2. Write `promotions.json` with the March 2026 promotion entry.
+2. When a promotion is active, create `promotions.json` with an entry defining the promotion window (see Component 4 for format). When no promotion is running, `promotions.json` should be an empty array `[]` (flat 1.0 multiplier).
 
 3. Unit tests:
    - Peak hour boundaries (7:59 AM ET → 1x, 8:00 AM ET → 1x peak, 2:01 PM ET → 2x)
@@ -1837,7 +1841,7 @@ Binary replacement is atomic — config files are never touched.
 cgov disable
 rm ~/.local/bin/cgov
 ```
-Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (collected data) or `~/.needle/config/governor.yaml` (configuration).
+Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (collected data) or `~/.config/claude-governor/governor.yaml` (configuration).
 
 **Deliverable:** `cgov` binary, systemd unit files, `README.md` quickstart
 
@@ -1899,7 +1903,7 @@ Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (col
    - Test: synthetic token records with known cache ratios, verify metric and alert logic
 
 9. Implement `src/doctor.rs` (Component 19):
-   - 12 health checks with pass/warn/fail thresholds
+   - Health checks with pass/warn/fail thresholds (the implementation includes ~20 checks covering OAuth, API, collector, burn rates, pricing, promotions, database, daemon, and prediction accuracy)
    - Structured JSON output (`--json`) + human-readable table (TTY)
    - Specific remediation commands per failure type
    - Test: break each check condition, verify detection and remediation text
@@ -1927,27 +1931,36 @@ Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (col
 ```
 claude-governor/
 ├── Cargo.toml                # Rust project manifest
+├── Makefile                  # Build automation (linux-amd64, linux-arm64)
 ├── src/
 │   ├── main.rs               # CLI entry point + subcommand dispatch
+│   ├── lib.rs                # Library exports
+│   ├── config.rs             # Configuration loader and path resolution
+│   ├── db.rs                 # Database layer (SQLite wrapper)
 │   ├── poller.rs             # Usage API poller (Phase 1) — ureq + rustls
 │   ├── collector.rs          # Token collector (Phase 1b)
 │   ├── governor.rs           # Main daemon loop (Phase 4)
+│   ├── governor_cycle_snapshot_test.rs  # Integration test fixtures
 │   ├── worker.rs             # Worker manager — launch/stop via configured commands (Phase 4)
 │   ├── alerts.rs             # Alert creation (Phase 5)
 │   ├── schedule.rs           # Peak/off-peak calculator (Phase 2)
 │   ├── burn_rate.rs          # Model-specific burn rate EMA (Phase 3)
+│   ├── pricing.rs            # Pricing model and dollar-equivalent calculation
 │   ├── simulator.rs          # Trajectory projection (Phase 7)
 │   ├── calibrator.rs         # Prediction accuracy self-tuning (Phase 7)
 │   ├── narrator.rs           # Decision explanation generator (Phase 7)
 │   ├── doctor.rs             # Health diagnostic (Phase 7)
-│   └── state.rs              # State store — JSON read/write + rusqlite
+│   ├── state.rs              # State store — JSON read/write + rusqlite
+│   ├── capacity_summary.rs  # Capacity forecast aggregation
+│   ├── status_display.rs     # Human-readable status output
+│   └── fixtures.rs          # Test fixtures and helpers
 ├── config/
 │   ├── governor.yaml         # Main configuration (incl. pricing table)
-│   └── promotions.json       # Promotion window definitions
-├── systemd/
+│   ├── promotions.json       # Promotion window definitions (empty by default when no active promotion)
 │   ├── claude-governor.service       # Systemd user service — governor daemon
-│   └── claude-token-collector.service  # Systemd user service — token collector
-├── install.sh                # Download binary + write default config
+│   ├── claude-token-collector.service  # Systemd user service — token collector
+│   └── cgov.service         # Alternative governor daemon service name
+├── install.sh                # Download binary + write default config (supports linux-amd64, linux-arm64)
 ├── docs/
 │   ├── research/
 │   │   ├── usage-tracking.md
@@ -2009,7 +2022,7 @@ claude-governor/
 
 4. **Bead state after forced kill:** If a worker is killed mid-task, the bead remains `IN_PROGRESS` until the stale claim threshold fires. Prefer graceful shutdown to avoid this.
 
-5. **Promotion end date:** After March 28, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly.
+5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. (The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after this date, `promotions.json` should have been reverted to an empty array `[]`.)
 
 6. **Multiple accounts / credential rotation:** The poller assumes a single `~/.claude/.credentials.json`. If multiple accounts are used, parameterize the credentials path.
 
@@ -2019,4 +2032,4 @@ claude-governor/
 
 9. **Single vs. two-tier cache write fallback:** Not all API responses include the `cache_creation` sub-object (it may be absent in older response formats or certain service tiers). When absent, attribute all `cache_creation_input_tokens` to the 5-minute tier (1.25× rate) as the conservative fallback — this slightly underestimates cost rather than overestimating.
 
-9. **Model attribution in multi-model sessions:** A single Claude Code session can make calls to multiple models (e.g., a tool-call routing to Haiku while the main conversation uses Sonnet). Token records must be attributed per-model from the `model` field in each response, not inferred from the session path alone.
+10. **Model attribution in multi-model sessions:** A single Claude Code session can make calls to multiple models (e.g., a tool-call routing to Haiku while the main conversation uses Sonnet). Token records must be attributed per-model from the `model` field in each response, not inferred from the session path alone.
