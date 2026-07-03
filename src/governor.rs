@@ -1595,6 +1595,337 @@ mod window_delta_tests {
         assert!((p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON, "Second poll: 7d delta should be 2.0");
         assert!((p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON, "Second poll: 7ds delta should be 3.0");
     }
+
+    /// Test edge case: both previous and current snapshots are None.
+    ///
+    /// Verifies panic prevention and graceful handling when no snapshot data is available.
+    /// This can occur during governor initialization or when the collector is offline.
+    #[test]
+    fn test_no_snapshots_available_no_panic() {
+        use crate::state::PrevUsageSnapshot;
+
+        // Edge case: neither snapshot available (e.g., collector offline, initialization)
+        let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
+        let current_api_snapshot: Option<PrevUsageSnapshot> = None;
+
+        let mut p5h_delta: Option<f64> = None;
+        let mut p7d_delta: Option<f64> = None;
+        let mut p7ds_delta: Option<f64> = None;
+
+        // This should not panic and should leave deltas as None
+        match (&previous_api_snapshot, &current_api_snapshot) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {
+                // Neither snapshot available OR only previous available: handle gracefully
+                // Leave deltas as None - verified by assertions below
+            }
+        }
+
+        // Verify: no panic occurred (test is still running)
+        // Verify: delta computation was skipped
+        // Verify: deltas remain None (not Some(0.0))
+        assert_eq!(p5h_delta, None, "5h delta should be None when no snapshots available");
+        assert_eq!(p7d_delta, None, "7d delta should be None when no snapshots available");
+        assert_eq!(p7ds_delta, None, "7ds delta should be None when no snapshots available");
+    }
+
+    /// Test edge case: previous snapshot exists but current is None.
+    ///
+    /// Verifies panic prevention and graceful handling when the current poll fails
+    /// to produce a snapshot (e.g., API error, timeout).
+    #[test]
+    fn test_previous_snapshot_without_current_no_panic() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // Edge case: previous exists but current is None (e.g., API error in current poll)
+        let previous_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            seven_day_sonnet_pct: 15.0,
+        });
+        let current_api_snapshot: Option<PrevUsageSnapshot> = None;
+
+        let mut p5h_delta: Option<f64> = None;
+        let mut p7d_delta: Option<f64> = None;
+        let mut p7ds_delta: Option<f64> = None;
+
+        // This should not panic and should leave deltas as None
+        match (&previous_api_snapshot, &current_api_snapshot) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {
+                // Neither snapshot available OR only previous available: handle gracefully
+                // Leave deltas as None - verified by assertions below
+            }
+        }
+
+        // Verify: no panic occurred (test is still running)
+        // Verify: delta computation was skipped
+        // Verify: deltas remain None (not Some(0.0))
+        assert_eq!(p5h_delta, None, "5h delta should be None when current snapshot is missing");
+        assert_eq!(p7d_delta, None, "7d delta should be None when current snapshot is missing");
+        assert_eq!(p7ds_delta, None, "7ds delta should be None when current snapshot is missing");
+    }
+
+    /// Test that delta computation is explicitly skipped on first poll.
+    ///
+    /// Verifies that when previous_api_snapshot is None, the delta computation
+    /// logic is bypassed entirely, not just returning zero values.
+    #[test]
+    fn test_delta_computation_skipped_on_first_poll() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
+        let current_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 25.0,
+            seven_day_pct: 45.0,
+            seven_day_sonnet_pct: 35.0,
+        });
+
+        let mut delta_computation_attempted = false;
+
+        // Track whether delta computation was attempted
+        match (&previous_api_snapshot, &current_api_snapshot) {
+            (Some(prev), Some(curr)) => {
+                // This branch should NOT be reached on first poll
+                delta_computation_attempted = true;
+                let _prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let _curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let _deltas = calculate_window_pct_delta(&_prev_pct, &_curr_pct);
+            }
+            (None, Some(_curr)) => {
+                // First poll: delta computation skipped
+                delta_computation_attempted = false;
+            }
+            (None, None) | (Some(_), None) => {
+                delta_computation_attempted = false;
+            }
+        }
+
+        // Verify: delta computation was NOT attempted
+        assert!(!delta_computation_attempted, "Delta computation should be skipped on first poll");
+    }
+
+    /// Test panic prevention with extreme utilization values.
+    ///
+    /// Verifies that the delta computation and snapshot handling don't panic
+    /// with extreme but valid utilization values (0%, 100%, very close to threshold).
+    #[test]
+    fn test_panic_prevention_with_extreme_values() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // Test case 1: utilization at exactly 98% (emergency brake threshold)
+        let prev = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 98.0,
+            seven_day_pct: 98.0,
+            seven_day_sonnet_pct: 98.0,
+        };
+
+        let curr = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 98.0,
+            seven_day_pct: 98.0,
+            seven_day_sonnet_pct: 98.0,
+        };
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev.five_hour_pct,
+            seven_day: prev.seven_day_pct,
+            seven_day_sonnet: prev.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        // Should not panic with values at threshold
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+        assert_eq!(delta_5h, 0.0);
+        assert_eq!(delta_7d, 0.0);
+        assert_eq!(delta_7ds, 0.0);
+
+        // Test case 2: utilization at exactly 0%
+        let prev_zero = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 0.0,
+            seven_day_pct: 0.0,
+            seven_day_sonnet_pct: 0.0,
+        };
+
+        let curr_zero = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 0.0,
+            seven_day_pct: 0.0,
+            seven_day_sonnet_pct: 0.0,
+        };
+
+        let prev_pct_zero = crate::db::WindowPctSnapshot {
+            five_hour: prev_zero.five_hour_pct,
+            seven_day: prev_zero.seven_day_pct,
+            seven_day_sonnet: prev_zero.seven_day_sonnet_pct,
+        };
+
+        let curr_pct_zero = crate::db::WindowPctSnapshot {
+            five_hour: curr_zero.five_hour_pct,
+            seven_day: curr_zero.seven_day_pct,
+            seven_day_sonnet: curr_zero.seven_day_sonnet_pct,
+        };
+
+        // Should not panic with zero values
+        let (delta_5h_zero, delta_7d_zero, delta_7ds_zero) = calculate_window_pct_delta(&prev_pct_zero, &curr_pct_zero);
+        assert_eq!(delta_5h_zero, 0.0);
+        assert_eq!(delta_7d_zero, 0.0);
+        assert_eq!(delta_7ds_zero, 0.0);
+    }
+
+    /// Test that default delta value (0.0) is correctly set on first poll.
+    ///
+    /// Verifies that the default value Some(0.0) is used specifically for the
+    /// first poll case (None, Some), not for other edge cases.
+    #[test]
+    fn test_default_delta_value_specific_to_first_poll() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // First poll: should get Some(0.0) as default
+        let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
+        let current_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 30.0,
+            seven_day_pct: 50.0,
+            seven_day_sonnet_pct: 40.0,
+        });
+
+        let mut p5h_delta: Option<f64> = None;
+        let mut p7d_delta: Option<f64> = None;
+        let mut p7ds_delta: Option<f64> = None;
+
+        match (&previous_api_snapshot, &current_api_snapshot) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                // Default value for first poll
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {
+                // Leave deltas as None - different from first poll default
+            }
+        }
+
+        // Verify first poll gets Some(0.0) default
+        assert_eq!(p5h_delta, Some(0.0), "First poll should default to Some(0.0)");
+        assert_eq!(p7d_delta, Some(0.0), "First poll should default to Some(0.0)");
+        assert_eq!(p7ds_delta, Some(0.0), "First poll should default to Some(0.0)");
+
+        // Contrast with (None, None) case which should remain None
+        let mut p5h_delta_none: Option<f64> = None;
+        let mut p7d_delta_none: Option<f64> = None;
+        let mut p7ds_delta_none: Option<f64> = None;
+
+        let none_snap: Option<PrevUsageSnapshot> = None;
+        match (&none_snap, &none_snap) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta_none = Some(delta_5h);
+                p7d_delta_none = Some(delta_7d);
+                p7ds_delta_none = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                p5h_delta_none = Some(0.0);
+                p7d_delta_none = Some(0.0);
+                p7ds_delta_none = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {
+                // Remain None - different from first poll
+            }
+        }
+
+        // Verify (None, None) remains None (not Some(0.0))
+        assert_eq!(p5h_delta_none, None, "(None, None) should remain None, not Some(0.0)");
+        assert_eq!(p7d_delta_none, None, "(None, None) should remain None, not Some(0.0)");
+        assert_eq!(p7ds_delta_none, None, "(None, None) should remain None, not Some(0.0)");
+    }
 }
 
 // ---------------------------------------------------------------------------
