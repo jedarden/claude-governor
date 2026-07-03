@@ -2022,11 +2022,9 @@ pub fn run_governor_cycle(
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
                 // Store computed deltas in governor state
-                state.last_fleet_aggregate.window_pct_deltas = state::WindowPctDeltas {
-                    five_hour: delta_5h,
-                    seven_day: delta_7d,
-                    seven_day_sonnet: delta_7ds,
-                };
+                state.p5h_delta = Some(delta_5h);
+                state.p7d_delta = Some(delta_7d);
+                state.p7ds_delta = Some(delta_7ds);
 
                 log::info!(
                     "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
