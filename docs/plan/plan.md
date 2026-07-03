@@ -1957,37 +1957,37 @@ Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (col
 ```
 claude-governor/
 ├── Cargo.toml                # Rust project manifest
-├── Makefile                  # Build automation (linux-amd64, linux-arm64)
-├── install.sh                # Download binary + write default config (supports linux-amd64, linux-arm64)
+├── Makefile                   # Build automation (linux-amd64, linux-arm64)
+├── install.sh                 # Download binary + write default config (supports linux-amd64, linux-arm64)
 ├── src/
-│   ├── main.rs               # CLI entry point + subcommand dispatch
-│   ├── lib.rs                # Library exports
-│   ├── config.rs             # Configuration loader and path resolution
-│   ├── db.rs                 # Database layer (SQLite wrapper)
-│   ├── poller.rs             # Usage API poller (Phase 1) — ureq + rustls
-│   ├── collector.rs          # Token collector (Phase 1b)
-│   ├── governor.rs           # Main daemon loop (Phase 4)
-│   ├── worker.rs             # Worker manager — launch/stop via configured commands (Phase 4)
-│   ├── alerts.rs             # Alert creation (Phase 5)
-│   ├── schedule.rs           # Peak/off-peak calculator (Phase 2)
-│   ├── burn_rate.rs          # Model-specific burn rate EMA (Phase 3)
-│   ├── pricing.rs            # Pricing model and dollar-equivalent calculation
-│   ├── simulator.rs          # Trajectory projection (Phase 7)
-│   ├── calibrator.rs         # Prediction accuracy self-tuning (Phase 7)
-│   ├── narrator.rs           # Decision explanation generator (Phase 7)
-│   ├── doctor.rs             # Health diagnostic (Phase 7)
-│   ├── state.rs              # State store — JSON read/write + rusqlite
-│   ├── capacity_summary.rs   # Capacity forecast aggregation
-│   └── status_display.rs     # Human-readable status output
+│   ├── main.rs                # CLI entry point + subcommand dispatch
+│   ├── lib.rs                 # Library exports
+│   ├── config.rs              # Configuration loader and path resolution
+│   ├── db.rs                  # Database layer (SQLite wrapper)
+│   ├── poller.rs              # Usage API poller (Phase 1) — ureq + rustls
+│   ├── collector.rs           # Token collector (Phase 1b)
+│   ├── governor.rs            # Main daemon loop (Phase 4)
+│   ├── worker.rs              # Worker manager — launch/stop via configured commands (Phase 4)
+│   ├── alerts.rs              # Alert creation (Phase 5)
+│   ├── schedule.rs            # Peak/off-peak calculator (Phase 2)
+│   ├── burn_rate.rs           # Model-specific burn rate EMA (Phase 3)
+│   ├── pricing.rs             # Pricing model and dollar-equivalent calculation
+│   ├── simulator.rs           # Trajectory projection (Phase 7)
+│   ├── calibrator.rs          # Prediction accuracy self-tuning (Phase 7)
+│   ├── narrator.rs            # Decision explanation generator (Phase 7)
+│   ├── doctor.rs              # Health diagnostic (Phase 7)
+│   ├── state.rs               # State store — JSON read/write + rusqlite
+│   ├── capacity_summary.rs    # Capacity forecast aggregation
+│   └── status_display.rs      # Human-readable status output
 ├── tests/
-│   ├── fixtures.rs           # Test fixtures and helpers
+│   ├── fixtures.rs            # Test fixtures and helpers
 │   └── governor_cycle_snapshot_test.rs  # Integration test fixtures
 ├── config/
-│   ├── governor.yaml         # Main configuration (incl. pricing table)
-│   ├── promotions.json       # Promotion window definitions (empty by default when no active promotion)
-│   ├── claude-governor.service        # Systemd user service — governor daemon
-│   ├── claude-token-collector.service # Systemd user service — token collector
-│   └── cgov.service          # Alternative governor daemon service name
+│   ├── governor.yaml          # Main configuration (incl. pricing table)
+│   ├── promotions.json        # Promotion window definitions (empty by default when no active promotion)
+│   ├── cgov.service           # Systemd user service — governor daemon
+│   ├── claude-governor.service        # Alternative governor daemon service name
+│   └── claude-token-collector.service # Systemd user service — token collector
 ├── docs/
 │   ├── research/
 │   │   ├── usage-tracking.md
