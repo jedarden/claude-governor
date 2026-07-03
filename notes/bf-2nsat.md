@@ -111,3 +111,42 @@ Line 2036 comment says:
 > "Ensure delta fields remain at default (0.0) - no update needed"
 
 But the actual default is `None`, not `0.0`. The comment is misleading - on first poll, the delta fields remain `None`, not `0.0`. Only after the **second** poll (when both prev and curr exist) do they get set to `Some(f64_value)`.
+
+## PrevUsageSnapshot Type
+
+From `src/state.rs`:
+
+```rust
+/// Persisted in state so that the governor can compute pct/hr from consecutive
+/// API readings even across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrevUsageSnapshot {
+    /// When this snapshot was taken (wall-clock time of the API poll)
+    pub taken_at: DateTime<Utc>,
+    pub five_hour_pct: f64,
+    pub seven_day_pct: f64,
+    pub seven_day_sonnet_pct: f64,
+}
+```
+
+## Lifecycle Summary
+
+| Phase | previous_api_snapshot | current_api_snapshot | Delta Fields | Notes |
+|-------|----------------------|----------------------|--------------|-------|
+| Initial state | `None` | `None` | `None`, `None`, `None` | Before first poll |
+| After shift (1st poll) | `None` | `None` | `None`, `None`, `None` | take() on None = None |
+| After 1st successful poll | `None` | `Some(snapshot1)` | `None`, `None`, `None` | Delta computation skipped |
+| After shift (2nd poll) | `Some(snapshot1)` | `None` | `None`, `None`, `None` | Deltas still from prior cycle |
+| After 2nd successful poll | `Some(snapshot1)` | `Some(snapshot2)` | `Some(d5h)`, `Some(d7d)`, `Some(d7ds)` | First delta computed |
+| After shift (3rd poll) | `Some(snapshot2)` | `None` | Preserved | Deltas persist |
+| After 3rd successful poll | `Some(snapshot2)` | `Some(snapshot3)` | Updated | New deltas computed |
+
+**Key insight:** Delta fields persist in state between cycles. They are only updated when both snapshots exist (after the second poll and onward).
+
+## Acceptance Criteria Status
+
+- [x] Understand the snapshot shift logic (line 1980)
+- [x] Understand current pattern matching for delta computation (lines 2011-2040)
+- [x] Identify what happens on first poll when prev_snapshot is None
+- [x] Understand state initialization of p5h_delta, p7d_delta, p7ds_delta fields
