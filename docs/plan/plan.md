@@ -478,7 +478,7 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 - The schedule calculator returns the current effective multiplier at any moment.
 
 **Example — historical promotion entry:**
-The following configuration was used during the March 2026 Off-Peak 2x promotion (now expired):
+The following configuration was used during the March 2026 Off-Peak 2x promotion (now expired). This is provided as a reference for future promotions; when no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier).
 
 ```json
 [
@@ -494,7 +494,13 @@ The following configuration was used during the March 2026 Off-Peak 2x promotion
 ]
 ```
 
-After the promotion ends, `promotions.json` should be reverted to an empty array `[]` to return to the flat 1.0 multiplier model.
+**Default configuration (no active promotion):**
+
+```json
+[]
+```
+
+An empty `promotions.json` results in `offpeak_multiplier = 1.0` (flat model — this is the correct default when no promotion is running).
 
 **Effective capacity calculation:**
 ```python
@@ -1164,36 +1170,56 @@ The governor does not automatically act on cache efficiency (causes are too vari
 | OAuth credentials | Valid, >1h to expiry | <30min to expiry | Expired or missing |
 | API reachability | 200 OK in <2s | Slow (>2s) | Unreachable or auth error |
 | Token collector | Running, cursors advancing | Cursors stale >10min | Not running |
+| State file freshness | Updated <2× interval | Stale 2–10× interval | Missing or stale >10× interval |
+| Heartbeat consistency | Worker count matches tmux sessions | Minor mismatch | Major mismatch or corruption |
 | Burn rate samples | ≥5 per window | 3–4 samples | <3 (using baseline fallback) |
 | Pricing config | All detected models have entries | — | Unknown model in token records |
 | Model generation | Rates match known generation | — | Opus 4.6 priced at $15/$75 (legacy) |
 | Promotion dates | Active or future promo configured | Expires in <48h | Expired, still in config |
 | SQLite integrity | `PRAGMA integrity_check` passes | — | Corruption detected |
 | JSONL/DB sync | Row counts within 1% | Diverge >1% | DB missing or empty |
+| Config parseable | Valid YAML, all required fields present | — | Syntax error or missing required fields |
+| Tmux available | `tmux` command works | — | Not installed (worker management requires tmux) |
+| Alert cooldown | Cooldown timestamps valid | — | Invalid timestamps |
+| Disk space | >1GB free on state partition | <500MB free | <100MB free |
 | Daemon status | Running, last cycle <2× interval | Last cycle >2× interval | Not running |
 | Log file | Exists, <100MB | >100MB | Missing or not writable |
 | Prediction accuracy | Median error <5% | 5–10% | >10% or insufficient data |
+| Claude binary installed | `claude` in PATH | — | Not found (API polling requires Claude CLI) |
+| Claude print installed | `claude print` command available | — | Not found (older Claude CLI version) |
+| Subscription session | Valid session file exists | — | No active Claude Code subscription session |
 
 **Output:**
 
 ```
 cgov doctor — 2026-03-18 14:30 ET
 ──────────────────────────────────────────
-✓ OAuth credentials     valid, expires in 3h12m
-✓ API reachability      200 OK (142ms)
-✓ Token collector       running, cursors current
-✓ Burn rate samples     12 samples (seven_day_sonnet)
-✓ Pricing config        all models matched
-✓ Model generation      rates consistent
-⚠ Promotion dates       expires in 10 days
-✓ SQLite integrity      OK
-✓ JSONL/DB sync         4,201 / 4,198 rows (99.9%)
-✓ Daemon status         running, last cycle 42s ago
-✓ Log file              12.4 MB
-✓ Prediction accuracy   median error -2.1% (24 scored)
+✓ OAuth credentials        valid, expires in 3h12m
+✓ API reachability         200 OK (142ms)
+✓ Token collector          running, cursors current
+✓ State file freshness     updated 14s ago
+✓ Heartbeat consistency    2 workers, 2 sessions
+✓ Burn rate samples        12 samples (seven_day_sonnet)
+✓ Pricing config           all models matched
+✓ Model generation         rates consistent
+⚠ Promotion dates          expires in 10 days
+✓ SQLite integrity         OK
+✓ JSONL/DB sync            4,201 / 4,198 rows (99.9%)
+✓ Config parseable         valid YAML
+✓ Tmux available           /usr/bin/tmux found
+✓ Alert cooldown           valid timestamps
+✓ Disk space               8.2GB free
+✓ Daemon status            running, last cycle 42s ago
+✓ Log file                 12.4 MB
+✓ Prediction accuracy      median error -2.1% (24 scored)
+✓ Claude binary installed  /usr/local/bin/claude found
+✓ Claude print installed   v2.1.78
+✓ Subscription session     active (claude-code-glm47-charlie)
 ──────────────────────────────────────────
-11 passed · 1 warning · 0 failed
+19 passed · 2 warnings · 0 failed
 ```
+
+**Note:** The implementation includes ~20 health checks covering OAuth, API, collector, state files, heartbeats, burn rates, pricing, promotions, database integrity, configuration, tmux, alerts, disk space, daemon status, logs, prediction accuracy, Claude CLI installation, and subscription session presence. The table above shows all implemented checks.
 
 **Exit codes:** `0` = all pass (warnings OK), `1` = any fail.
 
@@ -1550,7 +1576,7 @@ safe_mode:
    - `effective_hours_remaining(reset_time)` → float
    - Reads from `promotions.json`
 
-2. When a promotion is active, create `promotions.json` with an entry defining the promotion window (see Component 4 for format). When no promotion is running, `promotions.json` should be an empty array `[]` (flat 1.0 multiplier).
+2. Create `promotions.json` with an entry defining the promotion window when a promotion is active (see Component 4 for format). When no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier — this is the default shipped configuration).
 
 3. Unit tests:
    - Peak hour boundaries (7:59 AM ET → 1x, 8:00 AM ET → 1x peak, 2:01 PM ET → 2x)
@@ -1574,7 +1600,7 @@ safe_mode:
 
    This guards against: the promotion ending early, the multiplier applying to some limit buckets but not others, or a future promotion with a different multiplier being misconfigured.
 
-**Deliverable:** `src/schedule.rs` + `config/promotions.json` + promotion validation logic in burn_rate module
+**Deliverable:** `src/schedule.rs` + `config/promotions.json` (empty array by default) + promotion validation logic in burn_rate module
 
 ---
 
@@ -1903,7 +1929,7 @@ Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (col
    - Test: synthetic token records with known cache ratios, verify metric and alert logic
 
 9. Implement `src/doctor.rs` (Component 19):
-   - Health checks with pass/warn/fail thresholds (the implementation includes ~20 checks covering OAuth, API, collector, burn rates, pricing, promotions, database, daemon, and prediction accuracy)
+   - Health checks with pass/warn/fail thresholds (the implementation includes ~20 checks covering OAuth, API, collector, burn rates, pricing, promotions, database integrity, configuration, tmux, alerts, disk space, daemon status, logs, prediction accuracy, Claude CLI installation, and subscription session presence)
    - Structured JSON output (`--json`) + human-readable table (TTY)
    - Specific remediation commands per failure type
    - Test: break each check condition, verify detection and remediation text
@@ -1932,6 +1958,7 @@ Removes the binary and systemd units. Does **not** touch `~/.needle/state/` (col
 claude-governor/
 ├── Cargo.toml                # Rust project manifest
 ├── Makefile                  # Build automation (linux-amd64, linux-arm64)
+├── install.sh                # Download binary + write default config (supports linux-amd64, linux-arm64)
 ├── src/
 │   ├── main.rs               # CLI entry point + subcommand dispatch
 │   ├── lib.rs                # Library exports
@@ -1940,7 +1967,6 @@ claude-governor/
 │   ├── poller.rs             # Usage API poller (Phase 1) — ureq + rustls
 │   ├── collector.rs          # Token collector (Phase 1b)
 │   ├── governor.rs           # Main daemon loop (Phase 4)
-│   ├── governor_cycle_snapshot_test.rs  # Integration test fixtures
 │   ├── worker.rs             # Worker manager — launch/stop via configured commands (Phase 4)
 │   ├── alerts.rs             # Alert creation (Phase 5)
 │   ├── schedule.rs           # Peak/off-peak calculator (Phase 2)
@@ -1951,16 +1977,17 @@ claude-governor/
 │   ├── narrator.rs           # Decision explanation generator (Phase 7)
 │   ├── doctor.rs             # Health diagnostic (Phase 7)
 │   ├── state.rs              # State store — JSON read/write + rusqlite
-│   ├── capacity_summary.rs  # Capacity forecast aggregation
-│   ├── status_display.rs     # Human-readable status output
-│   └── fixtures.rs          # Test fixtures and helpers
+│   ├── capacity_summary.rs   # Capacity forecast aggregation
+│   └── status_display.rs     # Human-readable status output
+├── tests/
+│   ├── fixtures.rs           # Test fixtures and helpers
+│   └── governor_cycle_snapshot_test.rs  # Integration test fixtures
 ├── config/
 │   ├── governor.yaml         # Main configuration (incl. pricing table)
 │   ├── promotions.json       # Promotion window definitions (empty by default when no active promotion)
-│   ├── claude-governor.service       # Systemd user service — governor daemon
-│   ├── claude-token-collector.service  # Systemd user service — token collector
-│   └── cgov.service         # Alternative governor daemon service name
-├── install.sh                # Download binary + write default config (supports linux-amd64, linux-arm64)
+│   ├── claude-governor.service        # Systemd user service — governor daemon
+│   ├── claude-token-collector.service # Systemd user service — token collector
+│   └── cgov.service          # Alternative governor daemon service name
 ├── docs/
 │   ├── research/
 │   │   ├── usage-tracking.md
