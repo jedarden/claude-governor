@@ -2036,10 +2036,13 @@ pub fn run_governor_cycle(
                     );
                 }
                 (None, Some(_curr)) => {
-                    // Only current snapshot available: first poll, skip delta computation
-                    // Delta fields remain at default (0.0) - no update needed
-                    log::debug!(
-                        "[governor] first poll detected (no previous snapshot), skipping delta computation"
+                    // First poll: no previous snapshot available, cannot compute delta
+                    // Set delta fields to zero to indicate no change from initial state
+                    state.p5h_delta = Some(0.0);
+                    state.p7d_delta = Some(0.0);
+                    state.p7ds_delta = Some(0.0);
+                    log::info!(
+                        "[governor] first poll detected (no previous snapshot), skipping delta computation; deltas set to zero"
                     );
                 }
                 (None, None) | (Some(_), None) => {
