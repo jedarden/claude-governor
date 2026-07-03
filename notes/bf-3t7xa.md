@@ -5,41 +5,55 @@ Verify that delta computation logic is ONLY inside the Some-Some block at govern
 
 ## Verification Results
 
-All acceptance criteria are **MET**:
+### All Delta Components Inside Some-Some Block ✅
 
-| Check | Location | Status |
-|-------|----------|--------|
-| WindowPctSnapshot for prev_pct | Lines 2587-2591 | ✅ Inside block |
-| WindowPctSnapshot for curr_pct | Lines 2592-2596 | ✅ Inside block |
-| calculate_window_pct_delta call | Line 2597 | ✅ Inside block |
-| state delta assignments | Lines 2600-2602 | ✅ Inside block |
+| Component | Location | Status |
+|-----------|----------|--------|
+| WindowPctSnapshot creation for prev_pct | Lines 2587-2591 | ✅ INSIDE |
+| WindowPctSnapshot creation for curr_pct | Lines 2592-2596 | ✅ INSIDE |
+| calculate_window_pct_delta call | Line 2597 | ✅ INSIDE |
+| state.p5h_delta assignment | Line 2600 | ✅ INSIDE |
+| state.p7d_delta assignment | Line 2601 | ✅ INSIDE |
+| state.p7ds_delta assignment | Line 2602 | ✅ INSIDE |
 
-## Additional Verification
-
-- Only `state.p5h_delta`, `state.p7d_delta`, `state.p7ds_delta` assignments in the file are at lines 2600-2602
-- No delta computation logic exists outside the `if let (Some(prev), Some(curr))` block
-- The `calculate_window_pct_delta` function definition (line 776) is a separate helper function
-- Test code uses local variables, not state field mutations
-
-## Code Structure
+### Code Structure (governor.rs:2584-2609)
 
 ```rust
-// Line 2585-2609
+// Calculate window deltas from consecutive API snapshots
 if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
     // Both snapshots available: proceed with delta computation
-    let prev_pct = crate::db::WindowPctSnapshot { ... };  // Line 2587-2591
-    let curr_pct = crate::db::WindowPctSnapshot { ... };  // Line 2592-2596
-    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);  // Line 2597
+    let prev_pct = crate::db::WindowPctSnapshot {
+        five_hour: prev.five_hour_pct,
+        seven_day: prev.seven_day_pct,
+        seven_day_sonnet: prev.seven_day_sonnet_pct,
+    };
+    let curr_pct = crate::db::WindowPctSnapshot {
+        five_hour: curr.five_hour_pct,
+        seven_day: curr.seven_day_pct,
+        seven_day_sonnet: curr.seven_day_sonnet_pct,
+    };
+    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
     // Store computed deltas in governor state
-    state.p5h_delta = Some(delta_5h);   // Line 2600
-    state.p7d_delta = Some(delta_7d);   // Line 2601
-    state.p7ds_delta = Some(delta_7ds); // Line 2602
+    state.p5h_delta = Some(delta_5h);
+    state.p7d_delta = Some(delta_7d);
+    state.p7ds_delta = Some(delta_7ds);
 
-    log::info!(...);  // Line 2604-2608
+    log::info!(
+        "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
+        now.to_rfc3339(),
+        delta_5h, delta_7d, delta_7ds
+    );
 }
 ```
 
+### Additional Verification
+
+Grep search confirmed:
+- `state.p5h_delta`, `state.p7d_delta`, `state.p7ds_delta` are ONLY assigned at lines 2600-2602
+- No other assignments to these state fields exist in the codebase
+- The `calculate_window_pct_delta` call at line 2905 is for burn rate EMA calculation and does NOT modify state delta fields
+
 ## Conclusion
 
-The delta computation logic is correctly isolated within the Some-Some pattern matching block, ensuring it only executes when both previous and current API snapshots are available.
+✅ All delta computation is correctly contained within the Some-Some block as required by bead bf-3t7xa.
