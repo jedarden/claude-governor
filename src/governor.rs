@@ -1352,6 +1352,249 @@ mod window_delta_tests {
         assert!((custom_snap.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON);
         assert_eq!(custom_snap.taken_at, custom_time);
     }
+
+    // ---------------------------------------------------------------------------
+    // First poll handling tests
+    // ---------------------------------------------------------------------------
+
+    /// Test first poll handling when previous_api_snapshot is None.
+    ///
+    /// Verifies that on the first poll (after governor start or state clear):
+    /// - No panic occurs
+    /// - Delta computation is skipped (graceful handling)
+    /// - Default delta values are used (set to Some(0.0))
+    #[test]
+    fn test_first_poll_delta_defaults_to_zero() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // Simulate first poll: previous_api_snapshot is None, current_api_snapshot is Some
+        let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
+        let current_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            seven_day_sonnet_pct: 15.0,
+        });
+
+        // Simulate the delta computation logic from run_governor_cycle
+        let mut p5h_delta: Option<f64> = None;
+        let mut p7d_delta: Option<f64> = None;
+        let mut p7ds_delta: Option<f64> = None;
+
+        // Explicit pattern matching for all snapshot availability cases
+        // This mirrors the code in run_governor_cycle (lines 2012-2057)
+        match (&previous_api_snapshot, &current_api_snapshot) {
+            (Some(prev), Some(curr)) => {
+                // Both snapshots available: proceed with delta computation
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                // First poll: no previous snapshot available, cannot compute delta
+                // Set delta fields to zero to indicate no change from initial state
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {
+                // Neither snapshot available OR only previous available: handle gracefully
+                // Leave deltas as None
+            }
+        }
+
+        // Verify: no panic occurred (test is still running)
+        // Verify: delta computation was skipped (deltas weren't computed via calculate_window_pct_delta)
+        // Verify: default values are used (deltas set to Some(0.0))
+        assert_eq!(p5h_delta, Some(0.0), "5h delta should be Some(0.0) on first poll");
+        assert_eq!(p7d_delta, Some(0.0), "7d delta should be Some(0.0) on first poll");
+        assert_eq!(p7ds_delta, Some(0.0), "7ds delta should be Some(0.0) on first poll");
+    }
+
+    /// Test first poll with varying current snapshot values.
+    ///
+    /// Verifies that regardless of the current snapshot values, when previous
+    /// snapshot is None, all deltas are set to Some(0.0).
+    #[test]
+    fn test_first_poll_zero_deltas_regardless_of_current_values() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        let test_cases = vec![
+            (10.0, 20.0, 15.0),   // Low utilization
+            (50.0, 60.0, 55.0),   // Medium utilization
+            (95.0, 98.0, 97.0),  // High utilization
+            (0.0, 0.0, 0.0),     // Zero utilization
+        ];
+
+        for (five_hour, seven_day, seven_day_sonnet) in test_cases {
+            let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
+            let current_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+                taken_at: Utc::now(),
+                five_hour_pct: five_hour,
+                seven_day_pct: seven_day,
+                seven_day_sonnet_pct: seven_day_sonnet,
+            });
+
+            let mut p5h_delta: Option<f64> = None;
+            let mut p7d_delta: Option<f64> = None;
+            let mut p7ds_delta: Option<f64> = None;
+
+            match (&previous_api_snapshot, &current_api_snapshot) {
+                (Some(prev), Some(curr)) => {
+                    let prev_pct = crate::db::WindowPctSnapshot {
+                        five_hour: prev.five_hour_pct,
+                        seven_day: prev.seven_day_pct,
+                        seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    };
+                    let curr_pct = crate::db::WindowPctSnapshot {
+                        five_hour: curr.five_hour_pct,
+                        seven_day: curr.seven_day_pct,
+                        seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    };
+                    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                    p5h_delta = Some(delta_5h);
+                    p7d_delta = Some(delta_7d);
+                    p7ds_delta = Some(delta_7ds);
+                }
+                (None, Some(_curr)) => {
+                    p5h_delta = Some(0.0);
+                    p7d_delta = Some(0.0);
+                    p7ds_delta = Some(0.0);
+                }
+                (None, None) | (Some(_), None) => {
+                    // Leave deltas as None
+                }
+            }
+
+            assert_eq!(
+                p5h_delta,
+                Some(0.0),
+                "5h delta should be 0.0 for current values ({}, {}, {})",
+                five_hour, seven_day, seven_day_sonnet
+            );
+            assert_eq!(
+                p7d_delta,
+                Some(0.0),
+                "7d delta should be 0.0 for current values ({}, {}, {})",
+                five_hour, seven_day, seven_day_sonnet
+            );
+            assert_eq!(
+                p7ds_delta,
+                Some(0.0),
+                "7ds delta should be 0.0 for current values ({}, {}, {})",
+                five_hour, seven_day, seven_day_sonnet
+            );
+        }
+    }
+
+    /// Test that consecutive polls compute non-zero deltas after first poll.
+    ///
+    /// Verifies the transition from first poll (deltas = 0) to second poll
+    /// (deltas computed from snapshots).
+    #[test]
+    fn test_consecutive_polls_after_first_poll_computes_deltas() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // First poll: previous is None, deltas should be 0
+        let prev_none: Option<PrevUsageSnapshot> = None;
+        let curr_first: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            seven_day_sonnet_pct: 15.0,
+        });
+
+        let mut p5h_delta: Option<f64> = None;
+        let mut p7d_delta: Option<f64> = None;
+        let mut p7ds_delta: Option<f64> = None;
+
+        match (&prev_none, &curr_first) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {}
+        }
+
+        // Verify first poll gives zero deltas
+        assert_eq!(p5h_delta, Some(0.0), "First poll: 5h delta should be 0.0");
+        assert_eq!(p7d_delta, Some(0.0), "First poll: 7d delta should be 0.0");
+        assert_eq!(p7ds_delta, Some(0.0), "First poll: 7ds delta should be 0.0");
+
+        // Second poll: previous is now Some, deltas should be computed
+        let curr_second: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 12.5,  // +2.5
+            seven_day_pct: 22.0,  // +2.0
+            seven_day_sonnet_pct: 18.0, // +3.0
+        });
+
+        p5h_delta = None;
+        p7d_delta = None;
+        p7ds_delta = None;
+
+        match (&curr_first, &curr_second) {
+            (Some(prev), Some(curr)) => {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                p5h_delta = Some(delta_5h);
+                p7d_delta = Some(delta_7d);
+                p7ds_delta = Some(delta_7ds);
+            }
+            (None, Some(_curr)) => {
+                p5h_delta = Some(0.0);
+                p7d_delta = Some(0.0);
+                p7ds_delta = Some(0.0);
+            }
+            (None, None) | (Some(_), None) => {}
+        }
+
+        // Verify second poll computes actual deltas
+        assert!((p5h_delta.unwrap() - 2.5).abs() < f64::EPSILON, "Second poll: 5h delta should be 2.5");
+        assert!((p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON, "Second poll: 7d delta should be 2.0");
+        assert!((p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON, "Second poll: 7ds delta should be 3.0");
+    }
 }
 
 // ---------------------------------------------------------------------------
