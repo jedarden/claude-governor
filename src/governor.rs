@@ -5142,3 +5142,423 @@ mod tests {
             "Should decide NoChange when target equals current");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mock Poller for Testing
+// ---------------------------------------------------------------------------
+
+/// Mock poller for governor cycle testing.
+///
+/// This mock poller allows tests to configure the usage data returned by `poll()`,
+/// simulate error conditions, and test stale data scenarios for token refresh logic.
+#[cfg(test)]
+pub struct MockPoller {
+    /// Configurable usage data to return on success
+    pub usage_data: Option<crate::poller::UsageData>,
+    /// Configurable error message to return on failure
+    pub error_message: Option<String>,
+    /// Whether to simulate stale data (for testing token refresh logic)
+    pub stale: bool,
+    /// Call count tracker for testing behavior across multiple calls
+    pub poll_count: u32,
+}
+
+#[cfg(test)]
+impl MockPoller {
+    /// Create a new mock poller with default settings.
+    ///
+    /// By default, returns successful usage data with moderate utilization values.
+    pub fn new() -> Self {
+        Self {
+            usage_data: Some(Self::default_usage_data()),
+            error_message: None,
+            stale: false,
+            poll_count: 0,
+        }
+    }
+
+    /// Create a mock poller that always returns an error.
+    ///
+    /// Useful for testing error handling in governor cycles.
+    pub fn with_error(message: impl Into<String>) -> Self {
+        Self {
+            usage_data: None,
+            error_message: Some(message.into()),
+            stale: false,
+            poll_count: 0,
+        }
+    }
+
+    /// Create a mock poller that returns stale data.
+    ///
+    /// Simulates token refresh failure scenarios where the poller
+    /// falls back to cached data with the `stale` flag set.
+    pub fn with_stale_data() -> Self {
+        let mut data = Self::default_usage_data();
+        data.stale = true;
+
+        Self {
+            usage_data: Some(data),
+            error_message: None,
+            stale: true,
+            poll_count: 0,
+        }
+    }
+
+    /// Create a mock poller with custom utilization values.
+    ///
+    /// # Arguments
+    /// - `five_hour_util`: 5-hour window utilization percentage
+    /// - `seven_day_util`: 7-day window utilization percentage (all models)
+    /// - `seven_day_sonnet_util`: 7-day window utilization percentage (Sonnet only)
+    pub fn with_utilization(
+        five_hour_util: f64,
+        seven_day_util: f64,
+        seven_day_sonnet_util: f64,
+    ) -> Self {
+        let mut data = Self::default_usage_data();
+        data.five_hour_utilization = five_hour_util;
+        data.seven_day_utilization = seven_day_util;
+        data.seven_day_sonnet_utilization = seven_day_sonnet_util;
+
+        Self {
+            usage_data: Some(data),
+            error_message: None,
+            stale: false,
+            poll_count: 0,
+        }
+    }
+
+    /// Create a mock poller that simulates emergency brake conditions.
+    ///
+    /// Returns utilization >= 98% to trigger the emergency brake.
+    pub fn with_emergency_brake() -> Self {
+        Self::with_utilization(99.0, 99.0, 99.0)
+    }
+
+    /// Create a mock poller that simulates low utilization.
+    ///
+    /// Returns utilization <= 25% for underutilization scenarios.
+    pub fn with_low_utilization() -> Self {
+        Self::with_utilization(15.0, 20.0, 18.0)
+    }
+
+    /// Create a mock poller that simulates high utilization (near cutoff).
+    ///
+    /// Returns utilization >= 90% for near-cutoff scenarios.
+    pub fn with_high_utilization() -> Self {
+        Self::with_utilization(92.0, 94.0, 93.0)
+    }
+
+    /// Create default usage data with moderate utilization values.
+    ///
+    /// Returns a UsageData struct with:
+    /// - 5-hour window: 50% utilization
+    /// - 7-day window: 60% utilization (all models)
+    /// - 7-day window: 55% utilization (Sonnet only)
+    /// - Reset times 4-5 hours in the future
+    fn default_usage_data() -> crate::poller::UsageData {
+        use chrono::Duration;
+
+        let now = Utc::now();
+        let five_hour_reset = now + Duration::hours(4);
+        let seven_day_reset = now + Duration::hours(120);
+
+        crate::poller::UsageData {
+            five_hour_utilization: 50.0,
+            five_hour_resets_at: five_hour_reset.to_rfc3339(),
+            five_hour_hours_remaining: 4.0,
+            seven_day_utilization: 60.0,
+            seven_day_resets_at: seven_day_reset.to_rfc3339(),
+            seven_day_hours_remaining: 120.0,
+            seven_day_sonnet_utilization: 55.0,
+            seven_day_sonnet_resets_at: seven_day_reset.to_rfc3339(),
+            seven_day_sonnet_hours_remaining: 120.0,
+            timestamp: now,
+            stale: false,
+        }
+    }
+
+    /// Simulate a poll call, returning configured data or error.
+    ///
+    /// This method implements the same interface as `Poller::poll()` but
+    /// returns mock data instead of making actual API calls.
+    ///
+    /// Increments `poll_count` on each call to track invocation patterns.
+    ///
+    /// # Returns
+    /// - `Ok(UsageData)` if `usage_data` is set
+    /// - `Err(anyhow::Error)` if `error_message` is set
+    pub fn poll(&mut self) -> anyhow::Result<crate::poller::UsageData> {
+        self.poll_count += 1;
+
+        if let Some(ref message) = self.error_message {
+            Err(anyhow::anyhow!("{}", message))
+        } else if let Some(ref data) = self.usage_data {
+            Ok(data.clone())
+        } else {
+            // Should not happen with proper construction, but handle gracefully
+            Ok(Self::default_usage_data())
+        }
+    }
+
+    /// Set a new error to return on subsequent polls.
+    ///
+    /// Clears any existing `usage_data`.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.error_message = Some(message.into());
+        self.usage_data = None;
+    }
+
+    /// Set new usage data to return on subsequent polls.
+    ///
+    /// Clears any existing `error_message`.
+    pub fn set_usage_data(&mut self, data: crate::poller::UsageData) {
+        self.usage_data = Some(data);
+        self.error_message = None;
+    }
+
+    /// Reset the poll counter.
+    pub fn reset_poll_count(&mut self) {
+        self.poll_count = 0;
+    }
+}
+
+#[cfg(test)]
+impl Default for MockPoller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mock Poller Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mock_poller_tests {
+    use super::*;
+
+    /// Test that MockPoller returns default usage data.
+    #[test]
+    fn test_mock_poller_default_returns_usage_data() {
+        let mut poller = MockPoller::new();
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert!(!data.stale, "Default data should not be stale");
+        assert_eq!(data.five_hour_utilization, 50.0);
+        assert_eq!(data.seven_day_utilization, 60.0);
+        assert_eq!(data.seven_day_sonnet_utilization, 55.0);
+    }
+
+    /// Test that MockPoller can return error responses.
+    #[test]
+    fn test_mock_poller_returns_error() {
+        let test_message = "Test API error";
+        let mut poller = MockPoller::with_error(test_message);
+
+        let result = poller.poll();
+
+        assert!(result.is_err(), "poll() should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), test_message);
+    }
+
+    /// Test that MockPoller can return stale data.
+    #[test]
+    fn test_mock_poller_returns_stale_data() {
+        let mut poller = MockPoller::with_stale_data();
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert!(data.stale, "Data should be marked as stale");
+    }
+
+    /// Test that MockPoller can return custom utilization values.
+    #[test]
+    fn test_mock_poller_custom_utilization() {
+        let mut poller =
+            MockPoller::with_utilization(75.0, 80.0, 77.5);
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert_eq!(data.five_hour_utilization, 75.0);
+        assert_eq!(data.seven_day_utilization, 80.0);
+        assert_eq!(data.seven_day_sonnet_utilization, 77.5);
+        assert!(!data.stale, "Custom data should not be stale");
+    }
+
+    /// Test that MockPoller emergency brake scenario returns 99% utilization.
+    #[test]
+    fn test_mock_poller_emergency_brake() {
+        let mut poller = MockPoller::with_emergency_brake();
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert_eq!(data.five_hour_utilization, 99.0);
+        assert_eq!(data.seven_day_utilization, 99.0);
+        assert_eq!(data.seven_day_sonnet_utilization, 99.0);
+    }
+
+    /// Test that MockPoller low utilization scenario returns low values.
+    #[test]
+    fn test_mock_poller_low_utilization() {
+        let mut poller = MockPoller::with_low_utilization();
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert!(data.five_hour_utilization <= 25.0);
+        assert!(data.seven_day_utilization <= 25.0);
+        assert!(data.seven_day_sonnet_utilization <= 25.0);
+    }
+
+    /// Test that MockPoller high utilization scenario returns high values.
+    #[test]
+    fn test_mock_poller_high_utilization() {
+        let mut poller = MockPoller::with_high_utilization();
+
+        let result = poller.poll();
+
+        assert!(result.is_ok(), "poll() should return Ok");
+        let data = result.unwrap();
+        assert!(data.five_hour_utilization >= 90.0);
+        assert!(data.seven_day_utilization >= 90.0);
+        assert!(data.seven_day_sonnet_utilization >= 90.0);
+    }
+
+    /// Test that poll_count tracks invocations.
+    #[test]
+    fn test_mock_poller_poll_count_tracking() {
+        let mut poller = MockPoller::new();
+
+        assert_eq!(poller.poll_count, 0, "Initial count should be 0");
+
+        poller.poll().unwrap();
+        assert_eq!(poller.poll_count, 1, "Count should increment after first poll");
+
+        poller.poll().unwrap();
+        assert_eq!(poller.poll_count, 2, "Count should increment after second poll");
+
+        poller.reset_poll_count();
+        assert_eq!(poller.poll_count, 0, "Count should reset to 0");
+    }
+
+    /// Test that set_error changes poller behavior to return errors.
+    #[test]
+    fn test_mock_poller_set_error() {
+        let mut poller = MockPoller::new();
+
+        // First poll succeeds
+        assert!(poller.poll().is_ok());
+
+        // Set error
+        let test_message = "New error";
+        poller.set_error(test_message);
+
+        // Subsequent polls fail
+        let result = poller.poll();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), test_message);
+    }
+
+    /// Test that set_usage_data changes poller behavior to return new data.
+    #[test]
+    fn test_mock_poller_set_usage_data() {
+        use chrono::Duration;
+
+        let mut poller = MockPoller::with_error("Error");
+
+        // First poll fails
+        assert!(poller.poll().is_err());
+
+        // Set new usage data
+        let now = Utc::now();
+        let new_data = crate::poller::UsageData {
+            five_hour_utilization: 88.0,
+            five_hour_resets_at: (now + Duration::hours(2)).to_rfc3339(),
+            five_hour_hours_remaining: 2.0,
+            seven_day_utilization: 75.0,
+            seven_day_resets_at: (now + Duration::hours(96)).to_rfc3339(),
+            seven_day_hours_remaining: 96.0,
+            seven_day_sonnet_utilization: 72.0,
+            seven_day_sonnet_resets_at: (now + Duration::hours(96)).to_rfc3339(),
+            seven_day_sonnet_hours_remaining: 96.0,
+            timestamp: now,
+            stale: false,
+        };
+
+        poller.set_usage_data(new_data.clone());
+
+        // Subsequent polls return the new data
+        let result = poller.poll();
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        assert_eq!(data.five_hour_utilization, 88.0);
+        assert_eq!(data.seven_day_utilization, 75.0);
+    }
+
+    /// Test that MockPoller is reusable across multiple tests.
+    #[test]
+    fn test_mock_poller_reusability() {
+        // Create a poller for one scenario
+        let mut poller = MockPoller::with_emergency_brake();
+        let result1 = poller.poll().unwrap();
+        assert_eq!(result1.five_hour_utilization, 99.0);
+
+        // Reconfigure for a different scenario
+        poller.set_usage_data(MockPoller::default_usage_data());
+        let result2 = poller.poll().unwrap();
+        assert_eq!(result2.five_hour_utilization, 50.0);
+
+        // Configure for error scenario
+        poller.set_error("Transient error");
+        assert!(poller.poll().is_err());
+
+        // Back to success scenario
+        poller.set_usage_data(MockPoller::with_low_utilization().usage_data.unwrap());
+        let result3 = poller.poll().unwrap();
+        assert!(result3.five_hour_utilization <= 25.0);
+    }
+
+    /// Test that MockPoller handles concurrent-like usage patterns.
+    #[test]
+    fn test_mock_poller_multiple_calls_consistency() {
+        let mut poller = MockPoller::with_utilization(65.0, 70.0, 68.0);
+
+        // Multiple calls should return consistent data
+        let result1 = poller.poll().unwrap();
+        let result2 = poller.poll().unwrap();
+        let result3 = poller.poll().unwrap();
+
+        assert_eq!(result1.five_hour_utilization, result2.five_hour_utilization);
+        assert_eq!(result2.five_hour_utilization, result3.five_hour_utilization);
+        assert_eq!(poller.poll_count, 3);
+    }
+
+    /// Test MockPoller with extreme utilization values.
+    #[test]
+    fn test_mock_poller_extreme_values() {
+        // Test 0% utilization
+        let mut poller = MockPoller::with_utilization(0.0, 0.0, 0.0);
+        let result = poller.poll().unwrap();
+        assert_eq!(result.five_hour_utilization, 0.0);
+        assert_eq!(result.seven_day_utilization, 0.0);
+
+        // Test 100% utilization
+        poller = MockPoller::with_utilization(100.0, 100.0, 100.0);
+        let result = poller.poll().unwrap();
+        assert_eq!(result.five_hour_utilization, 100.0);
+        assert_eq!(result.seven_day_utilization, 100.0);
+    }
+}
