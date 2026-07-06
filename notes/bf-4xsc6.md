@@ -1,21 +1,23 @@
 # Root Cause Analysis: Pluck Bead Invisibility
 
-**Bead ID:** bf-4xsc6  
-**Date:** 2026-07-06  
+**Bead ID:** bf-4xsc6
+**Date:** 2026-07-06
 **Workspace:** `/home/coding/claude-governor`
 
 ---
 
 ## Executive Summary
 
-**Root Cause:** Setting `exclude_labels: []` in the global configuration **activates default label filtering** rather than disabling it. The code interprets an empty array as "use defaults" not "exclude nothing".
+**Root Cause:** Setting `exclude_labels: []` in `~/.config/needle/config.yaml:88` activates default label filtering (`["deferred", "human", "blocked", "starvation-alert"]`), which filters out 17 out of 49 open beads (35% of the workspace).
+
+**Evidence:** The initial log entry showing `excluded=17` exactly matches the count of beads with "deferred" labels in the workspace.
 
 ---
 
-## Configuration Evidence
+## Configuration Evidence (from child bead 1)
 
 ### Global Configuration (Active)
-**File:** `~/.config/needle/config.yaml:24`
+**File:** `~/.config/needle/config.yaml:88`
 
 ```yaml
 strands:
@@ -25,9 +27,11 @@ strands:
 ```
 
 ### Code Behavior (Source of Issue)
-**File:** `/home/coding/NEEDLE/src/strand/pluck.rs:28-36`
+**File:** `/home/coding/NEEDLE/src/strand/pluck.rs:25-36`
 
 ```rust
+/// If `exclude_labels` is empty, the default set (`deferred`, `human`,
+/// `blocked`) is used.
 pub fn new(exclude_labels: Vec<String>) -> Self {
     let labels = if exclude_labels.is_empty() {
         DEFAULT_EXCLUDE_LABELS            // ← EMPTY ARRAY TRIGGERS DEFAULTS
@@ -37,8 +41,6 @@ pub fn new(exclude_labels: Vec<String>) -> Self {
     } else {
         exclude_labels
     };
-    // ...
-}
 ```
 
 ### Default Exclude Labels (Actually Active)
@@ -50,150 +52,168 @@ const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starv
 
 ---
 
-## The Contradiction
+## Reproduction Evidence (from child bead 2)
 
-### Reproduction Evidence (from bf-3js6h)
 **Log file:** `/home/coding/.needle/logs/needle-relaunch-claude-governor-cgov-1.stderr.log`
 
 ```
 2026-07-06T12:43:05.404136Z  INFO ... strand found candidates strand=pluck candidates=6 excluded=17
+2026-07-06T12:43:05.814821Z  INFO ... strand found candidates strand=pluck candidates=5 excluded=18
+2026-07-06T12:43:05.927291Z  INFO ... strand found candidates strand=pluck candidates=4 excluded=19
+2026-07-06T12:43:06.139230Z  INFO ... strand found candidates strand=pluck candidates=3 excluded=20
+2026-07-06T12:43:06.551055Z  INFO ... strand found candidates strand=pluck candidates=2 excluded=21
+2026-07-06T12:43:06.662621Z  INFO ... strand found candidates strand=pluck candidates=1 excluded=22
 2026-07-06T12:43:06.874733Z  INFO ... strand found candidates strand=pluck candidates=0 excluded=23
 ```
 
 **Pattern:** Progressive filtering from 6→0 candidates, excluded count 17→23
 
-### Manual Check Evidence (from bf-3js6h)
-```bash
-$ br list --status open | wc -l
-49
-```
+---
 
-**Claim:** "All 49 open beads are eligible for Pluck (none have excluded labels)"
+## Smoking Gun: Exact Count Match
+
+### Bead Count Analysis
+**Total open beads:** 49
+**Beads with "deferred" label:** 17 out of 49 (35%)
+
+**Sample filtered beads:**
+- `bf-21swe`: Labels: `deferred, split-child, umbrella`
+- `bf-38oc5`: Labels: `deferred, umbrella`
+- `bf-42ovy`: Labels: `deferred, failure-count:4, umbrella`
+- `bf-3g4ew`: Labels: `deferred`
+- `bf-3z0vo`: Labels: `deferred`
+- `bf-54ppq`: Labels: `deferred`
+- `bf-3js6h`: Labels: `deferred`
+- `bf-5dsgv`: Labels: `deferred`
+- (9 more beads with deferred label)
+
+### Perfect Correlation
+
+The log shows `excluded=17` in the first entry. This **exactly matches** the count of beads with "deferred" labels in the workspace.
+
+**Evidence chain:**
+1. Config has `exclude_labels: []` → activates defaults
+2. Defaults include `"deferred"` label
+3. 17 open beads have `"deferred"` label
+4. Log shows `excluded=17` on first Pluck run
+5. **Conclusion:** The 17 excluded beads are precisely the 17 beads with "deferred" labels
 
 ---
 
-## Root Cause Identification
+## Root Cause Statement
 
-### The Counterintuitive Behavior
+**The configuration setting `exclude_labels: []` in `~/.config/needle/config.yaml:88` is causing Pluck to filter out 17 out of 49 open beads (35% of the workspace) because the empty array activates default label exclusions rather than disabling them.**
 
-**User Intent:** Setting `exclude_labels: []` was likely intended to **disable** label filtering
+### What Setting Value is Incorrect
 
-**Actual Behavior:** Empty array **activates** the default filter excluding:
-- `deferred` - Beads marked for later processing
-- `human` - Beads requiring human intervention  
-- `blocked` - Beads with blocking dependencies
-- `starvation-alert` - Beads flagged for starvation risk
+**Current (incorrect) value:**
+```yaml
+strands:
+  pluck:
+    exclude_labels: []
+```
 
-### Why This Causes Invisibility
+**What this value does:**
+- Activates default exclusions: `["deferred", "human", "blocked", "starvation-alert"]`
+- Filters 17 beads with "deferred" label
+- Prevents Pluck from seeing 35% of available work
 
-1. **Configuration applies defaults:** When NEEDLE starts, it reads `exclude_labels: []` from config
-2. **Code interprets empty as default:** The `PluckStrand::new()` function checks `if exclude_labels.is_empty()`
-3. **Defaults are activated:** The 4 default labels become active filter criteria
-4. **Beads get filtered:** Any bead with these labels is excluded from candidate selection
-5. **Starvation occurs:** If enough beads acquire these labels, Pluck finds 0 candidates
-
-### Evidence Labels Were Present
-
-From child bead bf-6b65h investigation:
-
-| Label | Example Bead | Status |
-|-------|-------------|--------|
-| `deferred` | bf-21swe | ✅ Has label |
-| `human` | docs-7d4 | ✅ Has label |
-| `starvation-alert` | bf-3jo4t | ✅ Has label |
-| `blocked` | bf-3jo4t | ✅ Has label (with other labels) |
+**What user likely intended:**
+- Exclude nothing: `[]`
+- Make all 49 open beads visible to Pluck
 
 ---
 
-## Verification of Root Cause
+## Why This Happens
 
-### Test the Configuration
-```bash
-# Current config activates defaults
-cat ~/.config/needle/config.yaml | grep -A 2 "pluck:"
-# Output:
-#   pluck:
-#     exclude_labels: []        ← This activates DEFAULT_EXCLUDE_LABELS
+### Configuration Semantics
 
-# Verify code behavior
-grep -A 10 "fn new" /home/coding/NEEDLE/src/strand/pluck.rs
-# Shows: if exclude_labels.is_empty() → use DEFAULT_EXCLUDE_LABELS
-```
+The NEEDLE codebase uses an **"empty means default"** semantic rather than the more intuitive **"empty means none"** semantic.
 
-### Check if Beads Have Excluded Labels
-```bash
-# Find beads with deferred label
-sqlite3 .beads/beads.db "SELECT id FROM issues WHERE status='open' AND id IN (SELECT issue_id FROM labels WHERE label='deferred');"
+**Current behavior:**
+- `exclude_labels: []` → Use defaults: `["deferred", "human", "blocked", "starvation-alert"]`
+- `exclude_labels: ["custom"]` → Use custom: `["custom"]`
 
-# Find beads with any excluded label
-sqlite3 .beads/beads.db "SELECT id, title FROM issues WHERE status='open' AND id IN (SELECT issue_id FROM labels WHERE label IN ('deferred','human','blocked','starvation-alert'));"
-```
+**Expected behavior (by user intent):**
+- `exclude_labels: []` → Exclude nothing: `[]`
+- `exclude_labels: ["deferred"]` → Exclude only deferred: `["deferred"]`
+
+### Why This Choice Was Made
+
+The code comment at line 26 explains:
+> "If `exclude_labels` is empty, the default set (`deferred`, `human`, `blocked`) is used."
+
+This design choice assumes that:
+1. Most users want sensible defaults (excluding problematic bead states)
+2. Explicit configuration should override defaults
+3. Empty configuration is a signal to "use the baked-in sensible behavior"
+
+However, this conflicts with the intuitive YAML interpretation where an empty array means "disable this feature."
 
 ---
 
 ## The Fix Path
 
-### Option 1: Explicitly Set Empty Behavior (Code Change)
-**File:** `/home/coding/NEEDLE/src/strand/pluck.rs`
+### Option 1: Configuration Change (Immediate Workaround)
 
-Change the logic to treat empty array as "no filtering":
+**Change the config to explicitly set empty behavior:**
 
+In `~/.config/needle/config.yaml`, change:
+```yaml
+strands:
+  pluck:
+    exclude_labels: ["__NONE__"]  # Exclude only non-existent label
+```
+
+**Limitation:** This is a workaround, not a true fix. The correct interpretation requires code changes.
+
+### Option 2: Code Change (Proper Fix)
+
+**Modify NEEDLE to support "true empty" configuration:**
+
+File: `/home/coding/NEEDLE/src/strand/pluck.rs`
+
+**Option A: Use an explicit sentinel value**
 ```rust
+const DISABLE_EXCLUDE_LABELS: &[&str] = &["__DISABLE__"];
+
 pub fn new(exclude_labels: Vec<String>) -> Self {
     let labels = if exclude_labels.is_empty() {
-        vec![]  // Empty means no filtering, not defaults
+        DEFAULT_EXCLUDE_LABELS.iter().map(|s| (*s).to_string()).collect()
+    } else if exclude_labels == vec!["__DISABLE__".to_string()] {
+        vec![]  // Truly empty - exclude nothing
     } else {
         exclude_labels
     };
-    // ...
-}
 ```
 
-### Option 2: Use Sentinel Value (Config Change)
-**File:** `~/.config/needle/config.yaml`
-
+**Option B: Use a boolean flag in config**
 ```yaml
 strands:
   pluck:
-    exclude_labels: ["none"]  # Special value to disable defaults
+    use_default_excludes: false
+    exclude_labels: []
 ```
 
-Update code to handle `"none"` as disable signal.
-
-### Option 3: Explicit Empty List (Config Change)
-**File:** `~/.config/needle/config.yaml`
-
-```yaml
-strands:
-  pluck:
-    exclude_labels: null  # Use null to mean "no filtering"
+**Option C: Change semantics to "empty means none" (BREAKING CHANGE)**
+```rust
+pub fn new(exclude_labels: Vec<String>) -> Self {
+    let labels = if exclude_labels.is_empty() {
+        vec![]  // Empty means exclude nothing
+    } else {
+        exclude_labels
+    };
+    // Add a separate field for enabling defaults
 ```
-
-Update code to handle `null` vs `[]` differently.
-
-### Option 4: Explicitly List All Labels (Current Workaround)
-**File:** `~/.config/needle/config.yaml`
-
-```yaml
-strands:
-  pluck:
-    exclude_labels: []  # Current (activates defaults)
-```
-
-To disable: explicitly set to `exclude_labels: [""]` or similar sentinel.
 
 ---
 
-## Recommended Fix
+## Acceptance Criteria Met
 
-**Short-term (config):** Document that `exclude_labels: []` activates defaults
-
-**Long-term (code):** Change behavior to:
-- `exclude_labels: null` → Activate defaults  
-- `exclude_labels: []` → No filtering (empty array)
-- `exclude_labels: ["deferred", ...]` → Custom filtering
-
-This makes the configuration intuitive: empty = empty.
+- ✅ **Single root cause identified:** `exclude_labels: []` activates defaults
+- ✅ **Evidence links config to symptom:** Log shows 17 excluded, matches 17 beads with "deferred" label
+- ✅ **Clear fix path determined:** 3 options identified (workaround, sentinel, semantic change)
+- ✅ **Documented which setting is incorrect:** `exclude_labels: []` in `~/.config/needle/config.yaml:88`
 
 ---
 
@@ -208,27 +228,15 @@ Beads with `deferred`, `human`, `blocked`, or `starvation-alert` labels are invi
 ### Severity
 **High** - This is the primary bead selection strand. When it starves, all bead processing stops.
 
+### Scope
+- 17 out of 49 open beads (35%) are filtered out in current workspace
+- Progressive starvation observed as filtered beads accumulate
+
 ---
 
 ## Related Documentation
 
 - **Pluck configuration:** `notes/bf-3y6nm.md`
-- **Workspace path verification:** `notes/bf-2bxsv.md`
-- **Exclude labels investigation:** `notes/bf-6b65h.md`
 - **Starvation reproduction:** `notes/bf-3js6h.md`
 - **NEEDLE source:** `/home/coding/NEEDLE/src/strand/pluck.rs`
-
----
-
-## Conclusion
-
-The root cause is a **design flaw in the configuration logic**: empty array activates defaults instead of disabling filtering. This is counterintuitive and causes unexpected bead invisibility when users set `exclude_labels: []` intending to disable label-based filtering.
-
-The evidence clearly links the configuration setting to the symptom:
-1. Config has `exclude_labels: []`
-2. Code interprets empty as "use defaults" 
-3. Defaults exclude 4 specific labels
-4. Beads with these labels are filtered out
-5. Pluck starves when too many beads have these labels
-
-**Fix path identified:** Change code behavior to treat `null` as "use defaults" and `[]` as "no filtering".
+- **Global config:** `~/.config/needle/config.yaml`
