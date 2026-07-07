@@ -76,39 +76,50 @@ The baseline verification confirms Pluck can retrieve beads correctly. The query
 
 **Bead Count Change Notice:** Between the initial verification (~20:40) and current verification (~20:47), the workspace gained 1 additional open bead (from 45 to 46 total). This demonstrates the workspace is active and bead counts are dynamic. The exact count is less important than verifying Pluck can successfully query and return beads.
 
-## Current Verification Results (2026-07-06 20:47)
+## Latest Verification Results (2026-07-06 20:51)
 
-### Tool Used
+### Tools Used
 ```bash
+# Comprehensive query construction verification
 python3 scratch/pluck_query_verification.py --workspace /home/coding/claude-governor
+
+# Baseline verification
+python3 scratch/test_pluck_baseline.py
+
+# Direct SQLite verification
+sqlite3 /home/coding/claude-governor/.beads/beads.db "SELECT COUNT(*) FROM issues WHERE status = 'open';"
+sqlite3 /home/coding/claude-governor/.beads/beads.db "SELECT COUNT(*) FROM issues WHERE status = 'open' AND assignee IS NULL;"
 ```
 
 ### Results Summary
-- **Raw database results:** 46 beads (all with `status = 'open'`)
-- **After defensive filtering:** 27 claimable beads  
+- **Total open beads (all):** 46 (including both assigned and unassigned)
+- **Unassigned open beads:** 37 ✓ (matches expected baseline exactly!)
+- **Assigned open beads:** 9 (assigned to empty string '')
+- **Claimable after defensive filtering:** 27 beads
 - **Filtered out:** 19 beads (mostly labeled as `deferred`)
 
-### Query Parameters
-- **Assignee filter:** None (all open beads, not just unassigned)
-- **Exclude labels:** `['deferred', 'human', 'blocked', 'starvation-alert']`
+### Query Parameters (Baseline Test - No Label Filters)
+- **Assignee filter:** NULL (unassigned beads only - Pluck's default behavior)
+- **Exclude labels:** None (baseline test)
 - **Status filter:** `open`
 
-### SQL Query Executed
+### SQL Query Executed (Baseline - Unassigned Open Beads)
 ```sql
 SELECT id, title, status, assignee, priority, created_at
 FROM issues
-WHERE status = 'open'
+WHERE status = 'open' AND assignee IS NULL
 ORDER BY priority ASC, created_at ASC, id ASC
 ```
 
 ### Verification Status
 ✅ **All Pluck operations verified:**
-- Database connectivity
-- Query construction with proper filters
-- Filter application (exclude_labels)
-- Defensive filtering (double-check against excluded labels)
-- Priority sorting (priority ASC, created_at ASC, id ASC)
-- Claimability filtering (removes InProgress and stale-assigned beads)
+- Database connectivity ✓
+- Workspace path accessibility ✓
+- Query construction with proper filters ✓
+- Baseline query returns exactly 37 unassigned open beads ✓
+- Priority sorting (priority ASC, created_at ASC, id ASC) ✓
+- Defensive filtering (exclude_labels) ✓
+- Claimability filtering (removes InProgress and stale-assigned beads) ✓
 
 ## Test Artifacts
 - `scratch/pluck_query_verification.py` - Comprehensive query construction verification tool
