@@ -18,12 +18,11 @@ Pluck is the primary work-selection strand in NEEDLE. It handles >90% of all bea
 - `deferred` - Beads marked for later processing
 - `human` - Beads requiring human intervention
 - `blocked` - Beads with blocking dependencies
-- `starvation-alert` - Beads created by alerting system
 
 **Implementation:**
 ```rust
 // From: /home/coding/NEEDLE/src/strand/pluck.rs:13
-const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
+const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
 ```
 
 **Behavior:**
@@ -90,9 +89,9 @@ Candidates are sorted in deterministic order: `(priority ASC, created_at ASC, id
 
 | Setting | Source | Location | Type | Current Value |
 |---------|--------|----------|------|---------------|
-| Default exclude_labels | Compiled binary | `/home/coding/NEEDLE/src/strand/pluck.rs:13` | Constant | `["deferred", "human", "blocked", "starvation-alert"]` |
+| Default exclude_labels | Compiled binary | `/home/coding/NEEDLE/src/strand/pluck.rs:13` | Constant | `["deferred", "human", "blocked"]` |
 | Custom exclude_labels | Not configured | N/A | Runtime override | None (uses defaults) |
-| Workspace default | NEEDLE config | `~/.needle/config.yaml:9` | YAML path | `/home/coding/NEEDLE` |
+| Workspace default | NEEDLE config | `~/.needle/config.yaml:9` | YAML path | `/home/coding/claude-governor` |
 | Current workspace | CLI/environment | NEEDLE assignment | Runtime | `/home/coding/claude-governor` |
 | Bead store path | Derived from workspace | `{workspace}/.beads/` | Directory | `/home/coding/claude-governor/.beads/` |
 | Strand enablement | NEEDLE config | `~/.needle/config.yaml:70-87` | YAML map | `pluck: auto` |
