@@ -1,8 +1,10 @@
 # Pluck Configuration Filter Diagnosis - bf-1y51s
 
-**Completed:** 2026-07-06
+**Completed:** 2026-07-07
 **Workspace:** `/home/coding/claude-governor`
 **Task:** Diagnose configuration filter and exclude_labels issues
+
+**Status:** ✅ **COMPLETE** - Root cause identified, fix applied and verified
 
 ## Executive Summary
 
@@ -157,3 +159,59 @@ needle --workspace /home/coding/claude-governor
 - ✓ Tested different filter combinations (all working correctly)
 - ✓ Determined exclude_labels is NOT too broad
 - ✓ Identified workspace path configuration as root cause
+
+---
+
+## 2026-07-07 Verification - Fix Applied and Working
+
+**Configuration Status:** ✅ FIXED
+
+The workspace configuration has been corrected in `~/.needle/config.yaml`:
+
+```yaml
+workspace:
+  default: /home/coding/claude-governor  # ✅ NOW CORRECT
+```
+
+### Current Diagnostic Results (2026-07-07)
+
+**Latest Filter Test:**
+- **Total open beads:** 79 (increased from 45)
+- **Claimable beads:** 27 (using default filters)
+- **Blocked by exclude_labels:** 17 (only `deferred` label effective)
+
+**Filter Performance:**
+```
+Default Pluck (exclude: deferred,human,blocked,starvation-alert): 27 beads ✓
+No exclude labels: 44 beads
+Exclude only 'deferred': 27 beads ← PRIMARY BLOCKER
+Exclude only 'human': 44 beads (no beads with this label)
+Exclude only 'blocked': 44 beads (no beads with this label)
+Exclude only 'starvation-alert': 44 beads (no beads with this label)
+```
+
+### NEEDLE Activity Verification
+
+**Recent Pluck Performance (from logs):**
+```
+2026-07-06T12:46:04.728263Z  INFO ... workspace=/home/coding/claude-governor
+  strand found candidates strand=pluck candidates=8 excluded=15 elapsed_ms=4
+...
+2026-07-06T12:46:06.569069Z  INFO ... workspace=/home/coding/claude-governor
+  strand found candidates strand=pluck candidates=0 excluded=23 elapsed_ms=3
+```
+
+**Worker Performance:**
+- ✅ Successfully processed 20 beads
+- ✅ Workspace path correct: `/home/coding/claude-governor`
+- ✅ Pluck finding and claiming beads normally
+
+### Conclusions
+
+1. **Root Cause CONFIRMED:** Workspace configuration mismatch was the issue
+2. **Fix VERIFIED:** Workspace path corrected in NEEDLE config
+3. **Pluck Operating:** Finding 27 claimable beads, filtering correctly
+4. **Exclude Labels:** Working as designed (only `deferred` active, 17 beads excluded)
+5. **No Starvation:** 27 beads available to Pluck, system functioning normally
+
+**Final Status:** ✅ Configuration issue resolved, Pluck operating normally.
