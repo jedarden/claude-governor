@@ -71,8 +71,8 @@ After receiving results from the store, Pluck applies additional defensive filte
 
 ### Test 1: Default Pluck Query
 - **Configuration**: No assignee, default exclude labels
-- **Store results**: 46 beads
-- **After defensive filtering**: 28 claimable, 18 filtered
+- **Store results**: 45 beads
+- **After defensive filtering**: 27 claimable, 18 filtered
 - **Filtering reasons**:
   - 18 beads filtered due to `deferred` label
 
@@ -84,14 +84,14 @@ After receiving results from the store, Pluck applies additional defensive filte
 
 ### Test 3: Custom Exclude Labels
 - **Configuration**: No assignee, exclude labels `["deferred", "human"]`
-- **Store results**: 46 beads
-- **After defensive filtering**: 28 claimable, 18 filtered
+- **Store results**: 45 beads
+- **After defensive filtering**: 27 claimable, 18 filtered
 - **Same results as Test 1**: `blocked` and `starvation-alert` labels not present in workspace
 
 ### Test 4: No Exclude Labels
 - **Configuration**: No assignee, no exclude labels
-- **Store results**: 46 beads
-- **After defensive filtering**: 46 claimable, 0 filtered
+- **Store results**: 45 beads
+- **After defensive filtering**: 45 claimable, 0 filtered
 - **Result**: All open beads are claimable (including deferred ones)
 
 ## Key Findings
@@ -110,7 +110,7 @@ The defensive filtering in PluckStrand successfully removes:
 
 ### 3. Label Filtering is Effective
 - Default exclude labels: `["deferred", "human", "blocked", "starvation-alert"]`
-- 18 of 46 beads (39%) were filtered out due to `deferred` label
+- 18 of 45 beads (40%) were filtered out due to `deferred` label
 - No beads had `human`, `blocked`, or `starvation-alert` labels in this workspace
 
 ### 4. Agent Assignment Query Returns Empty Results
@@ -140,3 +140,42 @@ The complete test script is available at:
 `/home/coding/claude-governor/scratch/test_pluck_exact_query_with_logging.py`
 
 This script can be run to verify Pluck query construction in any workspace.
+
+## Logging Output Structure
+
+The logging script produces structured output in 9 sections:
+
+1. **WORKSPACE CONFIGURATION** - Path and database location
+2. **FILTER PARAMETERS** - Assignee, exclude_labels, status
+3. **SQL QUERY CONSTRUCTION** - Exact SQL query and parameters
+4. **QUERY EXECUTION** - Raw count from database
+5. **STORE-LEVEL RESULTS** - First 5 beads before filtering
+6. **DEFENSIVE FILTERING** - Filtering step counts
+7. **FILTERED BEADS** - Beads removed with specific reasons
+8. **FINAL CLAIMABLE BEADS** - Beads that pass all filters
+9. **QUERY SUMMARY** - Final counts and configuration
+
+## Final Test Summary
+
+```
+Test 1 (default): 45 store → 27 claimable
+Test 2 (with agent): 0 store → 0 claimable  
+Test 3 (custom excludes): 45 store → 27 claimable
+Test 4 (no excludes): 45 store → 45 claimable
+```
+
+## Conclusion
+
+✅ **All acceptance criteria met:**
+- Logging captures the exact query Pluck constructs
+- All filter parameters are documented (workspace, labels, exclude_labels, state)
+- Final query is logged before execution  
+- Query construction matches expected configuration
+
+The Pluck query construction logging provides complete visibility into:
+- How queries are constructed at the SQL level
+- How defensive filtering is applied
+- Which beads are filtered and why
+- The final claimable bead set
+
+This foundational logging enables future beads to test variations and verify different configurations.
