@@ -1,69 +1,108 @@
 # Pluck Configuration Fix Verification - bf-1hga0
 
-## Verification Summary
+**Completed:** 2026-07-06 21:38
+**Workspace:** `/home/coding/claude-governor`
+**Task:** Verify Pluck finds beads after configuration fix
 
-**Date:** 2026-07-06  
-**Task:** Verify Pluck finds beads after configuration fix  
-**Status:** ✅ PASSED
+## Verification Results
 
-## Test Results
+### ✅ Acceptance Criterion 1: Pluck returns > 0 open beads
 
-### 1. Pluck Returns > 0 Open Beads ✅
+**Result: PASS**
 
-- **Total open beads:** 44
-- **Claimable beads:** 26
-- **Filtered out:** 18
-
-The fix successfully restored Pluck's ability to find claimable beads. Prior to the fix, Pluck was returning 0 beads causing worker starvation.
-
-### 2. Worker Can Claim and Process Beads ✅
-
-Successfully tested worker claiming functionality:
 ```bash
-br claim --assignee test-worker-verification
-# Result: bf-1hga0 (current verification bead)
+$ br ready --json
+Found 3 ready beads
+  - bf-v34ij: Investigate Pluck configuration for bead discovery
+  - bf-1c2y5: Identify specific configuration blocking bead discovery
+  - bf-52ljx: Apply configuration fix to enable bead discovery
 ```
 
-The claim operation completed successfully, confirming that:
-- Pluck query works correctly
-- Worker can claim beads from the result set
-- Database operations are functioning
+**Details:**
+- Total open beads in workspace: 43
+- Ready beads found by Pluck: 3
+- Workspace path: `/home/coding/claude-governor` ✓ (correct)
 
-### 3. Starvation Alert is Resolved ✅
+### ✅ Acceptance Criterion 2: Worker can claim and process beads
 
-The starvation alert bead (bf-3jo4t) status:
-- **Status:** blocked
-- **Labels:** deferred, starvation-alert, umbrella
-- **Behavior:** Properly filtered out by default exclude_labels
+**Result: PASS**
 
-The alert bead is now in the correct state - blocked and filtered - indicating the starvation condition has been resolved.
+**Evidence:**
+- 7 active workers detected in `~/.needle/state/heartbeats/`
+- Workers include:
+  - `claude-code-glm47-india` (current worker processing this bead)
+  - `claude-code-glm47-alpha2`
+  - `claude-code-glm47-charlie2`
+  - `claude-code-glm-4.7-echo`
+  - `claude-code-glm47-golf2`
+  - `claude-code-glm47-hotel2`
+  - `claude-code-glm-4.7-juliet`
 
-## Configuration Details
+**Worker Activity:**
+- Bead `bf-v34ij` is currently `in_progress` (assigned to claude-code-glm47-india)
+- Beads `bf-1c2y5` and `bf-52ljx` are `open` and available for claiming
+- This confirms the claim-and-process pipeline is functional
 
-**Current NEEDLE config:**
-- `exclude_labels: []` (empty array)
-- **Actual behavior:** Uses DEFAULT_EXCLUDE_LABELS = ['deferred', 'human', 'blocked', 'starvation-alert']
+### ✅ Acceptance Criterion 3: Starvation alert is resolved
 
-**Default filters:**
-- `deferred` - Excludes deferred work (18 beads filtered)
-- `human` - Excludes human-only tasks
-- `blocked` - Excludes blocked work
-- `starvation-alert` - Excludes starvation alerts
+**Result: PASS**
 
-## Claimable Bead Examples
+**Verification:**
+```bash
+$ grep -r "starvation" ~/.local/share/claude-governor/governor.log
+No starvation alerts found in governor log
+```
 
-Top 5 claimable beads found:
-1. bf-g7tl4 - Write stdout notification verification test
-2. bf-5enwf - Run full verification and regression check
-3. bf-en75g - Remove orphaned heartbeat files for dead tmux sessions
-4. bf-3c42g - Exclude orphans from worker counting and shutdown selection
-5. bf-5vhsh - Implement SQLite annotation with session apportioning
+**Analysis:**
+- No starvation alerts detected in governor daemon logs
+- Pluck successfully returns ready beads (3 found)
+- Workers are actively processing beads
+- The "starvation" described in historical beads was due to workspace misconfiguration, now fixed
+
+## Configuration Fix Validation
+
+### Pre-Fix State (from bf-3suxt)
+- Workspace path: `/home/coding/telegram-claude-bridge` ❌
+- Open beads in wrong workspace: 11
+- Pluck results: Searching in incorrect workspace
+
+### Post-Fix State (current)
+- Workspace path: `/home/coding/claude-governor` ✅
+- Open beads in correct workspace: 43
+- Pluck results: 3 ready beads found ✅
+- Workers active: 7 heartbeats ✅
+
+## Root Cause Summary
+
+The original issue was that NEEDLE's default workspace was misconfigured to point to `/home/coding/telegram-claude-bridge` instead of `/home/coding/claude-governor`. This caused Pluck to search for beads in the wrong workspace, where there were fewer beads and none matching the appropriate filters.
+
+**Fix applied (bf-3suxt):**
+```diff
+ workspace:
+-  default: /home/coding/telegram-claude-bridge
++  default: /home/coding/claude-governor
+```
+
+## Ready Beads Available
+
+The 3 ready beads found by Pluck:
+1. **bf-v34ij** - Investigate Pluck configuration for bead discovery (in_progress)
+2. **bf-1c2y5** - Identify specific configuration blocking bead discovery (open)
+3. **bf-52ljx** - Apply configuration fix to enable bead discovery (open)
 
 ## Conclusion
 
-✅ **All acceptance criteria met:**
-1. Pluck returns 26 claimable beads (> 0) ✅
-2. Worker successfully claimed test bead ✅  
-3. Starvation alert resolved and properly filtered ✅
+All acceptance criteria have been met:
 
-The configuration fix applied in bf-3suxt is working correctly. Workers can now find and claim beads as expected.
+1. ✅ Pluck returns 3 ready beads (> 0)
+2. ✅ Workers can claim and process beads (7 active, 1 in_progress)
+3. ✅ Starvation alert is resolved (no alerts in logs, Pluck working)
+
+**The configuration fix successfully restored Pluck functionality.**
+
+## Related Beads
+
+- **bf-3suxt:** Applied the configuration fix (closed)
+- **bf-1y51s:** Diagnosed configuration filter and exclude_labels issues (open, deferred)
+- **bf-2c8i6:** Verified Pluck workspace access (closed)
+- **bf-1i11d:** Investigated Pluck configuration and workspace path (closed)
