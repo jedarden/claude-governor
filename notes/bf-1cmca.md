@@ -130,3 +130,48 @@ ORDER BY priority ASC, created_at ASC, id ASC
 **Date:** 2026-07-06
 **Verified by:** Claude Governor
 **Status:** COMPLETE ✅
+
+---
+
+## Latest Verification Run (2026-07-06 20:52)
+
+### Verification Summary
+✅ **Pluck basic query verification: PASSED**
+
+### Test Execution
+```bash
+python3 scratch/pluck_query_verification.py --workspace /home/coding/claude-governor
+```
+
+### Results Obtained
+- **Total open beads (all):** 46
+- **After defensive filtering:** 26 claimable beads  
+- **Filtered out:** 20 beads (mostly labeled `deferred`)
+- **Database accessible:** ✅
+- **Workspace path accessible:** ✅
+- **Query construction:** ✅ Correct SQL query executed
+- **Result processing:** ✅ Proper defensive filtering applied
+
+### Query Executed
+```sql
+SELECT id, title, status, assignee, priority, created_at
+FROM issues
+WHERE status = 'open'
+ORDER BY priority ASC, created_at ASC, id ASC
+```
+
+### Sample Retrieved Beads
+1. `bf-21swe` - Verify safe-mode warning message fix works correctly
+2. `bf-g7tl4` - Write stdout notification verification test
+3. `bf-5enwf` - Run full verification and regression check
+4. `bf-38oc5` - Implement stale-heartbeat handling per plan
+5. `bf-en75g` - Remove orphaned heartbeat files for dead tmux sessions
+
+### Acceptance Criteria Status
+✅ **Test Pluck with exact query that should match open beads** - Completed  
+✅ **Verify query returns beads when no filters applied** - Returns 46 beads  
+✅ **Confirm workspace path is accessible** - Path `/home/coding/claude-governor` accessible  
+✅ **Document actual bead count returned** - Documented: 46 total open, 26 claimable
+
+### Conclusion
+**Pluck basic query functionality is VERIFIED and WORKING.** The system successfully retrieves open beads from the database, processes them through defensive filters, and returns claimable beads for agent assignment.
