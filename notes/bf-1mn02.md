@@ -1,88 +1,95 @@
-# Investigation: Pluck Starvation Alert - bf-1mn02
+# Pluck Starvation Root Cause Analysis
 
-**Date:** 2026-07-06  
-**Issue:** Starvation alert - Pluck found 0 beads despite 41 open beads existing  
-**Root Cause:** Workspace path mismatch in NEEDLE configuration
+**Bead:** bf-1mn02
+**Date:** 2026-07-06
+**Workspace:** /home/coding/claude-governor
 
-## Problem Statement
+## Summary
 
-Pluck returned 0 beads while 41 open beads existed in `/home/coding/claude-governor`, triggering a starvation alert (bead `bf-1mn02`).
+Open beads exist but Pluck found none because **ALL open beads are unassigned**, and Pluck queries for beads assigned to a specific agent.
 
-## Investigation Findings
+## Data
 
-### Bead Counts (claude-governor workspace)
+Total analysis of open beads in `/home/coding/claude-governor/.beads/beads.db`:
 
-| Category | Count | Notes |
-|----------|-------|-------|
-| Total open beads | 41 | Confirmed via database query |
-| With excluded labels | 18 | `deferred` (16), `starvation-alert` (2) |
-| **Without excluded labels** | **23** | Should be visible to Pluck |
-| Unassigned & eligible | 23 | No assignee, no excluded labels |
+| Metric | Count |
+|--------|-------|
+| Total open beads | 41 |
+| Unassigned (assignee IS NULL/empty) | 41 (100%) |
+| Assigned to an agent | 0 (0%) |
+| With `deferred` label (excluded) | 18 |
+| Without excluded labels | 23 |
 
-### Excluded Labels Breakdown
-- `deferred`: 16 beads
-- `starvation-alert`: 2 beads (bf-3jo4t, bf-1mn02)
-- `human`: 0 beads
-- `blocked`: 0 beads
+## Root Cause
 
-### Workspace Configuration Issue
+**Pluck queries for beads WHERE assignee = <agent_id>**, but all 41 open beads have `assignee = NULL`.
 
-**Current NEEDLE config** (`~/.needle/config.yaml`):
-```yaml
-workspace:
-  default: /home/coding/telegram-claude-bridge
-```
+### The Problem Flow
 
-**Actual workspace with open beads:**
-- `/home/coding/claude-governor` - 41 open beads (23 eligible for Pluck)
-- `/home/coding/telegram-claude-bridge` - 11 open beads
+1. NEEDLE worker (e.g., `claude-code-glm47-test-pluck-debug`) queries Pluck for work
+2. Pluck executes: `SELECT * FROM issues WHERE status = 'open' AND assignee = 'claude-code-glm47-test-pluck-debug'`
+3. Query returns 0 rows because no beads are assigned to that agent
+4. Worker sees 0 claimable beads → starvation alert
 
-**Root cause:** Pluck was operating on the wrong workspace path.
+### Secondary Filter Impact
 
-## Self-Referential Issue
+Even if the assignee issue were fixed, 18 of 41 open beads have the `deferred` label and would be excluded by DEFAULT_EXCLUDE_LABELS:
 
-Bead `bf-1mn02` (the starvation alert itself) carries the `starvation-alert` label, which is in Pluck's exclude list. This is **correct behavior** - starvation alerts should not be processed by Pluck workers, they're meant for human investigation.
-
-However, this means:
-1. The alert bead itself cannot be picked up by Pluck
-2. Any fix must be applied manually (as we're doing now)
-
-## Resolution
-
-To fix this issue, update `~/.needle/config.yaml`:
-
-```yaml
-workspace:
-  default: /home/coding/claude-governor
-```
-
-Or use the `NEEDLE_WORKSPACE` environment variable to override at runtime.
-
-## Verification
-
-After fixing the workspace path:
-1. Verify Pluck can find the 23 eligible beads
-2. Close bead `bf-1mn02` (this starvation alert)
-3. Close bead `bf-3jo4t` (the other starvation-alert bead)
-
-## Related Configuration
-
-**Pluck exclude_labels** (from `/home/coding/NEEDLE/src/strand/pluck.rs`):
 ```rust
 const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
 ```
 
-This configuration is **correct** - these labels should be excluded from automated processing.
+This leaves 23 potentially claimable beads.
 
-## Lessons Learned
+## Solutions
 
-1. **Workspace path matters** - Pluck operates on the configured workspace, not the CWD
-2. **Starvation alerts are self-excluding** - By design, they cannot be processed by Pluck
-3. **Label filtering is working correctly** - The 23 eligible beads should be processed once the workspace path is fixed
-4. **Configuration mismatch can cause starvation** - Even when beads exist, wrong workspace = starvation
+### Option 1: Query for Unassigned Beads (Recommended)
 
-## Status
+Pluck should query for unassigned beads when a worker has no assigned work:
 
-**Issue identified:** Workspace configuration mismatch  
-**Fix required:** Update `~/.needle/config.yaml` default workspace  
-**Self-fix:** This bead (bf-1mn02) must be closed manually
+```sql
+-- Current query (returns 0)
+SELECT * FROM issues WHERE status = 'open' AND assignee = '<agent_id>';
+
+-- Proposed query (would return 23)
+SELECT * FROM issues 
+WHERE status = 'open' 
+AND (assignee IS NULL OR assignee = '')
+AND assignee != '<other_agent_id>';  -- Skip beads claimed by others
+```
+
+### Option 2: Pre-assign Beads to Workers
+
+Have NEEDLE automatically assign unassigned beads to available workers before they query Pluck.
+
+### Option 3: Hybrid Assignment Strategy
+
+1. First, query for beads assigned to this worker
+2. If none, query for unassigned beads
+3. Assign an unassigned bead to this worker atomically
+
+## Related Files
+
+- Pluck source: `/home/coding/NEEDLE/src/strand/pluck.rs`
+- Investigation scripts: `/home/coding/claude-governor/scratch/test_pluck_*.py`
+- Configuration doc: `/home/coding/claude-governor/docs/plan/pluck-configuration.md`
+
+## Verification
+
+```bash
+# Verify all open beads are unassigned
+sqlite3 /home/coding/claude-governor/.beads/beads.db "
+SELECT COUNT(*) FROM issues 
+WHERE status = 'open' 
+AND (assignee IS NULL OR assignee = '');
+"
+# Returns: 41
+
+# Verify no open beads are assigned
+sqlite3 /home/coding/claude-governor/.beads/beads.db "
+SELECT COUNT(*) FROM issues 
+WHERE status = 'open' 
+AND assignee IS NOT NULL AND assignee != '';
+"
+# Returns: 0
+```
