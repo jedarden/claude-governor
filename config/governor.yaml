@@ -145,6 +145,14 @@ daemon:
   max_scale_down_per_cycle: 1       # Max workers to scale down per cycle
   min_scale_interval_secs: 60       # Minimum time between scale operations
   target_ceiling: 90.0              # Target utilization ceiling percentage
+                                     # Per-window overrides available (optional):
+                                     #   windows:
+                                     #     five_hour:
+                                     #       target_utilization: 0.85  # tighter to avoid mid-task cutoff
+                                     #     seven_day:
+                                     #       target_utilization: 0.90
+                                     #     seven_day_sonnet:
+                                     #       target_utilization: 0.90
   mode: auto                        # Daemon mode: auto, systemd, or tmux
   log_max_bytes: 104857600         # Maximum log file size before rotation (100 MB)
   log_backup_count: 3               # Number of rotated log files to keep (.1, .2, .3)

@@ -3368,21 +3368,10 @@ pub fn run_governor_cycle(
     }
 
     // Effective settings — conservative overrides applied when safe mode is active.
-    // - target_ceiling: reduced by SAFE_MODE_CEILING_REDUCTION pct points
     // - hysteresis_band: widened by SAFE_MODE_HYSTERESIS_MULTIPLIER
     // - composite risk: disabled (cross-window optimisation is too uncertain)
     // - sprint: sprint eligibility is also blocked (checked in check_underutilization_sprint)
-    let effective_target_ceiling = if state.safe_mode.active {
-        let reduced = target_ceiling - SAFE_MODE_CEILING_REDUCTION;
-        log::info!(
-            "[governor] safe_mode active: target_ceiling {:.0}% → {:.0}%",
-            target_ceiling,
-            reduced
-        );
-        reduced.max(50.0) // never below 50%
-    } else {
-        target_ceiling
-    };
+    // - target_ceiling: reduced by SAFE_MODE_CEILING_REDUCTION pct points per-window
 
     let effective_hysteresis = if state.safe_mode.active {
         let widened = hysteresis_band * SAFE_MODE_HYSTERESIS_MULTIPLIER;
@@ -3426,10 +3415,33 @@ pub fn run_governor_cycle(
     let mut seven_day_forecast = state::WindowForecast::default();
     let mut seven_day_sonnet_forecast = state::WindowForecast::default();
 
+    // Track effective target ceilings per window (after safe mode reduction)
+    let mut effective_target_ceilings = std::collections::HashMap::new();
+
     for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
         let util = current_utilization.get(*window).copied().unwrap_or(0.0);
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
         let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
+
+        // Get the base target ceiling for this specific window (from config override or global default)
+        let base_target_ceiling = pricing_config.daemon.get_target_ceiling_for_window(window);
+
+        // Apply safe mode reduction if active (per-window)
+        let effective_target_ceiling = if state.safe_mode.active {
+            let reduced = base_target_ceiling - SAFE_MODE_CEILING_REDUCTION;
+            log::info!(
+                "[governor] safe_mode active: {} target_ceiling {:.0}% → {:.0}%",
+                window,
+                base_target_ceiling,
+                reduced
+            );
+            reduced.max(50.0) // never below 50%
+        } else {
+            base_target_ceiling
+        };
+
+        // Store effective target ceiling for this window (used later for logging)
+        effective_target_ceilings.insert(window.to_string(), effective_target_ceiling);
 
         // Per-worker pct/hr rate for safe_worker_count calculation
         let pct_per_worker = if current_total > 0 && fleet_pct_hr > 0.0 {
@@ -3666,17 +3678,23 @@ pub fn run_governor_cycle(
     // 6. Log capacity forecast
     log_capacity_forecast(&state.capacity_forecast);
 
+    // Get the effective target ceiling for the binding window (used for logging)
+    let binding_effective_ceiling = effective_target_ceilings
+        .get(&binding_window)
+        .copied()
+        .unwrap_or(target_ceiling);
+
     // 4. Compute target workers
     let target = compute_target_workers(
         &state,
-        effective_target_ceiling,
+        binding_effective_ceiling,
         effective_composite_risk,
         effective_cone_scaling,
     );
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%{})",
         target,
-        effective_target_ceiling,
+        binding_effective_ceiling,
         if state.safe_mode.active {
             ", safe_mode"
         } else {

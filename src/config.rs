@@ -176,6 +176,24 @@ pub struct DaemonConfig {
     /// Rotated logs are named governor.log.1, governor.log.2, governor.log.3
     #[serde(default = "default_log_backup_count")]
     pub log_backup_count: u32,
+
+    /// Per-window target utilization overrides (optional)
+    ///
+    /// Allows specifying different target ceilings for specific windows.
+    /// If a window is not listed, it uses the global target_ceiling.
+    ///
+    /// Example:
+    /// ```yaml
+    /// daemon:
+    ///   target_ceiling: 90.0  # global default
+    ///   windows:
+    ///     five_hour:
+    ///       target_utilization: 0.85  # uses 85% instead of 90%
+    ///     seven_day_sonnet:
+    ///       target_utilization: 0.90  # same as global (redundant but explicit)
+    /// ```
+    #[serde(default)]
+    pub windows: std::collections::HashMap<String, WindowOverrideConfig>,
 }
 
 fn default_loop_interval_secs() -> u64 {
@@ -221,7 +239,49 @@ impl Default for DaemonConfig {
             pre_scale_minutes: default_pre_scale_minutes(),
             log_max_bytes: default_log_max_bytes(),
             log_backup_count: default_log_backup_count(),
+            windows: std::collections::HashMap::new(),
         }
+    }
+}
+
+impl DaemonConfig {
+    /// Get the target ceiling for a specific window
+    ///
+    /// Returns the window-specific override if configured, otherwise the global default.
+    /// The target_ceiling is a percentage (0-100), e.g., 90.0 for 90%.
+    ///
+    /// # Arguments
+    /// * `window_name` - The window name (e.g., "five_hour", "seven_day", "seven_day_sonnet")
+    ///
+    /// # Returns
+    /// The target ceiling percentage for the specified window
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = DaemonConfig {
+    ///     target_ceiling: 90.0,
+    ///     windows: {
+    ///         let mut map = HashMap::new();
+    ///         map.insert("five_hour".to_string(), WindowOverrideConfig {
+    ///             target_utilization: Some(0.85),
+    ///         });
+    ///         map
+    ///     },
+    ///     ..Default::default()
+    /// };
+    ///
+    /// assert_eq!(config.get_target_ceiling_for_window("five_hour"), 85.0);
+    /// assert_eq!(config.get_target_ceiling_for_window("seven_day"), 90.0);
+    /// ```
+    pub fn get_target_ceiling_for_window(&self, window_name: &str) -> f64 {
+        if let Some(window_config) = self.windows.get(window_name) {
+            if let Some(utilization) = window_config.target_utilization {
+                // Convert from 0-1 range to 0-100 percentage
+                return utilization * 100.0;
+            }
+        }
+        // Fall back to global default
+        self.target_ceiling
     }
 }
 
@@ -391,6 +451,25 @@ impl Default for ConeScalingConfig {
         Self {
             narrow_threshold: default_cone_narrow_threshold(),
         }
+    }
+}
+
+/// Per-window target utilization override configuration
+///
+/// Allows overriding the global target_ceiling for specific windows.
+/// For example, five_hour can use 85% while seven_day uses 90%.
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct WindowOverrideConfig {
+    /// Target utilization for this window (optional, inherits global if absent)
+    /// Range: 0.0-1.0 (e.g., 0.85 for 85%)
+    /// Converted to percentage internally: target_utilization * 100 = target_ceiling
+    #[serde(default)]
+    pub target_utilization: Option<f64>,
+}
+
+impl Default for WindowOverrideConfig {
+    fn default() -> Self {
+        Self { target_utilization: None }
     }
 }
 
@@ -865,5 +944,161 @@ agents:
         assert_eq!(agent.subscription, true);
         assert_eq!(agent.min_workers, 0);
         assert_eq!(agent.max_workers, 8);
+    }
+
+    #[test]
+    fn test_window_config_defaults() {
+        let yaml = r#"
+pricing:
+  models: {}
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        // No window overrides configured, should fall back to global default
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 90.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 90.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 90.0);
+        // Unknown window should also use global default
+        assert_eq!(config.daemon.get_target_ceiling_for_window("unknown_window"), 90.0);
+    }
+
+    #[test]
+    fn test_window_config_custom() {
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 90.0
+  windows:
+    five_hour:
+      target_utilization: 0.85
+    seven_day:
+      target_utilization: 0.92
+    seven_day_sonnet:
+      target_utilization: 0.88
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // five_hour has override: 0.85 * 100 = 85.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
+
+        // seven_day has override: 0.92 * 100 = 92.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 92.0);
+
+        // seven_day_sonnet has override: 0.88 * 100 = 88.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 88.0);
+
+        // Unknown window falls back to global default (90.0)
+        assert_eq!(config.daemon.get_target_ceiling_for_window("unknown_window"), 90.0);
+    }
+
+    #[test]
+    fn test_window_config_partial_override() {
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 95.0
+  windows:
+    five_hour:
+      target_utilization: 0.80
+    # seven_day and seven_day_sonnet are not configured, should use global 95.0
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // five_hour has override: 0.80 * 100 = 80.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 80.0);
+
+        // seven_day uses global default: 95.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 95.0);
+
+        // seven_day_sonnet uses global default: 95.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 95.0);
+    }
+
+    #[test]
+    fn test_window_config_none_utilization() {
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 90.0
+  windows:
+    five_hour:
+      # target_utilization is explicitly None (or not set)
+      # This should fall back to global default
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // five_hour has no target_utilization set, should use global default: 90.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 90.0);
+    }
+
+    #[test]
+    fn test_window_config_empty_map() {
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 85.0
+  windows: {}
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // Empty windows map, all windows should use global default: 85.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 85.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 85.0);
+    }
+
+    #[test]
+    fn test_window_config_five_hour_tighter() {
+        // Test the plan's design intent: five_hour uses tighter ceiling to avoid mid-task cutoff
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 90.0
+  windows:
+    five_hour:
+      target_utilization: 0.85
+    # seven_day and seven_day_sonnet use global default
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // five_hour has tighter override: 0.85 * 100 = 85.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
+
+        // seven_day uses global default: 90.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 90.0);
+
+        // seven_day_sonnet uses global default: 90.0
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 90.0);
+    }
+
+    #[test]
+    fn test_window_config_all_different() {
+        // Test all three windows with different ceilings
+        let yaml = r#"
+pricing:
+  models: {}
+daemon:
+  target_ceiling: 95.0
+  windows:
+    five_hour:
+      target_utilization: 0.80
+    seven_day:
+      target_utilization: 0.92
+    seven_day_sonnet:
+      target_utilization: 0.88
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // Each window has its own override
+        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 80.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 92.0);
+        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day_sonnet"), 88.0);
+
+        // Unknown window still uses global default
+        assert_eq!(config.daemon.get_target_ceiling_for_window("unknown"), 95.0);
     }
 }
