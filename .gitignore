@@ -1,2 +1,3 @@
 /target
 /.beads
+__pycache__/
