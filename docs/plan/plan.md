@@ -2060,3 +2060,66 @@ claude-governor/
 9. **Single vs. two-tier cache write fallback:** Not all API responses include the `cache_creation` sub-object (it may be absent in older response formats or certain service tiers). When absent, attribute all `cache_creation_input_tokens` to the 5-minute tier (1.25× rate) as the conservative fallback — this slightly underestimates cost rather than overestimating.
 
 10. **Model attribution in multi-model sessions:** A single Claude Code session can make calls to multiple models (e.g., a tool-call routing to Haiku while the main conversation uses Sonnet). Token records must be attributed per-model from the `model` field in each response, not inferred from the session path alone.
+
+---
+
+## ADR-001: 2026-07-20 — Split the governor daemon into an always-on Observe loop and a separately-gated Act loop
+
+**Status:** Proposed
+
+### Context
+
+This ADR was written during a fleet-wide artifact-improvement pass, prompted by inspecting the actual live deployment on the `ex44` host rather than just the plan.
+
+Live findings (2026-07-20):
+
+- `claude-token-collector.service` is `enabled`/`active`, has been running continuously, and is still appending `i`/`f` records to `token-history.jsonl` (visible in `journalctl --user -u claude-token-collector`).
+- Both `claude-governor.service` and `cgov.service` (see the two-unit duplication noted separately below) are `disabled`/`inactive`. `~/.config/claude-governor/governor-state.json` has not been updated since `2026-06-28T19:51:09Z` — **21+ days stale** as of this writing.
+- `cgov doctor` on the live host reports 4 hard failures directly caused by this: `daemon_running` (stopped), `state_freshness` (stale), `burn_rate_samples` (insufficient — no fresh EMA data), `prediction_accuracy` (10 stale scored predictions, 14% median error).
+- `governor.yaml`'s `alerts.auto_bead` is `false`, with the comment `"Disabled: alert predicates have 100% FP rate (docs-878a) ... Re-enable only after FP rate < 5% over 100-alert window."` `docs-878a` (closed) and `notes/bf-h7toj.md` show the false-positive rate was later driven to 0% across 9 samples by an `is_cutoff_alert_consistent()` guard — but `auto_bead` was never turned back on, and the FP telemetry counter (`alert_fp_telemetry.total_recorded`) is stuck at effectively zero precisely because the daemon that would grow it towards the 100-sample re-enablement threshold is the same daemon that got shut off.
+- Git history (`docs/notes/bf-48qtz.md`, 2026-07-09) shows this is not a one-time incident: the daemon has previously been confirmed running, then gone stopped again, at least once before in the last two weeks, with no record of *why* it was stopped either time.
+
+The root cause is architectural, not incidental: `src/governor.rs`'s main loop (`cgov _daemon`) bundles three things that have very different risk profiles into one process behind one on/off switch:
+
+1. **Observe** — poll `/api/oauth/usage`, read the token collector's output, compute per-window EMA burn rates, capacity forecasts, the confidence cone (Component 21), calibrator scoring (Component 12), and safe-mode evaluation (Component 20). This is read-only with respect to the outside world — it only ever writes `governor-state.json`.
+2. **Act (scale)** — launch/stop NEEDLE workers via `launch_cmd` / graceful SIGINT (Component 6).
+3. **Act (alert)** — shell out to create HUMAN-type beads (Component 8).
+
+Because these three are one process, the only way to stop *acting* on distrusted predictions (which is exactly what happened around `docs-878a`, and is presumably why `auto_bead: false` was set) is to kill the *whole* daemon — which also stops the harmless, valuable Observe half. That, in turn, starves the calibrator of the very data (`prediction-accuracy.jsonl` samples, `alert_fp_telemetry` samples) needed to decide when it is safe to re-enable Act. It is a self-perpetuating blackout: nothing is currently accumulating the evidence that would justify turning the governor back on. The token collector, which the plan already correctly identifies as "an independent daemon... can be started, stopped, and queried independently" (Component 2), is the existing proof that this separation is both desirable and already half-built in practice — it just needs to be extended to the forecasting/calibration logic that currently lives only inside the coupled daemon.
+
+### Decision
+
+Split `cgov _daemon` into two independently-supervised processes:
+
+- **`cgov _observe`** (new hidden subcommand, replaces the observation portion of `_daemon`): runs the poll → burn-rate EMA → capacity-forecast → confidence-cone → calibrator → safe-mode pipeline every `loop_interval` seconds and writes `governor-state.json` / `governor-state.prev.json` / `prediction-accuracy.jsonl`. It **never** shells out to `launch_cmd`, never sends SIGINT/kill to a worker session, and never executes the alert command. It is installed as its own systemd unit (`claude-governor-observe.service`), `enabled` and `Restart=always` by default at `cgov init` time — exactly like `claude-token-collector.service` already is.
+- **`cgov _act`** (new hidden subcommand, replaces the scaling+alerting portion of `_daemon`): reads the state that `_observe` last wrote, and *only* performs `apply_scaling()` (Component 6/7/9/13/14/17) and `check_alerts()` / `fire_alert()` (Component 8). It is installed as a separate systemd unit (`claude-governor-act.service`) that an operator can `cgov stop act` / `cgov disable act` independently, without losing forecasting, calibration, or `cgov status` freshness.
+
+`governor-state.json` gains an explicit ownership split so the two processes don't race on the same file: `_observe` owns `usage`, `capacity_forecast`, `burn_rate`, `schedule`, `calibration`, `safe_mode`, `alert_fp_telemetry`; `_act` owns `workers.*.target`, `alert_cooldown`, and appends to `alerts`. `_act` reads the file, computes its decision, and writes back only its own subtree (last-writer-wins on the rest is acceptable since `_observe` is the sole writer of everything else).
+
+`cgov status`, `cgov doctor`, `cgov explain`, and `cgov simulate` are unaffected — they already read state from disk and don't care which process wrote it. `cgov enable` installs and starts both units; `cgov disable`/`cgov stop` gain a target argument (`observe`, `act`, or `all`, default `all`) so `cgov stop act` becomes the documented, single command for "pause automated scaling and alerting without losing telemetry," replacing the undocumented `systemctl --user disable claude-governor.service` that appears to be what actually happened here.
+
+`doctor` also gains a distinction it currently lacks: today `daemon_running: stopped` reads as an unqualified failure. Post-split, `doctor` checks `_observe` and `_act` independently, and a deliberately-stopped `_act` (an intentional, tracked posture) is a `warn`, not a `fail` — while a stopped `_observe` remains a hard `fail`, because there is no valid reason for the read-only half to ever be off.
+
+### Alternatives Considered
+
+1. **Do nothing; just document "remember to `cgov restart` after disabling."** Rejected — this is what the previous incident (`bf-48qtz`, then regression by 2026-06-28) already tried implicitly, and it silently regressed within three weeks. Documentation doesn't fix a coupling.
+2. **Add a `--dry-run` / `--observe-only` flag to the single `_daemon` process instead of splitting into two processes.** Simpler (one binary invocation, one unit file), and would fix the "forecast keeps flowing while paused" problem. Rejected as the primary fix because it's still one process / one systemd unit / one failure domain: a crash, an unhandled panic in the scaling code path, or a future risky feature added to the same loop still takes down forecasting with it. A flag also doesn't give operators a way to stop *only* alerting while keeping scaling (or vice versa) without a third flag. Two independently-supervised units, mirroring the token collector's already-proven pattern, is more robust for the same implementation cost and generalizes better.
+3. **Add a watchdog process that automatically restarts `claude-governor.service` if state goes stale.** Treats the symptom (daemon is down) rather than the cause (the only way to stop untrusted actions is to stop everything, so operators are incentivized to leave it down). A watchdog would have fought the operator's actual intent in this incident — repeatedly restarting a daemon whose *acting* half was correctly distrusted — rather than giving them a precise tool to keep observing while pausing acting.
+4. **Keep one process, but gate `apply_scaling()`/`fire_alert()` behind the existing `auto_bead`-style config flags instead of a process split.** This is close to what already exists for alerts (`auto_bead: false`) but doesn't exist at all for scaling, and — critically — doesn't change *which systemd unit* the operator has to stop to get "no actions." An operator who wants to pause scaling still has only the single-daemon on/off switch available, so they still stop the whole thing. The config-flag approach and the process split are complementary, not mutually exclusive; this ADR chooses the process split because it's the one that actually removes the "stopping actions blinds you to state" failure mode.
+
+### Consequences
+
+**Positive:**
+- `governor-state.json`, the confidence cone, and the calibrator's `prediction-accuracy.jsonl` keep accumulating fresh data even while scaling/alerting is paused — which is precisely the data the calibrator/FP-telemetry re-enablement criteria need in order for anyone to ever have evidence it's safe to turn `_act` back on. Breaks the self-perpetuating blackout described in Context.
+- `cgov status`/`cgov doctor` stop going stale as a side effect of an operator's decision to distrust actions — the two concerns are now independently observable.
+- Mirrors the token collector's already-successful independent-unit pattern instead of introducing a new one.
+- `doctor`'s `daemon_running` check becomes more precise (distinguishes "observe is down" — always bad — from "act is intentionally paused" — a normal, trackable posture).
+
+**Negative / costs:**
+- Two systemd units to install/manage instead of one (`cgov init`/`cgov enable`/`cgov disable` all need updating; `install.sh` and `config/*.service` need a third unit file, on top of resolving the existing `cgov.service` vs. `claude-governor.service` duplication noted as a separate bead).
+- `governor-state.json` needs a documented ownership split (above) to avoid a torn-write race between two processes; this is a small but real increase in state-management complexity versus the current single-writer model.
+- Slightly higher baseline resource usage (a second always-on process, though `_observe`'s workload — HTTP poll + arithmetic — is lighter than `_act`'s tmux/process-exec work).
+
+### Follow-up
+
+Implementing this ADR is out of scope for this pass (this pass files it as a decision, not an implementation). The concrete first steps — extracting `_observe`/`_act` from `governor.rs`, writing the new unit files, and updating `cgov enable`/`disable`/`stop` — should be filed as their own beads once someone picks this ADR up; the beads filed alongside this ADR (see bf beads labeled `artifact-improvement` in this repo) cover the narrower, immediately-actionable problems found during this same investigation (stale pricing table, wrong default alert-bead command, duplicate systemd units, alert-bead spam) that don't require the full split to fix.
