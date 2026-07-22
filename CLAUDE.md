@@ -153,7 +153,19 @@ systemctl --user enable --now claude-polish-seeder.timer   # every 30 min
 #    or, if you prefer a foreground loop:  scripts/polish-seeder.sh --loop 1800
 ```
 
-Env overrides: `CGOV_POLISH_QUEUE`, `CGOV_POLISH_LOW_WATER`, `CGOV_POLISH_TARGETS`.
+Env overrides: `CGOV_POLISH_QUEUE`, `CGOV_POLISH_LOW_WATER`, `CGOV_POLISH_TARGETS`,
+`CGOV_POLISH_PUSH` (1 = also `git push` bead commits, best-effort; default 0 = local commit only).
+
+**Bead git durability:** `bf create` writes to the live SQLite store (`.beads/beads.db`,
+gitignored); only `bf sync --flush-only` updates the committed `.beads/issues.jsonl`
+checkpoint. So each seeder pass **flushes and commits** every target repo's (and the
+queue's) beads — scoped to the `.beads/` pathspec so a dirty tree is untouched — so
+runner-produced beads survive a fresh clone / db rebuild and are visible to other hosts.
+
+**Runners can view deployed artifacts via ADB:** the generator prompt reminds runners
+that for a repo with a deployed web frontend they have ADB access to a Pixel 6 over
+Tailscale (`adb-check`, then open the URL in Chrome and `screencap`) to audit the real
+deployed UI/UX, not just the source.
 
 ---
 

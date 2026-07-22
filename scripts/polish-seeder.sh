@@ -31,6 +31,7 @@ QUEUE="${CGOV_POLISH_QUEUE:-$HOME/cgov-polish-queue}"
 LOW_WATER="${CGOV_POLISH_LOW_WATER:-5}"
 TARGETS_FILE="${CGOV_POLISH_TARGETS:-$HOME/.config/claude-governor/polish-targets.txt}"
 BF="${BF:-bf}"
+GIT_PUSH="${CGOV_POLISH_PUSH:-0}"    # 1 = also push bead commits (best-effort); 0 = local commit only
 
 log() { echo "[polish-seeder $(date -u +%H:%M:%S)] $*"; }
 
@@ -63,6 +64,29 @@ ready_count() {
   ( cd "$1" && "$BF" ready 2>/dev/null | grep -c 'bf-' ) || echo 0
 }
 
+# Flush any runner-produced beads to the JSONL checkpoint and commit them to git so
+# they survive a fresh clone / db rebuild and are visible to other hosts. bf writes to
+# the live SQLite store (gitignored); only `bf sync --flush-only` updates issues.jsonl.
+# Commits ONLY the .beads/ pathspec, so an otherwise-dirty working tree is left alone.
+# Push is opt-in (CGOV_POLISH_PUSH=1) and best-effort — a rejected push just leaves the
+# beads committed locally.
+sync_beads_git() {
+  local repo="$1" label="$2"
+  ( cd "$repo" || exit 0
+    "$BF" sync --flush-only >/dev/null 2>&1 || true
+    [ -d .git ] || exit 0
+    [ -n "$(git status --porcelain -- .beads 2>/dev/null)" ] || exit 0
+    git add .beads >/dev/null 2>&1 || true
+    if git -c user.email=github@jedarden.com -c user.name=jedarden \
+        commit -q -m "chore(beads): sync polish-loop beads [$label]" -- .beads 2>/dev/null; then
+      log "committed beads: $label"
+      if [ "$GIT_PUSH" = "1" ]; then
+        if git push >/dev/null 2>&1; then log "pushed beads: $label"; else log "push failed (committed locally): $label"; fi
+      fi
+    fi
+  )
+}
+
 # The generator prompt for a target repo. $repo and $QUEUE expand; backticks and
 # <ID> are kept literal for the worker to fill in.
 meta_prompt() {
@@ -72,6 +96,7 @@ POLISH-GENERATION PASS. Target repo: $repo. Your ONLY output is new bf beads in 
 STEPS:
 1. cd $repo
 2. Read docs/plan/plan.md (treat as scope CEILING) and skim src/.
+   If the repo has a DEPLOYED web frontend/app, you have ADB access to a Pixel 6 over Tailscale (run adb-check first): open the deployed URL in Chrome and screenshot it to audit the REAL deployed artifact's UI/UX, not just the source — adb shell am start -a android.intent.action.VIEW -d '<url>' com.android.chrome ; sleep 2 ; adb shell screencap -p > /tmp/polish-view.png ; then read /tmp/polish-view.png.
 3. Run \`bf ready\` and \`bf list\` there; do NOT duplicate anything already tracked.
 4. Find real, concrete, VERIFIABLE polish opportunities WITHIN existing scope ONLY: bugs, stubs/TODOs, silently-swallowed errors, missing edge cases, test gaps, impl diverging from plan.md. NOT new features.
 5. Adversarial self-check each candidate: real defect at a SPECIFIC file:line? fix objectively verifiable? If subjective/speculative/uncertain -> DISCARD.
@@ -90,6 +115,7 @@ seed_once() {
     if [ ! -d "$repo" ]; then log "skip (missing): $repo"; continue; fi
     local name pend ready
     name="$(basename "$repo")"
+    sync_beads_git "$repo" "$name"    # commit any beads runners produced in this repo
     pend="$(pending_meta "$name")"
     if [ "${pend:-0}" -ge 1 ]; then log "skip (meta pending): $name"; continue; fi
     ready="$(ready_count "$repo")"
@@ -100,7 +126,7 @@ seed_once() {
     log "seeded meta-bead: $name (ready=${ready})"
     seeded=$((seeded + 1))
   done < <(read_targets)
-  ( cd "$QUEUE" && "$BF" sync --flush-only >/dev/null 2>&1 ) || true
+  sync_beads_git "$QUEUE" "queue"
   log "pass complete: seeded ${seeded}"
 }
 
