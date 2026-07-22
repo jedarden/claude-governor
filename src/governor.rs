@@ -6398,4 +6398,120 @@ mod mock_poller_tests {
         assert_eq!(result.five_hour_utilization, 100.0);
         assert_eq!(result.seven_day_utilization, 100.0);
     }
+
+    // ---------------------------------------------------------------------------
+    // Governor cycle smoke tests
+    // ---------------------------------------------------------------------------
+
+    /// Basic smoke test for governor cycle - verifies the cycle runs without panicking.
+    ///
+    /// This test creates a minimal environment and calls run_governor_cycle with
+    /// dry_run=true to verify that:
+    /// - The function executes without panic or crash
+    /// - The function returns Ok(())
+    /// - The cycle handles minimal state gracefully
+    ///
+    /// The test uses a temporary directory for state files and minimal config fixtures.
+    /// Even if the poller fails to reach the API (no credentials), the cycle should
+    /// complete successfully because errors are handled gracefully.
+    #[test]
+    fn test_governor_cycle_smoke() {
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        // 1. Create temporary directory for state files
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        // 2. Create minimal poller (will fail if no credentials, but that's OK)
+        let poller_result = crate::poller::Poller::with_credentials_path(Some(
+            temp_dir.path().join("fake-credentials.json").to_string_lossy().to_string(),
+        ));
+
+        // 3. Create minimal config objects with defaults
+        let alert_config = crate::config::AlertConfig::default();
+        let composite_risk_config = crate::config::CompositeRiskConfig::default();
+        let cone_scaling_config = crate::config::ConeScalingConfig::default();
+
+        // Create minimal pricing config with required fields
+        let pricing_config = crate::config::GovernorConfig {
+            pricing: crate::config::PricingConfig {
+                models: HashMap::new(),
+            },
+            sprint: crate::config::SprintConfig::default(),
+            daemon: crate::config::DaemonConfig::default(),
+            alerts: crate::config::AlertConfig::default(),
+            composite_risk: crate::config::CompositeRiskConfig::default(),
+            cone_scaling: crate::config::ConeScalingConfig::default(),
+            agents: HashMap::new(),
+            credentials_path: None,
+        };
+
+        // 4. Create minimal agents HashMap (empty is OK for smoke test)
+        let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
+
+        // 5. Create empty promotions list
+        let promotions: Vec<crate::schedule::Promotion> = Vec::new();
+
+        // 6. Attempt to run the governor cycle
+        //
+        // If poller creation failed (no credentials), we still test that the
+        // governor cycle can handle the error gracefully.
+        let result = if let Ok(mut poller) = poller_result {
+            run_governor_cycle(
+                &mut poller,
+                &state_path,
+                true,  // dry_run = true
+                60,    // loop_interval
+                2.0,   // hysteresis_band
+                3,     // max_up_per_cycle
+                2,     // max_down_per_cycle
+                90.0,  // target_ceiling
+                &alert_config,
+                &agents,
+                0,     // pre_scale_minutes (disabled)
+                &promotions,
+                &composite_risk_config,
+                &cone_scaling_config,
+                &pricing_config,
+            )
+        } else {
+            // Poller creation failed - verify that run_governor_cycle handles
+            // this case gracefully by creating a test with no actual polling
+            let mut fake_poller = crate::poller::Poller::with_credentials_path(None)
+                .expect("Failed to create default poller");
+
+            run_governor_cycle(
+                &mut fake_poller,
+                &state_path,
+                true,  // dry_run = true
+                60,    // loop_interval
+                2.0,   // hysteresis_band
+                3,     // max_up_per_cycle
+                2,     // max_down_per_cycle
+                90.0,  // target_ceiling
+                &alert_config,
+                &agents,
+                0,     // pre_scale_minutes (disabled)
+                &promotions,
+                &composite_risk_config,
+                &cone_scaling_config,
+                &pricing_config,
+            )
+        };
+
+        // 7. Verify the cycle completed successfully
+        //
+        // The function should return Ok(()) even if:
+        // - Polling fails (error is handled gracefully)
+        // - State file doesn't exist yet (creates new state)
+        // - No agents are configured (valid for test)
+        assert!(result.is_ok(), "run_governor_cycle should return Ok(()) in dry_run mode");
+
+        // 8. Verify state file was created (even if minimal)
+        assert!(state_path.exists(), "State file should be created after cycle run");
+
+        // 9. Verify no panic occurred (test reaching this point means no panic)
+        // This is the key "smoke test" - the cycle runs without crashing
+    }
 }
