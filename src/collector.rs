@@ -164,7 +164,14 @@ pub struct CursorStore {
 impl CursorStore {
     /// Load cursor store from a JSON file
     ///
-    /// Returns an empty CursorStore if the file doesn't exist.
+    /// Returns an empty CursorStore if the file doesn't exist OR if it fails to
+    /// parse. A corrupt cursor file (e.g. from the concurrent-writer race that
+    /// `save()` now avoids — see ADR-002) must never take down usage tracking
+    /// indefinitely: cursors are just "how far we've read" bookkeeping, not the
+    /// usage data itself, so resetting them costs at most a bit of re-reading, not
+    /// data loss. Previously a parse error here hard-failed every collection pass
+    /// (and the governor's burn-rate polling with it) until someone noticed and
+    /// manually repaired the file.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -172,20 +179,37 @@ impl CursorStore {
 
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let store: Self = serde_json::from_reader(reader)?;
-        Ok(store)
+        match serde_json::from_reader(reader) {
+            Ok(store) => Ok(store),
+            Err(e) => {
+                log::warn!(
+                    "[collector] cursor file {} is corrupt ({}); starting with empty cursors instead of failing the collection pass",
+                    path.display(),
+                    e
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Save cursor store to a JSON file atomically
     ///
-    /// Writes to a .tmp file first, then renames to the final path.
+    /// Writes to a per-process temp file first, then renames to the final path.
+    /// The temp filename includes the PID (see ADR-002): two writers racing on a
+    /// *shared* temp filename can each open/truncate/write it independently, and
+    /// their writes can interleave at the byte level before either rename runs —
+    /// this is how the cursor file got corrupted (multiple governor instances
+    /// restarting and saving concurrently). `fs::rename` itself is atomic at the
+    /// filesystem level, so as long as each writer's temp file is unique, the
+    /// final file is always a complete, valid write from exactly one writer —
+    /// whichever rename lands last simply wins outright, never a byte-level splice.
     pub fn save(&self, path: &Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
 
         // Write to temp file
         {
@@ -1459,8 +1483,19 @@ mod tests {
         // Save
         store.save(&cursor_path).unwrap();
 
-        // Verify no .tmp file remains
+        // Verify no temp file remains (neither the old shared name nor the
+        // per-PID name save() now uses — see ADR-002)
         assert!(!cursor_path.with_extension("tmp").exists());
+        let leftover_tmp: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "expected no leftover per-PID temp files, found {:?}",
+            leftover_tmp
+        );
 
         // Load back
         let loaded = CursorStore::load(&cursor_path).unwrap();
@@ -1472,6 +1507,40 @@ mod tests {
             loaded.get_offset(Path::new("/path/to/nested/file3.jsonl")),
             500
         );
+    }
+
+    #[test]
+    fn cursor_save_uses_per_process_temp_file_not_shared_name() {
+        // ADR-002: two writers racing on a *shared* .tmp filename can interleave
+        // their writes at the byte level before either rename runs — this is how
+        // the real cursor file got corrupted in production. save() must derive a
+        // temp filename that includes the PID so concurrent writers never share one.
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("cursors.json");
+        let store = CursorStore::default();
+        store.save(&cursor_path).unwrap();
+
+        let expected_tmp = cursor_path.with_extension(format!("tmp.{}", std::process::id()));
+        assert!(
+            !expected_tmp.exists(),
+            "temp file should be renamed away after save, not left behind"
+        );
+        // The shared old-style name must never be used as the actual write target.
+        assert!(!cursor_path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn cursor_load_corrupt_json_returns_empty_instead_of_erroring() {
+        // ADR-002: a corrupt cursor file (e.g. from the pre-fix concurrent-write
+        // race) must not take down usage tracking indefinitely. Cursors are just
+        // read-position bookkeeping, not the usage data itself — recovering by
+        // resetting them costs a bit of re-reading, never data loss.
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("cursors.json");
+        fs::write(&cursor_path, r#"{"cursors":{"/a/b.jsonl": 5841": 98899,}}"#).unwrap();
+
+        let loaded = CursorStore::load(&cursor_path).expect("corrupt file must not error");
+        assert_eq!(loaded.get_offset(Path::new("/a/b.jsonl")), 0);
     }
 
     #[test]

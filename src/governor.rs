@@ -729,19 +729,31 @@ pub enum ScalingDecision {
 /// Resolve safe_worker_count to a concrete target, with an explicit fallback when
 /// the burn rate data is insufficient (None).
 ///
-/// - `None` → `max_workers`: no burn rate data yet; use the configured ceiling so the
-///   fleet stays at full capacity rather than freezing at current_total.
+/// - `None` → `current_total`: no burn rate data (token collector offline, cursor
+///   corruption, or too few samples since restart — see ADR-002). Hold at whatever
+///   is currently running and take no scaling action either way, rather than guess.
+///   This deliberately does NOT fall back to `max_workers`: doing so meant a fresh
+///   restart (current_total=0, zero samples) launched workers at full configured
+///   capacity with zero burn-rate awareness — an unmonitored subscription-usage
+///   burn with no idea how much quota was actually left. `max_workers` is now only
+///   ever reached by data-driven scale-up, one step at a time, once real samples
+///   confirm it's affordable. The independent emergency brake (any window >= 98%
+///   current utilization, checked before this fallback runs) still applies
+///   regardless of data availability, so a real cutoff is still caught.
 /// - `Some(0)` → `0`: the forecast says even one worker exhausts the binding window
 ///   before it resets — scale to 0 and let the window recover. (This is a `use-or-lose`
 ///   subscription-utilisation governor: idle-then-refill is the intended cycle, and the
 ///   pools it drives idle at no cost, so there is no cold-start penalty worth holding
 ///   capacity that would drive the window to a platform cutoff.)
 /// - `Some(w)` → `w`: normal case.
-fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, _current_total: u32) -> u32 {
+fn safe_worker_count_or_hold(safe: Option<u32>, _max_workers: u32, current_total: u32) -> u32 {
     match safe {
         None => {
-            log::info!("[governor] insufficient burn rate data, using max_workers as ceiling");
-            max_workers
+            log::info!(
+                "[governor] insufficient burn rate data, holding at current worker count ({}) — no scaling action",
+                current_total
+            );
+            current_total
         }
         Some(w) => w,
     }
@@ -2325,11 +2337,11 @@ pub fn compute_target_workers(
             }
             None => {
                 // Composite risk not applicable, fall back to cone-selected binding window estimate
-                safe_worker_count_or_max(selected_safe, global_max, current_total)
+                safe_worker_count_or_hold(selected_safe, global_max, current_total)
             }
         }
     } else {
-        safe_worker_count_or_max(selected_safe, global_max, current_total)
+        safe_worker_count_or_hold(selected_safe, global_max, current_total)
     };
 
     let target = base_target.min(global_max).max(global_min);
@@ -5060,24 +5072,33 @@ mod tests {
         );
     }
 
-    // --- safe_worker_count_or_max fallback tests ---
+    // --- safe_worker_count_or_hold fallback tests ---
 
     #[test]
-    fn safe_worker_count_none_uses_max_workers() {
-        // None → max_workers, not current_total
-        assert_eq!(safe_worker_count_or_max(None, 8, 3), 8);
+    fn safe_worker_count_none_holds_at_current() {
+        // None → current_total, not max_workers (ADR-002: never guess capacity up
+        // when there's no data to guess from — hold, don't scale).
+        assert_eq!(safe_worker_count_or_hold(None, 8, 3), 3);
+    }
+
+    #[test]
+    fn safe_worker_count_none_at_fresh_restart_holds_at_zero() {
+        // The failure mode ADR-002 fixes: a fresh restart has current_total=0 and no
+        // burn-rate samples yet. Must NOT launch workers at max_workers capacity
+        // before any usage data confirms it's affordable.
+        assert_eq!(safe_worker_count_or_hold(None, 8, 0), 0);
     }
 
     #[test]
     fn safe_worker_count_some_zero_scales_to_zero() {
         // Some(0) → 0: the binding window can't afford even one worker; scale to 0 and
         // let it recover (use-or-lose governor: idle-then-refill, no cold-start penalty).
-        assert_eq!(safe_worker_count_or_max(Some(0), 8, 3), 0);
+        assert_eq!(safe_worker_count_or_hold(Some(0), 8, 3), 0);
     }
 
     #[test]
     fn safe_worker_count_some_nonzero_uses_value() {
-        assert_eq!(safe_worker_count_or_max(Some(5), 8, 3), 5);
+        assert_eq!(safe_worker_count_or_hold(Some(5), 8, 3), 5);
     }
 
     #[test]
@@ -5092,10 +5113,10 @@ mod tests {
     }
 
     #[test]
-    fn compute_target_workers_none_safe_count_falls_back_to_max() {
-        // When safe_worker_count is None (zero burn rate, no data yet), the governor
-        // must fall back to global_max rather than current_total to keep the fleet
-        // running at full capacity.
+    fn compute_target_workers_none_safe_count_holds_at_current() {
+        // ADR-002: when safe_worker_count is None (no burn-rate data), the governor
+        // holds at current_total rather than jumping to global_max — it must not
+        // scale up capacity it can't confirm is affordable.
         let mut state = state::GovernorState::new();
         state.workers.insert(
             "w1".to_string(),
@@ -5119,10 +5140,44 @@ mod tests {
             &ConeScalingConfig::default(),
         );
 
-        // Should be global_max (6), clamped to [min=1, max=6]
+        // Should hold at current_total (2), clamped to [min=1, max=6]
         assert_eq!(
-            target, 6,
-            "expected fallback to max_workers=6 when safe_worker_count is None"
+            target, 2,
+            "expected hold at current_total=2 when safe_worker_count is None"
+        );
+    }
+
+    #[test]
+    fn compute_target_workers_none_safe_count_at_fresh_restart_stays_zero() {
+        // The actual incident ADR-002 fixes: a freshly restarted governor has
+        // current_total=0 and no burn-rate samples. Must not launch any workers
+        // until real usage data confirms it's safe to do so.
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "w1".to_string(),
+            state::WorkerState {
+                current: 0,
+                target: 0,
+                min: 0,
+                max: 4,
+            },
+        );
+        state.capacity_forecast.binding_window = "seven_day_sonnet".to_string();
+        // Leave safe_worker_count as None (default) — mirrors a restart with zero samples
+
+        let target = compute_target_workers(
+            &state,
+            90.0,
+            &CompositeRiskConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            &ConeScalingConfig::default(),
+        );
+
+        assert_eq!(
+            target, 0,
+            "expected no workers launched at fresh restart with no burn-rate data"
         );
     }
 

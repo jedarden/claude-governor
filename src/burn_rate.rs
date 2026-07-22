@@ -1360,7 +1360,7 @@ pub fn estimate_burn_rates(
         let binding_forecast = forecasts.get(&binding_window);
         match binding_forecast.and_then(|f| f.safe_worker_count) {
             None => log::info!(
-                "[burn_rate] → binding window {}: insufficient burn rate data, using max_workers as ceiling",
+                "[burn_rate] → binding window {}: insufficient burn rate data, will hold at current worker count",
                 binding_window,
             ),
             Some(safe_w) => log::info!(
@@ -1484,7 +1484,7 @@ pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
         };
         match binding_forecast.safe_worker_count {
             None => log::info!(
-                "[governor] → binding window {}: insufficient burn rate data, will use max_workers as ceiling",
+                "[governor] → binding window {}: insufficient burn rate data, will hold at current worker count",
                 forecast.binding_window,
             ),
             Some(w) => log::info!(

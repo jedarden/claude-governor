@@ -622,6 +622,8 @@ binding_window = argmin(margin_hrs[W] for W in windows)
 
 The governor's `compute_target_workers()` uses `safe_worker_count[binding_window]` as its ceiling. Any window where `cutoff_risk=True` immediately triggers a scale-down toward `safe_worker_count`. When the 5h and 7d windows give contradictory ceilings, the lower (more conservative) `safe_worker_count` wins.
 
+**When `safe_worker_count[binding_window]` is `None`** (no burn-rate samples yet — e.g. immediately after a daemon restart, or while the token collector is offline/recovering), the governor holds at `current_total` and takes no scaling action, rather than guessing a number. See ADR-002 — this replaced an earlier fallback that used `max_workers` as the ceiling whenever data was missing, which meant a fresh restart with `current_total=0` launched the fleet at full configured capacity with zero usage awareness.
+
 #### Dollar-Based Remaining Capacity
 
 ```
@@ -649,7 +651,9 @@ Stored separately for peak vs. off-peak intervals per window. The 5h and 7d wind
 
 **Token collector offline — graceful degradation:**
 
-The governor must function when the Token Collector is not running, using a three-tier fallback based on data staleness:
+The governor must function when the Token Collector is not running or its data is stale. **As of ADR-002 (2026-07-22), the policy is: no fresh burn-rate data → hold at `current_total`, take no scaling action.** This superseded an earlier three-tier staleness design (below, kept for history) that was never actually wired up end-to-end — the shipped code instead fell back to `max_workers` whenever `safe_worker_count` was `None`, which is the opposite of graceful: it scaled a subscription-billed fleet to full configured capacity with no idea how much quota was left. The incident that surfaced this: `claude-token-collector.service` was silently failing every cycle for hours (`Failed to load cursors: JSON error`, itself caused by a concurrent-write race in `CursorStore::save()` — also fixed by ADR-002), so the `None`-fallback ran continuously and scaled the `polish-opus` pool (Anthropic subscription billing) from 0 to 4 concurrent Opus workers with zero usage awareness while weekly usage was already at ~51%.
+
+Originally-planned three-tier design (not implemented as such; superseded by the hold-at-current policy above):
 
 | Collector data age | Behavior |
 |---|---|
@@ -658,6 +662,8 @@ The governor must function when the Token Collector is not running, using a thre
 | > 30 minutes | Fall back to `baseline_burn_rate` from `governor.yaml`; create HUMAN alert bead: `"Token collector offline — burn rate using baseline fallback"` |
 
 In fallback mode, dollar-equivalent burn rates and cache efficiency metrics are unavailable. The governor continues scaling using percentage-based burn rate only. When the collector resumes, the governor returns to EMA-based rates within one interval.
+
+The independent emergency brake (any window's `current_utilization >= 98%`, checked from the last polled snapshot before the EMA/forecast pipeline runs at all) is unaffected by data staleness and still fires regardless — so a real cutoff is caught even while the fleet is held at `current_total` for lack of forecast data.
 
 **Claude Code cache behavior note:** Cache reads dominate token counts (cheap, 0.1× input) while 1h cache writes are the most expensive token type per unit (2.0× input). Dollar-equivalent burn rate is the most accurate single measure of plan consumption rate, more so than raw token count or even pct/hr alone.
 
@@ -2123,3 +2129,50 @@ Split `cgov _daemon` into two independently-supervised processes:
 ### Follow-up
 
 Implementing this ADR is out of scope for this pass (this pass files it as a decision, not an implementation). The concrete first steps — extracting `_observe`/`_act` from `governor.rs`, writing the new unit files, and updating `cgov enable`/`disable`/`stop` — should be filed as their own beads once someone picks this ADR up; the beads filed alongside this ADR (see bf beads labeled `artifact-improvement` in this repo) cover the narrower, immediately-actionable problems found during this same investigation (stale pricing table, wrong default alert-bead command, duplicate systemd units, alert-bead spam) that don't require the full split to fix.
+
+---
+
+## ADR-002: 2026-07-22 — Missing burn-rate data must hold at current worker count, never fall back to max_workers
+
+**Status:** Implemented
+
+### Context
+
+Live incident on the `lab` host (2026-07-22): the operator (jose) noticed `claude-governor.service` had scaled the `polish-opus` agent pool (Anthropic subscription billing, `claude-print-opus`) from 0 to 4 concurrently-running Opus workers, and was actively trying to scale further toward a `target workers: 8` — while the account was already at ~51% of its weekly usage limit with 5 days remaining until reset. This was caught and stopped (all 4 workers killed, `claude-governor.service` stopped) before it escalated further, but it was a real, live over-provisioning of the most expensive model tier against a constrained weekly budget, not a theoretical risk.
+
+Root-caused to two compounding bugs:
+
+1. **The decision bug.** `governor.rs::safe_worker_count_or_max()` — the function `compute_target_workers()` calls whenever the binding window's `safe_worker_count` is `None` (no usable burn-rate EMA data) — returned `max_workers` in that case, by explicit original design: the doc comment read *"no burn rate data yet; use the configured ceiling so the fleet stays at full capacity rather than freezing at current_total"*. On a fresh daemon restart, `current_total` is `0` and there are zero EMA samples (`insufficient burn rate data, using max_workers as ceiling` was logged every single cycle), so the very first thing a restarted governor did — every time, unconditionally — was launch workers up to `max_workers` with no idea what fraction of quota was actually left. This is the opposite of what an "automated capacity *governor* for subscription usage" should do when it cannot see the meter.
+2. **The data bug that made (1) fire continuously instead of only briefly.** `claude-token-collector.service` had been failing every collection pass for an extended period (`collection pass failed: Failed to load cursors: JSON error: expected ',' or '}' at line 9576 column 105`) — `~/.needle/state/collector-cursors.json` was corrupted. Root cause: `CursorStore::save()` wrote to a *shared* fixed temp filename (`<path>.tmp`) with no per-writer uniqueness or locking; when multiple `cgov`/collector processes saved concurrently (which repeated `claude-governor.service` restarts that same day produced), two writers could each open/truncate/write the same temp path independently, splicing their output together at the byte level before either atomic rename ran. `CursorStore::load()` then hard-errored the entire collection pass on any parse failure, so the corruption was permanent until manually fixed — there was no self-healing path, and no scaling decision ever again had real data to work with once this happened, hence why the `None → max_workers` bug wasn't a one-cycle blip but a standing, repeated over-provision every 5-minute cycle for hours.
+
+### Decision
+
+Three changes, all in this same pass:
+
+1. **`safe_worker_count_or_max` → `safe_worker_count_or_hold`** (`src/governor.rs`): the `None` case now returns `current_total` instead of `max_workers`, and logs accordingly. Concretely: a fresh restart with `current_total=0` and no samples now computes `target=0` and takes **no scaling action** — matching the operator's explicit instruction that in the absence of tracked usage, the governor should do nothing. `max_workers` is only ever reached by genuine data-driven scale-up, one hysteresis-limited step per cycle, once real EMA samples confirm it's affordable. The pre-existing, independent emergency brake (any window's `current_utilization >= 98%` from the last polled snapshot, checked *before* this fallback runs) is untouched and still fires regardless of burn-rate data availability — a real cutoff is still caught even while the fleet is held for lack of forecast data.
+2. **`CursorStore::save()` uses a per-process temp filename** (`<path>.tmp.<pid>` instead of `<path>.tmp`): `fs::rename` is atomic at the filesystem level, so as long as no two writers ever share a temp path, the final file is always a complete write from exactly one writer — whichever rename lands last simply wins outright, never a byte-level splice. This removes the actual corruption mechanism, not just its symptom.
+3. **`CursorStore::load()` degrades gracefully on corrupt JSON** instead of returning `Err` and aborting the whole collection pass: it now logs a warning and returns an empty `CursorStore`, so a corrupted file (from this bug, a disk issue, or anything else) costs at most one pass of re-reading already-seen JSONL bytes — never a multi-hour (or multi-day) blackout of usage tracking. Cursors are read-position bookkeeping, not the usage data itself, so this is a safe boundary to be defensive at.
+
+Verified live on `lab` post-deploy: the collector recovered on its first pass with the new binary (`collector recovered — last record 0s old, clearing offline alert cooldown`), and the governor's first post-restart cycle logged `insufficient burn rate data, holding at current worker count (0) — no scaling action` / `target workers: 0` / `decision: NoChange` — zero workers launched, as intended.
+
+### Alternatives Considered
+
+1. **Keep `None → max_workers`, but gate it on `current_total > 0`** (i.e. only "stay at full capacity" if some workers were already running, don't launch fresh ones from zero). Rejected: still guesses a number (`max_workers`) with no data behind it whenever the fleet happens to already be nonzero when data drops out mid-run, which is exactly the scenario a data-availability blip during active operation would hit. `current_total` (hold, no guess in either direction) dominates this for the "no data" case specifically.
+2. **`None → 0`** (treat missing data as maximally unsafe, scale everything to zero immediately). Rejected as the primary behavior because it's not what "do nothing" means — it's an active kill of in-flight, already-supervised work over a transient collector hiccup (a single missed cycle, a brief restart window), which is disruptive and wastes partial task progress for a problem that resolves itself within one interval most of the time. The existing emergency brake already owns the "actively force to zero" response, gated on a real signal (>=98% utilization) rather than mere data absence. `current_total` reuses the parameter that was already present-but-unused in the function signature for exactly this purpose.
+3. **Implement the plan's originally-specified three-tier staleness fallback** (< 10min normal, 10-30min stale-EMA + warn, > 30min baseline-rate + alert bead) verbatim. Rejected for this pass as larger in scope than the incident required and only partially specified (`baseline_burn_rate` exists as a struct in `burn_rate.rs` but was never wired into the decision path, and `alerts.auto_bead` is currently disabled repo-wide for an unrelated reason — see ADR-001 context). `current_total`-hold is a strict subset/simplification: it's the same "don't guess" spirit without introducing a new baseline-rate code path that would itself need its own verification. Left as documented follow-up if finer-grained staleness tiers are wanted later.
+
+### Consequences
+
+**Positive:**
+- The specific incident (0→4→trending-to-8 concurrent Opus workers with a corrupted usage-data pipeline) cannot recur via this code path: a restart with no data now launches nothing.
+- The corruption vector (concurrent writers on a shared temp filename) is fixed at the root, not papered over.
+- A future corruption (from any cause) self-heals within one collection pass instead of requiring someone to notice `journalctl` errors and manually repair a JSON file, as happened here.
+
+**Negative / costs:**
+- On a genuinely fresh install or a long-stale restart, the fleet now stays at 0 workers until the collector accumulates enough fresh samples to produce a `safe_worker_count`, rather than immediately running at full capacity. This trades a startup-latency cost (bounded by the collector's poll interval, currently 120s, times however many samples the EMA needs) for never running blind. Given the governor's stated purpose is subscription-usage safety, this tradeoff is intentional and correct.
+- `CursorStore::load()` silently discarding a corrupt file means whatever incremental read-position progress was in that file is lost on the one pass where corruption is detected — the next pass re-reads already-seen JSONL bytes once. Cheap in practice (bounded by file sizes under `~/.claude/projects`), but not literally free.
+
+### Follow-up
+
+- Consider re-introducing the plan's staleness-tiered fallback (Alternative 3) as a deliberate enhancement — `current_total`-hold is safe but coarse; a 10-30min "trust the last known EMA" tier would reduce startup latency for short-lived collector blips without reintroducing the max_workers guess. Not filed as a bead yet; revisit if hold-at-current proves too conservative in practice.
+- The `polish-opus` agent's `max_workers: 4` in `governor.yaml` predates this incident and was not itself changed by this ADR — it remains the ceiling that data-driven scale-up can reach once real samples justify it. Whether 4 is still the right ceiling given current weekly-usage patterns is a separate, operator-facing config question, not a code-correctness one.
