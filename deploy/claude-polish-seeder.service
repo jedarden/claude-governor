@@ -8,5 +8,8 @@ Description=cgov polish-loop seeder (top up the polish queue)
 [Service]
 Type=oneshot
 ExecStart=%h/claude-governor/scripts/polish-seeder.sh
-# Env overrides if needed:
+# Push produced beads to the remote (Forgejo) each pass, best-effort — a non-ff
+# rejection just leaves them committed locally to push on a later pass.
+Environment=CGOV_POLISH_PUSH=1
+# Other overrides if needed:
 # Environment=CGOV_POLISH_LOW_WATER=5 CGOV_POLISH_TARGETS=%h/.config/claude-governor/polish-targets.txt
