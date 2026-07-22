@@ -731,16 +731,18 @@ pub enum ScalingDecision {
 ///
 /// - `None` → `max_workers`: no burn rate data yet; use the configured ceiling so the
 ///   fleet stays at full capacity rather than freezing at current_total.
-/// - `Some(0)` → `current_total`: formula computed 0 (near-exhaustion) but we don't
-///   drop below current to avoid a sudden cold-start penalty.
+/// - `Some(0)` → `0`: the forecast says even one worker exhausts the binding window
+///   before it resets — scale to 0 and let the window recover. (This is a `use-or-lose`
+///   subscription-utilisation governor: idle-then-refill is the intended cycle, and the
+///   pools it drives idle at no cost, so there is no cold-start penalty worth holding
+///   capacity that would drive the window to a platform cutoff.)
 /// - `Some(w)` → `w`: normal case.
-fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, current_total: u32) -> u32 {
+fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, _current_total: u32) -> u32 {
     match safe {
         None => {
             log::info!("[governor] insufficient burn rate data, using max_workers as ceiling");
             max_workers
         }
-        Some(0) => current_total,
         Some(w) => w,
     }
 }
@@ -4969,9 +4971,10 @@ mod tests {
     }
 
     #[test]
-    fn safe_worker_count_some_zero_uses_current_total() {
-        // Some(0) → current_total (near-exhaustion, avoid cold-start drop)
-        assert_eq!(safe_worker_count_or_max(Some(0), 8, 3), 3);
+    fn safe_worker_count_some_zero_scales_to_zero() {
+        // Some(0) → 0: the binding window can't afford even one worker; scale to 0 and
+        // let it recover (use-or-lose governor: idle-then-refill, no cold-start penalty).
+        assert_eq!(safe_worker_count_or_max(Some(0), 8, 3), 0);
     }
 
     #[test]

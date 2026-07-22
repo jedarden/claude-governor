@@ -1,19 +1,27 @@
-# Polish-loop agent block — append under `agents:` in ~/.config/claude-governor/governor.yaml,
+# Subscription-generator pool — append under `agents:` in ~/.config/claude-governor/governor.yaml,
 # then `cgov restart` (the daemon loads agents only at startup).
 #
-# min_workers: 1 makes cgov GUARANTEE one standing polish strand within the capacity
-# budget (it idles at no cost when the queue is empty). When the safe budget is tight
-# (target=1) this pool takes the slot and cheaper pools yield to 0 — intended; the
-# emergency brake still forces all pools to 0 when a window >= 98%.
+# THIS FLAVOR of cgov governs ONLY subscription-billed *generator* pools: cgov-driven
+# claude-print runners produce beads (they never change code); the beads are worked by
+# a separate, normal NEEDLE fleet. cgov flexes the runner count 0 <-> N to track
+# subscription window utilisation — filling spare use-or-lose capacity with productive
+# bead-generation, and scaling to 0 when a window is tight (so it never drives the
+# subscription to a platform cutoff).
 #
-# Requires the claude-print-opus adapter installed at
-# ~/.config/needle/adapters/claude-print-opus.yaml (see deploy/needle-adapters/).
+#   min_workers: 0   -> genuinely allowed to idle at 0 (safe_worker_count=0 => 0 workers)
+#   max_workers: 4   -> headroom to scale up and burn spare capacity when windows have room
+#   subscription: true
+#
+# IMPORTANT: do NOT also configure a non-subscription pool (e.g. glm via a proxy) in this
+# instance. It doesn't consume the subscription (so filling it does nothing for the goal)
+# and, being cheaper, the cost-priority distribution hands it every slot — starving the
+# generator. Disable such pools here (max_workers: 0) or run them under a separate governor.
 
 agents:
   polish-opus:
     launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
     session_pattern: "needle-claude-print-opus-cgov-polish-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
-    min_workers: 1
-    max_workers: 1
+    min_workers: 0
+    max_workers: 4
     subscription: true

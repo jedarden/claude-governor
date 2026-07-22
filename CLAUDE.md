@@ -96,25 +96,34 @@ itself in the queue. The seeder writes these; see `scripts/polish-seeder.sh`.
 
 ---
 
-## 5. The `polish-opus` agent (add to `governor.yaml`)
+## 5. The generator pool (add to `governor.yaml`)
 
-See `deploy/polish-opus-agent.yaml` for the block. Key fields:
+See `deploy/polish-opus-agent.yaml`. **This flavor governs subscription-billed
+*generator* pools only** — cgov-driven claude-print runners that **produce beads**
+(never change code); the beads are worked by a separate, normal NEEDLE fleet.
 
 ```yaml
   polish-opus:
     launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
     session_pattern: "needle-claude-print-opus-cgov-polish-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
-    min_workers: 1        # a standing strand: idles with no meta-bead (no cost), works one when present
-    max_workers: 1        # at most one concurrent polish strand
+    min_workers: 0        # genuinely allowed to idle at 0
+    max_workers: 4        # headroom to scale up and burn spare capacity when windows have room
     subscription: true    # billed against the subscription pool, not the SDK credit pool
 ```
 
-`min_workers: 1` means cgov **guarantees** one polish strand within the capacity
-budget. **Consequence:** when the safe budget is tight (`target=1`) the polish pool
-takes the slot and cheaper pools (e.g. glm) yield to 0. That is intended; raise
-capacity headroom if you want both running. The emergency brake still overrides the
-min (all pools → 0 when a window ≥ 98%).
+cgov flexes the runner count **`0 ↔ N`** to track subscription window utilisation:
+`safe_worker_count` (from the binding window) drives it up when there's headroom and
+**down to 0** when a window is tight — filling spare use-or-lose capacity with
+productive bead-generation, never driving the subscription to a platform cutoff.
+`Some(0) → 0` (see §8) makes the scale-to-0 real; the emergency brake (window ≥ 98%)
+forces 0 regardless.
+
+> ⚠️ **Do NOT also configure a non-subscription pool** (e.g. glm via a proxy) in this
+> instance. It doesn't consume the subscription — so filling it does nothing for the
+> goal — and, being cheaper, the cost-priority distribution hands it every slot,
+> starving the generator. Disable such pools here (`max_workers: 0`) or govern them
+> from a separate cgov instance.
 
 ---
 
@@ -176,8 +185,12 @@ choking on `null`/`Inf` from the API/state, or treating agents as fungible.
   `min_workers` floor before cost-distributing the remainder, so an expensive pool
   (Opus, max 1) actually wins a slot. Gentle scale-up/down behaviour preserved.
 - **governor.rs `NoChange` arm** — reconciles the per-agent allocation even when the
-  aggregate total is unchanged, so a min-1 pool launches at a steady total instead of
+  aggregate total is unchanged, so a pinned pool launches at a steady total instead of
   the daemon only ever acting on aggregate deltas.
+- **governor.rs `safe_worker_count_or_max`** — `Some(0) → 0` (was `→ current_total`):
+  when the binding window can't afford even one worker, cgov now actually scales to 0
+  instead of holding capacity that would drive the shared window to a platform cutoff.
+  This is what makes "allow scaling to 0" real for a use-or-lose utilisation governor.
 
 ---
 
