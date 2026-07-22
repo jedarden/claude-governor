@@ -223,10 +223,12 @@ pub struct WindowForecast {
     pub exh_hrs_p75: f64,
     /// Cone ratio = exh_hrs_p75 / exh_hrs_p25 (1.0 = no spread, higher = wider uncertainty)
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub cone_ratio: f64,
     /// Composite risk score (higher = riskier). Factors in margin, duration, and volatility.
     /// Used for binding window selection.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub risk_score: f64,
     /// Remaining headroom to the hard platform limit (100% - current_utilization).
     /// Unlike remaining_pct (which uses the target ceiling), this measures distance to the
@@ -236,7 +238,10 @@ pub struct WindowForecast {
     /// Margin in hours against the hard platform limit (100%).
     /// positive = safe (won't hit 100% before reset), negative = will hit 100% before reset.
     /// Alert predicates use this instead of margin_hrs (which is against the target ceiling).
+    /// A null in the state file means f64::INFINITY (no hard-limit constraint) — round-trip it
+    /// back rather than failing the whole load and discarding all learned calibration.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub hard_limit_margin_hrs: f64,
 }
 

@@ -120,14 +120,36 @@ impl UsageWindow {
 }
 
 /// Full usage response from the API
+///
+/// Each window is optional: the usage API legitimately returns `null` for a
+/// window that is not an active limit for the account (e.g. no separate sonnet
+/// limit, or a window with no recorded usage yet). Treating these as required
+/// structs made a single null crash the entire poll, leaving the governor with
+/// no capacity data. They are `Option` so a null window is tolerated.
 #[derive(Debug, Deserialize)]
 pub struct UsageResponse {
-    #[serde(rename = "seven_day_sonnet")]
-    pub seven_day_sonnet: UsageWindow,
-    #[serde(rename = "seven_day")]
-    pub seven_day: UsageWindow,
-    #[serde(rename = "five_hour")]
-    pub five_hour: UsageWindow,
+    #[serde(rename = "seven_day_sonnet", default)]
+    pub seven_day_sonnet: Option<UsageWindow>,
+    #[serde(rename = "seven_day", default)]
+    pub seven_day: Option<UsageWindow>,
+    #[serde(rename = "five_hour", default)]
+    pub five_hour: Option<UsageWindow>,
+}
+
+/// Extract `(utilization, resets_at, hours_remaining)` from an optional window.
+///
+/// A null/absent window is treated as non-binding: 0% utilization with a far-off
+/// reset, so the governor does not restrict scaling on a window the API did not
+/// report as an active limit.
+fn window_or_default(window: &Option<UsageWindow>) -> (f64, String, f64) {
+    match window {
+        Some(w) => (
+            w.utilization,
+            w.resets_at.clone(),
+            w.hours_remaining().unwrap_or(0.0),
+        ),
+        None => (0.0, String::new(), 168.0),
+    }
 }
 
 /// Formatted usage data for human or machine consumption
@@ -425,20 +447,24 @@ impl Poller {
 
         let usage = self.fetch_usage(&access_token)?;
 
-        // Compute hours remaining for each window
-        let seven_day_sonnet_hours = usage.seven_day_sonnet.hours_remaining().unwrap_or(0.0);
-        let seven_day_hours = usage.seven_day.hours_remaining().unwrap_or(0.0);
-        let five_hour_hours = usage.five_hour.hours_remaining().unwrap_or(0.0);
+        // Extract per-window fields, tolerating windows the API returns as null
+        // (a null window is treated as non-binding rather than failing the poll).
+        let (seven_day_sonnet_utilization, seven_day_sonnet_resets_at, seven_day_sonnet_hours) =
+            window_or_default(&usage.seven_day_sonnet);
+        let (seven_day_utilization, seven_day_resets_at, seven_day_hours) =
+            window_or_default(&usage.seven_day);
+        let (five_hour_utilization, five_hour_resets_at, five_hour_hours) =
+            window_or_default(&usage.five_hour);
 
         let data = UsageData {
-            seven_day_sonnet_utilization: usage.seven_day_sonnet.utilization,
-            seven_day_sonnet_resets_at: usage.seven_day_sonnet.resets_at.clone(),
+            seven_day_sonnet_utilization,
+            seven_day_sonnet_resets_at,
             seven_day_sonnet_hours_remaining: seven_day_sonnet_hours,
-            seven_day_utilization: usage.seven_day.utilization,
-            seven_day_resets_at: usage.seven_day.resets_at.clone(),
+            seven_day_utilization,
+            seven_day_resets_at,
             seven_day_hours_remaining: seven_day_hours,
-            five_hour_utilization: usage.five_hour.utilization,
-            five_hour_resets_at: usage.five_hour.resets_at.clone(),
+            five_hour_utilization,
+            five_hour_resets_at,
             five_hour_hours_remaining: five_hour_hours,
             timestamp: Utc::now(),
             stale: false,
@@ -540,21 +566,36 @@ mod tests {
     #[test]
     fn test_usage_data_from_response() {
         let response = UsageResponse {
-            seven_day_sonnet: UsageWindow {
+            seven_day_sonnet: Some(UsageWindow {
                 utilization: 75.5,
                 resets_at: "2026-03-20T03:59:59Z".to_string(),
-            },
-            seven_day: UsageWindow {
+            }),
+            seven_day: Some(UsageWindow {
                 utilization: 60.0,
                 resets_at: "2026-03-20T03:00:00Z".to_string(),
-            },
-            five_hour: UsageWindow {
+            }),
+            five_hour: Some(UsageWindow {
                 utilization: 30.0,
                 resets_at: "2026-03-18T15:59:59Z".to_string(),
-            },
+            }),
         };
 
-        assert_eq!(response.seven_day_sonnet.utilization, 75.5);
-        assert_eq!(response.five_hour.utilization, 30.0);
+        assert_eq!(response.seven_day_sonnet.as_ref().unwrap().utilization, 75.5);
+        assert_eq!(response.five_hour.as_ref().unwrap().utilization, 30.0);
+    }
+
+    #[test]
+    fn test_null_window_is_tolerated() {
+        // A window the API returns as null must not fail deserialization, and
+        // must be treated as a non-binding limit (0% utilization).
+        let json = r#"{"seven_day_sonnet": null,
+                       "seven_day": {"utilization": 42.0, "resets_at": "2026-03-20T03:00:00Z"},
+                       "five_hour": {"utilization": 10.0, "resets_at": "2026-03-18T15:59:59Z"}}"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("null window must parse");
+        assert!(resp.seven_day_sonnet.is_none());
+        let (util, resets_at, _hours) = window_or_default(&resp.seven_day_sonnet);
+        assert_eq!(util, 0.0);
+        assert!(resets_at.is_empty());
+        assert_eq!(resp.seven_day.as_ref().unwrap().utilization, 42.0);
     }
 }

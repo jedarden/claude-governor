@@ -1,0 +1,11 @@
+# polish-seeder targets — one ABSOLUTE repo path per line.
+# Blank lines and lines starting with '#' are ignored.
+# Copy to ~/.config/claude-governor/polish-targets.txt and edit.
+#
+# Only list "finished" repos you want continuously, gently improved. Each must have
+# docs/plan/plan.md and a .beads workspace. Generation is additive-within-scope, so
+# do NOT list repos that should be frozen — the loop keeps them warm indefinitely.
+
+/home/coding/claude-print
+# /home/coding/claude-governor
+# /home/coding/pdftract

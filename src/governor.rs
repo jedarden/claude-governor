@@ -2034,90 +2034,90 @@ fn distribute_workers_by_cost_priority(
     pricing_config: &crate::config::GovernorConfig,
     _cutoff_risk: bool,  // Reserved for future scale-down priority adjustments
 ) -> HashMap<String, u32> {
-    let mut result = HashMap::new();
+    // Base distribution: start from the current allocation and adjust gently by the
+    // delta (minimising churn) — scale down sheds the most expensive workers first,
+    // scale up adds to the cheapest agent first. A second pass then enforces each
+    // agent's min_workers floor so a dedicated pool (e.g. an Opus polish strand with
+    // max_workers=1) actually launches — the pure cost sort would otherwise always
+    // fill the cheap, high-max agent (glm, max 8) first and never give it a slot.
+    let mut result: HashMap<String, u32> = HashMap::new();
 
-    // Calculate current total and delta
     let current_total: u32 = current_workers.values().sum();
     let delta = target_total as i32 - current_total as i32;
 
-    if delta == 0 {
-        // No change, return current distribution
-        for (agent, &count) in current_workers {
-            result.insert(agent.clone(), count);
-        }
-        return result;
-    }
-
-    // Build list of agents with their costs and constraints
-    let mut agent_costs: Vec<(String, f64, u32, u32)> = Vec::new();
+    // (name, cost/hr, current, min, max)
+    let mut agent_costs: Vec<(String, f64, u32, u32, u32)> = Vec::new();
     for (name, config) in agents {
         let cost = get_agent_cost_per_worker(name, config, burn_rate_by_model, pricing_config);
         let current = *current_workers.get(name).unwrap_or(&0);
-        let max = config.max_workers;
-        agent_costs.push((name.clone(), cost, current, max));
+        agent_costs.push((
+            name.clone(),
+            cost,
+            current,
+            config.min_workers.min(config.max_workers),
+            config.max_workers,
+        ));
+        result.insert(name.clone(), current);
     }
 
     if delta < 0 {
-        // Scaling down: prioritize high-cost agents first
-        let scale_down = delta.abs() as u32;
-
-        // Sort by cost descending (highest first)
+        // Scale down: remove from the highest-cost agent first.
+        let mut remaining = delta.unsigned_abs();
         agent_costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut remaining_to_remove = scale_down;
-
-        for (name, cost, current, _max) in agent_costs {
-            if remaining_to_remove == 0 {
-                result.insert(name, current);
-                continue;
+        for (name, _cost, current, _min, _max) in &agent_costs {
+            if remaining == 0 {
+                break;
             }
-
-            let can_remove = current.min(remaining_to_remove);
-            result.insert(name.clone(), current.saturating_sub(can_remove));
-            remaining_to_remove -= can_remove;
-
-            if can_remove > 0 {
-                log::info!(
-                    "[governor] scale-down priority: removing {} workers from {} (cost ${:.2}/hr)",
-                    can_remove,
-                    name,
-                    cost
-                );
-            }
+            let can_remove = (*current).min(remaining);
+            result.insert(name.clone(), current - can_remove);
+            remaining -= can_remove;
         }
-    } else {
-        // Scaling up: prioritize low-cost agents first
-        let scale_up = delta as u32;
-
-        // Sort by cost ascending (lowest first), then by remaining capacity
+    } else if delta > 0 {
+        // Scale up: add to the lowest-cost agent first (tie-break on spare capacity).
+        let mut remaining = delta as u32;
         agent_costs.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| (b.3 - b.2).cmp(&(a.3 - a.2))) // Prefer agents with more capacity
+                .then_with(|| (b.4 - b.2).cmp(&(a.4 - a.2)))
         });
+        for (name, _cost, current, _min, max) in &agent_costs {
+            if remaining == 0 {
+                break;
+            }
+            let room = max.saturating_sub(*current);
+            let can_add = room.min(remaining);
+            result.insert(name.clone(), current + can_add);
+            remaining -= can_add;
+        }
+    }
 
-        let mut remaining_to_add = scale_up;
-
-        for (name, cost, current, max) in agent_costs {
-            if remaining_to_add == 0 {
-                result.insert(name, current);
+    // Enforce per-agent min_workers: raise any agent below its floor, pulling the
+    // needed workers from the most expensive agent that has spare capacity above its
+    // own min. mins of 0 make this a no-op, preserving pure cost-priority behaviour.
+    let mut donors = agent_costs.clone();
+    donors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let deficits: Vec<(String, u32)> = agent_costs
+        .iter()
+        .filter_map(|(name, _cost, _current, min, _max)| {
+            let have = *result.get(name).unwrap_or(&0);
+            (have < *min).then(|| (name.clone(), *min - have))
+        })
+        .collect();
+    for (dname, mut needed) in deficits {
+        for (sname, _scost, _scur, smin, _smax) in &donors {
+            if needed == 0 {
+                break;
+            }
+            if *sname == dname {
                 continue;
             }
-
-            let capacity = max.saturating_sub(current);
-            let can_add = capacity.min(remaining_to_add);
-            result.insert(name.clone(), current.saturating_add(can_add));
-            remaining_to_add -= can_add;
-
-            if can_add > 0 {
-                log::info!(
-                    "[governor] scale-up priority: adding {} workers to {} (cost ${:.2}/hr, capacity {}/{})",
-                    can_add,
-                    name,
-                    cost,
-                    current + can_add,
-                    max
-                );
+            let shave = *result.get(sname).unwrap_or(&0);
+            let take = shave.saturating_sub(*smin).min(needed);
+            if take > 0 {
+                result.insert(sname.clone(), shave - take);
+                let cur = *result.get(&dname).unwrap_or(&0);
+                result.insert(dname.clone(), cur + take);
+                needed -= take;
             }
         }
     }
@@ -3648,7 +3648,80 @@ pub fn run_governor_cycle(
     // - Scale up: add to lowest-cost agents first with capacity
     match &decision {
         ScalingDecision::NoChange => {
-            log::info!("[governor] no scaling action this cycle");
+            // The aggregate total is unchanged, but the per-agent allocation can
+            // still violate a pool's min_workers (e.g. a dedicated polish pool that
+            // must always run 1 worker). Reconcile the distribution so such a pool
+            // launches even at a steady total — moving a worker off an over-allocated
+            // agent — instead of only ever acting on aggregate deltas.
+            if !dry_run {
+                let cutoff_risk = match state.capacity_forecast.binding_window.as_str() {
+                    WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+                    WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                };
+                let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+                for (name, ws) in &state.workers {
+                    current_workers_map.insert(name.clone(), ws.current);
+                }
+                let target_distribution = distribute_workers_by_cost_priority(
+                    agents,
+                    &current_workers_map,
+                    current_total,
+                    &state.burn_rate.by_model,
+                    pricing_config,
+                    cutoff_risk,
+                );
+                let mut reconciled = false;
+                // Free capacity from over-allocated agents first, then launch the deficit.
+                for (agent_name, &target_count) in &target_distribution {
+                    if let Some(worker_config) =
+                        worker_configs.iter().find(|(name, _)| name == agent_name)
+                    {
+                        let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                        if target_count < current {
+                            worker::scale_down_graceful(
+                                current - target_count,
+                                &worker_config.1,
+                                false,
+                            );
+                            reconciled = true;
+                            log::info!(
+                                "[governor] reconcile: {} {} -> {} workers",
+                                agent_name,
+                                current,
+                                target_count
+                            );
+                        }
+                    }
+                }
+                for (agent_name, &target_count) in &target_distribution {
+                    if let Some(worker_config) =
+                        worker_configs.iter().find(|(name, _)| name == agent_name)
+                    {
+                        let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                        if target_count > current {
+                            worker::scale_up(target_count - current, &worker_config.1, false);
+                            reconciled = true;
+                            log::info!(
+                                "[governor] reconcile: {} {} -> {} workers",
+                                agent_name,
+                                current,
+                                target_count
+                            );
+                        }
+                    }
+                }
+                if reconciled {
+                    log::info!(
+                        "[governor] reconciled per-agent allocation at steady total {}",
+                        current_total
+                    );
+                } else {
+                    log::info!("[governor] no scaling action this cycle");
+                }
+            } else {
+                log::info!("[governor] no scaling action this cycle (dry-run)");
+            }
         }
         ScalingDecision::ScaleUp(n) => {
             log::info!("[governor] scaling up by {} workers", n);
@@ -5115,6 +5188,91 @@ mod tests {
         assert_eq!(result.get("opus"), Some(&2), "Opus should not be expanded yet");
         // Total should be 8
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
+    }
+
+    #[test]
+    fn distribute_enforces_min_workers_for_expensive_pool() {
+        // A dedicated expensive pool (opus, min 1, max 1) must get its guaranteed
+        // worker even though the cheap agent (sonnet) would win on pure cost.
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-opus --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "opus-{id}".to_string(),
+                min_workers: 1,
+                max_workers: 1,
+                subscription: true,
+            },
+        );
+        agents.insert(
+            "sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-sonnet --workspace test".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "sonnet-{id}".to_string(),
+                min_workers: 0,
+                max_workers: 8,
+                subscription: false,
+            },
+        );
+
+        let mut current_workers = std::collections::HashMap::new();
+        current_workers.insert("opus".to_string(), 0);
+        current_workers.insert("sonnet".to_string(), 1);
+
+        let burn_rate_by_model = std::collections::HashMap::new();
+        let mut pricing_models = std::collections::HashMap::new();
+        pricing_models.insert(
+            "claude-opus".to_string(),
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 75.0,
+                cache_write_5m_per_mtok: 18.75,
+                cache_write_1h_per_mtok: 30.0,
+                cache_read_per_mtok: 1.50,
+            },
+        );
+        pricing_models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_write_5m_per_mtok: 3.75,
+                cache_write_1h_per_mtok: 6.0,
+                cache_read_per_mtok: 0.30,
+            },
+        );
+        let pricing_config = GovernorConfig {
+            pricing: PricingConfig {
+                models: pricing_models,
+            },
+            sprint: Default::default(),
+            daemon: Default::default(),
+            alerts: Default::default(),
+            composite_risk: Default::default(),
+            cone_scaling: Default::default(),
+            agents: Default::default(),
+            credentials_path: None,
+        };
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            2, // budget for 2 workers total
+            &burn_rate_by_model,
+            &pricing_config,
+            false,
+        );
+
+        assert_eq!(
+            result.get("opus"),
+            Some(&1),
+            "expensive pool must get its guaranteed min worker"
+        );
+        assert_eq!(result.get("sonnet"), Some(&1), "cheap agent gets the remainder");
+        assert_eq!(result.values().sum::<u32>(), 2, "Total should be 2");
     }
 
     #[test]

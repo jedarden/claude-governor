@@ -1,0 +1,19 @@
+# Polish-loop agent block — append under `agents:` in ~/.config/claude-governor/governor.yaml,
+# then `cgov restart` (the daemon loads agents only at startup).
+#
+# min_workers: 1 makes cgov GUARANTEE one standing polish strand within the capacity
+# budget (it idles at no cost when the queue is empty). When the safe budget is tight
+# (target=1) this pool takes the slot and cheaper pools yield to 0 — intended; the
+# emergency brake still forces all pools to 0 when a window >= 98%.
+#
+# Requires the claude-print-opus adapter installed at
+# ~/.config/needle/adapters/claude-print-opus.yaml (see deploy/needle-adapters/).
+
+agents:
+  polish-opus:
+    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
+    session_pattern: "needle-claude-print-opus-cgov-polish-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+    min_workers: 1
+    max_workers: 1
+    subscription: true
