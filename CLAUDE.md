@@ -104,13 +104,17 @@ See `deploy/polish-opus-agent.yaml`. **This flavor governs subscription-billed
 
 ```yaml
   polish-opus:
-    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
-    session_pattern: "needle-claude-print-opus-cgov-polish-*"
+    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "needle-claude-print-opus-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0        # genuinely allowed to idle at 0
     max_workers: 4        # headroom to scale up and burn spare capacity when windows have room
     subscription: true    # billed against the subscription pool, not the SDK credit pool
 ```
+
+> ⚠️ **No fixed `--identifier`**: cgov runs the launch command once per scale-up step,
+> so a fixed identifier collides (`worker X already running`) and caps the pool at 1.
+> Omit it — needle NATO-names each worker and the `*` glob tracks them all.
 
 cgov flexes the runner count **`0 ↔ N`** to track subscription window utilisation:
 `safe_worker_count` (from the binding window) drives it up when there's headroom and
@@ -142,9 +146,11 @@ $EDITOR ~/.config/claude-governor/polish-targets.txt
 # 2. one pass (safe, idempotent)
 scripts/polish-seeder.sh
 
-# 3. on a cadence — cron every 30 min:
-#    */30 * * * * /home/coding/claude-governor/scripts/polish-seeder.sh >> ~/.local/share/claude-governor/seeder.log 2>&1
-#    or:  scripts/polish-seeder.sh --loop 1800
+# 3. on a cadence — systemd user timer (NixOS has no crontab):
+cp deploy/claude-polish-seeder.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-polish-seeder.timer   # every 30 min
+#    or, if you prefer a foreground loop:  scripts/polish-seeder.sh --loop 1800
 ```
 
 Env overrides: `CGOV_POLISH_QUEUE`, `CGOV_POLISH_LOW_WATER`, `CGOV_POLISH_TARGETS`.
@@ -191,6 +197,12 @@ choking on `null`/`Inf` from the API/state, or treating agents as fungible.
   when the binding window can't afford even one worker, cgov now actually scales to 0
   instead of holding capacity that would drive the shared window to a platform cutoff.
   This is what makes "allow scaling to 0" real for a use-or-lose utilisation governor.
+- **governor.rs `apply_underutilization_sprint`** — wires the previously **dead** sprint
+  (`check_underutilization_sprint` was defined but never called in the cycle) into the
+  daemon: when a window is under-used and resets soon and nothing is at cutoff risk,
+  cgov boosts the subscription generator toward its max to burn the spare use-or-lose
+  capacity before it resets — **gated on real backlog** (`bf ready` depth in the pool's
+  workspace > running workers) so the boost is productive, not idle runners.
 
 ---
 

@@ -1,0 +1,12 @@
+# Runs the polish seeder every 30 min (keeps the queue fed so the generator pool never
+# starves — the work-supply side of "never leave the subscription empty").
+[Unit]
+Description=Run the cgov polish seeder every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

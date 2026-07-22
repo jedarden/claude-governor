@@ -1,0 +1,12 @@
+# cgov polish-loop seeder — one pass. Paired with claude-polish-seeder.timer.
+# Install: cp deploy/claude-polish-seeder.{service,timer} ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now claude-polish-seeder.timer
+[Unit]
+Description=cgov polish-loop seeder (top up the polish queue)
+
+[Service]
+Type=oneshot
+ExecStart=%h/claude-governor/scripts/polish-seeder.sh
+# Env overrides if needed:
+# Environment=CGOV_POLISH_LOW_WATER=5 CGOV_POLISH_TARGETS=%h/.config/claude-governor/polish-targets.txt

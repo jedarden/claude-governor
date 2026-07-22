@@ -19,8 +19,11 @@
 
 agents:
   polish-opus:
-    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
-    session_pattern: "needle-claude-print-opus-cgov-polish-*"
+    # NO fixed --identifier: cgov launches one worker per scale-up step, so a fixed
+    # identifier collides ("worker X already running") and caps the pool at 1. Let
+    # needle NATO-name each worker; the glob below tracks them all.
+    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "needle-claude-print-opus-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
     max_workers: 4

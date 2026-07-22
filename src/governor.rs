@@ -747,6 +747,80 @@ fn safe_worker_count_or_max(safe: Option<u32>, max_workers: u32, _current_total:
     }
 }
 
+/// Parse the `--workspace <path>` argument out of an agent launch command.
+fn workspace_from_launch_cmd(launch_cmd: &str) -> Option<String> {
+    let mut it = launch_cmd.split_whitespace();
+    while let Some(tok) = it.next() {
+        if tok == "--workspace" {
+            return it.next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Count ready beads in a workspace via `bf ready`. Returns 0 on any error — a missing
+/// backlog signal must only ever *suppress* a sprint, never cause one.
+fn count_ready_beads(workspace: &str) -> u32 {
+    match std::process::Command::new("bf")
+        .arg("ready")
+        .current_dir(workspace)
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("bf-"))
+            .count() as u32,
+        _ => 0,
+    }
+}
+
+/// Underutilization sprint: when a subscription generator pool is sprint-eligible (a
+/// window is under-used, resets soon, nothing at cutoff risk, not in safe mode) AND
+/// there is more queued generation work than running workers, boost the target toward
+/// that pool's max so spare use-or-lose capacity is burned *productively* rather than
+/// left to reset unused. The backlog gate is what keeps "never leave the subscription
+/// empty" from meaning "spin up idle runners". Returns the (possibly boosted) target.
+fn apply_underutilization_sprint(
+    state: &state::GovernorState,
+    sprint_config: &SprintConfig,
+    agents: &HashMap<String, AgentConfig>,
+    base_target: u32,
+    now: DateTime<Utc>,
+) -> u32 {
+    for (name, cfg) in agents {
+        if !cfg.subscription || cfg.max_workers == 0 {
+            continue;
+        }
+        let workspace = match workspace_from_launch_cmd(&cfg.launch_cmd) {
+            Some(w) => w,
+            None => continue,
+        };
+        let backlog = count_ready_beads(&workspace);
+        let current = state.workers.get(name).map(|w| w.current).unwrap_or(0);
+        // Only sprint if there is unclaimed work for the extra runners to do.
+        if backlog <= current {
+            continue;
+        }
+        if let Some(trigger) = crate::alerts::check_underutilization_sprint_for_worker(
+            state,
+            sprint_config,
+            name,
+            cfg.max_workers,
+            now,
+        ) {
+            let boosted = base_target.max(trigger.target_workers);
+            if boosted > base_target {
+                log::info!(
+                    "[governor] underutilization sprint: {} has backlog {} > {} workers; boosting target {} -> {} ({})",
+                    name, backlog, current, base_target, boosted, trigger.reason
+                );
+                return boosted;
+            }
+        }
+    }
+    base_target
+}
+
 // ---------------------------------------------------------------------------
 // Window delta calculation helpers
 // ---------------------------------------------------------------------------
@@ -3610,6 +3684,12 @@ pub fn run_governor_cycle(
         }
     );
 
+    // 4b. Underutilization sprint: burn spare use-or-lose capacity by boosting a
+    // subscription generator toward its max when a window is under-used and resets
+    // soon — but only while it has queued generation work, so the boost is productive.
+    let target =
+        apply_underutilization_sprint(&state, &pricing_config.sprint, agents, target, now);
+
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
     //
     // Conservative-only: pre-scale DOWN before losing multiplier bonus,
@@ -4980,6 +5060,17 @@ mod tests {
     #[test]
     fn safe_worker_count_some_nonzero_uses_value() {
         assert_eq!(safe_worker_count_or_max(Some(5), 8, 3), 5);
+    }
+
+    #[test]
+    fn workspace_from_launch_cmd_parses_flag() {
+        assert_eq!(
+            workspace_from_launch_cmd(
+                "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
+            ),
+            Some("/home/coding/cgov-polish-queue".to_string())
+        );
+        assert_eq!(workspace_from_launch_cmd("needle run --agent x"), None);
     }
 
     #[test]
