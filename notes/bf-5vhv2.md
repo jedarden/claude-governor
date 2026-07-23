@@ -32,13 +32,29 @@ The basic governor cycle test infrastructure was already implemented in prior co
 - `make_usage_snapshot_from_map(windows)` - Creates snapshot from custom HashMap
 - `governor_with_agents()` - Creates GovernorState with pre-configured test agents
 
-## Verification Results
+## Verification Results (Updated 2026-07-22)
+
+### Latest Test Run
 
 ```bash
+# Run all mock_poller_tests (includes governor cycle smoke test)
+cargo test --lib mock_poller_tests
+```
+
+**Result:** All 14 tests passed ✓
+- `test_governor_cycle_smoke` - Main governor cycle test ✓
+- 13 additional MockPoller unit tests ✓
+
+```bash
+# Full governor test suite
 cargo test --lib governor::tests
 ```
 
-**Result:** All 53 tests passed ✓
+**Result:** All tests passed ✓
+
+### Commit History
+- `19d5bba` - Initial smoke test implementation (bead bf-375k6)
+- `88dc735` - Additional behavior verification tests (bead bf-4bzt9)
 
 ## Acceptance Criteria Verification
 
