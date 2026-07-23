@@ -1111,12 +1111,20 @@ mod window_delta_tests {
 
         let previous: Option<PrevUsageSnapshot> = None;
 
+        // Track whether delta computation was attempted
+        let mut delta_computation_attempted = false;
+
+        // ASSERTION 1: Verify snapshot state BEFORE the match
+        assert!(previous.is_none(), "Previous snapshot should be None on first poll");
+        assert!(current.is_some(), "Current snapshot should be Some on first poll");
+
         // The code should handle this gracefully - no delta computation
         // This simulates the check in run_governor_cycle:
         // if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot)
-        match (previous, current) {
+        let match_result = match (&previous, &current) {
             (Some(prev), Some(curr)) => {
                 // This branch should NOT execute on first poll
+                delta_computation_attempted = true;
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
@@ -1128,13 +1136,32 @@ mod window_delta_tests {
                     seven_day_sonnet: curr.seven_day_sonnet_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&prev_pct, &curr_pct);
-                panic!("Should not reach here on first poll - no previous snapshot");
+                "delta_computed"
             }
-            _ => {
-                // Expected: either None for previous, or None for current, or both
-                // This is the correct behavior on first poll
+            (None, Some(_curr)) => {
+                // Expected on first poll: previous is None, current exists
+                "first_poll_skip"
             }
-        }
+            (None, None) => {
+                // Neither snapshot available
+                "no_snapshots"
+            }
+            (Some(_prev), None) => {
+                // Only previous exists (shouldn't happen in normal flow)
+                "only_previous"
+            }
+        };
+
+        // ASSERTION 2: Verify delta computation was skipped (returns early)
+        assert!(!delta_computation_attempted,
+                "Delta computation should be skipped on first poll when prev_snapshot is None");
+
+        // ASSERTION 3: Verify the match fell into the correct branch
+        assert_eq!(match_result, "first_poll_skip",
+                   "Should match the (None, Some) branch on first poll");
+
+        // ASSERTION 4: Verify no panic occurred - test reaches this point
+        // (If we reach here, graceful handling succeeded)
     }
 
     /// Test that delta calculation uses the correct window fields.
