@@ -16,6 +16,7 @@ pub mod poller;
 pub mod pricing;
 pub mod schedule;
 pub mod simulator;
+pub mod snapshot_fixtures;
 pub mod state;
 pub mod status_display;
 pub mod worker;
