@@ -74,10 +74,53 @@ pub struct AgentConfig {
     /// Subscription agents use cli-entrypoint sessions; false implies sdk-cli (credits billing)
     #[serde(default)]
     pub subscription: bool,
+
+    /// Baseline burn rate for this agent (fallback when collector is offline or EMA not ready)
+    #[serde(default)]
+    pub baseline_burn_rate: Option<BaselineBurnRateConfig>,
+}
+
+/// Per-agent baseline burn rate configuration
+#[derive(Debug, Deserialize, Clone, serde::Serialize)]
+pub struct BaselineBurnRateConfig {
+    /// Baseline percentage burn per worker per hour (default: 1.5)
+    #[serde(default = "default_baseline_pct")]
+    pub pct_per_worker_per_hour: f64,
+
+    /// Baseline dollar burn per worker per hour (default: 5.0)
+    #[serde(default = "default_baseline_dollars")]
+    pub dollars_per_worker_per_hour: f64,
+}
+
+fn default_baseline_pct() -> f64 {
+    1.5
+}
+
+fn default_baseline_dollars() -> f64 {
+    5.0
 }
 
 fn default_max_workers() -> u32 {
     8
+}
+
+impl BaselineBurnRateConfig {
+    /// Convert to the burn_rate module's BaselineBurnRates
+    pub fn to_baseline_burn_rates(&self) -> crate::burn_rate::BaselineBurnRates {
+        crate::burn_rate::BaselineBurnRates {
+            pct_per_worker_per_hour: self.pct_per_worker_per_hour,
+            dollars_per_worker_per_hour: self.dollars_per_worker_per_hour,
+        }
+    }
+}
+
+impl Default for BaselineBurnRateConfig {
+    fn default() -> Self {
+        Self {
+            pct_per_worker_per_hour: default_baseline_pct(),
+            dollars_per_worker_per_hour: default_baseline_dollars(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -103,6 +146,14 @@ impl AgentConfig {
         self.session_pattern
             .trim_end_matches('*')
             .trim_end_matches('-')
+    }
+
+    /// Get the baseline burn rate for this agent, or the default if not configured
+    pub fn baseline_burn_rate_or_default(&self) -> crate::burn_rate::BaselineBurnRates {
+        match &self.baseline_burn_rate {
+            Some(config) => config.to_baseline_burn_rates(),
+            None => crate::burn_rate::BaselineBurnRates::default(),
+        }
     }
 }
 
@@ -866,6 +917,7 @@ agents:
             min_workers: 0,
             max_workers: 8,
             subscription: false,
+            baseline_burn_rate: None,
         };
         let expanded = agent.heartbeat_dir_expanded();
         assert!(expanded.to_string_lossy().contains(".needle"));
@@ -879,6 +931,7 @@ agents:
             min_workers: 0,
             max_workers: 8,
             subscription: false,
+            baseline_burn_rate: None,
         };
         let expanded_abs = agent_abs.heartbeat_dir_expanded();
         assert_eq!(expanded_abs.to_string_lossy(), "/var/lib/heartbeats");
@@ -893,6 +946,7 @@ agents:
             min_workers: 0,
             max_workers: 8,
             subscription: false,
+            baseline_burn_rate: None,
         };
         assert_eq!(agent.session_prefix(), "needle-claude");
 
@@ -904,6 +958,7 @@ agents:
             min_workers: 0,
             max_workers: 8,
             subscription: false,
+            baseline_burn_rate: None,
         };
         assert_eq!(agent2.session_prefix(), "worker");
     }
@@ -944,6 +999,83 @@ agents:
         assert_eq!(agent.subscription, true);
         assert_eq!(agent.min_workers, 0);
         assert_eq!(agent.max_workers, 8);
+    }
+
+    #[test]
+    fn test_agent_config_baseline_burn_rate_default() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  default-agent:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("default-agent").unwrap();
+        // baseline_burn_rate should default to None (uses BaselineBurnRates::default() instead)
+        assert!(agent.baseline_burn_rate.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_baseline_burn_rate_custom() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  custom-agent:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+    baseline_burn_rate:
+      pct_per_worker_per_hour: 2.5
+      dollars_per_worker_per_hour: 8.0
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("custom-agent").unwrap();
+        assert!(agent.baseline_burn_rate.is_some());
+        let baseline = agent.baseline_burn_rate.as_ref().unwrap();
+        assert!((baseline.pct_per_worker_per_hour - 2.5).abs() < 1e-9);
+        assert!((baseline.dollars_per_worker_per_hour - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_agent_config_baseline_burn_rate_helper() {
+        let agent = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "test-*".to_string(),
+            heartbeat_dir: "/tmp".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+            subscription: false,
+            baseline_burn_rate: Some(BaselineBurnRateConfig {
+                pct_per_worker_per_hour: 3.0,
+                dollars_per_worker_per_hour: 10.0,
+            }),
+        };
+
+        let baseline = agent.baseline_burn_rate_or_default();
+        assert!((baseline.pct_per_worker_per_hour - 3.0).abs() < 1e-9);
+        assert!((baseline.dollars_per_worker_per_hour - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_agent_config_baseline_burn_rate_helper_default() {
+        let agent = AgentConfig {
+            launch_cmd: "echo test".to_string(),
+            session_pattern: "test-*".to_string(),
+            heartbeat_dir: "/tmp".to_string(),
+            min_workers: 0,
+            max_workers: 8,
+            subscription: false,
+            baseline_burn_rate: None,
+        };
+
+        let baseline = agent.baseline_burn_rate_or_default();
+        // Should use BaselineBurnRates::default()
+        assert!((baseline.pct_per_worker_per_hour - 1.5).abs() < 1e-9);
+        assert!((baseline.dollars_per_worker_per_hour - 5.0).abs() < 1e-9);
     }
 
     #[test]
