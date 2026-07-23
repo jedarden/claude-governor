@@ -825,6 +825,103 @@ pub fn compute_composite_safe_workers(
 }
 
 // ---------------------------------------------------------------------------
+// Staleness Handling
+// ---------------------------------------------------------------------------
+
+/// Staleness tier for three-tier fallback behavior
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StalenessTier {
+    /// Fresh data (under 10 minutes) - use normally
+    Fresh,
+    /// Aging data (10-30 minutes) - use last EMA values with WARN log
+    Aging {
+        /// Age of data in seconds
+        age_secs: u64,
+    },
+    /// Stale data (30+ minutes) - revert to baseline for dollar-denominated fields
+    Stale {
+        /// Age of data in seconds
+        age_secs: u64,
+    },
+}
+
+/// Compute the age of collector data relative to now
+///
+/// Returns the age in seconds since the fleet aggregate was last updated.
+/// Uses absolute value to handle clock skew.
+///
+/// # Arguments
+/// - `last_update`: DateTime<Utc> from `state.last_fleet_aggregate.t1`
+///
+/// # Returns
+/// Age in seconds (u64)
+pub fn collector_data_age(last_update: DateTime<Utc>) -> u64 {
+    let now = Utc::now();
+    (now - last_update).num_seconds().abs() as u64
+}
+
+/// Determine staleness tier for three-tier fallback behavior
+///
+/// # Arguments
+/// - `last_update`: DateTime<Utc> from `state.last_fleet_aggregate.t1`
+///
+/// # Returns
+/// `StalenessTier` indicating whether data is fresh, aging, or stale
+pub fn staleness_tier(last_update: DateTime<Utc>) -> StalenessTier {
+    let age_secs = collector_data_age(last_update);
+
+    // Tier thresholds (in seconds)
+    const FRESH_THRESHOLD_SECS: u64 = 10 * 60;   // 10 minutes
+    const STALE_THRESHOLD_SECS: u64 = 30 * 60;   // 30 minutes
+
+    if age_secs < FRESH_THRESHOLD_SECS {
+        StalenessTier::Fresh
+    } else if age_secs < STALE_THRESHOLD_SECS {
+        StalenessTier::Aging { age_secs }
+    } else {
+        StalenessTier::Stale { age_secs }
+    }
+}
+
+/// Check staleness and log appropriately for three-tier fallback
+///
+/// This function implements the three-tier staleness behavior:
+/// - Under 10 minutes: silent, use normally
+/// - 10-30 minutes: log WARN, use last EMA values
+/// - Over 30 minutes: log WARN, dollar fields should use baseline
+///
+/// # Arguments
+/// - `last_update`: DateTime<Utc> from `state.last_fleet_aggregate.t1`
+///
+/// # Returns
+/// `StalenessTier` indicating whether data is fresh, aging, or stale
+pub fn check_staleness(last_update: DateTime<Utc>) -> StalenessTier {
+    let tier = staleness_tier(last_update);
+
+    match tier {
+        StalenessTier::Fresh => {
+            log::debug!("[burn_rate] collector data is fresh (age < 10min)");
+        }
+        StalenessTier::Aging { age_secs } => {
+            let age_min = age_secs as f64 / 60.0;
+            log::warn!(
+                "[burn_rate] collector data is aging but usable (age={:.1}min, 10-30min tier) — using last EMA values",
+                age_min
+            );
+        }
+        StalenessTier::Stale { age_secs } => {
+            let age_min = age_secs as f64 / 60.0;
+            log::warn!(
+                "[burn_rate] collector data is stale (age={:.1}min, >=30min tier) — dollar-denominated fields reverting to baseline",
+                age_min
+            );
+        }
+    }
+
+    tier
+}
+
+// ---------------------------------------------------------------------------
 // Adaptive Burn Rate Estimator
 // ---------------------------------------------------------------------------
 
@@ -1450,9 +1547,13 @@ pub fn build_burn_rate_state(
 
 /// Get staleness-checked USD per worker rate from fleet aggregate.
 ///
-/// Returns the per-worker USD rate from the fleet aggregate if it's fresh
-/// (updated within the last 30 minutes), otherwise falls back to the baseline rate.
-/// This prevents stale data from being used in capacity calculations.
+/// Returns the per-worker USD rate from the fleet aggregate using three-tier fallback:
+/// - Under 10 minutes: use normally
+/// - 10-30 minutes: use last EMA values with WARN log
+/// - Over 30 minutes: revert to baseline for dollar-denominated fields
+///
+/// This prevents stale data from being used in capacity calculations while
+/// maintaining accuracy for fresh data.
 ///
 /// # Arguments
 /// - `aggregate`: Fleet aggregate containing p75 USD/hr and worker count
@@ -1464,30 +1565,44 @@ pub fn staleness_checked_fleet_dollar_rate(
     aggregate: &crate::state::FleetAggregate,
     baseline: &crate::state::BaselineBurnRates,
 ) -> f64 {
-    // Staleness threshold: 30 minutes
-    let staleness_threshold_secs = 30 * 60;
-    let now = Utc::now();
-    let age_secs = (now - aggregate.t1).num_seconds().abs() as u64;
+    // Use three-tier staleness check
+    let tier = check_staleness(aggregate.t1);
 
-    // Use baseline if aggregate is stale or has no workers
-    if age_secs > staleness_threshold_secs || aggregate.sonnet_workers == 0 {
+    // Handle no workers case
+    if aggregate.sonnet_workers == 0 {
         log::debug!(
-            "[burn_rate] fleet aggregate stale (age={}s) or no workers, using baseline ${:.2}/worker/hr",
-            age_secs,
+            "[burn_rate] no workers in fleet aggregate, using baseline ${:.2}/worker/hr",
             baseline.dollars_per_worker_per_hour
         );
         return baseline.dollars_per_worker_per_hour;
     }
 
-    // Aggregate is fresh - compute per-worker rate from p75 total
-    let usd_per_worker = aggregate.sonnet_p75_usd_hr / aggregate.sonnet_workers as f64;
-    log::debug!(
-        "[burn_rate] using fresh fleet aggregate: ${:.2}/worker/hr (p75 total ${:.2}/hr for {} workers)",
-        usd_per_worker,
-        aggregate.sonnet_p75_usd_hr,
-        aggregate.sonnet_workers
-    );
-    usd_per_worker
+    match tier {
+        // Fresh data (< 10min): use normally
+        StalenessTier::Fresh => {
+            let usd_per_worker = aggregate.sonnet_p75_usd_hr / aggregate.sonnet_workers as f64;
+            log::debug!(
+                "[burn_rate] using fresh fleet aggregate: ${:.2}/worker/hr (p75 total ${:.2}/hr for {} workers)",
+                usd_per_worker,
+                aggregate.sonnet_p75_usd_hr,
+                aggregate.sonnet_workers
+            );
+            usd_per_worker
+        }
+        // Aging data (10-30min): use last EMA values with WARN log (already logged in check_staleness)
+        StalenessTier::Aging { .. } => {
+            let usd_per_worker = aggregate.sonnet_p75_usd_hr / aggregate.sonnet_workers as f64;
+            usd_per_worker
+        }
+        // Stale data (>=30min): revert to baseline for dollar-denominated fields
+        StalenessTier::Stale { .. } => {
+            log::debug!(
+                "[burn_rate] using baseline ${:.2}/worker/hr (stale data fallback)",
+                baseline.dollars_per_worker_per_hour
+            );
+            baseline.dollars_per_worker_per_hour
+        }
+    }
 }
 
 /// Log per-window capacity forecast (for governor loop integration)
@@ -3683,5 +3798,185 @@ mod tests {
         assert_eq!(rates_mixed[0].window, "seven_day");
         assert!((rates_mixed[0].pct_per_hour - 2.0).abs() < 1e-9);
         assert!((rates_mixed[0].dollar_per_hour - 5.0).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------------
+    // Staleness handling tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a FleetAggregate for testing staleness
+    fn test_fleet_aggregate(age_minutes: i64, p75_usd_hr: f64, workers: u32) -> crate::state::FleetAggregate {
+        let t1 = Utc::now() - chrono::Duration::minutes(age_minutes);
+        crate::state::FleetAggregate {
+            t0: t1 - chrono::Duration::seconds(60),
+            t1,
+            sonnet_workers: workers,
+            sonnet_usd_total: p75_usd_hr * workers as f64,
+            sonnet_p75_usd_hr: p75_usd_hr,
+            sonnet_std_usd_hr: p75_usd_hr * 0.1,
+            window_pct_deltas: crate::state::WindowPctDeltas::default(),
+            fleet_cache_eff: 0.8,
+            cache_eff_p25: 0.7,
+            cli_tokens: 0,
+            cli_cost: 0.0,
+            sdk_tokens: 0,
+            sdk_cost: 0.0,
+        }
+    }
+
+    #[test]
+    fn collector_data_age_fresh() {
+        let five_min_ago = Utc::now() - chrono::Duration::minutes(5);
+        let age = collector_data_age(five_min_ago);
+        assert!((age as f64 - 300.0).abs() < 2.0, "expected ~300s, got {}", age);
+    }
+
+    #[test]
+    fn collector_data_age_stale() {
+        let forty_min_ago = Utc::now() - chrono::Duration::minutes(40);
+        let age = collector_data_age(forty_min_ago);
+        assert!((age as f64 - 2400.0).abs() < 2.0, "expected ~2400s, got {}", age);
+    }
+
+    #[test]
+    fn staleness_tier_fresh_under_10_minutes() {
+        let five_min_ago = Utc::now() - chrono::Duration::minutes(5);
+        let tier = staleness_tier(five_min_ago);
+        assert_eq!(tier, StalenessTier::Fresh);
+    }
+
+    #[test]
+    fn staleness_tier_aging_10_to_30_minutes() {
+        let fifteen_min_ago = Utc::now() - chrono::Duration::minutes(15);
+        let tier = staleness_tier(fifteen_min_ago);
+        match tier {
+            StalenessTier::Aging { age_secs } => {
+                assert!(age_secs >= 600 && age_secs < 1800, "age_secs should be 600-1800, got {}", age_secs);
+            }
+            _ => panic!("expected Aging tier, got {:?}", tier),
+        }
+    }
+
+    #[test]
+    fn staleness_tier_stale_over_30_minutes() {
+        let forty_min_ago = Utc::now() - chrono::Duration::minutes(40);
+        let tier = staleness_tier(forty_min_ago);
+        match tier {
+            StalenessTier::Stale { age_secs } => {
+                assert!(age_secs >= 1800, "age_secs should be >= 1800, got {}", age_secs);
+            }
+            _ => panic!("expected Stale tier, got {:?}", tier),
+        }
+    }
+
+    #[test]
+    fn staleness_tier_boundary_9_minutes_is_fresh() {
+        let nine_min_ago = Utc::now() - chrono::Duration::minutes(9);
+        let tier = staleness_tier(nine_min_ago);
+        assert_eq!(tier, StalenessTier::Fresh, "9 minutes should be fresh");
+    }
+
+    #[test]
+    fn staleness_tier_boundary_10_minutes_is_aging() {
+        let ten_min_ago = Utc::now() - chrono::Duration::minutes(10);
+        let tier = staleness_tier(ten_min_ago);
+        match tier {
+            StalenessTier::Aging { .. } => {
+                // 10 minutes exactly should be aging
+            }
+            _ => panic!("expected Aging tier at exactly 10 minutes, got {:?}", tier),
+        }
+    }
+
+    #[test]
+    fn staleness_tier_boundary_29_minutes_is_aging() {
+        let twenty_nine_min_ago = Utc::now() - chrono::Duration::minutes(29);
+        let tier = staleness_tier(twenty_nine_min_ago);
+        match tier {
+            StalenessTier::Aging { .. } => {
+                // 29 minutes should still be aging
+            }
+            _ => panic!("expected Aging tier at 29 minutes, got {:?}", tier),
+        }
+    }
+
+    #[test]
+    fn staleness_tier_boundary_30_minutes_is_stale() {
+        let thirty_min_ago = Utc::now() - chrono::Duration::minutes(30);
+        let tier = staleness_tier(thirty_min_ago);
+        match tier {
+            StalenessTier::Stale { .. } => {
+                // 30 minutes exactly should be stale
+            }
+            _ => panic!("expected Stale tier at exactly 30 minutes, got {:?}", tier),
+        }
+    }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_fresh_uses_aggregate() {
+        let aggregate = test_fleet_aggregate(5, 10.0, 2); // 5 minutes old, $10/hr, 2 workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // Fresh data should use aggregate: $10/hr / 2 workers = $5/worker/hr
+        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from fresh aggregate, got ${:.2}", rate);
+    }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_aging_uses_aggregate() {
+        let aggregate = test_fleet_aggregate(15, 10.0, 2); // 15 minutes old, $10/hr, 2 workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // Aging data should still use aggregate EMA values
+        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from aging aggregate, got ${:.2}", rate);
+    }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_stale_uses_baseline() {
+        let aggregate = test_fleet_aggregate(35, 10.0, 2); // 35 minutes old, $10/hr, 2 workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // Stale data should use baseline
+        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from baseline, got ${:.2}", rate);
+    }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_no_workers_uses_baseline() {
+        let aggregate = test_fleet_aggregate(5, 10.0, 0); // Fresh but no workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // No workers should always use baseline
+        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from baseline (no workers), got ${:.2}", rate);
+    }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_stale_baseline_differs_from_aggregate() {
+        // This test verifies that when aggregate is stale, we actually use baseline
+        // even if aggregate has different values
+        let aggregate = test_fleet_aggregate(35, 20.0, 2); // 35 minutes old, $20/hr, 2 workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 7.5, // Different from aggregate ($20/hr / 2 = $10/worker/hr)
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // Stale data should use baseline, not aggregate
+        assert!((rate - 7.5).abs() < 0.01, "expected $7.5/worker/hr from baseline, got ${:.2}", rate);
+        assert!((rate - 10.0).abs() > 0.01, "should NOT use aggregate value $10/worker/hr");
     }
 }
