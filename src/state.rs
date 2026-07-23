@@ -518,9 +518,10 @@ pub struct BaselineBurnRates {
 
 impl Default for BaselineBurnRates {
     fn default() -> Self {
+        // Use config-derived defaults as the single source of truth
         Self {
-            pct_per_worker_per_hour: 1.5,
-            dollars_per_worker_per_hour: 5.0,
+            pct_per_worker_per_hour: crate::config::default_baseline_pct(),
+            dollars_per_worker_per_hour: crate::config::default_baseline_dollars(),
         }
     }
 }
