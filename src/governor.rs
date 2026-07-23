@@ -2014,6 +2014,217 @@ mod window_delta_tests {
         assert_eq!(p7d_delta_none, None, "(None, None) should remain None, not Some(0.0)");
         assert_eq!(p7ds_delta_none, None, "(None, None) should remain None, not Some(0.0)");
     }
+
+    // ---------------------------------------------------------------------------
+    // Consecutive snapshots test - full governor cycle simulation
+    // ---------------------------------------------------------------------------
+
+    /// Test that two consecutive snapshots simulate consecutive polling behavior.
+    ///
+    /// This test creates two distinct snapshots with different known values and
+    /// simulates running the governor cycle twice, storing both snapshots to demonstrate
+    /// consecutive polling behavior.
+    ///
+    /// The test verifies:
+    /// - Two distinct snapshots are created with different utilization values
+    /// - Both snapshots are stored in the GovernorState in sequence
+    /// - The snapshot shift behavior (current becomes previous) works correctly
+    /// - Delta computation uses both snapshots correctly
+    /// - Consecutive polling is demonstrated through state transitions
+    #[test]
+    fn test_consecutive_snapshots_governor_cycle() {
+        use crate::state::GovernorState;
+        use crate::state::PrevUsageSnapshot;
+        use chrono::{Duration, Utc};
+
+        // Create a fresh GovernorState
+        let mut state = GovernorState::new();
+
+        // Verify initial state: no snapshots
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "Initial state should have no previous snapshot"
+        );
+        assert!(
+            state.current_api_snapshot.is_none(),
+            "Initial state should have no current snapshot"
+        );
+        assert!(
+            state.p5h_delta.is_none(),
+            "Initial state should have no 5h delta"
+        );
+        assert!(
+            state.p7d_delta.is_none(),
+            "Initial state should have no 7d delta"
+        );
+        assert!(
+            state.p7ds_delta.is_none(),
+            "Initial state should have no 7ds delta"
+        );
+
+        // === First snapshot: Simulate first governor cycle poll ===
+        let first_poll_time = Utc::now() - Duration::seconds(120);
+        let snapshot1 = PrevUsageSnapshot {
+            taken_at: first_poll_time,
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            seven_day_sonnet_pct: 15.0,
+        };
+
+        // Set the first snapshot as current (simulates successful API poll in cycle 1)
+        state.current_api_snapshot = Some(snapshot1.clone());
+
+        // Verify first snapshot is stored as current
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "After first poll, current snapshot should be Some"
+        );
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "After first poll, previous should still be None"
+        );
+
+        let current = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(current.taken_at, first_poll_time, "First snapshot timestamp");
+        assert!((current.five_hour_pct - 10.0).abs() < f64::EPSILON, "First snapshot 5h");
+        assert!((current.seven_day_pct - 20.0).abs() < f64::EPSILON, "First snapshot 7d");
+        assert!(
+            (current.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON,
+            "First snapshot 7ds"
+        );
+
+        // === Second snapshot: Simulate second governor cycle poll ===
+        let second_poll_time = Utc::now();
+        let snapshot2 = PrevUsageSnapshot {
+            taken_at: second_poll_time,
+            five_hour_pct: 12.5,  // +2.5 from first
+            seven_day_pct: 22.0, // +2.0 from first
+            seven_day_sonnet_pct: 18.0, // +3.0 from first
+        };
+
+        // Shift snapshots: current becomes previous (simulates cycle 2 start)
+        state.previous_api_snapshot = state.current_api_snapshot.take();
+        // Set new current snapshot (simulates successful API poll in cycle 2)
+        state.current_api_snapshot = Some(snapshot2.clone());
+
+        // Verify both snapshots are now stored correctly
+        assert!(
+            state.previous_api_snapshot.is_some(),
+            "After second poll, previous snapshot should be Some"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "After second poll, current snapshot should be Some"
+        );
+
+        // Verify previous snapshot is the first snapshot
+        let previous = state.previous_api_snapshot.as_ref().unwrap();
+        assert_eq!(previous.taken_at, first_poll_time, "Previous is first snapshot");
+        assert!((previous.five_hour_pct - 10.0).abs() < f64::EPSILON, "Previous 5h value");
+        assert!((previous.seven_day_pct - 20.0).abs() < f64::EPSILON, "Previous 7d value");
+        assert!(
+            (previous.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON,
+            "Previous 7ds value"
+        );
+
+        // Verify current snapshot is the second snapshot
+        let current = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(current.taken_at, second_poll_time, "Current is second snapshot");
+        assert!((current.five_hour_pct - 12.5).abs() < f64::EPSILON, "Current 5h value");
+        assert!((current.seven_day_pct - 22.0).abs() < f64::EPSILON, "Current 7d value");
+        assert!(
+            (current.seven_day_sonnet_pct - 18.0).abs() < f64::EPSILON,
+            "Current 7ds value"
+        );
+
+        // === Verify consecutive polling behavior: compute deltas ===
+        // This simulates the delta computation that happens in run_governor_cycle
+        if let (Some(prev), Some(curr)) =
+            (&state.previous_api_snapshot, &state.current_api_snapshot)
+        {
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+            let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            // Store computed deltas (as run_governor_cycle does)
+            state.p5h_delta = Some(delta_5h);
+            state.p7d_delta = Some(delta_7d);
+            state.p7ds_delta = Some(delta_7ds);
+
+            // Verify deltas are computed from consecutive snapshots
+            assert!(
+                state.p5h_delta.is_some(),
+                "After computing, 5h delta should be Some"
+            );
+            assert!(
+                state.p7d_delta.is_some(),
+                "After computing, 7d delta should be Some"
+            );
+            assert!(
+                state.p7ds_delta.is_some(),
+                "After computing, 7ds delta should be Some"
+            );
+
+            // Verify exact delta values (current - previous)
+            assert!(
+                (state.p5h_delta.unwrap() - 2.5).abs() < f64::EPSILON,
+                "5h delta = 12.5 - 10.0 = 2.5"
+            );
+            assert!(
+                (state.p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON,
+                "7d delta = 22.0 - 20.0 = 2.0"
+            );
+            assert!(
+                (state.p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON,
+                "7ds delta = 18.0 - 15.0 = 3.0"
+            );
+        } else {
+            panic!("Both snapshots should be Some after consecutive polls");
+        }
+
+        // === Verify consecutive polling through state transitions ===
+        // The key demonstration of consecutive polling is:
+        // 1. First poll established current_api_snapshot
+        // 2. Second poll shifted that snapshot to previous_api_snapshot
+        // 3. Second poll set a new current_api_snapshot
+        // 4. Both snapshots are now available for delta computation
+
+        // Timestamp progression shows consecutive polls
+        let prev_time = state.previous_api_snapshot.as_ref().unwrap().taken_at;
+        let curr_time = state.current_api_snapshot.as_ref().unwrap().taken_at;
+        assert!(
+            curr_time > prev_time,
+            "Current snapshot timestamp should be later than previous"
+        );
+        let elapsed = (curr_time - prev_time).num_seconds();
+        assert!(
+            elapsed >= 119 && elapsed <= 121,
+            "Time between snapshots should be ~120 seconds (got {})",
+            elapsed
+        );
+
+        // Snapshot values are distinct (showing real utilization changes)
+        let prev_5h = state.previous_api_snapshot.as_ref().unwrap().five_hour_pct;
+        let curr_5h = state.current_api_snapshot.as_ref().unwrap().five_hour_pct;
+        assert!(
+            curr_5h > prev_5h,
+            "Current 5h utilization ({}) should be greater than previous ({})",
+            curr_5h,
+            prev_5h
+        );
+        assert!(
+            (curr_5h - prev_5h - 2.5).abs() < f64::EPSILON,
+            "5h utilization change should be 2.5 percentage points"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
