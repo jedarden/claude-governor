@@ -1182,7 +1182,7 @@ pub fn estimate_burn_rates(
     current_workers: u32,
     prev_workers: u32,
     ema_state: &mut HashMap<(String, String), ModelWindowEma>,
-    _baseline: &BaselineBurnRates,
+    baseline: &BaselineBurnRates,
     current_utilization: &HashMap<String, f64>, // window -> current %
     target_ceiling: f64,
     hours_remaining: &HashMap<String, f64>, // window -> hours until reset
