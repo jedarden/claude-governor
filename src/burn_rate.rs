@@ -3252,4 +3252,394 @@ mod tests {
         // risk = 0.9 * 1.0 * 1.0 = 0.9
         assert!((risk - 0.9).abs() < 0.01);
     }
+
+    // --- compute_empirical_promo_ratio() integration tests ---
+
+    #[test]
+    fn compute_empirical_promo_ratio_with_sufficient_data() {
+        use crate::db::{open_db, create_schema, insert_instance};
+        use tempfile::TempDir;
+
+        // Create a temporary database
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let conn = crate::db::open_db(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        let t0 = "2026-03-20T09:55:00Z";
+        let t1 = "2026-03-20T10:00:00Z";
+
+        // Insert 15 peak instances (pk=1, weekday, hour 8-13)
+        // Peak: 70,000 tokens/pct
+        for i in 0..15 {
+            let pk = 1;
+            let hr_et = 8 + (i % 6); // Hours 8-13
+            let dow = i % 5; // Mon-Fri (0-4)
+            let total_tokens = 70_000;
+            let p7ds = 1.0; // 1% delta
+            let total_usd = 1.5;
+
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("peak-{}", i),
+                "sid": format!("p{}", i),
+                "model": "sonnet",
+                "pk": pk, "hr_et": hr_et, "dow": dow,
+                "input-n": total_tokens,
+                "input-usd": 0.9,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": total_usd, "cache-eff": 0.0,
+                "p7ds": p7ds,
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Insert 15 off-peak instances (pk=0 or weekend/evening)
+        // Off-peak: 140,000 tokens/pct (2x peak)
+        for i in 0..15 {
+            let pk = 0;
+            let hr_et = 14 + (i % 10); // Hours 14-23 (off-peak)
+            let dow = i % 7; // Any day
+            let total_tokens = 140_000;
+            let p7ds = 1.0; // 1% delta
+            let total_usd = 3.0;
+
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("offpeak-{}", i),
+                "sid": format!("o{}", i),
+                "model": "sonnet",
+                "pk": pk, "hr_et": hr_et, "dow": dow,
+                "input-n": total_tokens,
+                "input-usd": 1.8,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": total_usd, "cache-eff": 0.0,
+                "p7ds": p7ds,
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Call compute_empirical_promo_ratio
+        let result = compute_empirical_promo_ratio(&db_path);
+
+        assert!(result.is_some(), "compute_empirical_promo_ratio should return Some()");
+        let ratio = result.unwrap();
+
+        // Verify the observed ratio is approximately 2.0 (offpeak/peak)
+        assert!((ratio.observed_ratio - 2.0).abs() < 0.1,
+            "expected ratio ~2.0, got {}", ratio.observed_ratio);
+
+        // Verify we have sufficient data
+        assert!(ratio.sufficient_data, "should have sufficient data (>=10 each)");
+        assert!(ratio.peak_samples >= 10, "should have >=10 peak samples");
+        assert!(ratio.offpeak_samples >= 10, "should have >=10 offpeak samples");
+
+        // Verify median values are approximately correct
+        assert!((ratio.median_peak - 70_000.0).abs() < 5_000.0,
+            "expected median_peak ~70k, got {}", ratio.median_peak);
+        assert!((ratio.median_offpeak - 140_000.0).abs() < 10_000.0,
+            "expected median_offpeak ~140k, got {}", ratio.median_offpeak);
+    }
+
+    #[test]
+    fn compute_empirical_promo_ratio_insufficient_data_returns_some() {
+        use crate::db::{open_db, create_schema, insert_instance};
+        use tempfile::TempDir;
+
+        // Create a temporary database
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let conn = crate::db::open_db(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        let t0 = "2026-03-20T09:55:00Z";
+        let t1 = "2026-03-20T10:00:00Z";
+
+        // Insert only 5 peak instances (insufficient for validation)
+        for i in 0..5 {
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("peak-{}", i),
+                "sid": format!("p{}", i),
+                "model": "sonnet",
+                "pk": 1, "hr_et": 10, "dow": 2,
+                "input-n": 70_000, "input-usd": 0.9,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": 1.5, "cache-eff": 0.0,
+                "p7ds": 1.0,
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Insert 5 off-peak instances
+        for i in 0..5 {
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("offpeak-{}", i),
+                "sid": format!("o{}", i),
+                "model": "sonnet",
+                "pk": 0, "hr_et": 15, "dow": 2,
+                "input-n": 140_000, "input-usd": 1.8,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": 3.0, "cache-eff": 0.0,
+                "p7ds": 1.0,
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Call compute_empirical_promo_ratio
+        let result = compute_empirical_promo_ratio(&db_path);
+
+        // Should still return Some(), but with insufficient_data = false
+        assert!(result.is_some(), "compute_empirical_promo_ratio should return Some()");
+        let ratio = result.unwrap();
+
+        assert!(!ratio.sufficient_data, "should not have sufficient data (<10 each)");
+        assert!(ratio.peak_samples < 10, "should have <10 peak samples");
+        assert!(ratio.offpeak_samples < 10, "should have <10 offpeak samples");
+    }
+
+    #[test]
+    fn compute_empirical_promo_ratio_no_data_returns_none() {
+        use crate::db::{open_db, create_schema};
+        use tempfile::TempDir;
+
+        // Create an empty temporary database
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let conn = crate::db::open_db(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // No data inserted
+
+        // Call compute_empirical_promo_ratio
+        let result = compute_empirical_promo_ratio(&db_path);
+
+        assert!(result.is_none(), "compute_empirical_promo_ratio should return None when no data");
+    }
+
+    /// Test: Integration test that creates synthetic data, annotates it, and returns Some(ratio)
+    /// This verifies the full workflow: create synthetic interval data → annotate with window deltas → compute empirical ratio
+    #[test]
+    fn compute_empirical_promo_ratio_integration_with_annotation() {
+        use crate::db::{open_db, create_schema, insert_instance, insert_fleet, WindowPctSnapshot, annotate_window_pct_deltas};
+        use tempfile::TempDir;
+        use chrono::{DateTime, Utc};
+
+        // Create a temporary database
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let conn = open_db(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        let t0_parsed: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1_parsed: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+        let t0 = t0_parsed.to_rfc3339();
+        let t1 = t1_parsed.to_rfc3339();
+
+        // Insert 15 peak instances (pk=1, weekday, hour 8-13) with NO annotation yet (p7ds is NULL)
+        // These will be annotated after we create them
+        for i in 0..15 {
+            let pk = 1;
+            let hr_et = 8 + (i % 6); // Hours 8-13 (peak)
+            let dow = i % 5; // Mon-Fri (0-4)
+            let total_tokens = 70_000;
+            let total_usd = 1.0; // Equal weight for fair apportioning
+
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("peak-{}", i),
+                "sid": format!("p{}", i),
+                "model": "sonnet",
+                "pk": pk, "hr_et": hr_et, "dow": dow,
+                "input-n": total_tokens,
+                "input-usd": 0.6,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": total_usd, "cache-eff": 0.0,
+                // No p7ds yet - will be annotated
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Insert 15 off-peak instances (pk=0 or weekend/evening) with NO annotation yet
+        for i in 0..15 {
+            let pk = 0;
+            let hr_et = 14 + (i % 10); // Hours 14-23 (off-peak)
+            let dow = i % 7; // Any day
+            let total_tokens = 140_000; // 2x peak tokens
+            let total_usd = 1.0; // Equal weight for fair apportioning
+
+            let rec = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("offpeak-{}", i),
+                "sid": format!("o{}", i),
+                "model": "sonnet",
+                "pk": pk, "hr_et": hr_et, "dow": dow,
+                "input-n": total_tokens,
+                "input-usd": 1.2,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": total_usd, "cache-eff": 0.0,
+                // No p7ds yet - will be annotated
+            });
+            insert_instance(&conn, &rec).unwrap();
+        }
+
+        // Insert fleet record
+        let fleet = serde_json::json!({
+            "r": "f", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "pk": 1, "hr_et": 10, "dow": 2, "workers": 2,
+            "total-usd": 30.0, // sum of all instance USD (15 * 1.0 + 15 * 1.0)
+            "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+            "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+        });
+        insert_fleet(&conn, &fleet).unwrap();
+
+        // Now ANNOTATE the interval with window deltas
+        // Old pct: 70.0, new pct: 71.0 (delta = 1.0 for all three windows)
+        let old_pct = WindowPctSnapshot {
+            five_hour: 40.0,
+            seven_day: 70.0,
+            seven_day_sonnet: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 41.0,   // delta_5h = 1.0
+            seven_day: 71.0,  // delta_7d = 1.0
+            seven_day_sonnet: 71.0,  // delta_7ds = 1.0
+        };
+
+        let result = annotate_window_pct_deltas(
+            &conn,
+            t0_parsed,
+            t1_parsed,
+            &old_pct,
+            &new_pct,
+            2, // workers_at_start
+            2, // workers_at_end
+        );
+        assert!(result.is_ok(), "annotate_window_pct_deltas should succeed");
+
+        // Now verify that compute_empirical_promo_ratio returns Some() with annotated data
+        let ratio_result = compute_empirical_promo_ratio(&db_path);
+
+        assert!(ratio_result.is_some(), "compute_empirical_promo_ratio should return Some() after annotation");
+        let ratio = ratio_result.unwrap();
+
+        // Verify sufficient_data is true (>= 10 peak and >= 10 off-peak)
+        assert!(ratio.sufficient_data, "should have sufficient data (>=10 each)");
+        assert!(ratio.peak_samples >= 10, "should have >=10 peak samples");
+        assert!(ratio.offpeak_samples >= 10, "should have >=10 off-peak samples");
+
+        // Verify the observed ratio is approximately 2.0 (offpeak/peak: 140k/70k tokens per %)
+        // After annotation with equal weights, each instance gets p7ds = 1.0 / 30 = 0.0333...
+        // Peak tokens_per_pct = 70000 / 0.0333 = 2,100,000
+        // Off-peak tokens_per_pct = 140000 / 0.0333 = 4,200,000
+        // Ratio = 4200000 / 2100000 = 2.0
+        assert!((ratio.observed_ratio - 2.0).abs() < 0.1,
+            "expected ratio ~2.0, got {}", ratio.observed_ratio);
+
+        // Verify median values reflect the 2x ratio (off-peak is double peak)
+        assert!((ratio.median_offpeak / ratio.median_peak - 2.0).abs() < 0.1,
+            "expected median_offpeak to be ~2x median_peak, got ratio {}",
+            ratio.median_offpeak / ratio.median_peak);
+    }
+
+    /// Test: Verify scaling behavior unchanged when annotation data is absent
+    /// This verifies that when p7ds is NULL (not yet annotated), the burn rate computation handles it gracefully
+    #[test]
+    fn scaling_unaffected_by_missing_annotation_data() {
+        // Create instance records with null pct_delta (simulating data before annotation)
+        let record = InstanceRecord {
+            session: "test-session".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            total_usd: 5.0,
+            total_tokens: 1_000_000,
+            windows: vec![
+                WindowUtilization {
+                    window: "five_hour".to_string(),
+                    pct_delta: None, // NOT YET ANNOTATED - this is the key test
+                    current_utilization: 45.0,
+                    previous_utilization: 40.0,
+                },
+                WindowUtilization {
+                    window: "seven_day".to_string(),
+                    pct_delta: None, // NOT YET ANNOTATED
+                    current_utilization: 65.0,
+                    previous_utilization: 60.0,
+                },
+                WindowUtilization {
+                    window: "seven_day_sonnet".to_string(),
+                    pct_delta: None, // NOT YET ANNOTATED
+                    current_utilization: 70.0,
+                    previous_utilization: 65.0,
+                },
+            ],
+        };
+
+        // Burn rate computation should skip windows with null pct_delta
+        let rates = compute_instance_burn(&record, 1.0);
+
+        // Should return empty vector since all windows have null pct_delta
+        assert!(rates.is_empty(), "compute_instance_burn should return empty when all pct_delta are null");
+
+        // Verify that with a mix of null and valid, only valid windows are used
+        let record_mixed = InstanceRecord {
+            session: "test-session-mixed".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            total_usd: 5.0,
+            total_tokens: 1_000_000,
+            windows: vec![
+                WindowUtilization {
+                    window: "five_hour".to_string(),
+                    pct_delta: None, // NULL - should be skipped
+                    current_utilization: 45.0,
+                    previous_utilization: 40.0,
+                },
+                WindowUtilization {
+                    window: "seven_day".to_string(),
+                    pct_delta: Some(2.0), // VALID - should be used
+                    current_utilization: 65.0,
+                    previous_utilization: 60.0,
+                },
+                WindowUtilization {
+                    window: "seven_day_sonnet".to_string(),
+                    pct_delta: None, // NULL - should be skipped
+                    current_utilization: 70.0,
+                    previous_utilization: 65.0,
+                },
+            ],
+        };
+
+        let rates_mixed = compute_instance_burn(&record_mixed, 1.0);
+
+        // Should have exactly one rate (from the valid seven_day window)
+        assert_eq!(rates_mixed.len(), 1, "compute_instance_burn should return 1 rate for 1 valid window");
+        assert_eq!(rates_mixed[0].window, "seven_day");
+        assert!((rates_mixed[0].pct_per_hour - 2.0).abs() < 1e-9);
+        assert!((rates_mixed[0].dollar_per_hour - 5.0).abs() < 1e-9);
+    }
 }
