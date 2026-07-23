@@ -3976,11 +3976,10 @@ pub fn run_governor_cycle(
         // If the governor was paused for > 30 min, the snapshot is too stale to use
         const MAX_ELAPSED_SECS: f64 = 1800.0;
 
-        let new_five_hour = state.usage.five_hour_pct;
-        let new_seven_day = state.usage.all_models_pct;
-        let new_seven_day_sonnet = state.usage.sonnet_pct;
-
         if !state.usage.stale {
+            let new_five_hour = state.usage.five_hour_pct;
+            let new_seven_day = state.usage.all_models_pct;
+            let new_seven_day_sonnet = state.usage.sonnet_pct;
             if let Some(snap) = old_snapshot.clone() {
                 let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
