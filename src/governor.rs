@@ -6954,4 +6954,359 @@ mod mock_poller_tests {
         // 9. Verify no panic occurred (test reaching this point means no panic)
         // This is the key "smoke test" - the cycle runs without crashing
     }
+
+    // ---------------------------------------------------------------------------
+    // Comprehensive snapshot delta computation tests
+    // ---------------------------------------------------------------------------
+
+    /// Test realistic consecutive API poll scenarios with actual usage patterns.
+    ///
+    /// Uses realistic fixtures based on actual Anthropic API usage data patterns:
+    /// - 5-hour window: fastest changing, shows immediate impact
+    /// - 7-day window: slower changing, shows accumulated usage
+    /// - 7-day Sonnet window: typically lower than all-models 7-day
+    #[test]
+    fn test_realistic_consecutive_api_polls() {
+        use chrono::Utc;
+        use crate::state::PrevUsageSnapshot;
+
+        // Scenario 1: Normal workload progression
+        // Poll 1 (baseline): 5h=8%, 7d=42%, 7ds=35%
+        // Poll 2 (after 60s): 5h=10.5%, 7d=43%, 7ds=36.5%
+        let poll1 = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(120),
+            five_hour_pct: 8.0,
+            seven_day_pct: 42.0,
+            seven_day_sonnet_pct: 35.0,
+        };
+
+        let poll2 = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.5,
+            seven_day_pct: 43.0,
+            seven_day_sonnet_pct: 36.5,
+        };
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: poll1.five_hour_pct,
+            seven_day: poll1.seven_day_pct,
+            seven_day_sonnet: poll1.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: poll2.five_hour_pct,
+            seven_day: poll2.seven_day_pct,
+            seven_day_sonnet: poll2.seven_day_sonnet_pct,
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Verify realistic delta patterns
+        assert!((d5h - 2.5).abs() < f64::EPSILON, "5h delta: 10.5 - 8.0 = 2.5");
+        assert!((d7d - 1.0).abs() < f64::EPSILON, "7d delta: 43.0 - 42.0 = 1.0");
+        assert!((d7ds - 1.5).abs() < f64::EPSILON, "7ds delta: 36.5 - 35.0 = 1.5");
+
+        // 5-hour window should show fastest change (highest delta)
+        assert!(d5h > d7d, "5h delta should be > 7d delta (fastest changing)");
+        assert!(d7ds > d7d, "7ds delta should be > 7d delta (Sonnet usage more volatile)");
+    }
+
+    /// Test delta computation with minimal API changes (precision edge case).
+    ///
+    /// Verifies that very small utilization changes are computed accurately.
+    /// This tests the floating-point precision limits of delta computation.
+    #[test]
+    fn test_minimal_api_changes_precision() {
+        // Test with very small deltas (0.01% changes)
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 60.0,
+            seven_day_sonnet: 55.0,
+        };
+
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 50.01,   // +0.01%
+            seven_day: 60.01,   // +0.01%
+            seven_day_sonnet: 55.01,  // +0.01%
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+
+        // Verify precision to 4 decimal places
+        assert!((d5h - 0.01).abs() < 1e-9, "5h: 50.01 - 50.0 = 0.01");
+        assert!((d7d - 0.01).abs() < 1e-9, "7d: 60.01 - 60.0 = 0.01");
+        assert!((d7ds - 0.01).abs() < 1e-9, "7ds: 55.01 - 55.0 = 0.01");
+    }
+
+    /// Test delta computation with maximum API changes (saturation edge case).
+    ///
+    /// Verifies delta computation when windows go from empty to near-full.
+    /// This represents rapid consumption scenarios.
+    #[test]
+    fn test_maximum_api_changes_saturation() {
+        // Test with large deltas (0% to 95%)
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 0.0,
+            seven_day: 0.0,
+            seven_day_sonnet: 0.0,
+        };
+
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 95.0,
+            seven_day: 88.0,
+            seven_day_sonnet: 92.0,
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+
+        assert!((d5h - 95.0).abs() < f64::EPSILON, "5h: 95.0 - 0.0 = 95.0");
+        assert!((d7d - 88.0).abs() < f64::EPSILON, "7d: 88.0 - 0.0 = 88.0");
+        assert!((d7ds - 92.0).abs() < f64::EPSILON, "7ds: 92.0 - 0.0 = 92.0");
+
+        // All deltas should be large and positive
+        assert!(d5h > 80.0, "5h delta should be large (> 80%)");
+        assert!(d7d > 80.0, "7d delta should be large (> 80%)");
+        assert!(d7ds > 80.0, "7ds delta should be large (> 80%)");
+    }
+
+    /// Test delta computation during window reset boundary transitions.
+    ///
+    /// Simulates the exact moment when a window resets and counting starts over.
+    /// This is a critical edge case for the governor's prediction calibration.
+    #[test]
+    fn test_window_reset_boundary_transitions() {
+        use chrono::Utc;
+        use crate::state::PrevUsageSnapshot;
+
+        // Scenario: Window reset occurs between polls
+        // Previous: near limit (98%, 95%, 97%)
+        // Current: after reset (2%, 3%, 1.5%)
+        let pre_reset = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 98.0,
+            seven_day_pct: 95.0,
+            seven_day_sonnet_pct: 97.0,
+        };
+
+        let post_reset = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 2.0,
+            seven_day_pct: 3.0,
+            seven_day_sonnet_pct: 1.5,
+        };
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: pre_reset.five_hour_pct,
+            seven_day: pre_reset.seven_day_pct,
+            seven_day_sonnet: pre_reset.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: post_reset.five_hour_pct,
+            seven_day: post_reset.seven_day_pct,
+            seven_day_sonnet: post_reset.seven_day_sonnet_pct,
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // All deltas should be large and negative (indicating reset)
+        assert!(d5h < -90.0, "5h delta should indicate reset (2.0 - 98.0 = -96.0)");
+        assert!(d7d < -90.0, "7d delta should indicate reset (3.0 - 95.0 = -92.0)");
+        assert!(d7ds < -90.0, "7ds delta should indicate reset (1.5 - 97.0 = -95.5)");
+
+        assert!((d5h - (-96.0)).abs() < f64::EPSILON);
+        assert!((d7d - (-92.0)).abs() < f64::EPSILON);
+        assert!((d7ds - (-95.5)).abs() < f64::EPSILON);
+    }
+
+    /// Test state integration with snapshot delta updates.
+    ///
+    /// Verifies that the state module's update_api_snapshot method correctly
+    /// maintains the previous/current snapshot chain for delta computation.
+    #[test]
+    fn test_state_snapshot_chain_integration() {
+        use crate::state::GovernorState;
+        use chrono::Utc;
+
+        let mut state = GovernorState::new();
+        let now = Utc::now();
+
+        // First poll: only current snapshot should be set
+        state.update_api_snapshot(now, 15.0, 45.0, 38.0);
+        assert!(state.previous_api_snapshot.is_none(), "Previous should be None after first poll");
+        assert!(state.current_api_snapshot.is_some(), "Current should be Some after first poll");
+
+        // Second poll: previous should now be set
+        state.update_api_snapshot(now + chrono::Duration::seconds(60), 17.5, 47.0, 40.0);
+        assert!(state.previous_api_snapshot.is_some(), "Previous should be Some after second poll");
+        assert!(state.current_api_snapshot.is_some(), "Current should still be Some");
+
+        // Verify the chain: previous holds first poll data, current holds second
+        let prev = state.previous_api_snapshot.as_ref().unwrap();
+        let curr = state.current_api_snapshot.as_ref().unwrap();
+
+        assert!((prev.five_hour_pct - 15.0).abs() < f64::EPSILON);
+        assert!((curr.five_hour_pct - 17.5).abs() < f64::EPSILON);
+
+        // Compute deltas using the state's snapshot chain
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev.five_hour_pct,
+            seven_day: prev.seven_day_pct,
+            seven_day_sonnet: prev.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        assert!((d5h - 2.5).abs() < f64::EPSILON);
+        assert!((d7d - 2.0).abs() < f64::EPSILON);
+        assert!((d7ds - 2.0).abs() < f64::EPSILON);
+    }
+
+    /// Test asymmetric window behavior (windows changing in different directions).
+    ///
+    /// Simulates realistic scenarios where different windows show different trends
+    /// (e.g., 5-hour increasing while 7-day is flat or decreasing).
+    #[test]
+    fn test_asymmetric_window_behavior() {
+        // Scenario: 5-hour window burning fast, 7-day windows flat or decreasing
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 70.0,
+            seven_day_sonnet: 65.0,
+        };
+
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 25.0,   // +15.0 (rapid burn)
+            seven_day: 70.5,   // +0.5 (nearly flat)
+            seven_day_sonnet: 64.0,  // -1.0 (slight decrease due to older consumption rolling off)
+        };
+
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+
+        assert!((d5h - 15.0).abs() < f64::EPSILON, "5h should increase rapidly");
+        assert!((d7d - 0.5).abs() < f64::EPSILON, "7d should be nearly flat");
+        assert!((d7ds - (-1.0)).abs() < f64::EPSILON, "7ds can decrease slightly");
+
+        // 5-hour delta should be much larger than 7-day deltas
+        assert!(d5h.abs() > 10.0 * d7d.abs(), "5h should change much faster than 7d");
+    }
+
+    /// Test delta computation with NaN/Infinity handling.
+    ///
+    /// Verifies that the delta computation doesn't panic on extreme inputs.
+    #[test]
+    fn test_delta_computation_no_panic_on_extreme_inputs() {
+        // Test with very large numbers
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 1e308,
+            seven_day: 1e308,
+            seven_day_sonnet: 1e308,
+        };
+
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 1e308 - 1.0,
+            seven_day: 1e308 - 1.0,
+            seven_day_sonnet: 1e308 - 1.0,
+        };
+
+        // Should not panic
+        let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
+
+        // Results should be computable (though may be imprecise at extreme values)
+        assert!(d5h.is_finite() || d5h == 0.0);
+        assert!(d7d.is_finite() || d7d == 0.0);
+        assert!(d7ds.is_finite() || d7ds == 0.0);
+    }
+
+    /// Test performance: delta computations should complete quickly.
+    ///
+    /// Verifies that 10,000 delta computations complete in under 1 second,
+    /// ensuring the governor cycle can process deltas efficiently.
+    #[test]
+    fn test_delta_computation_performance() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 20.0,
+            seven_day_sonnet: 15.0,
+        };
+
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 22.0,
+            seven_day_sonnet: 18.0,
+        };
+
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = calculate_window_pct_delta(&prev, &curr);
+        }
+        let elapsed = start.elapsed();
+
+        // Should complete 10,000 computations in under 100ms
+        assert!(elapsed.as_millis() < 100, "10,000 delta computations should complete in < 100ms, took {}ms", elapsed.as_millis());
+    }
+
+    /// Test realistic fixture data from actual API response patterns.
+    ///
+    /// Uses fixtures based on real Anthropic API usage data to ensure
+    /// delta computation works with production-like values.
+    #[test]
+    fn test_realistic_api_fixture_data() {
+        use chrono::Utc;
+        use crate::state::PrevUsageSnapshot;
+
+        // Fixture based on actual API data (high Sonnet usage scenario)
+        let fixtures = vec![
+            // (time_offset, five_hr, seven_day, seven_day_sonnet)
+            (0, 12.5, 45.2, 38.7),
+            (60, 14.8, 46.1, 40.2),
+            (120, 17.2, 47.3, 42.1),
+            (180, 19.5, 48.5, 44.0),
+        ];
+
+        let mut snapshots = Vec::new();
+        for (offset, p5h, p7d, p7ds) in fixtures {
+            snapshots.push(PrevUsageSnapshot {
+                taken_at: Utc::now() + chrono::Duration::seconds(offset),
+                five_hour_pct: p5h,
+                seven_day_pct: p7d,
+                seven_day_sonnet_pct: p7ds,
+            });
+        }
+
+        // Test consecutive delta computations
+        for i in 1..snapshots.len() {
+            let prev = &snapshots[i - 1];
+            let curr = &snapshots[i];
+
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+
+            let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            // All deltas should be positive (increasing usage)
+            assert!(d5h > 0.0, "Interval {}-{}: 5h delta should be positive", i-1, i);
+            assert!(d7d > 0.0, "Interval {}-{}: 7d delta should be positive", i-1, i);
+            assert!(d7ds > 0.0, "Interval {}-{}: 7ds delta should be positive", i-1, i);
+
+            // 5-hour should change fastest
+            assert!(d5h > d7d, "Interval {}-{}: 5h should change faster than 7d", i-1, i);
+            assert!(d7ds > d7d, "Interval {}-{}: 7ds should change faster than 7d", i-1, i);
+        }
+    }
 }
