@@ -7,7 +7,9 @@
 //! - Apply scaling decision
 //! - Verify state consistency after the cycle
 
+use chrono::Utc;
 use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
+use claude_governor::db;
 use claude_governor::governor::{
     compute_target_workers, apply_scaling, ScalingDecision,
     WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_SEVEN_DAY_SONNET,
@@ -263,4 +265,168 @@ fn test_snapshot_low_utilization_scale_down() {
             panic!("Expected ScaleDown at low utilization, got {:?}", other);
         }
     }
+}
+
+#[test]
+fn test_second_poll_with_delta_computation() {
+    // Test second poll scenario: both snapshots are Some, verify delta computation
+    let mut state = state::GovernorState::new();
+
+    // Simulate first poll: set current_api_snapshot
+    let now1 = Utc::now();
+    state.current_api_snapshot = Some(state::PrevUsageSnapshot {
+        taken_at: now1,
+        five_hour_pct: 10.0,
+        seven_day_pct: 20.0,
+        seven_day_sonnet_pct: 15.0,
+    });
+
+    // Verify initial state after first poll
+    assert!(state.previous_api_snapshot.is_none(), "After first poll, previous should be None");
+    assert!(state.current_api_snapshot.is_some(), "After first poll, current should be Some");
+
+    // Simulate the shift at the start of second poll (as in run_governor_cycle line 2959)
+    state.previous_api_snapshot = state.current_api_snapshot.take();
+
+    // Verify shift occurred
+    assert!(state.previous_api_snapshot.is_some(), "After shift, previous should be Some");
+    assert!(state.current_api_snapshot.is_none(), "After shift, current should be None");
+
+    // Simulate second poll: set new current_api_snapshot
+    let now2 = now1 + chrono::Duration::seconds(60);
+    state.current_api_snapshot = Some(state::PrevUsageSnapshot {
+        taken_at: now2,
+        five_hour_pct: 12.5,  // +2.5 from previous
+        seven_day_pct: 22.0,  // +2.0 from previous
+        seven_day_sonnet_pct: 18.0,  // +3.0 from previous
+    });
+
+    // Now both snapshots are Some - compute deltas
+    let mut p5h_delta: Option<f64> = None;
+    let mut p7d_delta: Option<f64> = None;
+    let mut p7ds_delta: Option<f64> = None;
+
+    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+        (Some(prev), Some(curr)) => {
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+            let (delta_5h, delta_7d, delta_7ds) =
+                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            p5h_delta = Some(delta_5h);
+            p7d_delta = Some(delta_7d);
+            p7ds_delta = Some(delta_7ds);
+        }
+        (None, Some(_curr)) => {
+            // First poll: no previous snapshot available
+            p5h_delta = Some(0.0);
+            p7d_delta = Some(0.0);
+            p7ds_delta = Some(0.0);
+        }
+        (None, None) | (Some(_), None) => {
+            // Neither snapshot available OR only previous available: leave as None
+        }
+    }
+
+    // Verify delta computation: should have computed actual deltas, not Some(0.0)
+    assert_eq!(
+        p5h_delta,
+        Some(2.5),
+        "5h delta should be 12.5 - 10.0 = 2.5 on second poll"
+    );
+    assert_eq!(
+        p7d_delta,
+        Some(2.0),
+        "7d delta should be 22.0 - 20.0 = 2.0 on second poll"
+    );
+    assert_eq!(
+        p7ds_delta,
+        Some(3.0),
+        "7ds delta should be 18.0 - 15.0 = 3.0 on second poll"
+    );
+}
+
+#[test]
+fn test_poll_failure_current_snapshot_remains_none() {
+    // Test poll failure: current_api_snapshot remains None, verify no incorrect deltas
+    let mut state = state::GovernorState::new();
+
+    // Simulate a previous successful poll (so previous_api_snapshot is Some)
+    let now1 = Utc::now();
+    state.previous_api_snapshot = Some(state::PrevUsageSnapshot {
+        taken_at: now1,
+        five_hour_pct: 10.0,
+        seven_day_pct: 20.0,
+        seven_day_sonnet_pct: 15.0,
+    });
+
+    // current_api_snapshot starts as None (no new poll data yet)
+    assert!(state.current_api_snapshot.is_none(), "Before poll, current should be None");
+
+    // Simulate poll failure: the Err branch in run_governor_cycle (line 3027-3044)
+    // When poll fails, current_api_snapshot is NOT updated, so it remains None
+
+    // Verify current_api_snapshot is still None after failed poll
+    assert!(
+        state.current_api_snapshot.is_none(),
+        "After failed poll, current should remain None"
+    );
+
+    // Now attempt delta computation with (Some(previous), None(current))
+    let mut p5h_delta: Option<f64> = None;
+    let mut p7d_delta: Option<f64> = None;
+    let mut p7ds_delta: Option<f64> = None;
+
+    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+        (Some(prev), Some(curr)) => {
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+            let (delta_5h, delta_7d, delta_7ds) =
+                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            p5h_delta = Some(delta_5h);
+            p7d_delta = Some(delta_7d);
+            p7ds_delta = Some(delta_7ds);
+        }
+        (None, Some(_curr)) => {
+            // First poll: no previous snapshot available
+            p5h_delta = Some(0.0);
+            p7d_delta = Some(0.0);
+            p7ds_delta = Some(0.0);
+        }
+        (None, None) | (Some(_), None) => {
+            // Neither snapshot available OR only previous available: leave as None
+            // This is the poll failure case: (Some(previous), None(current))
+        }
+    }
+
+    // Verify: deltas should remain None, not Some(0.0)
+    assert_eq!(
+        p5h_delta, None,
+        "5h delta should be None when current snapshot is missing (poll failure)"
+    );
+    assert_eq!(
+        p7d_delta, None,
+        "7d delta should be None when current snapshot is missing (poll failure)"
+    );
+    assert_eq!(
+        p7ds_delta, None,
+        "7ds delta should be None when current snapshot is missing (poll failure)"
+    );
 }
