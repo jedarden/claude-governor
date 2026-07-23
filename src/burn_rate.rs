@@ -3979,4 +3979,69 @@ mod tests {
         assert!((rate - 7.5).abs() < 0.01, "expected $7.5/worker/hr from baseline, got ${:.2}", rate);
         assert!((rate - 10.0).abs() > 0.01, "should NOT use aggregate value $10/worker/hr");
     }
+
+    #[test]
+    fn staleness_checked_fleet_dollar_rate_45_minutes_uses_baseline() {
+        // Test the specific 45-minute case from docs-y5p acceptance criteria
+        // "Very stale data at 45 minutes falls back to configured baseline"
+        let aggregate = test_fleet_aggregate(45, 15.0, 3); // 45 minutes old, $15/hr, 3 workers
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 6.0, // Baseline: $6/worker/hr
+        };
+
+        let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
+        // 45 minutes is well into the stale tier (>30 min), should use baseline
+        assert!((rate - 6.0).abs() < 0.01, "expected $6/worker/hr from baseline (45min stale), got ${:.2}", rate);
+
+        // Verify we're NOT using the aggregate value ($15/hr / 3 = $5/worker/hr)
+        assert!((rate - 5.0).abs() > 0.01, "should NOT use aggregate value $5/worker/hr when stale");
+    }
+
+    #[test]
+    fn staleness_recovery_restores_ema_within_one_interval() {
+        // Test recovery after a stale period: EMA-based rates should restore within one interval
+        // When data transitions from stale (using baseline) back to fresh, the next interval
+        // should use the aggregate value again (not stuck on baseline)
+
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        // Phase 1: Fresh data (5 min old) - should use aggregate
+        let fresh_aggregate = test_fleet_aggregate(5, 12.0, 2); // $12/hr, 2 workers = $6/worker/hr
+        let fresh_rate = staleness_checked_fleet_dollar_rate(&fresh_aggregate, &baseline);
+        assert!((fresh_rate - 6.0).abs() < 0.01, "fresh data should use aggregate ($6/worker/hr), got ${:.2}", fresh_rate);
+
+        // Phase 2: Stale data (45 min old) - should use baseline
+        let stale_aggregate = test_fleet_aggregate(45, 12.0, 2); // Same aggregate but stale
+        let stale_rate = staleness_checked_fleet_dollar_rate(&stale_aggregate, &baseline);
+        assert!((stale_rate - 5.0).abs() < 0.01, "stale data should use baseline ($5/worker/hr), got ${:.2}", stale_rate);
+
+        // Phase 3: Recovery - fresh data again (5 min old with new aggregate value)
+        // This simulates the collector running again after a stale period
+        let recovered_aggregate = test_fleet_aggregate(5, 18.0, 2); // New aggregate: $18/hr, 2 workers = $9/worker/hr
+        let recovered_rate = staleness_checked_fleet_dollar_rate(&recovered_aggregate, &baseline);
+
+        // Recovery should use the fresh aggregate value, not remain stuck on baseline
+        assert!((recovered_rate - 9.0).abs() < 0.01, "recovered data should use new aggregate ($9/worker/hr), got ${:.2}", recovered_rate);
+        assert!((recovered_rate - 5.0).abs() > 0.01, "recovered data should NOT stick to baseline ($5/worker/hr)");
+    }
+
+    #[test]
+    fn staleness_tier_exactly_15_minutes_is_aging() {
+        // Test the specific 15-minute case from docs-y5p acceptance criteria
+        // "Stale data at 15 minutes logs a warning and keeps last EMA"
+        let fifteen_min_ago = Utc::now() - chrono::Duration::minutes(15);
+        let tier = staleness_tier(fifteen_min_ago);
+
+        match tier {
+            StalenessTier::Aging { age_secs } => {
+                // 15 minutes should be in the aging tier (10-30 min range)
+                assert!((age_secs as f64 - 900.0).abs() < 2.0, "age_secs should be ~900s (15min), got {}", age_secs);
+            }
+            _ => panic!("expected Aging tier at exactly 15 minutes, got {:?}", tier),
+        }
+    }
 }
