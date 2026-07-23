@@ -3829,16 +3829,49 @@ pub fn run_governor_cycle(
                 seven_day_sonnet: state.usage.sonnet_pct,
             };
 
-            if let Err(e) = db::annotate_window_pct_deltas(
-                &conn,
-                t0,
-                t1,
-                &old_pct,
-                &new_pct,
-                workers_at_start,
-                workers_at_end,
-            ) {
-                log::warn!("[governor] failed to annotate window pct deltas: {}", e);
+            // Guard 1: Elapsed time < 2 minutes - too noisy for reliable annotation
+            let elapsed_seconds = (t1 - t0).num_seconds().abs();
+            if elapsed_seconds < 120 {
+                log::warn!(
+                    "[governor] skipping window delta annotation: interval too short ({}s < 120s)",
+                    elapsed_seconds
+                );
+            } else if workers_at_start != workers_at_end {
+                // Guard 2: Worker count changed mid-interval - sessions not comparable
+                log::warn!(
+                    "[governor] skipping window delta annotation: worker count changed mid-interval ({} -> {})",
+                    workers_at_start,
+                    workers_at_end
+                );
+            } else {
+                // Guard 3: Check if interval spans a window reset
+                // A reset is detected when any window utilization drops > 1%
+                let reset_threshold = 1.0;
+                let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+                let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
+                let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+
+                if five_hour_reset || seven_day_reset || seven_day_sonnet_reset {
+                    log::warn!(
+                        "[governor] skipping window delta annotation: interval spans window reset (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
+                        old_pct.five_hour, new_pct.five_hour,
+                        old_pct.seven_day, new_pct.seven_day,
+                        old_pct.seven_day_sonnet, new_pct.seven_day_sonnet
+                    );
+                } else {
+                    // All guards passed - proceed with annotation
+                    if let Err(e) = db::annotate_window_pct_deltas(
+                        &conn,
+                        t0,
+                        t1,
+                        &old_pct,
+                        &new_pct,
+                        workers_at_start,
+                        workers_at_end,
+                    ) {
+                        log::warn!("[governor] failed to annotate window pct deltas: {}", e);
+                    }
+                }
             }
         }
     }
@@ -7690,5 +7723,217 @@ mod mock_poller_tests {
             assert!(d5h > d7d, "Interval {}-{}: 5h should change faster than 7d", i-1, i);
             assert!(d7ds > d7d, "Interval {}-{}: 7ds should change faster than 7d", i-1, i);
         }
+    }
+}
+
+#[cfg(test)]
+mod annotation_guard_tests {
+    use super::*;
+    use chrono::{Utc, Duration};
+
+    /// Test Guard 1: Interval too short (< 2 minutes)
+    #[test]
+    fn test_annotation_guard_short_interval_skips() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(90); // Only 90 seconds - should skip
+
+        let elapsed_seconds = (t1 - t0).num_seconds().abs();
+
+        // Guard should trigger
+        assert!(elapsed_seconds < 120, "Test setup: interval should be < 120s");
+    }
+
+    /// Test Guard 1 passes: Interval >= 2 minutes
+    #[test]
+    fn test_annotation_guard_sufficient_interval_proceeds() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(150); // 150 seconds - should pass
+
+        let elapsed_seconds = (t1 - t0).num_seconds().abs();
+
+        // Guard should not trigger
+        assert!(elapsed_seconds >= 120, "Test setup: interval should be >= 120s");
+    }
+
+    /// Test Guard 2: Worker count changed mid-interval
+    #[test]
+    fn test_annotation_guard_worker_change_skips() {
+        let workers_at_start = 5;
+        let workers_at_end = 7;
+
+        // Guard should trigger - workers changed
+        assert_ne!(workers_at_start, workers_at_end, "Test setup: workers should differ");
+    }
+
+    /// Test Guard 2 passes: Worker count stable
+    #[test]
+    fn test_annotation_guard_stable_workers_proceeds() {
+        let workers_at_start = 5;
+        let workers_at_end = 5;
+
+        // Guard should not trigger
+        assert_eq!(workers_at_start, workers_at_end, "Test setup: workers should be equal");
+    }
+
+    /// Test Guard 3: Window reset detected (utilization drop > 1%)
+    #[test]
+    fn test_annotation_guard_window_reset_skips() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 18.5,  // Dropped 1.5% - should trigger
+            seven_day: 46.0,
+            seven_day_sonnet: 36.0,
+        };
+
+        let reset_threshold = 1.0;
+
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
+        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+
+        // At least one guard should trigger (5h dropped > 1%)
+        assert!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset,
+                "Test setup: at least one window should show reset");
+    }
+
+    /// Test Guard 3 passes: No window reset (normal utilization increase)
+    #[test]
+    fn test_annotation_guard_no_reset_proceeds() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.5,  // Increased 1.5% - normal
+            seven_day: 46.0,
+            seven_day_sonnet: 36.5,
+        };
+
+        let reset_threshold = 1.0;
+
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
+        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+
+        // No guard should trigger - all increased or stable
+        assert!(!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset),
+                "Test setup: no window should show reset");
+    }
+
+    /// Test Guard 3: Multiple windows reset
+    #[test]
+    fn test_annotation_guard_multiple_window_resets() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 25.0,
+            seven_day: 50.0,
+            seven_day_sonnet: 40.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 22.0,   // Dropped 3%
+            seven_day: 48.0,   // Dropped 2%
+            seven_day_sonnet: 38.5,  // Dropped 1.5%
+        };
+
+        let reset_threshold = 1.0;
+
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
+        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+
+        // Multiple guards should trigger
+        assert!(five_hour_reset, "5h window should show reset");
+        assert!(seven_day_reset, "7d window should show reset");
+        assert!(seven_day_sonnet_reset, "7ds window should show reset");
+    }
+
+    /// Test all guards pass: Ideal conditions for annotation
+    #[test]
+    fn test_annotation_all_guards_pass() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(180); // 3 minutes - passes Guard 1
+
+        let workers_at_start = 6;
+        let workers_at_end = 6; // Stable - passes Guard 2
+
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 22.0,   // Increased 2% - no reset
+            seven_day: 46.5,   // Increased 1.5%
+            seven_day_sonnet: 36.5,  // Increased 1.5%
+        };
+
+        // Guard 1: Check interval
+        let elapsed_seconds = (t1 - t0).num_seconds().abs();
+        assert!(elapsed_seconds >= 120, "Guard 1: interval should be sufficient");
+
+        // Guard 2: Check worker stability
+        assert_eq!(workers_at_start, workers_at_end, "Guard 2: workers should be stable");
+
+        // Guard 3: Check no window reset
+        let reset_threshold = 1.0;
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
+        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+        assert!(!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset),
+                "Guard 3: no window reset should occur");
+    }
+
+    /// Test Guard 3 edge case: Exactly at threshold (1% drop = reset)
+    #[test]
+    fn test_annotation_guard_reset_at_threshold() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 18.99,  // Dropped 1.01% - just over threshold
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let reset_threshold = 1.0;
+
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+
+        // Guard should trigger (just barely)
+        assert!(five_hour_reset, "Drop of 1.01% should trigger reset guard");
+    }
+
+    /// Test Guard 3 edge case: Just below threshold (0.99% drop = no reset)
+    #[test]
+    fn test_annotation_guard_reset_below_threshold() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 19.01,  // Dropped 0.99% - just under threshold
+            seven_day: 45.0,
+            seven_day_sonnet: 35.0,
+        };
+
+        let reset_threshold = 1.0;
+
+        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
+
+        // Guard should not trigger (just barely)
+        assert!(!five_hour_reset, "Drop of 0.99% should not trigger reset guard");
     }
 }
