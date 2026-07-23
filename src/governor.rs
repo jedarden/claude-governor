@@ -3660,7 +3660,7 @@ pub fn run_governor_cycle(
             });
 
             // Calculate window deltas from consecutive API snapshots
-            // Explicit pattern matching for all snapshot availability cases
+            // Pure structure: if let pattern matching on both snapshots
             if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
                 // Both snapshots available: proceed with delta computation
                 let prev_pct = crate::db::WindowPctSnapshot {
@@ -3687,21 +3687,6 @@ pub fn run_governor_cycle(
                 state.p5h_delta = Some(delta_5h);
                 state.p7d_delta = Some(delta_7d);
                 state.p7ds_delta = Some(delta_7ds);
-            } else if (state.previous_api_snapshot.is_none() && state.current_api_snapshot.is_some()) {
-                // First poll: no previous snapshot available, cannot compute delta
-                // Set delta fields to Some(0.0) to indicate no change from initial state
-                state.p5h_delta = Some(0.0);
-                state.p7d_delta = Some(0.0);
-                state.p7ds_delta = Some(0.0);
-                log::debug!(
-                    "[governor] window deltas: no previous snapshot (first poll), deltas initialized to 0.0",
-                );
-            } else {
-                // Neither snapshot available OR only previous available: handle gracefully
-                // Leave deltas as None (no change)
-                log::debug!(
-                    "[governor] window deltas: no valid snapshot pair available, deltas remain None",
-                );
             }
         }
         Err(e) => {
