@@ -2173,18 +2173,68 @@ mod window_delta_tests {
                 "After computing, 7ds delta should be Some"
             );
 
-            // Verify exact delta values (current - previous)
+            // === Delta value verification: manual calculation vs computed ===
+            // Delta formula: delta = current_snapshot_pct - previous_snapshot_pct
+            //
+            // This formula tracks the percentage point change in utilization between
+            // consecutive polling cycles. A positive delta indicates increasing utilization,
+            // while a negative delta indicates decreasing utilization.
+            //
+            // Example: if 5-hour utilization was 10.0% in the previous snapshot and is
+            // now 12.5% in the current snapshot, the 5-hour delta is 12.5 - 10.0 = 2.5
+            // percentage points.
+
+            // Calculate expected delta values manually from known snapshot inputs
+            let expected_5h_delta = snapshot2.five_hour_pct - snapshot1.five_hour_pct;
+            let expected_7d_delta = snapshot2.seven_day_pct - snapshot1.seven_day_pct;
+            let expected_7ds_delta = snapshot2.seven_day_sonnet_pct - snapshot1.seven_day_sonnet_pct;
+
+            // Document the expected calculations for clarity
             assert!(
-                (state.p5h_delta.unwrap() - 2.5).abs() < f64::EPSILON,
-                "5h delta = 12.5 - 10.0 = 2.5"
+                (expected_5h_delta - 2.5).abs() < f64::EPSILON,
+                "Expected 5h delta calculation: 12.5 - 10.0 = 2.5 percentage points"
             );
             assert!(
-                (state.p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON,
-                "7d delta = 22.0 - 20.0 = 2.0"
+                (expected_7d_delta - 2.0).abs() < f64::EPSILON,
+                "Expected 7d delta calculation: 22.0 - 20.0 = 2.0 percentage points"
             );
             assert!(
-                (state.p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON,
-                "7ds delta = 18.0 - 15.0 = 3.0"
+                (expected_7ds_delta - 3.0).abs() < f64::EPSILON,
+                "Expected 7ds delta calculation: 18.0 - 15.0 = 3.0 percentage points"
+            );
+
+            // Verify computed deltas match expected manual calculations
+            // This validates that the calculate_window_pct_delta function implements
+            // the correct formula: current - previous
+            let computed_5h_delta = state.p5h_delta.unwrap();
+            let computed_7d_delta = state.p7d_delta.unwrap();
+            let computed_7ds_delta = state.p7ds_delta.unwrap();
+
+            assert!(
+                (computed_5h_delta - expected_5h_delta).abs() < f64::EPSILON,
+                "Computed 5h delta ({}) should match expected 5h delta ({}) from formula: current ({}) - previous ({})",
+                computed_5h_delta,
+                expected_5h_delta,
+                snapshot2.five_hour_pct,
+                snapshot1.five_hour_pct
+            );
+
+            assert!(
+                (computed_7d_delta - expected_7d_delta).abs() < f64::EPSILON,
+                "Computed 7d delta ({}) should match expected 7d delta ({}) from formula: current ({}) - previous ({})",
+                computed_7d_delta,
+                expected_7d_delta,
+                snapshot2.seven_day_pct,
+                snapshot1.seven_day_pct
+            );
+
+            assert!(
+                (computed_7ds_delta - expected_7ds_delta).abs() < f64::EPSILON,
+                "Computed 7ds delta ({}) should match expected 7ds delta ({}) from formula: current ({}) - previous ({})",
+                computed_7ds_delta,
+                expected_7ds_delta,
+                snapshot2.seven_day_sonnet_pct,
+                snapshot1.seven_day_sonnet_pct
             );
         } else {
             panic!("Both snapshots should be Some after consecutive polls");
