@@ -1991,8 +1991,7 @@ claude-governor/
 ├── config/
 │   ├── governor.yaml          # Main configuration (incl. pricing table)
 │   ├── promotions.json        # Promotion window definitions (empty by default when no active promotion)
-│   ├── cgov.service           # Systemd user service — governor daemon
-│   ├── claude-governor.service        # Alternative governor daemon service name
+│   ├── claude-governor.service # Systemd user service — governor daemon
 │   └── claude-token-collector.service # Systemd user service — token collector
 ├── docs/
 │   ├── research/
@@ -2080,7 +2079,7 @@ This ADR was written during a fleet-wide artifact-improvement pass, prompted by 
 Live findings (2026-07-20):
 
 - `claude-token-collector.service` is `enabled`/`active`, has been running continuously, and is still appending `i`/`f` records to `token-history.jsonl` (visible in `journalctl --user -u claude-token-collector`).
-- Both `claude-governor.service` and `cgov.service` (see the two-unit duplication noted separately below) are `disabled`/`inactive`. `~/.config/claude-governor/governor-state.json` has not been updated since `2026-06-28T19:51:09Z` — **21+ days stale** as of this writing.
+- `claude-governor.service` is `disabled`/`inactive`. `~/.config/claude-governor/governor-state.json` has not been updated since `2026-06-28T19:51:09Z` — **21+ days stale** as of this writing.
 - `cgov doctor` on the live host reports 4 hard failures directly caused by this: `daemon_running` (stopped), `state_freshness` (stale), `burn_rate_samples` (insufficient — no fresh EMA data), `prediction_accuracy` (10 stale scored predictions, 14% median error).
 - `governor.yaml`'s `alerts.auto_bead` is `false`, with the comment `"Disabled: alert predicates have 100% FP rate (docs-878a) ... Re-enable only after FP rate < 5% over 100-alert window."` `docs-878a` (closed) and `notes/bf-h7toj.md` show the false-positive rate was later driven to 0% across 9 samples by an `is_cutoff_alert_consistent()` guard — but `auto_bead` was never turned back on, and the FP telemetry counter (`alert_fp_telemetry.total_recorded`) is stuck at effectively zero precisely because the daemon that would grow it towards the 100-sample re-enablement threshold is the same daemon that got shut off.
 - Git history (`docs/notes/bf-48qtz.md`, 2026-07-09) shows this is not a one-time incident: the daemon has previously been confirmed running, then gone stopped again, at least once before in the last two weeks, with no record of *why* it was stopped either time.
@@ -2122,7 +2121,7 @@ Split `cgov _daemon` into two independently-supervised processes:
 - `doctor`'s `daemon_running` check becomes more precise (distinguishes "observe is down" — always bad — from "act is intentionally paused" — a normal, trackable posture).
 
 **Negative / costs:**
-- Two systemd units to install/manage instead of one (`cgov init`/`cgov enable`/`cgov disable` all need updating; `install.sh` and `config/*.service` need a third unit file, on top of resolving the existing `cgov.service` vs. `claude-governor.service` duplication noted as a separate bead).
+- Two systemd units to install/manage instead of one (`cgov init`/`cgov enable`/`cgov disable` all need updating; `install.sh` and `config/*.service` need a third unit file).
 - `governor-state.json` needs a documented ownership split (above) to avoid a torn-write race between two processes; this is a small but real increase in state-management complexity versus the current single-writer model.
 - Slightly higher baseline resource usage (a second always-on process, though `_observe`'s workload — HTTP poll + arithmetic — is lighter than `_act`'s tmux/process-exec work).
 
