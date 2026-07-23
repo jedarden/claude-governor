@@ -1528,6 +1528,83 @@ mod tests {
     }
 
     #[test]
+    fn first_poll_transition_no_panic_with_none_previous() {
+        // Test the first poll transition scenario:
+        // - previous_api_snapshot starts as None
+        // - current_api_snapshot becomes Some after first poll
+        // - No panic should occur when accessing/processing None previous snapshot
+        let mut state = GovernorState::new();
+
+        // Verify initial state: both snapshots should be None
+        assert!(state.previous_api_snapshot.is_none(),
+                "Initial state: previous_api_snapshot should be None");
+        assert!(state.current_api_snapshot.is_none(),
+                "Initial state: current_api_snapshot should be None");
+
+        // Simulate first successful poll with realistic utilization values
+        let now = Utc::now();
+        let five_hour_pct = 45.2;
+        let seven_day_pct = 67.8;
+        let seven_day_sonnet_pct = 72.3;
+
+        // This should not panic even though previous_api_snapshot is None
+        state.update_api_snapshot(now, five_hour_pct, seven_day_pct, seven_day_sonnet_pct);
+
+        // Verify the transition: None -> Some for current_api_snapshot
+        assert!(state.previous_api_snapshot.is_none(),
+                "After first poll: previous_api_snapshot should still be None");
+        assert!(state.current_api_snapshot.is_some(),
+                "After first poll: current_api_snapshot should be Some");
+
+        // Verify all snapshot fields are stored correctly
+        let snapshot = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.five_hour_pct, five_hour_pct,
+                   "Five-hour utilization should match input");
+        assert_eq!(snapshot.seven_day_pct, seven_day_pct,
+                   "Seven-day utilization should match input");
+        assert_eq!(snapshot.seven_day_sonnet_pct, seven_day_sonnet_pct,
+                   "Seven-day sonnet utilization should match input");
+        assert_eq!(snapshot.taken_at, now,
+                   "Timestamp should match poll time");
+    }
+
+    #[test]
+    fn first_poll_handles_zero_utilization() {
+        // Edge case: first poll with zero utilization
+        let mut state = GovernorState::new();
+        let now = Utc::now();
+
+        // Should handle zero values gracefully
+        state.update_api_snapshot(now, 0.0, 0.0, 0.0);
+
+        assert!(state.previous_api_snapshot.is_none());
+        assert!(state.current_api_snapshot.is_some());
+
+        let snapshot = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.five_hour_pct, 0.0);
+        assert_eq!(snapshot.seven_day_pct, 0.0);
+        assert_eq!(snapshot.seven_day_sonnet_pct, 0.0);
+    }
+
+    #[test]
+    fn first_poll_handles_high_utilization() {
+        // Edge case: first poll near capacity limits
+        let mut state = GovernorState::new();
+        let now = Utc::now();
+
+        // Should handle high utilization values (near 100%)
+        state.update_api_snapshot(now, 95.7, 98.2, 99.1);
+
+        assert!(state.previous_api_snapshot.is_none());
+        assert!(state.current_api_snapshot.is_some());
+
+        let snapshot = state.current_api_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.five_hour_pct, 95.7);
+        assert_eq!(snapshot.seven_day_pct, 98.2);
+        assert_eq!(snapshot.seven_day_sonnet_pct, 99.1);
+    }
+
+    #[test]
     fn update_api_snapshot_second_poll_shifts_snapshots() {
         let mut state = GovernorState::new();
         let now1 = Utc::now();
