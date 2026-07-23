@@ -1,6 +1,6 @@
 [Unit]
 Description=Claude Token Collector - collects token usage data for Claude Governor
-Documentation=https://github.com/anthropics/claude-governor
+Documentation=https://github.com/jedarden/claude-governor
 After=network-online.target
 Wants=network-online.target
 

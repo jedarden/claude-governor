@@ -1,6 +1,6 @@
 [Unit]
 Description=Claude Governor - automated capacity governor for Claude Code
-Documentation=https://github.com/anthropics/claude-governor
+Documentation=https://github.com/jedarden/claude-governor
 After=network-online.target
 Wants=network-online.target claude-token-collector.service
 
