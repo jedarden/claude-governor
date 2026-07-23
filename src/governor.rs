@@ -835,16 +835,55 @@ fn apply_underutilization_sprint(
 
 /// Get baseline burn rate config for sonnet (subscription) agents.
 ///
-/// Returns the baseline config from the first subscription agent (preferring one with
-/// "sonnet" in the name), or the default baseline if no subscription agent has a
-/// configured baseline.
+/// Returns the baseline config from state (warm-start) or from agent config (cold-start).
+/// Priority:
+/// 1. state.baseline_burn_rates (warm-start - already loaded from config)
+/// 2. agent config lookup (cold-start - first time running)
+/// 3. default baseline (truly no config available)
 fn get_sonnet_baseline_config(
+    state: &state::GovernorState,
     agents: &HashMap<String, AgentConfig>,
-) -> crate::burn_rate::BaselineBurnRates {
+) -> crate::state::BaselineBurnRates {
+    // Warm-start: check state for already-loaded config-derived baselines
+    // Prefer needle-sonnet specifically, then any subscription agent baseline from state
+    for (name, baseline) in &state.baseline_burn_rates {
+        if name.contains("sonnet") || name.contains("needle") {
+            log::debug!(
+                "[governor] using state-loaded baseline for {} (pct={:.2}/hr, ${:.2}/hr)",
+                name,
+                baseline.pct_per_worker_per_hour,
+                baseline.dollars_per_worker_per_hour
+            );
+            return baseline.clone();
+        }
+    }
+
+    // Fallback: use any subscription agent baseline from state
+    if let Some((name, baseline)) = state.baseline_burn_rates.iter().next() {
+        log::debug!(
+            "[governor] using state-loaded baseline for {} (pct={:.2}/hr, ${:.2}/hr)",
+            name,
+            baseline.pct_per_worker_per_hour,
+            baseline.dollars_per_worker_per_hour
+        );
+        return baseline.clone();
+    }
+
+    // Cold-start: state has no baselines, fall back to agent config lookup
+    log::debug!("[governor] state has no baseline_burn_rates, falling back to agent config");
+
+    // Helper to convert from burn_rate::BaselineBurnRates to state::BaselineBurnRates
+    let convert_baseline = |br: crate::burn_rate::BaselineBurnRates| -> crate::state::BaselineBurnRates {
+        crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: br.pct_per_worker_per_hour,
+            dollars_per_worker_per_hour: br.dollars_per_worker_per_hour,
+        }
+    };
+
     // First try to find a subscription agent with "sonnet" in its name
     for (name, cfg) in agents {
         if cfg.subscription && (name.contains("sonnet") || name.contains("needle")) {
-            return cfg.baseline_burn_rate_or_default();
+            return convert_baseline(cfg.baseline_burn_rate_or_default());
         }
     }
 
@@ -855,7 +894,7 @@ fn get_sonnet_baseline_config(
                 "[governor] no sonnet agent found, using {} agent's baseline for dollar staleness checks",
                 name
             );
-            return cfg.baseline_burn_rate_or_default();
+            return convert_baseline(cfg.baseline_burn_rate_or_default());
         }
     }
 
@@ -863,8 +902,7 @@ fn get_sonnet_baseline_config(
     log::warn!(
         "[governor] no subscription agents configured, using default baseline for dollar staleness checks"
     );
-    // TODO: Will be updated to use config once baseline_burn_rate field is fully integrated
-    crate::burn_rate::BaselineBurnRates::default()
+    crate::state::BaselineBurnRates::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -3661,7 +3699,11 @@ pub fn run_governor_cycle(
     // 1. Load current state
     let mut state = state::load_state(state_path)?;
 
-    // 1a-pre. Shift snapshot state before poll: current becomes previous.
+    // 1a. Load baseline burn rates from config (warm state)
+    // This ensures that when EMA samples >= 3, we have config-derived baselines available
+    state.load_baseline_burn_rates_from_config(agents);
+
+    // 1b. Shift snapshot state before poll: current becomes previous.
     // On first poll, current_api_snapshot is None, so previous becomes None too.
     state.previous_api_snapshot = state.current_api_snapshot.take();
 
@@ -4019,7 +4061,7 @@ pub fn run_governor_cycle(
                         calculate_window_pct_delta(&old_pct, &new_pct);
 
                     // Fleet total USD/hr from the most recent fleet aggregate (with staleness checking)
-                    let baseline = get_sonnet_baseline_config(agents);
+                    let baseline = get_sonnet_baseline_config(&state, agents);
                     let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
                         &state.last_fleet_aggregate,
                         &baseline,
@@ -4341,7 +4383,7 @@ pub fn run_governor_cycle(
         let ema = &state.burn_rate.fleet_pct_hr_ema;
         let samples = state.burn_rate.fleet_pct_ema_samples;
         // Fleet total USD/hr (p75 per-worker × active workers) with staleness checking
-        let baseline = get_sonnet_baseline_config(agents);
+        let baseline = get_sonnet_baseline_config(state, agents);
         let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
             &state.last_fleet_aggregate,
             &baseline,
@@ -4530,7 +4572,7 @@ pub fn run_governor_cycle(
 
         // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
         // Falls back to baseline ratio from config when the learned ratio is unavailable.
-        let baseline = get_sonnet_baseline_config(agents);
+        let baseline = get_sonnet_baseline_config(state, agents);
         let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
         let usd_per_pct = match *window {
             "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
@@ -4746,7 +4788,7 @@ pub fn run_governor_cycle(
 
         // Compute per-worker rates (with staleness checking for dollar rate)
         let pct_per_worker = avg_pct_per_hour / current_total as f64;
-        let baseline = get_sonnet_baseline_config(agents);
+        let baseline = get_sonnet_baseline_config(state, agents);
         let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
             &state.last_fleet_aggregate,
             &baseline,
