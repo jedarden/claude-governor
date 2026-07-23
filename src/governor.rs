@@ -3001,10 +3001,23 @@ pub fn run_governor_cycle(
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
+                // Log computed window deltas
+                log::info!(
+                    "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}% (previous: {:.1}/{:.1}/{:.1}%, current: {:.1}/{:.1}/{:.1}%)",
+                    delta_5h, delta_7d, delta_7ds,
+                    prev_pct.five_hour, prev_pct.seven_day, prev_pct.seven_day_sonnet,
+                    curr_pct.five_hour, curr_pct.seven_day, curr_pct.seven_day_sonnet,
+                );
+
                 // Store computed deltas in governor state
                 state.p5h_delta = Some(delta_5h);
                 state.p7d_delta = Some(delta_7d);
                 state.p7ds_delta = Some(delta_7ds);
+            } else {
+                // No previous snapshot available (first poll)
+                log::info!(
+                    "[governor] window deltas: no previous snapshot (first poll), deltas unavailable",
+                );
             }
         }
         Err(e) => {
