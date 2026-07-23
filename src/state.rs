@@ -502,6 +502,29 @@ impl Default for SafeModeState {
     }
 }
 
+/// Baseline burn rates from configuration (fallback when collector is offline or EMA not ready)
+///
+/// These values are loaded from agent config's `baseline_burn_rate` settings and stored
+/// in governor-state.json for persistence. They provide conservative fallback burn rates
+/// when the token collector is offline or when insufficient EMA samples have been accumulated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineBurnRates {
+    /// Baseline percentage burn per worker per hour (default: 1.5)
+    pub pct_per_worker_per_hour: f64,
+
+    /// Baseline dollar burn per worker per hour (default: 5.0)
+    pub dollars_per_worker_per_hour: f64,
+}
+
+impl Default for BaselineBurnRates {
+    fn default() -> Self {
+        Self {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level state
 // ---------------------------------------------------------------------------
@@ -666,6 +689,11 @@ pub struct GovernorState {
     /// Computed from consecutive API readings across governor cycles.
     #[serde(default)]
     pub p7ds_delta: Option<f64>,
+    /// Per-agent baseline burn rates from config.
+    /// Used as fallback when token collector is offline or EMA is not yet ready.
+    /// Key is agent name (e.g., "needle-sonnet", "polish-opus").
+    #[serde(default)]
+    pub baseline_burn_rates: HashMap<String, BaselineBurnRates>,
 }
 
 impl Default for GovernorState {
@@ -690,6 +718,7 @@ impl Default for GovernorState {
             p5h_delta: None,
             p7d_delta: None,
             p7ds_delta: None,
+            baseline_burn_rates: HashMap::new(),
         }
     }
 }
@@ -698,6 +727,59 @@ impl GovernorState {
     /// Create a new empty state with the current timestamp
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Populate baseline burn rates from agent configuration
+    ///
+    /// This method loads the baseline_burn_rate settings from the provided agent config map
+    /// and stores them in the state. These values serve as fallback burn rates when the
+    /// token collector is offline or when insufficient EMA samples have been accumulated.
+    ///
+    /// # Arguments
+    /// - `agents_config`: A map of agent name to AgentConfig from governor.yaml
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut state = GovernorState::new();
+    /// let config = GovernorConfig::load()?;
+    /// state.load_baseline_burn_rates_from_config(&config.agents);
+    /// ```
+    pub fn load_baseline_burn_rates_from_config(
+        &mut self,
+        agents_config: &std::collections::HashMap<String, crate::config::AgentConfig>,
+    ) {
+        for (agent_name, agent_config) in agents_config {
+            if let Some(baseline_config) = &agent_config.baseline_burn_rate {
+                let baseline = BaselineBurnRates {
+                    pct_per_worker_per_hour: baseline_config.pct_per_worker_per_hour,
+                    dollars_per_worker_per_hour: baseline_config.dollars_per_worker_per_hour,
+                };
+                log::debug!(
+                    "[state] loaded baseline_burn_rate for {}: pct={:.2}/hr, ${:.2}/hr",
+                    agent_name,
+                    baseline.pct_per_worker_per_hour,
+                    baseline.dollars_per_worker_per_hour
+                );
+                self.baseline_burn_rates.insert(agent_name.clone(), baseline);
+            }
+            // If baseline_burn_rate is None, we don't insert anything
+            // The caller can use BaselineBurnRates::default() as a fallback
+        }
+    }
+
+    /// Get baseline burn rates for a specific agent
+    ///
+    /// Returns the configured baseline burn rates for the agent, or None if not configured.
+    /// Callers can use `BaselineBurnRates::default()` as a fallback when None is returned.
+    ///
+    /// # Arguments
+    /// - `agent_name`: The name of the agent (e.g., "needle-sonnet", "polish-opus")
+    ///
+    /// # Returns
+    /// - `Some(BaselineBurnRates)` if the agent has a configured baseline
+    /// - `None` if the agent is not in the state (cold-start or not configured)
+    pub fn get_baseline_burn_rates(&self, agent_name: &str) -> Option<&BaselineBurnRates> {
+        self.baseline_burn_rates.get(agent_name)
     }
 
     /// Update API snapshots after a poll.
@@ -724,8 +806,8 @@ impl GovernorState {
     ///
     /// // After second poll, previous is set to old current, current is updated
     /// state.update_api_snapshot(Utc::now(), 12.0, 22.0, 18.0);
-    /// assert!(state.previous_api_snapshot.is_some());
-    /// assert!(state.current_api_snapshot.is_some());
+    /// assert!(self.previous_api_snapshot.is_some());
+    /// assert!(self.current_api_snapshot.is_some());
     /// ```
     pub fn update_api_snapshot(
         &mut self,
@@ -1069,6 +1151,7 @@ mod tests {
             p5h_delta: None,
             p7d_delta: None,
             p7ds_delta: None,
+            baseline_burn_rates: HashMap::new(),
         }
     }
 
@@ -1389,6 +1472,130 @@ mod tests {
         let prev = previous_state_path(path);
 
         assert_eq!(prev, Path::new("/tmp/state-file.prev"));
+    }
+
+    // --- Baseline burn rates ---
+
+    #[test]
+    fn load_baseline_burn_rates_from_config_populates_state() {
+        use crate::config::{AgentConfig, BaselineBurnRateConfig};
+
+        let mut state = GovernorState::new();
+        let mut agents_config = std::collections::HashMap::new();
+
+        // Add two agents with different baseline configurations
+        agents_config.insert(
+            "needle-sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent sonnet".to_string(),
+                session_pattern: "sonnet-*".to_string(),
+                heartbeat_dir: "/tmp".to_string(),
+                min_workers: 0,
+                max_workers: 8,
+                subscription: true,
+                baseline_burn_rate: Some(BaselineBurnRateConfig {
+                    pct_per_worker_per_hour: 1.8,
+                    dollars_per_worker_per_hour: 6.5,
+                }),
+            },
+        );
+
+        agents_config.insert(
+            "polish-opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent opus".to_string(),
+                session_pattern: "opus-*".to_string(),
+                heartbeat_dir: "/tmp".to_string(),
+                min_workers: 0,
+                max_workers: 4,
+                subscription: true,
+                baseline_burn_rate: Some(BaselineBurnRateConfig {
+                    pct_per_worker_per_hour: 2.5,
+                    dollars_per_worker_per_hour: 10.0,
+                }),
+            },
+        );
+
+        // Agent without baseline_burn_rate configured
+        agents_config.insert(
+            "needle-default".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent default".to_string(),
+                session_pattern: "default-*".to_string(),
+                heartbeat_dir: "/tmp".to_string(),
+                min_workers: 0,
+                max_workers: 8,
+                subscription: false,
+                baseline_burn_rate: None,
+            },
+        );
+
+        state.load_baseline_burn_rates_from_config(&agents_config);
+
+        // Should have entries for the two agents with configured baselines
+        assert_eq!(state.baseline_burn_rates.len(), 2);
+
+        // Check needle-sonnet baseline
+        let sonnet_baseline = state.get_baseline_burn_rates("needle-sonnet");
+        assert!(sonnet_baseline.is_some());
+        assert!((sonnet_baseline.unwrap().pct_per_worker_per_hour - 1.8).abs() < 1e-9);
+        assert!((sonnet_baseline.unwrap().dollars_per_worker_per_hour - 6.5).abs() < 1e-9);
+
+        // Check polish-opus baseline
+        let opus_baseline = state.get_baseline_burn_rates("polish-opus");
+        assert!(opus_baseline.is_some());
+        assert!((opus_baseline.unwrap().pct_per_worker_per_hour - 2.5).abs() < 1e-9);
+        assert!((opus_baseline.unwrap().dollars_per_worker_per_hour - 10.0).abs() < 1e-9);
+
+        // Agent without baseline should return None
+        let default_baseline = state.get_baseline_burn_rates("needle-default");
+        assert!(default_baseline.is_none());
+
+        // Unknown agent should return None
+        let unknown_baseline = state.get_baseline_burn_rates("unknown-agent");
+        assert!(unknown_baseline.is_none());
+    }
+
+    #[test]
+    fn get_baseline_burn_rates_returns_none_for_unknown_agent() {
+        let state = GovernorState::new();
+        assert!(state.get_baseline_burn_rates("unknown").is_none());
+    }
+
+    #[test]
+    fn baseline_burn_rates_roundtrip_serialization() {
+        use crate::config::{AgentConfig, BaselineBurnRateConfig};
+
+        let mut state = GovernorState::new();
+        let mut agents_config = std::collections::HashMap::new();
+
+        agents_config.insert(
+            "test-agent".to_string(),
+            AgentConfig {
+                launch_cmd: "test".to_string(),
+                session_pattern: "test-*".to_string(),
+                heartbeat_dir: "/tmp".to_string(),
+                min_workers: 0,
+                max_workers: 8,
+                subscription: true,
+                baseline_burn_rate: Some(BaselineBurnRateConfig {
+                    pct_per_worker_per_hour: 3.0,
+                    dollars_per_worker_per_hour: 12.0,
+                }),
+            },
+        );
+
+        state.load_baseline_burn_rates_from_config(&agents_config);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: GovernorState = serde_json::from_str(&json).unwrap();
+
+        // Verify baseline_burn_rates survived the roundtrip
+        assert_eq!(loaded.baseline_burn_rates.len(), 1);
+        let baseline = loaded.get_baseline_burn_rates("test-agent");
+        assert!(baseline.is_some());
+        assert!((baseline.unwrap().pct_per_worker_per_hour - 3.0).abs() < 1e-9);
     }
 
     // --- safe_worker_count serialization ---
