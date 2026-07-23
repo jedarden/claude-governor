@@ -1448,6 +1448,48 @@ pub fn build_burn_rate_state(
     }
 }
 
+/// Get staleness-checked USD per worker rate from fleet aggregate.
+///
+/// Returns the per-worker USD rate from the fleet aggregate if it's fresh
+/// (updated within the last 30 minutes), otherwise falls back to the baseline rate.
+/// This prevents stale data from being used in capacity calculations.
+///
+/// # Arguments
+/// - `aggregate`: Fleet aggregate containing p75 USD/hr and worker count
+/// - `baseline`: Baseline burn rates to use as fallback
+///
+/// # Returns
+/// USD per worker per hour (f64)
+pub fn staleness_checked_fleet_dollar_rate(
+    aggregate: &crate::state::FleetAggregate,
+    baseline: &crate::state::BaselineBurnRates,
+) -> f64 {
+    // Staleness threshold: 30 minutes
+    let staleness_threshold_secs = 30 * 60;
+    let now = Utc::now();
+    let age_secs = (now - aggregate.t1).num_seconds().abs() as u64;
+
+    // Use baseline if aggregate is stale or has no workers
+    if age_secs > staleness_threshold_secs || aggregate.sonnet_workers == 0 {
+        log::debug!(
+            "[burn_rate] fleet aggregate stale (age={}s) or no workers, using baseline ${:.2}/worker/hr",
+            age_secs,
+            baseline.dollars_per_worker_per_hour
+        );
+        return baseline.dollars_per_worker_per_hour;
+    }
+
+    // Aggregate is fresh - compute per-worker rate from p75 total
+    let usd_per_worker = aggregate.sonnet_p75_usd_hr / aggregate.sonnet_workers as f64;
+    log::debug!(
+        "[burn_rate] using fresh fleet aggregate: ${:.2}/worker/hr (p75 total ${:.2}/hr for {} workers)",
+        usd_per_worker,
+        aggregate.sonnet_p75_usd_hr,
+        aggregate.sonnet_workers
+    );
+    usd_per_worker
+}
+
 /// Log per-window capacity forecast (for governor loop integration)
 pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
     let windows = [

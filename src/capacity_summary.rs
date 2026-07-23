@@ -1,5 +1,4 @@
 //! Capacity Summary Generation for NEEDLE Integration
-use std::collections::HashMap;
 //!
 //! This module provides capacity awareness for Claude Code workers via prompt injection.
 //! The `generate_capacity_summary` function produces markdown suitable for injection
@@ -21,6 +20,7 @@ use std::collections::HashMap;
 //! - `2` = cutoff_risk active
 //! - `3` = emergency brake engaged
 
+use std::collections::HashMap;
 use crate::state::{CapacityForecast, GovernorState, WindowForecast};
 
 /// Capacity pressure level for worker guidance

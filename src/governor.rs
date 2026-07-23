@@ -4383,7 +4383,7 @@ pub fn run_governor_cycle(
         let ema = &state.burn_rate.fleet_pct_hr_ema;
         let samples = state.burn_rate.fleet_pct_ema_samples;
         // Fleet total USD/hr (p75 per-worker × active workers) with staleness checking
-        let baseline = get_sonnet_baseline_config(state, agents);
+        let baseline = get_sonnet_baseline_config(&state, agents);
         let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
             &state.last_fleet_aggregate,
             &baseline,
@@ -4572,7 +4572,7 @@ pub fn run_governor_cycle(
 
         // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
         // Falls back to baseline ratio from config when the learned ratio is unavailable.
-        let baseline = get_sonnet_baseline_config(state, agents);
+        let baseline = get_sonnet_baseline_config(&state, agents);
         let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
         let usd_per_pct = match *window {
             "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
@@ -4776,6 +4776,13 @@ pub fn run_governor_cycle(
         let total_pct_delta = deltas.five_hour + deltas.seven_day + deltas.seven_day_sonnet;
         let avg_pct_per_hour = total_pct_delta / (elapsed_hours * 3.0); // Average across windows
 
+        // Get baseline before mutable borrow (for staleness checking)
+        let baseline = get_sonnet_baseline_config(&state, agents);
+        let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+            &state.last_fleet_aggregate,
+            &baseline,
+        );
+
         let entry = state
             .burn_rate
             .by_model
@@ -4788,11 +4795,6 @@ pub fn run_governor_cycle(
 
         // Compute per-worker rates (with staleness checking for dollar rate)
         let pct_per_worker = avg_pct_per_hour / current_total as f64;
-        let baseline = get_sonnet_baseline_config(state, agents);
-        let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
-            &state.last_fleet_aggregate,
-            &baseline,
-        );
 
         entry.pct_per_worker_per_hour = pct_per_worker;
         entry.dollars_per_worker_per_hour = usd_per_worker;
