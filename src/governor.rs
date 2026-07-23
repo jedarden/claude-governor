@@ -2331,6 +2331,384 @@ mod window_delta_tests {
             "5h utilization change should be 2.5 percentage points"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Tests using snapshot fixtures for realistic data
+    // ---------------------------------------------------------------------------
+
+    /// Test consecutive snapshots produce correct deltas using realistic fixture data.
+    ///
+    /// This test uses the baseline and 5-hour-later fixtures from snapshot_fixtures.rs
+    /// to verify that delta computation works correctly with realistic, production-like data.
+    #[test]
+    fn test_consecutive_snapshots_fixtures_produce_correct_deltas() {
+        use crate::snapshot_fixtures::{baseline_snapshot, snapshot_after_5h};
+
+        let prev = baseline_snapshot();
+        let curr = snapshot_after_5h();
+
+        // Convert to WindowPctSnapshot for delta calculation
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev.five_hour_pct,
+            seven_day: prev.seven_day_pct,
+            seven_day_sonnet: prev.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Verify all deltas are positive (utilization increased)
+        assert!(delta_5h > 0.0, "5h delta should be positive with increased usage");
+        assert!(delta_7d > 0.0, "7d delta should be positive with increased usage");
+        assert!(delta_7ds > 0.0, "7ds delta should be positive with increased usage");
+
+        // Verify exact delta values based on fixture documentation
+        // baseline: 5h=12.5%, 7d=45.2%, 7ds=38.7%
+        // after_5h: 5h=18.2%, 7d=46.8%, 7ds=40.3%
+        // Expected deltas: 5h=+5.7%, 7d=+1.6%, 7ds=+1.6%
+        assert!((delta_5h - 5.7).abs() < 1e-9, "5h delta should be +5.7% (18.2 - 12.5)");
+        assert!((delta_7d - 1.6).abs() < 1e-9, "7d delta should be +1.6% (46.8 - 45.2)");
+        assert!((delta_7ds - 1.6).abs() < 1e-9, "7ds delta should be +1.6% (40.3 - 38.7)");
+    }
+
+    /// Test consecutive snapshots with 7-day interval using fixtures.
+    ///
+    /// Verifies that the 7-day fixture pair produces the documented positive deltas.
+    #[test]
+    fn test_consecutive_snapshots_7d_fixtures_produce_correct_deltas() {
+        use crate::snapshot_fixtures::{baseline_snapshot, snapshot_after_7d};
+
+        let prev = baseline_snapshot();
+        let curr = snapshot_after_7d();
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev.five_hour_pct,
+            seven_day: prev.seven_day_pct,
+            seven_day_sonnet: prev.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Verify 7-day windows show positive increase
+        assert!(delta_7d > 0.0, "7d delta should be positive after 7 days");
+        assert!(delta_7ds > 0.0, "7ds delta should be positive after 7 days");
+
+        // Expected deltas: 7d=+7.2%, 7ds=+7.4%
+        assert!((delta_7d - 7.2).abs() < 1e-9, "7d delta should be +7.2% (52.4 - 45.2)");
+        assert!((delta_7ds - 7.4).abs() < 1e-9, "7ds delta should be +7.4% (46.1 - 38.7)");
+
+        // 5-hour window reset occurred, so delta should reflect new window value
+        assert!((delta_5h - 3.3).abs() < 1e-9, "5h delta should be +3.3% (15.8 - 12.5)");
+    }
+
+    /// Test consecutive snapshots with 7-day same-weekday using fixtures.
+    ///
+    /// Verifies that the 7-day same-weekday fixture produces the same results as the
+    /// regular 7-day fixture (both are Wednesday to Wednesday).
+    #[test]
+    fn test_consecutive_snapshots_7ds_fixtures_produce_correct_deltas() {
+        use crate::snapshot_fixtures::{baseline_snapshot, snapshot_after_7ds};
+
+        let prev = baseline_snapshot();
+        let curr = snapshot_after_7ds();
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev.five_hour_pct,
+            seven_day: prev.seven_day_pct,
+            seven_day_sonnet: prev.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Should produce same deltas as 7-day fixture (same weekday progression)
+        assert!((delta_7d - 7.2).abs() < 1e-9, "7ds delta should match 7d fixture (+7.2%)");
+        assert!((delta_7ds - 7.4).abs() < 1e-9, "7ds delta should be +7.4%");
+        assert!((delta_5h - 3.3).abs() < 1e-9, "5h delta should be +3.3%");
+    }
+
+    /// Test that identical fixture values produce zero deltas.
+    ///
+    /// Creates two identical snapshots using the baseline fixture to verify
+    /// that when utilization hasn't changed, all deltas are zero.
+    #[test]
+    fn test_identical_fixture_snapshots_produce_zero_deltas() {
+        use crate::snapshot_fixtures::baseline_snapshot;
+
+        let snapshot = baseline_snapshot();
+
+        // Use the same snapshot for both previous and current
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: snapshot.five_hour_pct,
+            seven_day: snapshot.seven_day_pct,
+            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: snapshot.five_hour_pct,
+            seven_day: snapshot.seven_day_pct,
+            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // All deltas should be exactly zero for identical snapshots
+        assert_eq!(delta_5h, 0.0, "5h delta should be zero for identical snapshots");
+        assert_eq!(delta_7d, 0.0, "7d delta should be zero for identical snapshots");
+        assert_eq!(delta_7ds, 0.0, "7ds delta should be zero for identical snapshots");
+    }
+
+    /// Test snapshot pair fixtures for delta computation.
+    ///
+    /// Uses the helper functions that return snapshot pairs to verify the
+    /// documented deltas are computed correctly.
+    #[test]
+    fn test_snapshot_pair_fixtures_compute_correct_deltas() {
+        use crate::snapshot_fixtures::{snapshot_pair_5h, snapshot_pair_7d, snapshot_pair_7ds};
+
+        // Test 5-hour pair
+        let (prev_5h, curr_5h) = snapshot_pair_5h();
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev_5h.five_hour_pct,
+            seven_day: prev_5h.seven_day_pct,
+            seven_day_sonnet: prev_5h.seven_day_sonnet_pct,
+        };
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr_5h.five_hour_pct,
+            seven_day: curr_5h.seven_day_pct,
+            seven_day_sonnet: curr_5h.seven_day_sonnet_pct,
+        };
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+        assert!((delta_5h - 5.7).abs() < 1e-9, "5h pair should produce +5.7% delta");
+        assert!((delta_7d - 1.6).abs() < 1e-9, "5h pair should produce +1.6% 7d delta");
+        assert!((delta_7ds - 1.6).abs() < 1e-9, "5h pair should produce +1.6% 7ds delta");
+
+        // Test 7-day pair
+        let (prev_7d, curr_7d) = snapshot_pair_7d();
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev_7d.five_hour_pct,
+            seven_day: prev_7d.seven_day_pct,
+            seven_day_sonnet: prev_7d.seven_day_sonnet_pct,
+        };
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr_7d.five_hour_pct,
+            seven_day: curr_7d.seven_day_pct,
+            seven_day_sonnet: curr_7d.seven_day_sonnet_pct,
+        };
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+        assert!((delta_5h - 3.3).abs() < 1e-9, "7d pair should produce +3.3% 5h delta");
+        assert!((delta_7d - 7.2).abs() < 1e-9, "7d pair should produce +7.2% 7d delta");
+        assert!((delta_7ds - 7.4).abs() < 1e-9, "7d pair should produce +7.4% 7ds delta");
+
+        // Test 7ds pair (should match 7d pair)
+        let (prev_7ds, curr_7ds) = snapshot_pair_7ds();
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: prev_7ds.five_hour_pct,
+            seven_day: prev_7ds.seven_day_pct,
+            seven_day_sonnet: prev_7ds.seven_day_sonnet_pct,
+        };
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr_7ds.five_hour_pct,
+            seven_day: curr_7ds.seven_day_pct,
+            seven_day_sonnet: curr_7ds.seven_day_sonnet_pct,
+        };
+        let (delta_5h_7ds, delta_7d_7ds, delta_7ds_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+        assert!((delta_5h_7ds - delta_5h).abs() < 1e-9, "7ds pair should match 7d 5h delta");
+        assert!((delta_7d_7ds - delta_7d).abs() < 1e-9, "7ds pair should match 7d 7d delta");
+        assert!((delta_7ds_7ds - delta_7ds).abs() < 1e-9, "7ds pair should match 7d 7ds delta");
+    }
+
+    /// Test that fixtures with increased utilization produce positive deltas.
+    ///
+    /// Verifies the core expectation that when current utilization is higher than
+    /// previous utilization, all computed deltas are positive.
+    #[test]
+    fn test_increased_fixture_values_produce_positive_deltas() {
+        use crate::snapshot_fixtures::{baseline_snapshot, make_snapshot};
+
+        let baseline = baseline_snapshot();
+        let now = baseline.taken_at;
+
+        // Create snapshots with various increases
+        let increases = vec![
+            (1.10, 10.0),  // +10% increase
+            (1.25, 25.0),  // +25% increase
+            (1.50, 50.0),  // +50% increase
+        ];
+
+        for (multiplier, expected_percent_increase) in increases {
+            let increased = make_snapshot(
+                now + chrono::Duration::hours(5),
+                baseline.five_hour_pct * multiplier,
+                baseline.seven_day_pct * multiplier,
+                baseline.seven_day_sonnet_pct * multiplier,
+            );
+
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: baseline.five_hour_pct,
+                seven_day: baseline.seven_day_pct,
+                seven_day_sonnet: baseline.seven_day_sonnet_pct,
+            };
+
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: increased.five_hour_pct,
+                seven_day: increased.seven_day_pct,
+                seven_day_sonnet: increased.seven_day_sonnet_pct,
+            };
+
+            let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            // All deltas should be positive
+            assert!(delta_5h > 0.0, "5h delta should be positive for +{}% increase", expected_percent_increase);
+            assert!(delta_7d > 0.0, "7d delta should be positive for +{}% increase", expected_percent_increase);
+            assert!(delta_7ds > 0.0, "7ds delta should be positive for +{}% increase", expected_percent_increase);
+
+            // Verify delta magnitude matches expected percentage
+            let expected_5h_delta = baseline.five_hour_pct * (multiplier - 1.0);
+            let expected_7d_delta = baseline.seven_day_pct * (multiplier - 1.0);
+            let expected_7ds_delta = baseline.seven_day_sonnet_pct * (multiplier - 1.0);
+
+            assert!((delta_5h - expected_5h_delta).abs() < 1e-9,
+                "5h delta should match expected increase for +{}%", expected_percent_increase);
+            assert!((delta_7d - expected_7d_delta).abs() < 1e-9,
+                "7d delta should match expected increase for +{}%", expected_percent_increase);
+            assert!((delta_7ds - expected_7ds_delta).abs() < 1e-9,
+                "7ds delta should match expected increase for +{}%", expected_percent_increase);
+        }
+    }
+
+    /// Test edge case fixtures for delta computation.
+    ///
+    /// Uses the idle, high utilization, and post-reset fixtures to verify delta
+    /// computation handles extreme values correctly.
+    #[test]
+    fn test_edge_case_fixture_snapshots_compute_deltas() {
+        use crate::snapshot_fixtures::{idle_snapshot, high_utilization_snapshot, post_reset_snapshot};
+
+        // Test idle -> high utilization (large positive delta)
+        let idle = idle_snapshot();
+        let high = high_utilization_snapshot();
+
+        let idle_pct = crate::db::WindowPctSnapshot {
+            five_hour: idle.five_hour_pct,
+            seven_day: idle.seven_day_pct,
+            seven_day_sonnet: idle.seven_day_sonnet_pct,
+        };
+
+        let high_pct = crate::db::WindowPctSnapshot {
+            five_hour: high.five_hour_pct,
+            seven_day: high.seven_day_pct,
+            seven_day_sonnet: high.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&idle_pct, &high_pct);
+
+        // Should show large positive increase
+        assert!(delta_5h > 80.0, "5h delta should be > 80% from idle to high");
+        assert!(delta_7d > 90.0, "7d delta should be > 90% from idle to high");
+        assert!(delta_7ds > 90.0, "7ds delta should be > 90% from idle to high");
+
+        // Test high -> post-reset (negative delta, window reset scenario)
+        let reset = post_reset_snapshot();
+
+        let reset_pct = crate::db::WindowPctSnapshot {
+            five_hour: reset.five_hour_pct,
+            seven_day: reset.seven_day_pct,
+            seven_day_sonnet: reset.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h_reset, delta_7d_reset, delta_7ds_reset) = calculate_window_pct_delta(&high_pct, &reset_pct);
+
+        // Should show negative delta (window reset)
+        assert!(delta_5h_reset < 0.0, "5h delta should be negative after reset");
+        assert!(delta_7d_reset < 0.0, "7d delta should be negative after reset");
+        assert!(delta_7ds_reset < 0.0, "7ds delta should be negative after reset");
+
+        // 5-hour reset should be dramatic (drops from 82.4% to 2.1%)
+        assert!((delta_5h_reset - (-80.3)).abs() < 0.1, "5h reset should drop ~80%");
+    }
+
+    /// Test that fixture snapshots produce correct time progression.
+    ///
+    /// Verifies that consecutive fixtures have the expected time differences
+    /// to ensure realistic polling simulation.
+    #[test]
+    fn test_fixture_snapshots_produce_correct_time_progression() {
+        use crate::snapshot_fixtures::{baseline_snapshot, snapshot_after_5h, snapshot_after_7d};
+        use chrono::Duration;
+
+        let baseline = baseline_snapshot();
+        let after_5h = snapshot_after_5h();
+        let after_7d = snapshot_after_7d();
+
+        // Verify 5-hour progression
+        let elapsed_5h = after_5h.taken_at.signed_duration_since(baseline.taken_at);
+        assert_eq!(elapsed_5h.num_hours(), 5, "5h snapshot should be 5 hours after baseline");
+
+        // Verify 7-day progression
+        let elapsed_7d = after_7d.taken_at.signed_duration_since(baseline.taken_at);
+        assert_eq!(elapsed_7d.num_days(), 7, "7d snapshot should be 7 days after baseline");
+
+        // Verify monotonic time progression
+        assert!(after_5h.taken_at > baseline.taken_at, "after_5h should be later than baseline");
+        assert!(after_7d.taken_at > after_5h.taken_at, "after_7d should be later than after_5h");
+    }
+
+    /// Test delta computation tolerance for floating-point precision.
+    ///
+    /// Verifies that the delta computation uses appropriate tolerance for
+    /// comparing floating-point values from fixtures.
+    #[test]
+    fn test_fixture_delta_computation_with_fp_tolerance() {
+        use crate::snapshot_fixtures::{baseline_snapshot, make_snapshot};
+        use chrono::Duration;
+
+        let baseline = baseline_snapshot();
+
+        // Create snapshot with values that produce floating-point results
+        let curr = make_snapshot(
+            baseline.taken_at + chrono::Duration::hours(5),
+            baseline.five_hour_pct + 0.1,  // Small increment
+            baseline.seven_day_pct + 0.05,
+            baseline.seven_day_sonnet_pct + 0.075,
+        );
+
+        let prev_pct = crate::db::WindowPctSnapshot {
+            five_hour: baseline.five_hour_pct,
+            seven_day: baseline.seven_day_pct,
+            seven_day_sonnet: baseline.seven_day_sonnet_pct,
+        };
+
+        let curr_pct = crate::db::WindowPctSnapshot {
+            five_hour: curr.five_hour_pct,
+            seven_day: curr.seven_day_pct,
+            seven_day_sonnet: curr.seven_day_sonnet_pct,
+        };
+
+        let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+        // Use appropriate tolerance for floating-point comparison
+        const TOLERANCE: f64 = 1e-9;
+        assert!((delta_5h - 0.1).abs() < TOLERANCE, "5h delta should be 0.1 with tolerance");
+        assert!((delta_7d - 0.05).abs() < TOLERANCE, "7d delta should be 0.05 with tolerance");
+        assert!((delta_7ds - 0.075).abs() < TOLERANCE, "7ds delta should be 0.075 with tolerance");
+    }
 }
 
 // ---------------------------------------------------------------------------
