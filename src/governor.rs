@@ -2190,6 +2190,62 @@ mod window_delta_tests {
             panic!("Both snapshots should be Some after consecutive polls");
         }
 
+        // === Verify delta fields in last_fleet_aggregate structure ===
+        // In addition to the individual delta fields (p5h_delta, p7d_delta, p7ds_delta),
+        // the governor state also stores deltas in the last_fleet_aggregate.window_pct_deltas
+        // structure. This is critical for fleet-level delta tracking and reporting.
+
+        // Verify last_fleet_aggregate exists and has window_pct_deltas field
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.five_hour >= 0.0,
+            "last_fleet_aggregate.window_pct_deltas.five_hour field should exist and be valid"
+        );
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.seven_day >= 0.0,
+            "last_fleet_aggregate.window_pct_deltas.seven_day field should exist and be valid"
+        );
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet >= 0.0,
+            "last_fleet_aggregate.window_pct_deltas.seven_day_sonnet field should exist and be valid"
+        );
+
+        // After computing deltas from consecutive snapshots, update last_fleet_aggregate
+        // This simulates what run_governor_cycle does when it stores fleet aggregate deltas
+        state.last_fleet_aggregate.window_pct_deltas.five_hour = state.p5h_delta.unwrap();
+        state.last_fleet_aggregate.window_pct_deltas.seven_day = state.p7d_delta.unwrap();
+        state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet = state.p7ds_delta.unwrap();
+
+        // Now verify window_pct_deltas fields are non-zero after two snapshots
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.five_hour != 0.0,
+            "last_fleet_aggregate.window_pct_deltas.five_hour should be non-zero after two snapshots (got {})",
+            state.last_fleet_aggregate.window_pct_deltas.five_hour
+        );
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.seven_day != 0.0,
+            "last_fleet_aggregate.window_pct_deltas.seven_day should be non-zero after two snapshots (got {})",
+            state.last_fleet_aggregate.window_pct_deltas.seven_day
+        );
+        assert!(
+            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet != 0.0,
+            "last_fleet_aggregate.window_pct_deltas.seven_day_sonnet should be non-zero after two snapshots (got {})",
+            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet
+        );
+
+        // Verify window_pct_deltas structure matches expected delta values
+        assert!(
+            (state.last_fleet_aggregate.window_pct_deltas.five_hour - 2.5).abs() < f64::EPSILON,
+            "window_pct_deltas.five_hour should match computed delta (2.5)"
+        );
+        assert!(
+            (state.last_fleet_aggregate.window_pct_deltas.seven_day - 2.0).abs() < f64::EPSILON,
+            "window_pct_deltas.seven_day should match computed delta (2.0)"
+        );
+        assert!(
+            (state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet - 3.0).abs() < f64::EPSILON,
+            "window_pct_deltas.seven_day_sonnet should match computed delta (3.0)"
+        );
+
         // === Verify consecutive polling through state transitions ===
         // The key demonstration of consecutive polling is:
         // 1. First poll established current_api_snapshot
