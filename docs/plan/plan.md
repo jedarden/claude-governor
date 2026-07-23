@@ -477,8 +477,8 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 - When no active promotion is defined, `promotions.json` contains an empty array `[]`, which results in `offpeak_multiplier = 1.0` (flat model — this is the correct default when no promotion is running).
 - The schedule calculator returns the current effective multiplier at any moment.
 
-**Example — historical promotion entry:**
-The following configuration was used during the March 2026 Off-Peak 2x promotion (now expired). This is provided as a reference for future promotions; when no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier).
+**Historical promotion entry (for reference only):**
+The following configuration was used during the March 2026 Off-Peak 2x promotion, which has now expired. This is provided as a reference example for defining future promotions; it is not an active configuration.
 
 ```json
 [
@@ -500,7 +500,7 @@ The following configuration was used during the March 2026 Off-Peak 2x promotion
 []
 ```
 
-An empty `promotions.json` results in `offpeak_multiplier = 1.0` (flat model — this is the correct default when no promotion is running).
+When no promotion is running, `promotions.json` should contain an empty array `[]`. This results in `offpeak_multiplier = 1.0` (flat model — this is the correct default when no promotion is running). The empty array is the shipped configuration and the normal operating state.
 
 **Effective capacity calculation:**
 ```python
@@ -1582,7 +1582,7 @@ safe_mode:
    - `effective_hours_remaining(reset_time)` → float
    - Reads from `promotions.json`
 
-2. Create `promotions.json` with an entry defining the promotion window when a promotion is active (see Component 4 for format). When no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier — this is the default shipped configuration).
+2. Create `promotions.json` with an entry defining the promotion window when a promotion is active (see Component 4 for format and a historical example of the March 2026 Off-Peak 2x promotion). When no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier — this is the default shipped configuration and the correct normal operating state).
 
 3. Unit tests:
    - Peak hour boundaries (7:59 AM ET → 1x, 8:00 AM ET → 1x peak, 2:01 PM ET → 2x)
@@ -2055,7 +2055,7 @@ claude-governor/
 
 4. **Bead state after forced kill:** If a worker is killed mid-task, the bead remains `IN_PROGRESS` until the stale claim threshold fires. Prefer graceful shutdown to avoid this.
 
-5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. (The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after this date, `promotions.json` should have been reverted to an empty array `[]`.)
+5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after this date, `promotions.json` was reverted to an empty array `[]`, which is the correct default when no promotion is running (flat 1.0 multiplier).
 
 6. **Multiple accounts / credential rotation:** The poller assumes a single `~/.claude/.credentials.json`. If multiple accounts are used, parameterize the credentials path.
 
