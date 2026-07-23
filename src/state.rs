@@ -807,8 +807,8 @@ impl GovernorState {
     ///
     /// // After second poll, previous is set to old current, current is updated
     /// state.update_api_snapshot(Utc::now(), 12.0, 22.0, 18.0);
-    /// assert!(self.previous_api_snapshot.is_some());
-    /// assert!(self.current_api_snapshot.is_some());
+    /// assert!(state.previous_api_snapshot.is_some());
+    /// assert!(state.current_api_snapshot.is_some());
     /// ```
     pub fn update_api_snapshot(
         &mut self,
