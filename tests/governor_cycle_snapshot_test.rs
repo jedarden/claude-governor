@@ -570,3 +570,208 @@ fn test_first_poll_with_realistic_values() {
         "7ds delta should be Some(0.0) on first poll with realistic values"
     );
 }
+
+#[test]
+fn test_identical_snapshots_produce_zero_deltas() {
+    // Test that consecutive snapshots with identical usage values produce 0% deltas
+    //
+    // This is a critical edge case: when the API reports the same utilization values
+    // across two consecutive polls (e.g., no new usage accumulated, or the usage exactly
+    // matches the previous snapshot), the delta computation should correctly identify
+    // that there is no change (0% delta) for all three windows.
+    //
+    // Covers:
+    // - p5h (5-hour window delta)
+    // - p7d (7-day window delta)
+    // - p7ds (7-day Sonnet window delta)
+    //
+    // The test uses identical utilization values but different timestamps to model
+    // consecutive polls where usage hasn't changed.
+
+    let mut state = state::GovernorState::new();
+
+    // Set up previous snapshot with specific utilization values
+    let now1 = Utc::now();
+    state.previous_api_snapshot = Some(state::PrevUsageSnapshot {
+        taken_at: now1,
+        five_hour_pct: 25.5,
+        seven_day_pct: 45.2,
+        seven_day_sonnet_pct: 38.7,
+    });
+
+    // Set up current snapshot with IDENTICAL utilization values but later timestamp
+    let now2 = now1 + chrono::Duration::seconds(60);
+    state.current_api_snapshot = Some(state::PrevUsageSnapshot {
+        taken_at: now2,
+        five_hour_pct: 25.5,          // Identical to previous
+        seven_day_pct: 45.2,          // Identical to previous
+        seven_day_sonnet_pct: 38.7,  // Identical to previous
+    });
+
+    // Verify both snapshots exist and have identical values
+    assert!(state.previous_api_snapshot.is_some());
+    assert!(state.current_api_snapshot.is_some());
+
+    let prev = state.previous_api_snapshot.as_ref().unwrap();
+    let curr = state.current_api_snapshot.as_ref().unwrap();
+
+    assert_eq!(prev.five_hour_pct, curr.five_hour_pct);
+    assert_eq!(prev.seven_day_pct, curr.seven_day_pct);
+    assert_eq!(prev.seven_day_sonnet_pct, curr.seven_day_sonnet_pct);
+
+    // Verify timestamps are different (simulating consecutive polls)
+    assert_ne!(prev.taken_at, curr.taken_at);
+    assert!(curr.taken_at > prev.taken_at);
+
+    // Compute deltas using the same logic as run_governor_cycle
+    let mut p5h_delta: Option<f64> = None;
+    let mut p7d_delta: Option<f64> = None;
+    let mut p7ds_delta: Option<f64> = None;
+
+    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+        (Some(prev), Some(curr)) => {
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+            let (delta_5h, delta_7d, delta_7ds) =
+                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            p5h_delta = Some(delta_5h);
+            p7d_delta = Some(delta_7d);
+            p7ds_delta = Some(delta_7ds);
+        }
+        (None, Some(_curr)) => {
+            p5h_delta = Some(0.0);
+            p7d_delta = Some(0.0);
+            p7ds_delta = Some(0.0);
+        }
+        (None, None) | (Some(_), None) => {}
+    }
+
+    // Verify: with identical snapshot values, all deltas should be 0.0
+    // Use f64::EPSILON for floating-point tolerance
+    assert!(
+        p5h_delta.is_some(),
+        "5h delta should be Some (not None) when both snapshots exist"
+    );
+    assert!(
+        (p5h_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "5h delta should be 0% when snapshot values are identical, got {}",
+        p5h_delta.unwrap()
+    );
+
+    assert!(
+        p7d_delta.is_some(),
+        "7d delta should be Some (not None) when both snapshots exist"
+    );
+    assert!(
+        (p7d_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "7d delta should be 0% when snapshot values are identical, got {}",
+        p7d_delta.unwrap()
+    );
+
+    assert!(
+        p7ds_delta.is_some(),
+        "7ds delta should be Some (not None) when both snapshots exist"
+    );
+    assert!(
+        (p7ds_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "7ds delta should be 0% when snapshot values are identical, got {}",
+        p7ds_delta.unwrap()
+    );
+}
+
+#[test]
+fn test_identical_snapshots_with_realistic_fixture_values() {
+    // Test identical snapshots using realistic fixture values from snapshot_fixtures
+    //
+    // This demonstrates that the zero-delta behavior works with realistic
+    // utilization data, ensuring the edge case isn't just theoretical.
+
+    use claude_governor::snapshot_fixtures::{baseline_snapshot, make_snapshot};
+
+    let mut state = state::GovernorState::new();
+
+    // Use baseline snapshot values (realistic starting point)
+    let baseline = baseline_snapshot();
+    let now1 = baseline.taken_at;
+
+    state.previous_api_snapshot = Some(baseline);
+
+    // Create current snapshot with identical values but later timestamp
+    let now2 = now1 + chrono::Duration::hours(5);
+    state.current_api_snapshot = Some(make_snapshot(
+        now2,
+        12.5,   // five_hour_pct: identical to baseline
+        45.2,   // seven_day_pct: identical to baseline
+        38.7,   // seven_day_sonnet_pct: identical to baseline
+    ));
+
+    // Verify values are identical
+    let prev = state.previous_api_snapshot.as_ref().unwrap();
+    let curr = state.current_api_snapshot.as_ref().unwrap();
+
+    assert_eq!(prev.five_hour_pct, curr.five_hour_pct, "five_hour_pct should be identical");
+    assert_eq!(prev.seven_day_pct, curr.seven_day_pct, "seven_day_pct should be identical");
+    assert_eq!(
+        prev.seven_day_sonnet_pct,
+        curr.seven_day_sonnet_pct,
+        "seven_day_sonnet_pct should be identical"
+    );
+
+    // Compute deltas
+    let mut p5h_delta: Option<f64> = None;
+    let mut p7d_delta: Option<f64> = None;
+    let mut p7ds_delta: Option<f64> = None;
+
+    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+        (Some(prev), Some(curr)) => {
+            let prev_pct = crate::db::WindowPctSnapshot {
+                five_hour: prev.five_hour_pct,
+                seven_day: prev.seven_day_pct,
+                seven_day_sonnet: prev.seven_day_sonnet_pct,
+            };
+            let curr_pct = crate::db::WindowPctSnapshot {
+                five_hour: curr.five_hour_pct,
+                seven_day: curr.seven_day_pct,
+                seven_day_sonnet: curr.seven_day_sonnet_pct,
+            };
+            let (delta_5h, delta_7d, delta_7ds) =
+                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+            p5h_delta = Some(delta_5h);
+            p7d_delta = Some(delta_7d);
+            p7ds_delta = Some(delta_7ds);
+        }
+        (None, Some(_curr)) => {
+            p5h_delta = Some(0.0);
+            p7d_delta = Some(0.0);
+            p7ds_delta = Some(0.0);
+        }
+        (None, None) | (Some(_), None) => {}
+    }
+
+    // Verify all deltas are exactly 0.0 with realistic values
+    assert!(
+        (p5h_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "5h delta should be 0% with identical realistic values, got {}",
+        p5h_delta.unwrap()
+    );
+    assert!(
+        (p7d_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "7d delta should be 0% with identical realistic values, got {}",
+        p7d_delta.unwrap()
+    );
+    assert!(
+        (p7ds_delta.unwrap() - 0.0).abs() < f64::EPSILON,
+        "7ds delta should be 0% with identical realistic values, got {}",
+        p7ds_delta.unwrap()
+    );
+}
