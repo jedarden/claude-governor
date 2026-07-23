@@ -3019,7 +3019,7 @@ pub fn run_governor_cycle(
                 state.p5h_delta = Some(0.0);
                 state.p7d_delta = Some(0.0);
                 state.p7ds_delta = Some(0.0);
-                log::info!(
+                log::debug!(
                     "[governor] window deltas: no previous snapshot (first poll), deltas initialized to 0.0",
                 );
             }
