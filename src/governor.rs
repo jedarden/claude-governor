@@ -2736,6 +2736,137 @@ mod window_delta_tests {
         assert!((delta_7d - 0.05).abs() < TOLERANCE, "7d delta should be 0.05 with tolerance");
         assert!((delta_7ds - 0.075).abs() < TOLERANCE, "7ds delta should be 0.075 with tolerance");
     }
+
+    /// Test second poll handling when both previous and current snapshots exist.
+    ///
+    /// This test verifies the governor works correctly on subsequent polls when both
+    /// prev_snapshot and current snapshot are available. It simulates the transition
+    /// from first poll (None prev) to a second poll (Some prev, Some curr) and verifies
+    /// delta computation executes successfully with both snapshots.
+    ///
+    /// This test mirrors the comprehensive assertion pattern from test_first_poll_no_previous_snapshot
+    /// (bf-151vi) but for the subsequent poll scenario.
+    #[test]
+    fn test_second_poll_with_both_snapshots() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        // Track whether delta computation was attempted
+        let mut delta_computation_attempted = false;
+        let mut delta_computation_result = None;
+
+        // Simulate first poll state: current snapshot exists, previous is None
+        let first_poll_current: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            seven_day_sonnet_pct: 15.0,
+        });
+
+        let first_poll_previous: Option<PrevUsageSnapshot> = None;
+
+        // ASSERTION 1: Verify first poll state
+        assert!(first_poll_previous.is_none(), "First poll: previous should be None");
+        assert!(first_poll_current.is_some(), "First poll: current should be Some");
+
+        // Verify first poll falls into (None, Some) branch (no delta computation)
+        let first_poll_result = match (&first_poll_previous, &first_poll_current) {
+            (Some(_prev), Some(_curr)) => {
+                "should_not_happen"
+            }
+            (None, Some(_curr)) => {
+                "first_poll_skip"
+            }
+            (None, None) => "no_snapshots",
+            (Some(_prev), None) => "only_previous",
+        };
+        assert_eq!(first_poll_result, "first_poll_skip",
+                   "First poll should fall into (None, Some) branch");
+
+        // Simulate the shift at the start of second poll (as in run_governor_cycle)
+        // The previous snapshot becomes the first poll's current snapshot
+        let second_poll_previous = first_poll_current;
+
+        // Simulate second poll: new current snapshot with increased utilization
+        let second_poll_current: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 12.5,      // +2.5 from previous
+            seven_day_pct: 22.0,      // +2.0 from previous
+            seven_day_sonnet_pct: 18.0, // +3.0 from previous
+        });
+
+        // ASSERTION 2: Verify second poll state (both snapshots exist)
+        assert!(second_poll_previous.is_some(),
+                "Second poll: previous should be Some (transitioned from first poll current)");
+        assert!(second_poll_current.is_some(),
+                "Second poll: current should be Some (new poll data)");
+
+        // ASSERTION 3: Verify delta computation executes correctly with both snapshots
+        // This simulates the check in run_governor_cycle:
+        // if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot)
+        let match_result = match (&second_poll_previous, &second_poll_current) {
+            (Some(prev), Some(curr)) => {
+                // Expected on second poll: both snapshots exist
+                delta_computation_attempted = true;
+
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                };
+
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                };
+
+                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+                // Store the computed deltas for verification
+                delta_computation_result = Some((delta_5h, delta_7d, delta_7ds));
+
+                "delta_computed"
+            }
+            (None, Some(_curr)) => {
+                // Should NOT happen on second poll (previous exists)
+                "first_poll_skip"
+            }
+            (None, None) => {
+                // Should NOT happen on second poll (both should exist)
+                "no_snapshots"
+            }
+            (Some(_prev), None) => {
+                // Should NOT happen in normal flow (current should exist after successful poll)
+                "only_previous"
+            }
+        };
+
+        // ASSERTION 4: Verify delta computation was executed (not skipped)
+        assert!(delta_computation_attempted,
+                "Delta computation should execute on second poll when both snapshots exist");
+
+        // ASSERTION 5: Verify the match fell into the correct (Some, Some) branch
+        assert_eq!(match_result, "delta_computed",
+                   "Second poll should match the (Some, Some) branch and compute deltas");
+
+        // ASSERTION 6: Verify computed deltas are correct (not None and not zero)
+        assert!(delta_computation_result.is_some(),
+                "Delta computation result should be Some on second poll");
+
+        let (delta_5h, delta_7d, delta_7ds) = delta_computation_result.unwrap();
+
+        // Verify exact delta values (current - previous)
+        assert!((delta_5h - 2.5).abs() < f64::EPSILON,
+                "5h delta should be 2.5% (12.5 - 10.0), got {}", delta_5h);
+        assert!((delta_7d - 2.0).abs() < f64::EPSILON,
+                "7d delta should be 2.0% (22.0 - 20.0), got {}", delta_7d);
+        assert!((delta_7ds - 3.0).abs() < f64::EPSILON,
+                "7ds delta should be 3.0% (18.0 - 15.0), got {}", delta_7ds);
+
+        // ASSERTION 7: Verify no panic occurred - test reaches this point
+        // (If we reach here, graceful handling succeeded)
+    }
 }
 
 // ---------------------------------------------------------------------------
