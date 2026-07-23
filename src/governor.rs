@@ -3005,12 +3005,6 @@ pub fn run_governor_cycle(
                 state.p5h_delta = Some(delta_5h);
                 state.p7d_delta = Some(delta_7d);
                 state.p7ds_delta = Some(delta_7ds);
-
-                log::info!(
-                    "[governor] {} computed window deltas: 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}%",
-                    now.to_rfc3339(),
-                    delta_5h, delta_7d, delta_7ds
-                );
             }
         }
         Err(e) => {
