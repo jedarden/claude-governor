@@ -3365,41 +3365,52 @@ pub fn run_governor_cycle(
             });
 
             // Calculate window deltas from consecutive API snapshots
-            if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
-                // Both snapshots available: proceed with delta computation
-                let prev_pct = crate::db::WindowPctSnapshot {
-                    five_hour: prev.five_hour_pct,
-                    seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
-                };
-                let curr_pct = crate::db::WindowPctSnapshot {
-                    five_hour: curr.five_hour_pct,
-                    seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
-                };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+            // Explicit pattern matching for all snapshot availability cases
+            match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+                (Some(prev), Some(curr)) => {
+                    // Both snapshots available: proceed with delta computation
+                    let prev_pct = crate::db::WindowPctSnapshot {
+                        five_hour: prev.five_hour_pct,
+                        seven_day: prev.seven_day_pct,
+                        seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    };
+                    let curr_pct = crate::db::WindowPctSnapshot {
+                        five_hour: curr.five_hour_pct,
+                        seven_day: curr.seven_day_pct,
+                        seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    };
+                    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-                // Log computed window deltas
-                log::info!(
-                    "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}% (previous: {:.1}/{:.1}/{:.1}%, current: {:.1}/{:.1}/{:.1}%)",
-                    delta_5h, delta_7d, delta_7ds,
-                    prev_pct.five_hour, prev_pct.seven_day, prev_pct.seven_day_sonnet,
-                    curr_pct.five_hour, curr_pct.seven_day, curr_pct.seven_day_sonnet,
-                );
+                    // Log computed window deltas
+                    log::info!(
+                        "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}% (previous: {:.1}/{:.1}/{:.1}%, current: {:.1}/{:.1}/{:.1}%)",
+                        delta_5h, delta_7d, delta_7ds,
+                        prev_pct.five_hour, prev_pct.seven_day, prev_pct.seven_day_sonnet,
+                        curr_pct.five_hour, curr_pct.seven_day, curr_pct.seven_day_sonnet,
+                    );
 
-                // Store computed deltas in governor state
-                state.p5h_delta = Some(delta_5h);
-                state.p7d_delta = Some(delta_7d);
-                state.p7ds_delta = Some(delta_7ds);
-            } else {
-                // No previous snapshot available (first poll)
-                // Set delta fields to Some(0.0) to indicate no change from initial state
-                state.p5h_delta = Some(0.0);
-                state.p7d_delta = Some(0.0);
-                state.p7ds_delta = Some(0.0);
-                log::debug!(
-                    "[governor] window deltas: no previous snapshot (first poll), deltas initialized to 0.0",
-                );
+                    // Store computed deltas in governor state
+                    state.p5h_delta = Some(delta_5h);
+                    state.p7d_delta = Some(delta_7d);
+                    state.p7ds_delta = Some(delta_7ds);
+                }
+                (None, Some(_curr)) => {
+                    // First poll: no previous snapshot available, cannot compute delta
+                    // Set delta fields to Some(0.0) to indicate no change from initial state
+                    state.p5h_delta = Some(0.0);
+                    state.p7d_delta = Some(0.0);
+                    state.p7ds_delta = Some(0.0);
+                    log::debug!(
+                        "[governor] window deltas: no previous snapshot (first poll), deltas initialized to 0.0",
+                    );
+                }
+                (None, None) | (Some(_), None) => {
+                    // Neither snapshot available OR only previous available: handle gracefully
+                    // Leave deltas as None (no change)
+                    log::debug!(
+                        "[governor] window deltas: no valid snapshot pair available, deltas remain None",
+                    );
+                }
             }
         }
         Err(e) => {
