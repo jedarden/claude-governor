@@ -3015,8 +3015,12 @@ pub fn run_governor_cycle(
                 state.p7ds_delta = Some(delta_7ds);
             } else {
                 // No previous snapshot available (first poll)
+                // Set delta fields to Some(0.0) to indicate no change from initial state
+                state.p5h_delta = Some(0.0);
+                state.p7d_delta = Some(0.0);
+                state.p7ds_delta = Some(0.0);
                 log::info!(
-                    "[governor] window deltas: no previous snapshot (first poll), deltas unavailable",
+                    "[governor] window deltas: no previous snapshot (first poll), deltas initialized to 0.0",
                 );
             }
         }
