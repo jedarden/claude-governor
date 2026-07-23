@@ -6466,9 +6466,10 @@ mod mock_poller_tests {
     /// - The function returns Ok(())
     /// - The cycle handles minimal state gracefully
     ///
-    /// The test uses a temporary directory for state files and minimal config fixtures.
-    /// Even if the poller fails to reach the API (no credentials), the cycle should
-    /// complete successfully because errors are handled gracefully.
+    /// The test uses:
+    /// - Real Poller with test credentials (gracefully handles missing credentials)
+    /// - Temporary directory for state files
+    /// - Minimal config fixtures
     #[test]
     fn test_governor_cycle_smoke() {
         use std::collections::HashMap;
@@ -6478,10 +6479,8 @@ mod mock_poller_tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let state_path = temp_dir.path().join("governor-state.json");
 
-        // 2. Create minimal poller (will fail if no credentials, but that's OK)
-        let poller_result = crate::poller::Poller::with_credentials_path(Some(
-            temp_dir.path().join("fake-credentials.json").to_string_lossy().to_string(),
-        ));
+        // 2. Create poller (will use default credentials path, or fail gracefully)
+        let poller_result = crate::poller::Poller::new();
 
         // 3. Create minimal config objects with defaults
         let alert_config = crate::config::AlertConfig::default();
@@ -6508,10 +6507,10 @@ mod mock_poller_tests {
         // 5. Create empty promotions list
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
-        // 6. Attempt to run the governor cycle
+        // 6. Run the governor cycle with dry_run=true
         //
-        // If poller creation failed (no credentials), we still test that the
-        // governor cycle can handle the error gracefully.
+        // Note: Even if poller creation fails (no credentials), the test verifies
+        // that the governor cycle handles errors gracefully and returns Ok(())
         let result = if let Ok(mut poller) = poller_result {
             run_governor_cycle(
                 &mut poller,
@@ -6531,13 +6530,11 @@ mod mock_poller_tests {
                 &pricing_config,
             )
         } else {
-            // Poller creation failed - verify that run_governor_cycle handles
-            // this case gracefully by creating a test with no actual polling
-            let mut fake_poller = crate::poller::Poller::with_credentials_path(None)
-                .expect("Failed to create default poller");
-
+            // Poller creation failed - verify that run_governor_cycle handles this gracefully
+            // by creating a default poller and testing the cycle
+            let mut poller = crate::poller::Poller::default();
             run_governor_cycle(
-                &mut fake_poller,
+                &mut poller,
                 &state_path,
                 true,  // dry_run = true
                 60,    // loop_interval
@@ -6556,11 +6553,6 @@ mod mock_poller_tests {
         };
 
         // 7. Verify the cycle completed successfully
-        //
-        // The function should return Ok(()) even if:
-        // - Polling fails (error is handled gracefully)
-        // - State file doesn't exist yet (creates new state)
-        // - No agents are configured (valid for test)
         assert!(result.is_ok(), "run_governor_cycle should return Ok(()) in dry_run mode");
 
         // 8. Verify state file was created (even if minimal)
