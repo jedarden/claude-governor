@@ -5929,16 +5929,34 @@ mod tests {
         // This is the core delta computation from run_governor_cycle (line 1738)
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-        // Step 3: Verify delta values match expected computation
-        // Expected: current - previous for each window
-        assert!((delta_5h - 2.5).abs() < f64::EPSILON,
-            "5-hour delta should be 12.5 - 10.0 = 2.5, got {}", delta_5h);
-        assert!((delta_7d - 2.0).abs() < f64::EPSILON,
-            "7-day delta should be 22.0 - 20.0 = 2.0, got {}", delta_7d);
-        assert!((delta_7ds - 3.0).abs() < f64::EPSILON,
-            "7-day-sonnet delta should be 18.0 - 15.0 = 3.0, got {}", delta_7ds);
+        // Step 3: Calculate expected delta percentage manually from snapshot values
+        // Delta formula: delta = current_snapshot_value - previous_snapshot_value
+        // This represents the percentage change in utilization between consecutive API polls
+        let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
+        let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
+        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
 
-        // Step 4: Populate delta fields in governor state structure
+        // Step 4: Verify computed deltas match expected calculation
+        // The delta formula: current_pct - previous_pct = delta_pct
+        assert!((delta_5h - expected_delta_5h).abs() < f64::EPSILON,
+            "5-hour delta: computed {} should equal expected {} ({} - {})",
+            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert!((delta_7d - expected_delta_7d).abs() < f64::EPSILON,
+            "7-day delta: computed {} should equal expected {} ({} - {})",
+            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
+            "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
+            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+
+        // Step 5: Verify the specific expected values for this test case
+        assert!((expected_delta_5h - 2.5).abs() < f64::EPSILON,
+            "Expected 5-hour delta should be 12.5 - 10.0 = 2.5");
+        assert!((expected_delta_7d - 2.0).abs() < f64::EPSILON,
+            "Expected 7-day delta should be 22.0 - 20.0 = 2.0");
+        assert!((expected_delta_7ds - 3.0).abs() < f64::EPSILON,
+            "Expected 7-day-sonnet delta should be 18.0 - 15.0 = 3.0");
+
+        // Step 6: Populate delta fields in governor state structure
         // This simulates storing deltas in state.last_fleet_aggregate.window_pct_deltas
         // (as done in run_governor_cycle lines 1741-1745)
         let window_pct_deltas = WindowPctDeltas {
@@ -5947,13 +5965,16 @@ mod tests {
             seven_day_sonnet: delta_7ds,
         };
 
-        // Step 5: Assert that delta fields are correctly populated
-        assert!((window_pct_deltas.five_hour - 2.5).abs() < f64::EPSILON,
-            "State five_hour delta should be 2.5");
-        assert!((window_pct_deltas.seven_day - 2.0).abs() < f64::EPSILON,
-            "State seven_day delta should be 2.0");
-        assert!((window_pct_deltas.seven_day_sonnet - 3.0).abs() < f64::EPSILON,
-            "State seven_day_sonnet delta should be 3.0");
+        // Step 7: Assert that delta fields are correctly populated with expected values
+        assert!((window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
+            "State five_hour delta should be {} (from {} - {})",
+            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
+            "State seven_day delta should be {} (from {} - {})",
+            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert!((window_pct_deltas.seven_day_sonnet - expected_delta_7ds).abs() < f64::EPSILON,
+            "State seven_day_sonnet delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
 
         // Verify all deltas are non-zero (indicating active consumption)
         assert!(delta_5h > 0.0, "5-hour delta should be positive (increasing)");
@@ -6002,13 +6023,30 @@ mod tests {
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-        // Verify negative deltas (window reset)
-        assert!((delta_5h - (-75.0)).abs() < f64::EPSILON,
-            "5-hour delta should be 5.0 - 80.0 = -75.0 (window reset)");
-        assert!((delta_7d - (-75.0)).abs() < f64::EPSILON,
-            "7-day delta should be 15.0 - 90.0 = -75.0 (window reset)");
-        assert!((delta_7ds - (-77.0)).abs() < f64::EPSILON,
-            "7-day-sonnet delta should be 8.0 - 85.0 = -77.0 (window reset)");
+        // Calculate expected deltas manually from snapshot values
+        // Delta formula: delta = current - previous (negative when window resets)
+        let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
+        let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
+        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
+
+        // Verify computed deltas match expected calculation (negative for window reset)
+        assert!((delta_5h - expected_delta_5h).abs() < f64::EPSILON,
+            "5-hour delta: computed {} should equal expected {} ({} - {})",
+            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert!((delta_7d - expected_delta_7d).abs() < f64::EPSILON,
+            "7-day delta: computed {} should equal expected {} ({} - {})",
+            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
+            "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
+            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+
+        // Verify the specific expected values for this window reset test case
+        assert!((expected_delta_5h - (-75.0)).abs() < f64::EPSILON,
+            "Expected 5-hour delta should be 5.0 - 80.0 = -75.0 (window reset)");
+        assert!((expected_delta_7d - (-75.0)).abs() < f64::EPSILON,
+            "Expected 7-day delta should be 15.0 - 90.0 = -75.0 (window reset)");
+        assert!((expected_delta_7ds - (-77.0)).abs() < f64::EPSILON,
+            "Expected 7-day-sonnet delta should be 8.0 - 85.0 = -77.0 (window reset)");
 
         // Populate in state structure
         let window_pct_deltas = WindowPctDeltas {
@@ -6017,7 +6055,18 @@ mod tests {
             seven_day_sonnet: delta_7ds,
         };
 
-        // Verify state correctly captures negative deltas
+        // Verify state correctly captures negative deltas (matching expected calculation)
+        assert!((window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
+            "State five_hour delta should be {} (from {} - {})",
+            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
+            "State seven_day delta should be {} (from {} - {})",
+            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert!((window_pct_deltas.seven_day_sonnet - expected_delta_7ds).abs() < f64::EPSILON,
+            "State seven_day_sonnet delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+
+        // Verify all deltas are negative (window reset condition)
         assert!(window_pct_deltas.five_hour < 0.0,
             "State five_hour delta should be negative (window reset)");
         assert!(window_pct_deltas.seven_day < 0.0,
@@ -6063,13 +6112,30 @@ mod tests {
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-        // Verify all deltas are exactly zero
-        assert_eq!(delta_5h, 0.0,
-            "5-hour delta should be 0.0 for identical snapshots");
-        assert_eq!(delta_7d, 0.0,
-            "7-day delta should be 0.0 for identical snapshots");
-        assert_eq!(delta_7ds, 0.0,
-            "7-day-sonnet delta should be 0.0 for identical snapshots");
+        // Calculate expected deltas manually from snapshot values
+        // Delta formula: delta = current - previous (both are identical here)
+        let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
+        let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
+        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
+
+        // Verify computed deltas match expected calculation (should be zero for identical snapshots)
+        assert_eq!(delta_5h, expected_delta_5h,
+            "5-hour delta: computed {} should equal expected {} ({} - {})",
+            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert_eq!(delta_7d, expected_delta_7d,
+            "7-day delta: computed {} should equal expected {} ({} - {})",
+            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert_eq!(delta_7ds, expected_delta_7ds,
+            "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
+            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+
+        // Verify all expected deltas are exactly zero (identical snapshots)
+        assert_eq!(expected_delta_5h, 0.0,
+            "Expected 5-hour delta should be 0.0 for identical snapshots");
+        assert_eq!(expected_delta_7d, 0.0,
+            "Expected 7-day delta should be 0.0 for identical snapshots");
+        assert_eq!(expected_delta_7ds, 0.0,
+            "Expected 7-day-sonnet delta should be 0.0 for identical snapshots");
 
         // Populate in state structure
         let window_pct_deltas = WindowPctDeltas {
@@ -6078,13 +6144,16 @@ mod tests {
             seven_day_sonnet: delta_7ds,
         };
 
-        // Verify state correctly shows zero deltas
-        assert_eq!(window_pct_deltas.five_hour, 0.0,
-            "State five_hour delta should be 0.0");
-        assert_eq!(window_pct_deltas.seven_day, 0.0,
-            "State seven_day delta should be 0.0");
-        assert_eq!(window_pct_deltas.seven_day_sonnet, 0.0,
-            "State seven_day_sonnet delta should be 0.0");
+        // Verify state correctly shows zero deltas (matching expected calculation)
+        assert_eq!(window_pct_deltas.five_hour, expected_delta_5h,
+            "State five_hour delta should be {} (from {} - {})",
+            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
+        assert_eq!(window_pct_deltas.seven_day, expected_delta_7d,
+            "State seven_day delta should be {} (from {} - {})",
+            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
+        assert_eq!(window_pct_deltas.seven_day_sonnet, expected_delta_7ds,
+            "State seven_day_sonnet delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
     }
 
     // ---------------------------------------------------------------------------
