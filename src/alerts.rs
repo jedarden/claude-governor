@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -1060,6 +1061,7 @@ mod tests {
             p5h_delta: None,
             p7d_delta: None,
             p7ds_delta: None,
+            baseline_burn_rates: HashMap::new(),
         }
     }
 

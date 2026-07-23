@@ -1,4 +1,5 @@
 //! Capacity Summary Generation for NEEDLE Integration
+use std::collections::HashMap;
 //!
 //! This module provides capacity awareness for Claude Code workers via prompt injection.
 //! The `generate_capacity_summary` function produces markdown suitable for injection
@@ -275,6 +276,7 @@ mod tests {
             p5h_delta: None,
             p7d_delta: None,
             p7ds_delta: None,
+            baseline_burn_rates: HashMap::new(),
         }
     }
 
