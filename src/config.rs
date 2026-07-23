@@ -92,11 +92,11 @@ pub struct BaselineBurnRateConfig {
     pub dollars_per_worker_per_hour: f64,
 }
 
-fn default_baseline_pct() -> f64 {
+pub(crate) fn default_baseline_pct() -> f64 {
     1.5
 }
 
-fn default_baseline_dollars() -> f64 {
+pub(crate) fn default_baseline_dollars() -> f64 {
     5.0
 }
 
