@@ -719,7 +719,7 @@ pub fn annotate_window_pct_deltas(
 ) -> Result<()> {
     // Compute elapsed time
     let elapsed_seconds = (t1 - t0).num_seconds().abs() as i64;
-    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
+    let _elapsed_hours = elapsed_seconds as f64 / 3600.0;
 
     // Guard: interval too short
     if elapsed_seconds < 120 {
@@ -1180,5 +1180,221 @@ mod tests {
 
         let results = query_last_fleets(&conn, 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn annotate_window_pct_deltas_apportions_by_session_weight() {
+        // Test the acceptance criteria: given 2 i rows with total_usd 0.10 and 0.30
+        // and window delta 0.8, writes p7ds 0.2 and 0.6, f gets 0.8
+        let (_temp, conn) = setup_db();
+
+        let t0_parsed: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1_parsed: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+
+        // Use RFC3339 format for consistency with what annotate_window_pct_deltas will query
+        let t0 = t0_parsed.to_rfc3339();
+        let t1 = t1_parsed.to_rfc3339();
+
+        // Insert two instance records with total_usd 0.10 and 0.30
+        let inst1 = serde_json::json!({
+            "r": "i", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "sess": "session-a", "sid": "a", "model": "sonnet",
+            "pk": 1, "hr_et": 10, "dow": 2,
+            "input-n": 0, "input-usd": 0.0,
+            "output-n": 0, "output-usd": 0.0,
+            "r-cache-n": 0, "r-cache-usd": 0.0,
+            "w-cache-n": 0, "w-cache-usd": 0.0,
+            "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+            "total-usd": 0.10, "cache-eff": 0.0,
+        });
+        let inst2 = serde_json::json!({
+            "r": "i", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "sess": "session-b", "sid": "b", "model": "sonnet",
+            "pk": 1, "hr_et": 10, "dow": 2,
+            "input-n": 0, "input-usd": 0.0,
+            "output-n": 0, "output-usd": 0.0,
+            "r-cache-n": 0, "r-cache-usd": 0.0,
+            "w-cache-n": 0, "w-cache-usd": 0.0,
+            "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+            "total-usd": 0.30, "cache-eff": 0.0,
+        });
+
+        insert_instance(&conn, &inst1).unwrap();
+        insert_instance(&conn, &inst2).unwrap();
+
+        // Insert fleet record with total_usd 0.40 (sum of instances)
+        let fleet = serde_json::json!({
+            "r": "f", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "pk": 1, "hr_et": 10, "dow": 2, "workers": 2,
+            "total-usd": 0.40, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+            "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+        });
+        insert_fleet(&conn, &fleet).unwrap();
+
+        // Call annotate with window delta 0.8 for p7ds
+        // Old pct: 70.0, new pct: 70.8 (delta = 0.8)
+        let old_pct = WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 70.0,
+            seven_day_sonnet: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 50.8,
+            seven_day: 70.8,
+            seven_day_sonnet: 70.8,
+        };
+
+        let result = annotate_window_pct_deltas(
+            &conn,
+            t0_parsed,
+            t1_parsed,
+            &old_pct,
+            &new_pct,
+            2, // workers_at_start
+            2, // workers_at_end
+        );
+
+        assert!(result.is_ok(), "annotate_window_pct_deltas should succeed: {:?}", result);
+
+        // Verify instance apportioning:
+        // - session-a (0.10 usd): 0.8 * (0.10 / 0.40) = 0.2
+        // - session-b (0.30 usd): 0.8 * (0.30 / 0.40) = 0.6
+        let p7ds_a: f64 = conn
+            .query_row(
+                "SELECT p7ds FROM i WHERE sess = 'session-a' AND t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let p7ds_b: f64 = conn
+            .query_row(
+                "SELECT p7ds FROM i WHERE sess = 'session-b' AND t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!((p7ds_a - 0.2).abs() < 1e-6, "session-a should get p7ds=0.2, got {}", p7ds_a);
+        assert!((p7ds_b - 0.6).abs() < 1e-6, "session-b should get p7ds=0.6, got {}", p7ds_b);
+
+        // Verify fleet record gets full delta (0.8)
+        let fleet_p7ds: f64 = conn
+            .query_row(
+                "SELECT p7ds FROM f WHERE t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!((fleet_p7ds - 0.8).abs() < 1e-6, "fleet should get p7ds=0.8, got {}", fleet_p7ds);
+
+        // Verify usd_per_pct_7ds is computed correctly: 0.40 / 0.8 = 0.5
+        let usd_per_pct: f64 = conn
+            .query_row(
+                "SELECT usd_per_pct_7ds FROM f WHERE t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!((usd_per_pct - 0.5).abs() < 1e-6, "usd_per_pct_7ds should be 0.5, got {}", usd_per_pct);
+    }
+
+    #[test]
+    fn annotate_window_pct_deltas_all_three_windows_apportioned() {
+        // Test that all three window deltas are apportioned correctly
+        let (_temp, conn) = setup_db();
+
+        let t0_parsed: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1_parsed: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+
+        // Use RFC3339 format for consistency with what annotate_window_pct_deltas will query
+        let t0 = t0_parsed.to_rfc3339();
+        let t1 = t1_parsed.to_rfc3339();
+
+        // Insert three instance records with equal weights
+        for i in 1..=3 {
+            let inst = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": format!("session-{}", i),
+                "sid": format!("s{}", i),
+                "model": "sonnet",
+                "pk": 1, "hr_et": 10, "dow": 2,
+                "input-n": 0, "input-usd": 0.0,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": 0.10, "cache-eff": 0.0,
+            });
+            insert_instance(&conn, &inst).unwrap();
+        }
+
+        // Insert fleet record
+        let fleet = serde_json::json!({
+            "r": "f", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "pk": 1, "hr_et": 10, "dow": 2, "workers": 3,
+            "total-usd": 0.30, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+            "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+        });
+        insert_fleet(&conn, &fleet).unwrap();
+
+        // All three windows have different deltas
+        let old_pct = WindowPctSnapshot {
+            five_hour: 40.0,
+            seven_day: 65.0,
+            seven_day_sonnet: 60.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 42.0,   // delta_5h = 2.0
+            seven_day: 68.0,  // delta_7d = 3.0
+            seven_day_sonnet: 64.0,  // delta_7ds = 4.0
+        };
+
+        let result = annotate_window_pct_deltas(
+            &conn,
+            t0_parsed,
+            t1_parsed,
+            &old_pct,
+            &new_pct,
+            3, // workers_at_start
+            3, // workers_at_end
+        );
+
+        assert!(result.is_ok());
+
+        // Each instance should get 1/3 of each delta
+        // p5h: 2.0 / 3 = 0.666..., p7d: 3.0 / 3 = 1.0, p7ds: 4.0 / 3 = 1.333...
+        for i in 1..=3 {
+            let (p5h, p7d, p7ds): (f64, f64, f64) = conn
+                .query_row(
+                    "SELECT p5h, p7d, p7ds FROM i WHERE sess = ? AND t0 = ? AND t1 = ?",
+                    params![format!("session-{}", i), t0, t1],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+
+            assert!((p5h - 2.0 / 3.0).abs() < 1e-6, "session-{} p5h should be {}", i, 2.0 / 3.0);
+            assert!((p7d - 1.0).abs() < 1e-6, "session-{} p7d should be 1.0", i);
+            assert!((p7ds - 4.0 / 3.0).abs() < 1e-6, "session-{} p7ds should be {}", i, 4.0 / 3.0);
+        }
+
+        // Fleet gets full deltas
+        let (fleet_p5h, fleet_p7d, fleet_p7ds): (f64, f64, f64) = conn
+            .query_row(
+                "SELECT p5h, p7d, p7ds FROM f WHERE t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert!((fleet_p5h - 2.0).abs() < 1e-6, "fleet p5h should be 2.0");
+        assert!((fleet_p7d - 3.0).abs() < 1e-6, "fleet p7d should be 3.0");
+        assert!((fleet_p7ds - 4.0).abs() < 1e-6, "fleet p7ds should be 4.0");
     }
 }
