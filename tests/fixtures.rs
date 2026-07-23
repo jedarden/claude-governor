@@ -36,6 +36,7 @@ pub fn test_agent_config(name: &str) -> AgentConfig {
         min_workers: 0,
         max_workers: 8,
         subscription: false,
+        baseline_burn_rate: None,
     }
 }
 
@@ -64,6 +65,7 @@ pub fn test_agent_config_with_bounds(name: &str, min_workers: u32, max_workers: 
         min_workers,
         max_workers,
         subscription: false,
+        baseline_burn_rate: None,
     }
 }
 

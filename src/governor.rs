@@ -833,6 +833,40 @@ fn apply_underutilization_sprint(
     base_target
 }
 
+/// Get baseline burn rate config for sonnet (subscription) agents.
+///
+/// Returns the baseline config from the first subscription agent (preferring one with
+/// "sonnet" in the name), or the default baseline if no subscription agent has a
+/// configured baseline.
+fn get_sonnet_baseline_config(
+    agents: &HashMap<String, AgentConfig>,
+) -> crate::burn_rate::BaselineBurnRates {
+    // First try to find a subscription agent with "sonnet" in its name
+    for (name, cfg) in agents {
+        if cfg.subscription && (name.contains("sonnet") || name.contains("needle")) {
+            return cfg.baseline_burn_rate_or_default();
+        }
+    }
+
+    // Fallback: use the first subscription agent's baseline, or default
+    for (name, cfg) in agents {
+        if cfg.subscription {
+            log::debug!(
+                "[governor] no sonnet agent found, using {} agent's baseline for dollar staleness checks",
+                name
+            );
+            return cfg.baseline_burn_rate_or_default();
+        }
+    }
+
+    // No subscription agents at all - use default
+    log::warn!(
+        "[governor] no subscription agents configured, using default baseline for dollar staleness checks"
+    );
+    // TODO: Will be updated to use config once baseline_burn_rate field is fully integrated
+    crate::burn_rate::BaselineBurnRates::default()
+}
+
 // ---------------------------------------------------------------------------
 // Window delta calculation helpers
 // ---------------------------------------------------------------------------
@@ -3984,9 +4018,13 @@ pub fn run_governor_cycle(
                     let (delta_5h, delta_7d, delta_7ds) =
                         calculate_window_pct_delta(&old_pct, &new_pct);
 
-                    // Fleet total USD/hr from the most recent fleet aggregate
-                    let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
-                        * state.last_fleet_aggregate.sonnet_workers as f64;
+                    // Fleet total USD/hr from the most recent fleet aggregate (with staleness checking)
+                    let baseline = get_sonnet_baseline_config(agents);
+                    let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+                        &state.last_fleet_aggregate,
+                        &baseline,
+                    );
+                    let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
 
                     let samples = state.burn_rate.fleet_pct_ema_samples;
                     let mut updated_any = false;
@@ -4302,12 +4340,15 @@ pub fn run_governor_cycle(
     let fleet_pct_per_hour: HashMap<String, f64> = {
         let ema = &state.burn_rate.fleet_pct_hr_ema;
         let samples = state.burn_rate.fleet_pct_ema_samples;
-        // Fleet total USD/hr (p75 per-worker × active workers)
-        let fleet_usd_hr = state.last_fleet_aggregate.sonnet_p75_usd_hr
-            * state.last_fleet_aggregate.sonnet_workers as f64;
-        // Baseline dollars-per-pct ratio from default burn rate assumptions:
-        // ~$5/hr/worker ÷ ~1.5%/hr/worker ≈ 3.33 $/pct
-        const BASELINE_USD_PER_PCT: f64 = 5.0 / 1.5;
+        // Fleet total USD/hr (p75 per-worker × active workers) with staleness checking
+        let baseline = get_sonnet_baseline_config(agents);
+        let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+            &state.last_fleet_aggregate,
+            &baseline,
+        );
+        let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
+        // Baseline dollars-per-pct ratio from agent config baseline_burn_rate
+        let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
 
         let rate_for = |ema_val: f64, usd_per_pct: f64| -> f64 {
             if samples >= 1 && ema_val > 0.0 {
@@ -4315,7 +4356,7 @@ pub fn run_governor_cycle(
             } else if fleet_usd_hr > 0.0 && usd_per_pct > 0.0 {
                 fleet_usd_hr / usd_per_pct // (B) learned ratio
             } else if fleet_usd_hr > 0.0 {
-                fleet_usd_hr / BASELINE_USD_PER_PCT // (C) baseline ratio fallback
+                fleet_usd_hr / baseline_usd_per_pct // (C) baseline ratio fallback
             } else {
                 0.0 // (D) no data at all
             }
@@ -4344,7 +4385,7 @@ pub fn run_governor_cycle(
                  (fleet_usd_hr={:.4}/hr, usd_per_pct={:.3}) → \
                  5h={:.4} 7d={:.4} 7ds={:.4} pct/hr",
                 fleet_usd_hr,
-                BASELINE_USD_PER_PCT,
+                baseline_usd_per_pct,
                 map["five_hour"],
                 map["seven_day"],
                 map["seven_day_sonnet"],
@@ -4488,8 +4529,9 @@ pub fn run_governor_cycle(
         };
 
         // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
-        // Falls back to baseline ratio (~3.33 $/pct) when the learned ratio is unavailable.
-        const BASELINE_USD_PER_PCT: f64 = 5.0 / 1.5;
+        // Falls back to baseline ratio from config when the learned ratio is unavailable.
+        let baseline = get_sonnet_baseline_config(agents);
+        let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
         let usd_per_pct = match *window {
             "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
             "seven_day" => state.burn_rate.usd_per_pct_ema_seven_day,
@@ -4499,7 +4541,7 @@ pub fn run_governor_cycle(
         let effective_usd_per_pct = if usd_per_pct > 0.0 {
             usd_per_pct
         } else {
-            BASELINE_USD_PER_PCT
+            baseline_usd_per_pct
         };
         let std_pct_hr = state.last_fleet_aggregate.sonnet_std_usd_hr / effective_usd_per_pct;
 
@@ -4702,9 +4744,13 @@ pub fn run_governor_cycle(
                 samples: 0,
             });
 
-        // Compute per-worker rates
+        // Compute per-worker rates (with staleness checking for dollar rate)
         let pct_per_worker = avg_pct_per_hour / current_total as f64;
-        let usd_per_worker = state.last_fleet_aggregate.sonnet_p75_usd_hr / current_total as f64;
+        let baseline = get_sonnet_baseline_config(agents);
+        let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+            &state.last_fleet_aggregate,
+            &baseline,
+        );
 
         entry.pct_per_worker_per_hour = pct_per_worker;
         entry.dollars_per_worker_per_hour = usd_per_worker;
@@ -6226,6 +6272,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
         agents.insert(
@@ -6237,6 +6284,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
 
@@ -6312,6 +6360,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
         agents.insert(
@@ -6323,6 +6372,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
 
@@ -6396,6 +6446,7 @@ mod tests {
                 min_workers: 1,
                 max_workers: 1,
                 subscription: true,
+                baseline_burn_rate: None,
             },
         );
         agents.insert(
@@ -6407,6 +6458,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 8,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
 
@@ -6483,6 +6535,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
         agents.insert(
@@ -6494,6 +6547,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 3, // Limited capacity
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
 
@@ -6568,6 +6622,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
         agents.insert(
@@ -6579,6 +6634,7 @@ mod tests {
                 min_workers: 0,
                 max_workers: 10,
                 subscription: false,
+                baseline_burn_rate: None,
             },
         );
 

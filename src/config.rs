@@ -152,6 +152,7 @@ impl AgentConfig {
     pub fn baseline_burn_rate_or_default(&self) -> crate::burn_rate::BaselineBurnRates {
         match &self.baseline_burn_rate {
             Some(config) => config.to_baseline_burn_rates(),
+            // TODO: Will be updated to use per-agent config once baseline_burn_rate field is integrated
             None => crate::burn_rate::BaselineBurnRates::default(),
         }
     }
