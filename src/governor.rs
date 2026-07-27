@@ -3813,8 +3813,16 @@ pub fn run_governor_cycle(
 
             state.usage = state::UsageState {
                 weekly_scoped_pct: usage_data.weekly_scoped_utilization,
-                // Only set sonnet_pct when weekly_scoped is actually tracking Sonnet;
-                // otherwise set to 0.0 since the legacy field should not reflect other models
+                // BUGFIX (bf-5zk558, commit 082e400):
+                // Previously, sonnet_pct was always set to weekly_scoped_utilization
+                // regardless of which model the weekly_scoped window was tracking.
+                // This was incorrect when the model rotated to Opus, Fable, etc.
+                //
+                // Fixed: Only set sonnet_pct when weekly_scoped is actually tracking Sonnet;
+                // otherwise set to 0.0 since the legacy field should not reflect other models.
+                //
+                // New code should use weekly_scoped_pct (model-agnostic) instead of sonnet_pct.
+                // See state.rs lines 53-56 for the deprecated sonnet_pct field documentation.
                 sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
                     usage_data.weekly_scoped_utilization
                 } else {
