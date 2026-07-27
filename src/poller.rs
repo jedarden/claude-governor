@@ -102,8 +102,7 @@ struct RefreshResponse {
 #[derive(Debug, Deserialize, Clone)]
 pub struct UsageWindow {
     /// Name of the window (e.g., "five_hour", "seven_day", "weekly_scoped")
-    /// This is not deserialized from the API; it must be set explicitly.
-    #[serde(skip)]
+    #[serde(default)]
     pub name: String,
     pub utilization: f64,
     #[serde(rename = "resets_at")]
@@ -680,8 +679,10 @@ mod tests {
     #[test]
     fn test_usage_window_hours_remaining() {
         let window = UsageWindow {
+            name: String::new(),
             utilization: 75.0,
             resets_at: "2026-03-18T20:00:00Z".to_string(),
+            is_active: None,
         };
         // This test just ensures parsing works; the actual value depends on current time
         let result = window.hours_remaining();
@@ -735,16 +736,22 @@ mod tests {
     fn test_usage_data_from_response() {
         let response = UsageResponse {
             weekly_scoped: Some(UsageWindow {
+                name: String::new(),
                 utilization: 75.5,
                 resets_at: "2026-03-20T03:59:59Z".to_string(),
+                is_active: None,
             }),
             seven_day: Some(UsageWindow {
+                name: String::new(),
                 utilization: 60.0,
                 resets_at: "2026-03-20T03:00:00Z".to_string(),
+                is_active: None,
             }),
             five_hour: Some(UsageWindow {
+                name: String::new(),
                 utilization: 30.0,
                 resets_at: "2026-03-18T15:59:59Z".to_string(),
+                is_active: None,
             }),
             limits: None,
         };
