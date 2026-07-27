@@ -9647,3 +9647,301 @@ mod annotation_guard_tests {
     }
 }
 
+#[cfg(test)]
+mod is_structurally_inactive_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Helper function to create a test UsageWindow
+    fn create_test_window(name: &str, is_active: Option<bool>) -> UsageWindow {
+        UsageWindow {
+            name: name.to_string(),
+            utilization: 50.0,
+            resets_at: "2024-01-01T00:00:00Z".to_string(),
+            is_active,
+        }
+    }
+
+    /// Helper function to create a test GovernorState with specific consecutive absent counts
+    fn create_test_state(consecutive_absent_counts: HashMap<String, u32>) -> state::GovernorState {
+        let mut state = state::GovernorState::new();
+        state.consecutive_absent_polls = consecutive_absent_counts;
+        state
+    }
+
+    /// Test: Returns true when consecutive_absence_count >= MIN_CONSECUTIVE_ABSENT
+    #[test]
+    fn test_returns_true_when_consecutive_absence_threshold_reached() {
+        let window_name = "five_hour";
+        let mut absent_counts = HashMap::new();
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT);
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "should return true when consecutive_absence_count >= MIN_CONSECUTIVE_ABSENT (3), got {}",
+            result
+        );
+    }
+
+    /// Test: Returns true when consecutive_absence_count > MIN_CONSECUTIVE_ABSENT
+    #[test]
+    fn test_returns_true_when_consecutive_absence_exceeds_threshold() {
+        let window_name = "seven_day";
+        let mut absent_counts = HashMap::new();
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT + 1);
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "should return true when consecutive_absence_count > MIN_CONSECUTIVE_ABSENT, got {}",
+            result
+        );
+    }
+
+    /// Test: Returns true when is_active == false
+    #[test]
+    fn test_returns_true_when_is_active_is_false() {
+        let window_name = "weekly_scoped";
+        let absent_counts = HashMap::new(); // No consecutive absences
+
+        // Window is explicitly marked as inactive by API
+        let window = create_test_window(window_name, Some(false));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "should return true when is_active == false, got {}",
+            result
+        );
+    }
+
+    /// Test: Returns true when BOTH conditions are true
+    #[test]
+    fn test_returns_true_when_both_conditions_are_true() {
+        let window_name = "five_hour";
+        let mut absent_counts = HashMap::new();
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT);
+
+        // Both conditions: consecutive absence threshold reached AND is_active is false
+        let window = create_test_window(window_name, Some(false));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "should return true when both conditions are true, got {}",
+            result
+        );
+    }
+
+    /// Test: Returns false when both conditions are false
+    #[test]
+    fn test_returns_false_when_both_conditions_are_false() {
+        let window_name = "seven_day";
+        let mut absent_counts = HashMap::new();
+        // Consecutive absence count below threshold (2 < 3)
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT - 1);
+
+        // Window is active (is_active = true)
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when both conditions are false (active + below threshold), got {}",
+            result
+        );
+    }
+
+    /// Test: Returns false when is_active is None/null (treat as active)
+    #[test]
+    fn test_returns_false_when_is_active_is_none() {
+        let window_name = "weekly_scoped";
+        let absent_counts = HashMap::new(); // No consecutive absences
+
+        // is_active is None (field not populated in API response)
+        let window = create_test_window(window_name, None);
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when is_active is None (treat as active), got {}",
+            result
+        );
+    }
+
+    /// Test: Returns false when is_active is None even with moderate consecutive absences
+    #[test]
+    fn test_returns_false_when_is_active_none_with_below_threshold_absent() {
+        let window_name = "five_hour";
+        let mut absent_counts = HashMap::new();
+        // Below threshold but still present
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT - 1);
+
+        // is_active is None (field not populated) - should treat as active
+        let window = create_test_window(window_name, None);
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when is_active is None even with below-threshold absences, got {}",
+            result
+        );
+    }
+
+    /// Test: Consecutive absence condition works independently
+    #[test]
+    fn test_consecutive_absence_condition_works_independently() {
+        let window_name = "seven_day";
+
+        // Test with consecutive absence threshold reached, but is_active = true
+        let mut absent_counts = HashMap::new();
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT);
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "consecutive absence condition should work independently (even with is_active=true), got {}",
+            result
+        );
+    }
+
+    /// Test: is_active == false condition works independently
+    #[test]
+    fn test_is_active_false_condition_works_independently() {
+        let window_name = "weekly_scoped";
+        let absent_counts = HashMap::new(); // No consecutive absences
+
+        // Test with is_active = false, but no consecutive absences
+        let window = create_test_window(window_name, Some(false));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "is_active=false condition should work independently (even with no absences), got {}",
+            result
+        );
+    }
+
+    /// Test: Returns false when consecutive absence count is 0
+    #[test]
+    fn test_returns_false_when_consecutive_absence_is_zero() {
+        let window_name = "five_hour";
+        let mut absent_counts = HashMap::new();
+        absent_counts.insert(window_name.to_string(), 0);
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when consecutive_absence_count is 0, got {}",
+            result
+        );
+    }
+
+    /// Test: Returns false when window not in consecutive_absent_polls map
+    #[test]
+    fn test_returns_false_when_window_not_in_absent_map() {
+        let window_name = "seven_day";
+        let absent_counts = HashMap::new(); // Window not present in map
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when window not in consecutive_absent_polls map, got {}",
+            result
+        );
+    }
+
+    /// Test: Boundary case - exactly at threshold
+    #[test]
+    fn test_boundary_case_exactly_at_threshold() {
+        let window_name = "weekly_scoped";
+        let mut absent_counts = HashMap::new();
+        // Exactly at threshold (3 == MIN_CONSECUTIVE_ABSENT)
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT);
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            result,
+            "should return true at exact threshold ({}), got {}",
+            MIN_CONSECUTIVE_ABSENT,
+            result
+        );
+    }
+
+    /// Test: Boundary case - just below threshold
+    #[test]
+    fn test_boundary_case_just_below_threshold() {
+        let window_name = "five_hour";
+        let mut absent_counts = HashMap::new();
+        // Just below threshold (2 == MIN_CONSECUTIVE_ABSENT - 1)
+        absent_counts.insert(window_name.to_string(), MIN_CONSECUTIVE_ABSENT - 1);
+
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false just below threshold ({}), got {}",
+            MIN_CONSECUTIVE_ABSENT - 1,
+            result
+        );
+    }
+
+    /// Test: is_active == true should not mark as inactive
+    #[test]
+    fn test_is_active_true_not_inactive() {
+        let window_name = "seven_day";
+        let absent_counts = HashMap::new();
+
+        // is_active = true should explicitly mark window as active
+        let window = create_test_window(window_name, Some(true));
+        let state = create_test_state(absent_counts);
+
+        let result = is_structurally_inactive(&window, &state);
+
+        assert!(
+            !result,
+            "should return false when is_active is true (window is active), got {}",
+            result
+        );
+    }
+}
+
