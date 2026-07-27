@@ -4860,6 +4860,7 @@ pub fn run_governor_cycle(
 
     let binding_window = windows
         .iter()
+        .filter(|(_, window)| !is_structurally_inactive(window, state))
         .max_by(|(_, a), (_, b)| {
             a.risk_score
                 .partial_cmp(&b.risk_score)
