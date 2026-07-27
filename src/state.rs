@@ -2316,6 +2316,198 @@ mod tests {
         state.update_consecutive_absent_polls(true, true, true);
         assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
     }
+
+    // --- Weekly scoped model identity change detection ---
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_detects_fable_to_opus_rotation() {
+        let mut burn_rate = BurnRateState {
+            fleet_pct_hr_ema: WindowPctDeltas {
+                five_hour: 5.0,
+                seven_day: 2.0,
+                weekly_scoped: 3.5, // Non-zero EMA samples
+            },
+            usd_per_pct_ema_weekly_scoped: 2.8,
+            ..BurnRateState::default()
+        };
+
+        let prev_model = Some("Fable".to_string());
+        let new_model = Some("Opus".to_string());
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(reset, "Should detect model change from Fable to Opus");
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
+            "Should reset weekly_scoped EMA to zero on model change"
+        );
+        assert_eq!(
+            burn_rate.usd_per_pct_ema_weekly_scoped, 0.0,
+            "Should reset usd_per_pct_ema_weekly_scoped to zero on model change"
+        );
+
+        // Other windows should remain unchanged
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.five_hour, 5.0,
+            "five_hour EMA should remain unchanged"
+        );
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.seven_day, 2.0,
+            "seven_day EMA should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_returns_false_when_same_model() {
+        let mut burn_rate = BurnRateState {
+            fleet_pct_hr_ema: WindowPctDeltas {
+                weekly_scoped: 4.2,
+                ..WindowPctDeltas::default()
+            },
+            usd_per_pct_ema_weekly_scoped: 3.1,
+            ..BurnRateState::default()
+        };
+
+        let original_ema = burn_rate.fleet_pct_hr_ema.weekly_scoped;
+        let original_usd = burn_rate.usd_per_pct_ema_weekly_scoped;
+
+        let prev_model = Some("Fable".to_string());
+        let new_model = Some("Fable".to_string());
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(!reset, "Should NOT reset when model is unchanged");
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped, original_ema,
+            "weekly_scoped EMA should remain unchanged"
+        );
+        assert_eq!(
+            burn_rate.usd_per_pct_ema_weekly_scoped, original_usd,
+            "usd_per_pct_ema_weekly_scoped should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_handles_none_to_some() {
+        let mut burn_rate = BurnRateState::default();
+
+        let prev_model = None;
+        let new_model = Some("Fable".to_string());
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(reset, "Should detect initialization from None to Some");
+        // When transitioning from None to Some, we start with cold EMA (already zero)
+        assert_eq!(burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0);
+        assert_eq!(burn_rate.usd_per_pct_ema_weekly_scoped, 0.0);
+    }
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_handles_some_to_none() {
+        let mut burn_rate = BurnRateState {
+            fleet_pct_hr_ema: WindowPctDeltas {
+                weekly_scoped: 2.8,
+                ..WindowPctDeltas::default()
+            },
+            usd_per_pct_ema_weekly_scoped: 1.9,
+            ..BurnRateState::default()
+        };
+
+        let prev_model = Some("Fable".to_string());
+        let new_model = None;
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(reset, "Should detect model cleared (Some to None)");
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
+            "Should reset weekly_scoped EMA when model cleared"
+        );
+        assert_eq!(
+            burn_rate.usd_per_pct_ema_weekly_scoped, 0.0,
+            "Should reset usd_per_pct_ema_weekly_scoped when model cleared"
+        );
+    }
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_handles_none_to_none() {
+        let mut burn_rate = BurnRateState {
+            fleet_pct_hr_ema: WindowPctDeltas {
+                weekly_scoped: 1.5,
+                ..WindowPctDeltas::default()
+            },
+            ..BurnRateState::default()
+        };
+
+        let original_ema = burn_rate.fleet_pct_hr_ema.weekly_scoped;
+
+        let prev_model = None;
+        let new_model = None;
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(!reset, "Should NOT reset when both are None");
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped, original_ema,
+            "weekly_scoped EMA should remain unchanged when both None"
+        );
+    }
+
+    #[test]
+    fn reset_weekly_scoped_on_model_change_realistic_rotation_scenario() {
+        // Scenario: Anthropic rotates the scoped weekly cap from Fable to Opus
+        // The governor must detect this and reset EMA to avoid using stale Fable data
+        let mut burn_rate = BurnRateState {
+            fleet_pct_hr_ema: WindowPctDeltas {
+                five_hour: 4.5,
+                seven_day: 1.8,
+                weekly_scoped: 3.2, // Stale Fable EMA
+            },
+            usd_per_pct_ema_five_hour: 2.5,
+            usd_per_pct_ema_seven_day: 1.2,
+            usd_per_pct_ema_weekly_scoped: 2.1, // Stale Fable USD/pct
+            ..BurnRateState::default()
+        };
+
+        let prev_model = Some("Fable".to_string());
+        let new_model = Some("Opus".to_string());
+
+        let reset = reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut burn_rate,
+        );
+
+        assert!(reset, "Should detect realistic rotation scenario");
+        assert_eq!(burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0);
+        assert_eq!(burn_rate.usd_per_pct_ema_weekly_scoped, 0.0);
+
+        // Other window EMAs must remain intact
+        assert_eq!(burn_rate.fleet_pct_hr_ema.five_hour, 4.5);
+        assert_eq!(burn_rate.fleet_pct_hr_ema.seven_day, 1.8);
+        assert_eq!(burn_rate.usd_per_pct_ema_five_hour, 2.5);
+        assert_eq!(burn_rate.usd_per_pct_ema_seven_day, 1.2);
+    }
 }
 
 #[cfg(test)]
