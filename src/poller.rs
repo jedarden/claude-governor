@@ -259,6 +259,22 @@ impl UsageData {
             Some((model_name, window))
         })
     }
+
+    /// Check if the weekly_scoped window is currently tracking Sonnet.
+    ///
+    /// Returns `true` if `weekly_scoped_model` indicates a Sonnet model
+    /// (e.g. "Sonnet"), `false` for other models or when no model is known.
+    /// This enables conditional logic like "only update sonnet_pct if
+    /// weekly_scoped is actually tracking Sonnet."
+    pub fn is_weekly_scoped_sonnet(&self) -> bool {
+        match self.weekly_scoped_model.as_deref() {
+            Some(model) => {
+                // Case-insensitive check for "Sonnet" display name
+                model.eq_ignore_ascii_case("Sonnet")
+            }
+            None => false,
+        }
+    }
 }
 
 /// Consecutive refresh failure counter
@@ -542,17 +558,16 @@ impl Poller {
 
         // Extract per-window fields, tolerating windows the API returns as null
         // (a null window is treated as non-binding rather than failing the poll).
-        let (weekly_scoped_utilization, weekly_scoped_resets_at, weekly_scoped_hours) =
-            window_or_default(&usage.weekly_scoped);
         let (seven_day_utilization, seven_day_resets_at, seven_day_hours) =
             window_or_default(&usage.seven_day);
         let (five_hour_utilization, five_hour_resets_at, five_hour_hours) =
             window_or_default(&usage.five_hour);
 
         let mut data = UsageData {
-            weekly_scoped_utilization,
-            weekly_scoped_resets_at,
-            weekly_scoped_hours_remaining: weekly_scoped_hours,
+            // weekly_scoped fields are populated below from the model-agnostic limits[] source
+            weekly_scoped_utilization: 0.0,
+            weekly_scoped_resets_at: String::new(),
+            weekly_scoped_hours_remaining: 168.0,
             weekly_scoped_model: None,
             seven_day_utilization,
             seven_day_resets_at,
@@ -565,11 +580,15 @@ impl Poller {
             stale: false,
         };
 
-        // Carry the resolved weekly_scoped model display name (e.g. "Fable") as
-        // metadata so downstream modules can label the window without changing
-        // the generic binding key. None when no model-scoped cap is active this
-        // period (scoped_weekly() returns None).
-        data.weekly_scoped_model = data.scoped_weekly().map(|(model, _)| model);
+        // Populate weekly_scoped from the model-agnostic limits[] array.
+        // This is the authoritative source for weekly_scoped utilization regardless
+        // of which model (Fable, Opus, Sonnet, etc.) is carrying the scoped cap.
+        if let Some((model_name, window)) = data.scoped_weekly() {
+            data.weekly_scoped_utilization = window.utilization;
+            data.weekly_scoped_hours_remaining = window.hours_remaining().unwrap_or(168.0);
+            data.weekly_scoped_resets_at = window.resets_at;
+            data.weekly_scoped_model = Some(model_name);
+        }
 
         // Update last usage
         self.last_usage = Some(data.clone());
@@ -868,5 +887,46 @@ mod tests {
 
         assert!(data.weekly_scoped_model.is_none());
         assert!(data.scoped_weekly().is_none());
+    }
+
+    #[test]
+    fn test_is_weekly_scoped_sonnet_true_for_sonnet() {
+        // When weekly_scoped_model is "Sonnet", return true
+        let mut data = usage_data_with_limits(vec![]);
+        data.weekly_scoped_model = Some("Sonnet".to_string());
+        assert!(data.is_weekly_scoped_sonnet());
+    }
+
+    #[test]
+    fn test_is_weekly_scoped_sonnet_true_for_sonnet_case_insensitive() {
+        // Case-insensitive matching
+        let mut data = usage_data_with_limits(vec![]);
+        data.weekly_scoped_model = Some("sonnet".to_string());
+        assert!(data.is_weekly_scoped_sonnet());
+
+        data.weekly_scoped_model = Some("SONNET".to_string());
+        assert!(data.is_weekly_scoped_sonnet());
+    }
+
+    #[test]
+    fn test_is_weekly_scoped_sonnet_false_for_other_models() {
+        // For non-Sonnet models, return false
+        let mut data = usage_data_with_limits(vec![]);
+        data.weekly_scoped_model = Some("Fable".to_string());
+        assert!(!data.is_weekly_scoped_sonnet());
+
+        data.weekly_scoped_model = Some("Opus".to_string());
+        assert!(!data.is_weekly_scoped_sonnet());
+
+        data.weekly_scoped_model = Some("Haiku".to_string());
+        assert!(!data.is_weekly_scoped_sonnet());
+    }
+
+    #[test]
+    fn test_is_weekly_scoped_sonnet_false_when_none() {
+        // When weekly_scoped_model is None, return false
+        let data = usage_data_with_limits(vec![]);
+        assert!(data.weekly_scoped_model.is_none());
+        assert!(!data.is_weekly_scoped_sonnet());
     }
 }
