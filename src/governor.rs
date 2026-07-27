@@ -3781,6 +3781,15 @@ pub fn run_governor_cycle(
                     );
                     prev_snap.weekly_scoped_pct = 0.0;
                 }
+
+                // Reset fleet_pct_ema_samples to 0 to trigger cold-start seeding on next cycle
+                // This ensures the new model starts with EstimateQuality::ColdStart and gets
+                // seeded from baseline_burn_rate instead of claiming 0% / infinite headroom
+                log::info!(
+                    "[governor] resetting fleet_pct_ema_samples from {} to 0 due to model change",
+                    state.burn_rate.fleet_pct_ema_samples
+                );
+                state.burn_rate.fleet_pct_ema_samples = 0;
             }
 
             state.usage = state::UsageState {
