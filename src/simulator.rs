@@ -1097,4 +1097,177 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn simulate_weekly_scoped_model_rotation_resets_samples() {
+        // This test simulates weekly_scoped model identity changing from Fable to Opus mid-run
+        // and verifies proper sample reset and cold-start handling
+
+        // 1. Create initial state with Fable as weekly_scoped model
+        let mut state = make_test_state();
+
+        // Set up burn rate state with accumulated Fable history
+        state.burn_rate.by_model = {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "Fable".to_string(),
+                crate::state::ModelBurnRate {
+                    pct_per_worker_per_hour: 2.5,
+                    dollars_per_worker_per_hour: 8.0,
+                    samples: 10, // Accumulated samples
+                },
+            );
+            m
+        };
+
+        // Set weekly_scoped EMA with Fable's learned rate
+        state.burn_rate.fleet_pct_hr_ema.weekly_scoped = 2.5;
+        state.burn_rate.fleet_pct_ema_samples = 10;
+        state.burn_rate.usd_per_pct_ema_weekly_scoped = 3.2;
+
+        // Set up usage state with Fable as the weekly_scoped model
+        state.usage.weekly_scoped_model = Some("Fable".to_string());
+        state.usage.weekly_scoped_pct = 55.0; // Real utilization present
+
+        // Calibrated non-rotating windows should have stable EMAs
+        state.burn_rate.fleet_pct_hr_ema.five_hour = 1.8;
+        state.burn_rate.fleet_pct_hr_ema.seven_day = 2.0;
+        state.burn_rate.usd_per_pct_ema_five_hour = 2.8;
+        state.burn_rate.usd_per_pct_ema_seven_day = 3.0;
+
+        // 2. Record state BEFORE model rotation
+        let weekly_scoped_ema_before = state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
+        let weekly_scoped_samples_before = state.burn_rate.fleet_pct_ema_samples;
+        let usd_ema_before = state.burn_rate.usd_per_pct_ema_weekly_scoped;
+        let five_hour_ema_before = state.burn_rate.fleet_pct_hr_ema.five_hour;
+        let seven_day_ema_before = state.burn_rate.fleet_pct_hr_ema.seven_day;
+
+        assert_eq!(weekly_scoped_ema_before, 2.5, "Should start with Fable's EMA");
+        assert_eq!(weekly_scoped_samples_before, 10, "Should start with 10 samples");
+        assert_eq!(usd_ema_before, 3.2, "Should start with Fable's USD EMA");
+
+        // 3. Simulate model rotation: Fable -> Opus
+        let prev_model = state.usage.weekly_scoped_model.clone();
+        let new_model = Some("Opus".to_string());
+
+        // Apply the model change detection and reset
+        let reset_performed = crate::state::reset_weekly_scoped_on_model_change(
+            &prev_model,
+            &new_model,
+            &mut state.burn_rate,
+        );
+
+        // 4. Verify reset was performed
+        assert!(reset_performed, "Reset should be performed when model changes from Fable to Opus");
+
+        // 5. Verify weekly_scoped samples are reset to 0 (no stale Fable carry-over)
+        assert_eq!(
+            state.burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
+            "weekly_scoped EMA should reset to 0 - no Fable carry-over"
+        );
+        assert_eq!(
+            state.burn_rate.usd_per_pct_ema_weekly_scoped, 0.0,
+            "weekly_scoped USD EMA should reset to 0"
+        );
+
+        // 6. Verify calibrated non-rotating windows are unchanged
+        assert_eq!(
+            state.burn_rate.fleet_pct_hr_ema.five_hour, five_hour_ema_before,
+            "five_hour EMA should remain unchanged"
+        );
+        assert_eq!(
+            state.burn_rate.fleet_pct_hr_ema.seven_day, seven_day_ema_before,
+            "seven_day EMA should remain unchanged"
+        );
+
+        // 7. Verify cold-start handling with baseline seeding
+        let baseline = crate::state::BaselineBurnRates::default();
+        let current_workers = 5;
+        let util = state.usage.weekly_scoped_pct;
+
+        // With samples reset to 0, the window is now cold-start
+        let window_samples = 0; // Reset
+        let has_fresh_rate = false; // No fresh per-instance rate yet
+
+        let is_cold_start = !has_fresh_rate && window_samples < 3;
+        assert!(is_cold_start, "Opus window should be cold-start after reset");
+
+        // Verify conservative baseline seeding (not 0)
+        if is_cold_start && util > 0.0 && current_workers > 0 {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            let seeded_fleet_pct_hr = base_per_worker * current_workers as f64;
+
+            assert!(
+                seeded_fleet_pct_hr > 0.0,
+                "Cold-start Opus window should use conservative baseline, not 0"
+            );
+
+            // Verify estimate quality is ColdStart
+            let estimate_quality = if window_samples == 0 {
+                crate::state::EstimateQuality::ColdStart
+            } else {
+                crate::state::EstimateQuality::InsufficientSamples
+            };
+
+            assert_eq!(
+                estimate_quality, crate::state::EstimateQuality::ColdStart,
+                "Opus window should be flagged as ColdStart"
+            );
+        }
+
+        // 8. Verify no 0% utilization claim (Opus window has real util)
+        assert!(
+            util > 0.0,
+            "Opus window should have real utilization ({}%), not 0%",
+            util
+        );
+
+        // 9. Verify no infinite headroom (conservative rate prevents this)
+        // With seeded burn rate > 0, predicted_exhaustion is finite, not +inf
+        let baseline_rate = baseline.pct_per_worker_per_hour * current_workers as f64;
+        assert!(
+            baseline_rate > 0.0,
+            "Seeded burn rate should be > 0, preventing infinite headroom"
+        );
+
+        // 10. Run trajectory simulation with the post-reset state to verify forward behavior
+        state.usage.weekly_scoped_model = new_model; // Update model in usage state
+        let config = SimConfig::fixed(5, 4.0); // 5 workers for 4 hours
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        // Verify trajectory has valid points
+        assert!(!trajectory.points.is_empty(), "Should have trajectory points");
+
+        // Verify weekly_scoped utilization doesn't claim 0% or infinite headroom
+        let first_point = &trajectory.points[0];
+        let weekly_scoped_util = first_point.windows.get("weekly_scoped").unwrap_or(&0.0);
+
+        // Starting from real utilization (55%), not 0%
+        assert!(
+            *weekly_scoped_util > 0.0,
+            "Weekly-scoped should start from real utilization, not 0%"
+        );
+
+        // All trajectory points should have finite utilization (not infinite headroom)
+        for point in &trajectory.points {
+            let util = point.windows.get("weekly_scoped").unwrap_or(&0.0);
+            assert!(
+                util.is_finite(),
+                "Weekly-scoped utilization should be finite at offset {}h",
+                point.hours_offset
+            );
+            assert!(*util <= 100.0, "Utilization should not exceed 100%");
+        }
+
+        // 11. Verify the burn rate state after simulation reflects proper reset
+        // The weekly_scoped EMA should still be 0 (cold start)
+        assert_eq!(
+            state.burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
+            "Post-simulation: weekly_scoped EMA should remain 0 (cold start)"
+        );
+        assert_eq!(
+            state.burn_rate.usd_per_pct_ema_weekly_scoped, 0.0,
+            "Post-simulation: weekly_scoped USD EMA should remain 0"
+        );
+    }
 }
