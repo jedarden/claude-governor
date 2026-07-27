@@ -208,6 +208,33 @@ fn deserialize_f64_null_as_infinity<'de, D: Deserializer<'de>>(
     Ok(opt.unwrap_or(f64::INFINITY))
 }
 
+/// Quality level of a window's burn rate estimate.
+///
+/// Distinguishes between calibrated forecasts (backed by sufficient samples) and
+/// uncertain/cold-start forecasts (seeded from baseline or lacking data). Downstream
+/// consumers (safe-mode logic, alert predicates) can branch on this field to apply
+/// conservative heuristics when the forecast is not grounded in measurement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EstimateQuality {
+    /// Forecast is backed by >= MIN_SAMPLES_FOR_EMA samples or fresh per-instance rates.
+    /// The burn rate is measured from real usage data — safe to use for scaling decisions.
+    Calibrated,
+    /// Forecast has no burn history yet (cold-start). Rate is seeded from a conservative
+    /// baseline. The estimate may be wrong; safe-worker paths should use pessimistic bounds.
+    ColdStart,
+    /// Not enough samples to trust the EMA yet (< MIN_SAMPLES_FOR_EMA). Falls back to
+    /// baseline rates with wider uncertainty bounds.
+    InsufficientSamples,
+}
+
+impl Default for EstimateQuality {
+    fn default() -> Self {
+        // Default to Calibrated for backward compatibility: existing state files
+        // that predate this field are assumed to represent mature, calibrated windows.
+        Self::Calibrated
+    }
+}
+
 /// Per-window capacity forecast
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -264,6 +291,11 @@ pub struct WindowForecast {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub hard_limit_margin_hrs: f64,
+    /// Quality indicator for the burn rate estimate backing this forecast.
+    /// Calibrated = enough samples to trust the rate; ColdStart/InsufficientSamples = seeded
+    /// from baseline, use conservative heuristics (p75 safe workers, wide uncertainty bounds).
+    #[serde(default)]
+    pub estimate_quality: EstimateQuality,
 }
 
 impl Default for WindowForecast {
@@ -287,6 +319,7 @@ impl Default for WindowForecast {
             risk_score: 0.0,
             hard_limit_remaining_pct: 0.0,
             hard_limit_margin_hrs: 0.0,
+            estimate_quality: EstimateQuality::Calibrated,
         }
     }
 }
@@ -716,6 +749,20 @@ pub struct GovernorState {
     /// Key is agent name (e.g., "needle-sonnet", "polish-opus").
     #[serde(default)]
     pub baseline_burn_rates: HashMap<String, BaselineBurnRates>,
+    /// Per-window count of consecutive polls in which the window was absent
+    /// (null) from the API response, or reported `is_active == false` for its
+    /// limit entry. Once a window's count reaches
+    /// [`crate::governor::INACTIVE_WINDOW_POLL_THRESHOLD`] it is treated as
+    /// structurally inactive: excluded from binding-window candidacy so the
+    /// governor stops pinning the worker count at the current value waiting
+    /// for burn data that cannot arrive (observed live: the model-scoped
+    /// weekly window null across every poll while the pooled windows had ample
+    /// headroom). Reset to 0 the instant the window reappears. Only the
+    /// dynamic weekly_scoped slot is observed to be absent in practice; this
+    /// is tracked per-window so the same rule applies to any window if that
+    /// ever changes.
+    #[serde(default)]
+    pub consecutive_absent_polls: HashMap<String, u32>,
 }
 
 impl Default for GovernorState {
@@ -741,6 +788,7 @@ impl Default for GovernorState {
             p7d_delta: None,
             p7ds_delta: None,
             baseline_burn_rates: HashMap::new(),
+            consecutive_absent_polls: HashMap::new(),
         }
     }
 }
@@ -1175,6 +1223,7 @@ mod tests {
             p7d_delta: None,
             p7ds_delta: None,
             baseline_burn_rates: HashMap::new(),
+            consecutive_absent_polls: HashMap::new(),
         }
     }
 

@@ -1263,6 +1263,7 @@ pub fn generate_window_forecast(
         } else {
             f64::INFINITY
         },
+        estimate_quality: crate::state::EstimateQuality::Calibrated,
     }
 }
 
@@ -1374,17 +1375,91 @@ pub fn estimate_burn_rates(
             });
 
         // Use fleet-level mean pct/hr as the fleet burn rate
-        let fleet_pct_hr = stats.mean_pct_hr;
+        let mut fleet_pct_hr = stats.mean_pct_hr;
 
         // Get p75 per-worker rate for safe worker computation
-        let p75_per_worker = if current_workers > 0 {
+        let mut p75_per_worker = if current_workers > 0 {
             stats.p75_pct_hr / current_workers as f64
         } else {
             0.0
         };
+        let mut std_pct_hr = stats.std_pct_hr;
 
         let util = current_utilization.get(*window).copied().unwrap_or(0.0);
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
+
+        // --- Cold-start base-rate seeding (bead bf-12wx4) ---
+        //
+        // A window with no observed burn history and no fresh per-instance rate
+        // this interval would otherwise carry fleet_pct_hr == 0.0 straight into
+        // `generate_window_forecast`, which interprets 0 as *infinite* headroom
+        // (predicted_exhaustion = +inf, safe_worker_count = None, urgency -inf).
+        // That is the correct, benign representation for a genuinely ABSENT
+        // window — one the API reports as null, which `poller::window_or_default`
+        // surfaces as 0% utilization (so `util == 0.0` below skips seeding).
+        //
+        // But it is a real risk for a window that EXISTS this period yet has no
+        // burn calibration yet. The most important case is the dynamic
+        // model-scoped weekly window: when Anthropic rotates which model carries
+        // the scoped weekly cap (it was Sonnet, is Fable, will be a third model),
+        // the newly-appearing window cold-starts at an ASSUMED 0%/hr — i.e. "it is
+        // definitely empty" — with full implied confidence, right up until its
+        // true (often high) inherited usage turns out to blow through the real
+        // cap with no warning. A governor that treats "no data" as "definitely
+        // empty" can over-scale the subscription pool on the cold window's first
+        // cycle. (Note: the instantaneous utilization IS already correct — it
+        // flows in via `util`; the bug is purely the burn RATE / trend defaulting
+        // to 0 change-per-hour.)
+        //
+        // Fix: when a window is cold-start (no fresh per-instance rate this
+        // interval AND fewer than MIN_SAMPLES_FOR_EMA historical samples across
+        // all models) AND the API reports real utilization for it (`util > 0.0`,
+        // i.e. it is present this period rather than the absent-window sentinel),
+        // seed its burn rate from the conservative configured baseline
+        // (`baseline.pct_per_worker_per_hour`) instead of 0.0, and widen the
+        // confidence cone (set a non-trivial fleet stddev) so the forecast is
+        // marked uncertain — the pessimistic p75 safe-worker path engages until
+        // real samples take over.
+        //
+        // Design choice (per acceptance criteria): we estimate a conservative
+        // rate with a wide margin rather than hard-holding at the current worker
+        // count, because a hard hold on a cold window that is genuinely near its
+        // cap would still let a *different* binding window over-scale the shared
+        // subscription. An estimated conservative rate makes the cold window a
+        // real scaling constraint from its very first cycle. Calibrated windows
+        // (>= MIN_SAMPLES_FOR_EMA, or any window with a fresh rate this interval)
+        // are entirely unaffected.
+        let has_fresh_rate = rates_by_window
+            .get(*window)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let window_samples: u32 = ema_state
+            .iter()
+            .filter(|((_, w), _)| w == *window)
+            .map(|(_, e)| e.samples)
+            .max()
+            .unwrap_or(0);
+        let is_cold_start = !has_fresh_rate && window_samples < MIN_SAMPLES_FOR_EMA;
+
+        if is_cold_start && util > 0.0 && current_workers > 0 {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            fleet_pct_hr = base_per_worker * current_workers as f64;
+            p75_per_worker = base_per_worker;
+            // Mark the estimate uncertain: a fleet stddev on the order of the
+            // rate itself widens the confidence cone (cone_ratio > 1) so the
+            // pessimistic p75 exhaustion / safe-worker path engages. Using the
+            // full fleet rate as the spread is deliberately conservative for a
+            // wholly unmeasured window.
+            std_pct_hr = fleet_pct_hr;
+            log::info!(
+                "[burn_rate] {}: cold-start (no burn samples yet) — seeding conservative \
+                 base rate {:.3}%/worker/hr across {} worker(s) with a widened uncertainty \
+                 cone; estimate will self-correct as real samples accumulate",
+                window,
+                base_per_worker,
+                current_workers,
+            );
+        }
 
         forecasts.insert(
             window.to_string(),
@@ -1395,7 +1470,7 @@ pub fn estimate_burn_rates(
                 target_ceiling,
                 hrs_left,
                 p75_per_worker,
-                stats.std_pct_hr,
+                std_pct_hr,
             ),
         );
     }

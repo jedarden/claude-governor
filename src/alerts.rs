@@ -1062,6 +1062,7 @@ mod tests {
             p7d_delta: None,
             p7ds_delta: None,
             baseline_burn_rates: HashMap::new(),
+            consecutive_absent_polls: HashMap::new(),
         }
     }
 
