@@ -701,6 +701,7 @@ mod tests {
 
         // Set up usage
         state.usage = UsageState {
+            weekly_scoped_pct: 50.0,
             sonnet_pct: 50.0,
             all_models_pct: 60.0,
             five_hour_pct: 30.0,

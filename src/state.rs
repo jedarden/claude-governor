@@ -50,6 +50,9 @@ pub type Result<T> = std::result::Result<T, StateError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageState {
+    /// Legacy field - kept for backward compatibility.
+    /// New code should use weekly_scoped_pct instead.
+    #[serde(default)]
     pub sonnet_pct: f64,
     pub all_models_pct: f64,
     pub five_hour_pct: f64,
@@ -66,6 +69,12 @@ pub struct UsageState {
     /// null-tolerance applied to hard_limit_margin_hrs/cone_ratio/risk_score.
     #[serde(default)]
     pub weekly_scoped_model: Option<String>,
+    /// Model-agnostic weekly_scoped utilization percentage.
+    /// This is the correct field to use for the weekly_scoped window, regardless
+    /// of which model (Fable, Opus, etc.) carries the scoped cap this period.
+    /// The legacy sonnet_pct field is kept for backward compatibility only.
+    #[serde(default)]
+    pub weekly_scoped_pct: f64,
 }
 
 impl Default for UsageState {
@@ -78,6 +87,7 @@ impl Default for UsageState {
             five_hour_resets_at: String::new(),
             stale: false,
             weekly_scoped_model: None,
+            weekly_scoped_pct: 0.0,
         }
     }
 }
@@ -91,6 +101,52 @@ impl Default for UsageState {
 /// tracks instead of the stale hardcoded `"7d-sonnet"`/`"sonnet"`.
 pub fn weekly_scoped_display_label(model: Option<&str>) -> &str {
     model.filter(|m| !m.is_empty()).unwrap_or("weekly_scoped")
+}
+
+/// Reset weekly_scoped EMA samples when the scoped model identity changes.
+///
+/// When Anthropic rotates which model carries the scoped weekly cap (e.g., Fable -> Opus),
+/// the weekly_scoped slot should NOT reuse the previous model's EMA samples. This function
+/// detects when the resolved model name differs from the persisted value and resets the
+/// weekly_scoped burn rate state to cold (zero samples).
+///
+/// Returns true if a reset was performed (identity changed), false otherwise.
+pub fn reset_weekly_scoped_on_model_change(
+    prev_model: &Option<String>,
+    new_model: &Option<String>,
+    burn_rate_state: &mut BurnRateState,
+) -> bool {
+    match (prev_model.as_deref(), new_model.as_deref()) {
+        (Some(old), Some(new)) if old != new => {
+            log::info!(
+                "[governor] weekly_scoped model identity changed: '{}' -> '{}', resetting EMA samples",
+                old,
+                new
+            );
+            // Reset weekly_scoped EMA samples to cold (zero)
+            burn_rate_state.fleet_pct_hr_ema.weekly_scoped = 0.0;
+            burn_rate_state.usd_per_pct_ema_weekly_scoped = 0.0;
+            true
+        }
+        (Some(old), None) => {
+            log::info!(
+                "[governor] weekly_scoped model cleared (was '{}'), resetting EMA samples",
+                old
+            );
+            burn_rate_state.fleet_pct_hr_ema.weekly_scoped = 0.0;
+            burn_rate_state.usd_per_pct_ema_weekly_scoped = 0.0;
+            true
+        }
+        (None, Some(new)) => {
+            log::info!(
+                "[governor] weekly_scoped model initialized as '{}', starting with cold EMA",
+                new
+            );
+            // No reset needed - starting from cold (already zero)
+            true
+        }
+        _ => false, // No change or both None
+    }
 }
 
 /// Last fleet aggregate from the token collector
@@ -1165,6 +1221,7 @@ mod tests {
         GovernorState {
             updated_at: "2026-03-18T14:30:00Z".parse().unwrap(),
             usage: UsageState {
+                weekly_scoped_pct: 72.0,
                 sonnet_pct: 72.0,
                 all_models_pct: 81.0,
                 five_hour_pct: 14.0,

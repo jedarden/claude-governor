@@ -644,6 +644,7 @@ mod tests {
                 five_hour_resets_at: "2026-03-18T16:00:00Z".to_string(),
                 stale: false,
                 weekly_scoped_model: None,
+                weekly_scoped_pct: 63.5,
             },
             last_fleet_aggregate: FleetAggregate {
                 t0: Utc::now() - chrono::Duration::minutes(10),

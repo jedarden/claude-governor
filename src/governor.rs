@@ -3751,15 +3751,41 @@ pub fn run_governor_cycle(
     // 1a. Poll Anthropic API for live usage data
     match poller.poll() {
         Ok(usage_data) => {
+            let scoped_label = crate::state::weekly_scoped_display_label(
+                usage_data.weekly_scoped_model.as_deref()
+            );
             log::info!(
-                "[governor] polled usage: sonnet={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
+                "[governor] polled usage: {}={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
+                scoped_label,
                 usage_data.weekly_scoped_utilization,
                 usage_data.seven_day_utilization,
                 usage_data.five_hour_utilization,
                 if usage_data.stale { " (stale)" } else { "" },
             );
+
+            // Detect weekly_scoped model identity change BEFORE updating state
+            let prev_model = state.usage.weekly_scoped_model.clone();
+            let new_model = usage_data.weekly_scoped_model.clone();
+            let model_changed = crate::state::reset_weekly_scoped_on_model_change(
+                &prev_model,
+                &new_model,
+                &mut state.burn_rate,
+            );
+
+            // If model changed, clear the previous weekly_scoped snapshot to avoid
+            // computing a delta against the old model's utilization value
+            if model_changed {
+                if let Some(ref mut prev_snap) = state.previous_api_snapshot {
+                    log::info!(
+                        "[governor] clearing previous_api_snapshot.weekly_scoped_pct due to model change"
+                    );
+                    prev_snap.weekly_scoped_pct = 0.0;
+                }
+            }
+
             state.usage = state::UsageState {
-                sonnet_pct: usage_data.weekly_scoped_utilization,
+                weekly_scoped_pct: usage_data.weekly_scoped_utilization,
+                sonnet_pct: usage_data.weekly_scoped_utilization, // Legacy field, kept for backward compatibility
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
                 sonnet_resets_at: usage_data.weekly_scoped_resets_at,
@@ -4082,7 +4108,11 @@ pub fn run_governor_cycle(
         if !state.usage.stale {
             let new_five_hour = state.usage.five_hour_pct;
             let new_seven_day = state.usage.all_models_pct;
-            let new_weekly_scoped = state.usage.sonnet_pct;
+            // NOTE: weekly_scoped_pct is the model-agnostic field for weekly_scoped utilization.
+            // The legacy sonnet_pct field is kept for backward compatibility but should not be used
+            // in new code. When model identity changes, reset logic above ensures stale samples
+            // are cleared.
+            let new_weekly_scoped = state.usage.weekly_scoped_pct;
             if let Some(snap) = old_snapshot.clone() {
                 let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
@@ -4234,7 +4264,7 @@ pub fn run_governor_cycle(
             let new_pct = db::WindowPctSnapshot {
                 five_hour: state.usage.five_hour_pct,
                 seven_day: state.usage.all_models_pct,
-                weekly_scoped: state.usage.sonnet_pct,
+                weekly_scoped: state.usage.weekly_scoped_pct,
             };
 
             // Guard 1: Elapsed time < 2 minutes - too noisy for reliable annotation
@@ -4288,7 +4318,7 @@ pub fn run_governor_cycle(
     let mut current_utilization = HashMap::new();
     current_utilization.insert("five_hour".to_string(), state.usage.five_hour_pct);
     current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
-    current_utilization.insert("weekly_scoped".to_string(), state.usage.sonnet_pct);
+    current_utilization.insert("weekly_scoped".to_string(), state.usage.weekly_scoped_pct);
 
     // 5a-pre. Detect window resets and score predictions for calibration.
     //
@@ -4302,7 +4332,7 @@ pub fn run_governor_cycle(
         // Current utilizations for comparison
         let cur_5h = state.usage.five_hour_pct;
         let cur_7d = state.usage.all_models_pct;
-        let cur_7ds = state.usage.sonnet_pct;
+        let cur_7ds = state.usage.weekly_scoped_pct;
 
         // Previous utilizations (from before the snapshot update)
         let prev_5h = prev_snap.five_hour_pct;
