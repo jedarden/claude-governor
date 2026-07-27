@@ -3785,6 +3785,15 @@ pub fn run_governor_cycle(
             // Detect weekly_scoped model identity change BEFORE updating state
             let prev_model = state.usage.weekly_scoped_model.clone();
             let new_model = usage_data.weekly_scoped_model.clone();
+
+            // VERIFICATION: Log the pct value being used for the new/rotated model
+            log::info!(
+                "[governor] weekly_scoped model change detection: prev_model={:?}, new_model={:?}, new_weekly_scoped_pct={:.2}%",
+                prev_model,
+                new_model,
+                usage_data.weekly_scoped_utilization
+            );
+
             let model_changed = crate::state::reset_weekly_scoped_on_model_change(
                 &prev_model,
                 &new_model,
@@ -4155,6 +4164,13 @@ pub fn run_governor_cycle(
             // in new code. When model identity changes, reset logic above ensures stale samples
             // are cleared.
             let new_weekly_scoped = state.usage.weekly_scoped_pct;
+
+            // VERIFICATION: Log that the EMA is using the rotated model's actual pct
+            log::info!(
+                "[governor] EMA input: weekly_scoped_model={:?}, weekly_scoped_pct={:.2}% (this is the actual pct from the rotated model)",
+                state.usage.weekly_scoped_model,
+                new_weekly_scoped
+            );
             if let Some(snap) = old_snapshot.clone() {
                 let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
@@ -4227,6 +4243,14 @@ pub fn run_governor_cycle(
 
                     if delta_7ds > 0.0 {
                         let rate = delta_7ds / elapsed_hours_snap;
+                        // VERIFICATION: Log that the weekly_scoped EMA is using the new model's pct
+                        log::info!(
+                            "[governor] updating weekly_scoped EMA: delta={:+.3}%, rate={:.4}%/hr, model={:?}, source_pct={:.2}%",
+                            delta_7ds,
+                            rate,
+                            state.usage.weekly_scoped_model,
+                            new_weekly_scoped
+                        );
                         if samples == 0 {
                             state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
                         } else {
