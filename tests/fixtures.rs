@@ -331,6 +331,12 @@ pub fn create_state_file_with_utilization(
 
     let mut state = state::GovernorState::new();
     state.usage.five_hour_pct = five_hour_pct;
+    // NOTE: This mirrors the sonnet_pct hard-coding pattern found in cycle behavior tests,
+    // but is semantically correct here since `weekly_scoped_pct` parameter is explicitly
+    // documented as "7-day Sonnet window utilization percentage" and fixture callers control
+    // the semantic meaning. Unlike the test bugs, this helper is a controlled setup function
+    // where the parameter's contract is clear. However, prefer using weekly_scoped_pct
+    // (model-agnostic) in new code instead of the legacy sonnet_pct field.
     state.usage.sonnet_pct = weekly_scoped_pct;
     state.usage.all_models_pct = seven_day_pct;
 
@@ -402,6 +408,12 @@ pub fn create_full_state_file(
 
     // Set utilization
     state.usage.five_hour_pct = five_hour_pct;
+    // NOTE: This mirrors the sonnet_pct hard-coding pattern found in cycle behavior tests,
+    // but is semantically correct here since `weekly_scoped_pct` parameter is explicitly
+    // documented as "7-day Sonnet window utilization percentage" and fixture callers control
+    // the semantic meaning. Unlike the test bugs, this helper is a controlled setup function
+    // where the parameter's contract is clear. However, prefer using weekly_scoped_pct
+    // (model-agnostic) in new code instead of the legacy sonnet_pct field.
     state.usage.sonnet_pct = weekly_scoped_pct;
     state.usage.all_models_pct = seven_day_pct;
 

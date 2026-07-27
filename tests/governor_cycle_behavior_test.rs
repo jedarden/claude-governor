@@ -334,6 +334,13 @@ fn test_emergency_brake_at_98_percent() {
 
     // Update state with high utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
@@ -377,6 +384,13 @@ fn test_no_emergency_brake_below_98_percent() {
 
     // Update state with moderate utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
@@ -414,6 +428,13 @@ fn test_state_updated_after_cycle() {
 
     // Simulate cycle: update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
@@ -567,6 +588,13 @@ fn test_stale_data_handling() {
     // In a real cycle, stale data would still update state but with a warning
     // Simulate updating state with stale data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
@@ -605,6 +633,13 @@ fn test_complete_governor_cycle() {
 
     // 3. Update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
@@ -684,6 +719,13 @@ fn test_emergency_brake_exact_threshold() {
 
     // Update state with threshold utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
+    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
+    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
+    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
+    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
+    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
+    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
+    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
     state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
