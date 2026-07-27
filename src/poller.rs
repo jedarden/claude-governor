@@ -136,6 +136,18 @@ pub struct UsageLimit {
     pub kind: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// **Model-agnostic weekly_scoped utilization source field.**
+    ///
+    /// For entries where `kind == "weekly_scoped"`, this `percent` field is the
+    /// authoritative source of the model-agnostic weekly_scoped utilization value,
+    /// regardless of which model (Fable, Opus, Sonnet, etc.) is carrying the scoped
+    /// cap this period.
+    ///
+    /// Data flow: API → `limits[].percent` → `UsageData.weekly_scoped_utilization`
+    /// → `UsageState.weekly_scoped_pct` (state.rs:76-77).
+    ///
+    /// See `scoped_weekly()` (poller.rs:244-261) for the extraction logic that
+    /// finds the weekly_scoped entry and reads this field.
     #[serde(default)]
     pub percent: Option<f64>,
     #[serde(default)]
@@ -233,10 +245,17 @@ pub struct UsageData {
 impl UsageData {
     /// The active model-scoped weekly cap, if any.
     ///
+    /// **Model-agnostic data extraction from limits[].**
+    ///
     /// Finds the `limits[]` entry with `kind == "weekly_scoped"` and returns
     /// its model display name (falling back to `"Scoped"`, matching the
     /// `usage-statusline.sh` reference) plus its `percent` / `resets_at` as a
     /// [`UsageWindow`].
+    ///
+    /// **Critical field access**: The `percent` field on the weekly_scoped entry
+    /// is the authoritative source for model-agnostic weekly_scoped utilization.
+    /// This field is read at line 256 below (`utilization: limit.percent.unwrap_or(0.0)`)
+    /// and flows into `UsageState.weekly_scoped_pct` via the poll() method.
     ///
     /// Returns `None` when this account/period has no active model-scoped
     /// weekly cap — callers must not treat the scoped cap as a binding limit
@@ -253,6 +272,7 @@ impl UsageData {
                 .and_then(|m| m.display_name.clone())
                 .unwrap_or_else(|| "Scoped".to_string());
             let window = UsageWindow {
+                /// **Model-agnostic weekly_scoped pct source: reads from limits[].percent**
                 utilization: limit.percent.unwrap_or(0.0),
                 resets_at: limit.resets_at.clone().unwrap_or_default(),
             };
@@ -581,6 +601,13 @@ impl Poller {
         };
 
         // Populate weekly_scoped from the model-agnostic limits[] array.
+        //
+        // **Data flow from model-agnostic source:**
+        // 1. API response: `limits[].percent` (where `kind == "weekly_scoped"`)
+        // 2. Extracted by: `scoped_weekly()` method (poller.rs:256)
+        // 3. Flows into: `UsageData.weekly_scoped_utilization`
+        // 4. Ultimately stored in: `UsageState.weekly_scoped_pct` (state.rs:76-77)
+        //
         // This is the authoritative source for weekly_scoped utilization regardless
         // of which model (Fable, Opus, Sonnet, etc.) is carrying the scoped cap.
         if let Some((model_name, window)) = data.scoped_weekly() {

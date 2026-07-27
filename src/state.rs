@@ -70,6 +70,18 @@ pub struct UsageState {
     #[serde(default)]
     pub weekly_scoped_model: Option<String>,
     /// Model-agnostic weekly_scoped utilization percentage.
+    ///
+    /// **Model-agnostic data source from limits[].**
+    ///
+    /// This field stores the weekly_scoped utilization from the model-agnostic
+    /// `limits[].percent` field (where `limits[].kind == "weekly_scoped"`).
+    ///
+    /// **Data flow:**
+    /// - API response → `UsageResponse.limits[].percent` (poller.rs:140)
+    /// - Extracted by `scoped_weekly()` → reads `limit.percent` (poller.rs:256)
+    /// - Flows into `UsageData.weekly_scoped_utilization` (poller.rs:587)
+    /// - Stored here as `UsageState.weekly_scoped_pct`
+    ///
     /// This is the correct field to use for the weekly_scoped window, regardless
     /// of which model (Fable, Opus, etc.) carries the scoped cap this period.
     /// The legacy sonnet_pct field is kept for backward compatibility only.
