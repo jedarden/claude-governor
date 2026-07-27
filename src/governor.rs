@@ -7645,6 +7645,33 @@ impl MockPoller {
         Self::with_utilization(92.0, 94.0, 93.0)
     }
 
+    /// Create a mock poller with a specific weekly_scoped model.
+    ///
+    /// # Arguments
+    /// - `model`: The model name for weekly_scoped (e.g., "Sonnet", "Opus", "Fable")
+    /// - `five_hour_util`: 5-hour window utilization percentage
+    /// - `seven_day_util`: 7-day window utilization percentage (all models)
+    /// - `weekly_scoped_util`: 7-day window utilization percentage (scoped to model)
+    pub fn with_model(
+        model: Option<&str>,
+        five_hour_util: f64,
+        seven_day_util: f64,
+        weekly_scoped_util: f64,
+    ) -> Self {
+        let mut data = Self::default_usage_data();
+        data.five_hour_utilization = five_hour_util;
+        data.seven_day_utilization = seven_day_util;
+        data.weekly_scoped_utilization = weekly_scoped_util;
+        data.weekly_scoped_model = model.map(|s| s.to_string());
+
+        Self {
+            usage_data: Some(data),
+            error_message: None,
+            stale: false,
+            poll_count: 0,
+        }
+    }
+
     /// Create default usage data with moderate utilization values.
     ///
     /// Returns a UsageData struct with:
@@ -8908,5 +8935,401 @@ mod annotation_guard_tests {
 
         // Guard should not trigger (just barely)
         assert!(!five_hour_reset, "Drop of 0.99% should not trigger reset guard");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model-Specific sonnet_pct Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sonnet_pct_tests {
+    use super::*;
+
+    /// Test that sonnet_pct equals weekly_scoped_utilization when weekly_scoped_model is Sonnet.
+    #[test]
+    fn test_sonnet_pct_when_model_is_sonnet() {
+        let mut poller = MockPoller::with_model(
+            Some("Sonnet"),
+            50.0,  // five_hour
+            60.0,  // seven_day
+            45.0,  // weekly_scoped
+        );
+
+        let result = poller.poll().expect("poll should succeed");
+        let usage_data = result;
+
+        // Verify the model is set to Sonnet
+        assert_eq!(
+            usage_data.weekly_scoped_model.as_deref(),
+            Some("Sonnet"),
+            "weekly_scoped_model should be Sonnet"
+        );
+
+        // Verify is_weekly_scoped_sonnet returns true
+        assert!(
+            usage_data.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return true for Sonnet model"
+        );
+
+        // Now test how governor sets sonnet_pct when processing this data
+        let mut state = state::GovernorState::new();
+
+        // Simulate the governor updating usage state from this poller data
+        let updated_usage = state::UsageState {
+            weekly_scoped_pct: usage_data.weekly_scoped_utilization,
+            sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
+                usage_data.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data.seven_day_utilization,
+            five_hour_pct: usage_data.five_hour_utilization,
+            sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data.five_hour_resets_at,
+            stale: usage_data.stale,
+            weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
+        };
+
+        // Critical assertion: sonnet_pct should equal weekly_scoped_utilization when model is Sonnet
+        assert_eq!(
+            updated_usage.sonnet_pct, usage_data.weekly_scoped_utilization,
+            "sonnet_pct should equal weekly_scoped_utilization when weekly_scoped_model is Sonnet"
+        );
+
+        assert_eq!(updated_usage.sonnet_pct, 45.0,
+            "sonnet_pct should be 45.0 (the weekly_scoped_utilization value)");
+    }
+
+    /// Test that sonnet_pct is 0.0 when weekly_scoped_model is Opus.
+    #[test]
+    fn test_sonnet_pct_when_model_is_opus() {
+        let mut poller = MockPoller::with_model(
+            Some("Opus"),
+            50.0,  // five_hour
+            60.0,  // seven_day
+            72.5,  // weekly_scoped (higher to show it's NOT used for sonnet_pct)
+        );
+
+        let result = poller.poll().expect("poll should succeed");
+        let usage_data = result;
+
+        // Verify the model is set to Opus
+        assert_eq!(
+            usage_data.weekly_scoped_model.as_deref(),
+            Some("Opus"),
+            "weekly_scoped_model should be Opus"
+        );
+
+        // Verify is_weekly_scoped_sonnet returns false
+        assert!(
+            !usage_data.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return false for Opus model"
+        );
+
+        // Simulate the governor updating usage state
+        let updated_usage = state::UsageState {
+            weekly_scoped_pct: usage_data.weekly_scoped_utilization,
+            sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
+                usage_data.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data.seven_day_utilization,
+            five_hour_pct: usage_data.five_hour_utilization,
+            sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data.five_hour_resets_at,
+            stale: usage_data.stale,
+            weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
+        };
+
+        // Critical assertion: sonnet_pct should be 0.0 when model is Opus
+        assert_eq!(
+            updated_usage.sonnet_pct, 0.0,
+            "sonnet_pct should be 0.0 when weekly_scoped_model is Opus (not 72.5)"
+        );
+
+        // Verify it's NOT using the weekly_scoped_utilization
+        assert_ne!(
+            updated_usage.sonnet_pct, usage_data.weekly_scoped_utilization,
+            "sonnet_pct should NOT equal weekly_scoped_utilization when model is Opus"
+        );
+    }
+
+    /// Test that sonnet_pct is 0.0 when weekly_scoped_model is None.
+    #[test]
+    fn test_sonnet_pct_when_model_is_none() {
+        let mut poller = MockPoller::with_model(
+            None,  // No model
+            50.0,  // five_hour
+            60.0,  // seven_day
+            55.0,  // weekly_scoped (exists but model is None)
+        );
+
+        let result = poller.poll().expect("poll should succeed");
+        let usage_data = result;
+
+        // Verify the model is None
+        assert_eq!(
+            usage_data.weekly_scoped_model, None,
+            "weekly_scoped_model should be None"
+        );
+
+        // Verify is_weekly_scoped_sonnet returns false
+        assert!(
+            !usage_data.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return false when model is None"
+        );
+
+        // Simulate the governor updating usage state
+        let updated_usage = state::UsageState {
+            weekly_scoped_pct: usage_data.weekly_scoped_utilization,
+            sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
+                usage_data.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data.seven_day_utilization,
+            five_hour_pct: usage_data.five_hour_utilization,
+            sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data.five_hour_resets_at,
+            stale: usage_data.stale,
+            weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
+        };
+
+        // Critical assertion: sonnet_pct should be 0.0 when model is None
+        assert_eq!(
+            updated_usage.sonnet_pct, 0.0,
+            "sonnet_pct should be 0.0 when weekly_scoped_model is None"
+        );
+    }
+
+    /// Test that sonnet_pct is 0.0 when weekly_scoped_model is Fable.
+    #[test]
+    fn test_sonnet_pct_when_model_is_fable() {
+        let mut poller = MockPoller::with_model(
+            Some("Fable"),
+            50.0,  // five_hour
+            60.0,  // seven_day
+            35.0,  // weekly_scoped
+        );
+
+        let result = poller.poll().expect("poll should succeed");
+        let usage_data = result;
+
+        // Verify the model is set to Fable
+        assert_eq!(
+            usage_data.weekly_scoped_model.as_deref(),
+            Some("Fable"),
+            "weekly_scoped_model should be Fable"
+        );
+
+        // Verify is_weekly_scoped_sonnet returns false
+        assert!(
+            !usage_data.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return false for Fable model"
+        );
+
+        // Simulate the governor updating usage state
+        let updated_usage = state::UsageState {
+            weekly_scoped_pct: usage_data.weekly_scoped_utilization,
+            sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
+                usage_data.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data.seven_day_utilization,
+            five_hour_pct: usage_data.five_hour_utilization,
+            sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data.five_hour_resets_at,
+            stale: usage_data.stale,
+            weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
+        };
+
+        // Critical assertion: sonnet_pct should be 0.0 when model is Fable
+        assert_eq!(
+            updated_usage.sonnet_pct, 0.0,
+            "sonnet_pct should be 0.0 when weekly_scoped_model is Fable"
+        );
+    }
+
+    /// Test rotation from Sonnet to Opus correctly clears sonnet_pct.
+    #[test]
+    fn test_sonnet_pct_rotation_from_sonnet_to_opus() {
+        // First poll: weekly_scoped_model is Sonnet
+        let mut poller_sonnet = MockPoller::with_model(
+            Some("Sonnet"),
+            50.0,  // five_hour
+            60.0,  // seven_day
+            68.0,  // weekly_scoped
+        );
+
+        let result_sonnet = poller_sonnet.poll().expect("poll should succeed");
+        let usage_data_sonnet = result_sonnet;
+
+        // Simulate governor state with Sonnet model
+        let mut state = state::GovernorState::new();
+        state.usage = state::UsageState {
+            weekly_scoped_pct: usage_data_sonnet.weekly_scoped_utilization,
+            sonnet_pct: if usage_data_sonnet.is_weekly_scoped_sonnet() {
+                usage_data_sonnet.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data_sonnet.seven_day_utilization,
+            five_hour_pct: usage_data_sonnet.five_hour_utilization,
+            sonnet_resets_at: usage_data_sonnet.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data_sonnet.five_hour_resets_at,
+            stale: usage_data_sonnet.stale,
+            weekly_scoped_model: usage_data_sonnet.weekly_scoped_model.clone(),
+        };
+
+        // Verify sonnet_pct is set to the Sonnet utilization
+        assert_eq!(
+            state.usage.sonnet_pct, 68.0,
+            "Initial sonnet_pct should be 68.0 with Sonnet model"
+        );
+        assert_eq!(
+            state.usage.weekly_scoped_model.as_deref(),
+            Some("Sonnet"),
+            "Initial weekly_scoped_model should be Sonnet"
+        );
+
+        // Second poll: weekly_scoped_model rotated to Opus
+        let mut poller_opus = MockPoller::with_model(
+            Some("Opus"),
+            55.0,  // five_hour
+            65.0,  // seven_day
+            75.0,  // weekly_scoped (different value to verify change)
+        );
+
+        let result_opus = poller_opus.poll().expect("poll should succeed");
+        let usage_data_opus = result_opus;
+
+        // Update governor state with the new Opus model
+        let prev_model = state.usage.weekly_scoped_model.clone();
+        let new_model = usage_data_opus.weekly_scoped_model.clone();
+
+        state.usage = state::UsageState {
+            weekly_scoped_pct: usage_data_opus.weekly_scoped_utilization,
+            sonnet_pct: if usage_data_opus.is_weekly_scoped_sonnet() {
+                usage_data_opus.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: usage_data_opus.seven_day_utilization,
+            five_hour_pct: usage_data_opus.five_hour_utilization,
+            sonnet_resets_at: usage_data_opus.weekly_scoped_resets_at,
+            five_hour_resets_at: usage_data_opus.five_hour_resets_at,
+            stale: usage_data_opus.stale,
+            weekly_scoped_model: usage_data_opus.weekly_scoped_model.clone(),
+        };
+
+        // Verify rotation happened
+        assert_eq!(
+            prev_model.as_deref(),
+            Some("Sonnet"),
+            "Previous model should be Sonnet"
+        );
+        assert_eq!(
+            new_model.as_deref(),
+            Some("Opus"),
+            "New model should be Opus"
+        );
+
+        // Critical assertion: sonnet_pct should be cleared to 0.0 after rotation to Opus
+        assert_eq!(
+            state.usage.sonnet_pct, 0.0,
+            "sonnet_pct should be cleared to 0.0 after rotation from Sonnet to Opus"
+        );
+
+        assert_eq!(
+            state.usage.weekly_scoped_model.as_deref(),
+            Some("Opus"),
+            "weekly_scoped_model should now be Opus"
+        );
+
+        // Verify sonnet_pct is NOT using the new weekly_scoped_utilization
+        assert_ne!(
+            state.usage.sonnet_pct, usage_data_opus.weekly_scoped_utilization,
+            "sonnet_pct should NOT equal the new weekly_scoped_utilization (75.0)"
+        );
+    }
+
+    /// Test case-insensitive model name matching (e.g., "sonnet" vs "Sonnet").
+    #[test]
+    fn test_sonnet_pct_case_insensitive() {
+        // Test lowercase "sonnet"
+        let mut poller_lowercase = MockPoller::with_model(
+            Some("sonnet"),  // lowercase
+            50.0,
+            60.0,
+            42.5,
+        );
+
+        let result_lower = poller_lowercase.poll().expect("poll should succeed");
+
+        // Verify case-insensitive matching works
+        assert!(
+            result_lower.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return true for lowercase 'sonnet'"
+        );
+
+        // Test mixed case "SONNET"
+        let mut poller_uppercase = MockPoller::with_model(
+            Some("SONNET"),  // uppercase
+            50.0,
+            60.0,
+            42.5,
+        );
+
+        let result_upper = poller_uppercase.poll().expect("poll should succeed");
+
+        // Verify case-insensitive matching works
+        assert!(
+            result_upper.is_weekly_scoped_sonnet(),
+            "is_weekly_scoped_sonnet() should return true for uppercase 'SONNET'"
+        );
+
+        // Verify both produce the same sonnet_pct value
+        let updated_lower = state::UsageState {
+            weekly_scoped_pct: result_lower.weekly_scoped_utilization,
+            sonnet_pct: if result_lower.is_weekly_scoped_sonnet() {
+                result_lower.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: result_lower.seven_day_utilization,
+            five_hour_pct: result_lower.five_hour_utilization,
+            sonnet_resets_at: result_lower.weekly_scoped_resets_at.clone(),
+            five_hour_resets_at: result_lower.five_hour_resets_at.clone(),
+            stale: result_lower.stale,
+            weekly_scoped_model: result_lower.weekly_scoped_model.clone(),
+        };
+
+        let updated_upper = state::UsageState {
+            weekly_scoped_pct: result_upper.weekly_scoped_utilization,
+            sonnet_pct: if result_upper.is_weekly_scoped_sonnet() {
+                result_upper.weekly_scoped_utilization
+            } else {
+                0.0
+            },
+            all_models_pct: result_upper.seven_day_utilization,
+            five_hour_pct: result_upper.five_hour_utilization,
+            sonnet_resets_at: result_upper.weekly_scoped_resets_at.clone(),
+            five_hour_resets_at: result_upper.five_hour_resets_at.clone(),
+            stale: result_upper.stale,
+            weekly_scoped_model: result_upper.weekly_scoped_model.clone(),
+        };
+
+        assert_eq!(
+            updated_lower.sonnet_pct, updated_upper.sonnet_pct,
+            "Case should not affect sonnet_pct value"
+        );
+
+        assert_eq!(
+            updated_lower.sonnet_pct, 42.5,
+            "sonnet_pct should be 42.5 regardless of case"
+        );
     }
 }
