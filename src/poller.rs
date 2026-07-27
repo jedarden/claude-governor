@@ -284,8 +284,10 @@ impl UsageData {
     ///
     /// Returns `true` if `weekly_scoped_model` indicates a Sonnet model
     /// (e.g. "Sonnet"), `false` for other models or when no model is known.
-    /// This enables conditional logic like "only update sonnet_pct if
-    /// weekly_scoped is actually tracking Sonnet."
+    ///
+    /// **Note:** The legacy `sonnet_pct` field is deprecated and should NOT be used
+    /// for weekly_scoped calculations. Use `weekly_scoped_pct` (model-agnostic) instead.
+    /// See state.rs lines 53-56 for the deprecated sonnet_pct field documentation.
     pub fn is_weekly_scoped_sonnet(&self) -> bool {
         match self.weekly_scoped_model.as_deref() {
             Some(model) => {

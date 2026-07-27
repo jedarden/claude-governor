@@ -50,8 +50,14 @@ pub type Result<T> = std::result::Result<T, StateError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageState {
-    /// Legacy field - kept for backward compatibility.
-    /// New code should use weekly_scoped_pct instead.
+    /// **DEPRECATED** - Legacy field kept for backward compatibility only.
+    ///
+    /// This field is NOT used for weekly_scoped calculations. Always set to 0.0.
+    /// New code should use `weekly_scoped_pct` (model-agnostic) instead.
+    ///
+    /// The weekly_scoped window now uses the model-agnostic `weekly_scoped_pct` field,
+    /// which tracks utilization regardless of which model (Fable, Opus, Sonnet, etc.)
+    /// carries the scoped cap this period.
     #[serde(default)]
     pub sonnet_pct: f64,
     pub all_models_pct: f64,

@@ -334,14 +334,8 @@ fn test_emergency_brake_at_98_percent() {
 
     // Update state with high utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
-    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
-    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
-    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
-    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
-    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
-    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
-    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
+    // Use model-agnostic weekly_scoped_pct instead of legacy sonnet_pct
+    state.usage.weekly_scoped_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Verify utilization is above emergency brake threshold
@@ -350,8 +344,8 @@ fn test_emergency_brake_at_98_percent() {
         "5-hour utilization should be at or above 98%"
     );
     assert!(
-        state.usage.sonnet_pct >= 98.0,
-        "Sonnet utilization should be at or above 98%"
+        state.usage.weekly_scoped_pct >= 98.0,
+        "Weekly-scoped utilization should be at or above 98%"
     );
     assert!(
         state.usage.all_models_pct >= 98.0,
@@ -384,14 +378,8 @@ fn test_no_emergency_brake_below_98_percent() {
 
     // Update state with moderate utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
-    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
-    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
-    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
-    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
-    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
-    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
-    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
+    // Use model-agnostic weekly_scoped_pct instead of legacy sonnet_pct
+    state.usage.weekly_scoped_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Verify utilization is below emergency brake threshold
@@ -400,8 +388,8 @@ fn test_no_emergency_brake_below_98_percent() {
         "5-hour utilization should be below 98%"
     );
     assert!(
-        state.usage.sonnet_pct < 98.0,
-        "Sonnet utilization should be below 98%"
+        state.usage.weekly_scoped_pct < 98.0,
+        "Weekly-scoped utilization should be below 98%"
     );
     assert!(
         state.usage.all_models_pct < 98.0,
@@ -428,14 +416,8 @@ fn test_state_updated_after_cycle() {
 
     // Simulate cycle: update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    // BUG: sonnet_pct is hard-coded to weekly_scoped_utilization without checking if the
-    // weekly_scoped window is actually tracking a Sonnet model. The weekly_scoped window can
-    // track any model (Sonnet, Opus, Fable, etc.). Correct behavior would be:
-    // sonnet_pct: if usage_data.is_weekly_scoped_sonnet() { usage_data.weekly_scoped_utilization } else { 0.0 }
-    // This test works because the mock poller's default data sets weekly_scoped_model in a way that
-    // makes the assignment semantically correct, but the pattern is fragile and model-incorrect.
-    // Prefer using weekly_scoped_pct (model-agnostic) instead of legacy sonnet_pct in tests.
-    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
+    // Use model-agnostic weekly_scoped_pct instead of legacy sonnet_pct
+    state.usage.weekly_scoped_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Update worker targets (simulate scaling decision)
@@ -458,9 +440,9 @@ fn test_state_updated_after_cycle() {
         "5-hour utilization should be updated"
     );
     assert_eq!(
-        reloaded_state.usage.sonnet_pct,
+        reloaded_state.usage.weekly_scoped_pct,
         58.0,
-        "Sonnet utilization should be updated"
+        "Weekly-scoped utilization should be updated"
     );
     assert_eq!(
         reloaded_state.usage.all_models_pct,
