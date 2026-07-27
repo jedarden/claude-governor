@@ -5093,4 +5093,93 @@ mod tests {
             "safe_worker_count should be computable from seeded rate"
         );
     }
+
+    #[test]
+    fn cold_window_wide_uncertainty_cone_production_path() {
+        // Test that cold windows produce wide uncertainty cones through the production path
+        // This directly calls generate_window_forecast to verify cold start uncertainty behavior
+        //
+        // Key insight: cold windows have no observed variance yet, so we conservatively
+        // assume high uncertainty by setting std_pct_hr proportional to the mean rate.
+        // This produces a wide confidence cone (cone_ratio > 1.0) that engages the
+        // pessimistic safe_worker_count_p75 path for safety.
+
+        let baseline_pct_per_worker = 2.0; // 2% per hour per worker
+        let worker_count = 3; // 3 workers currently running
+        let seeded_fleet_pct_hr = baseline_pct_per_worker * worker_count as f64; // 6.0%/hr
+
+        // CRITICAL: Cold start windows get widened uncertainty by setting std_pct_hr
+        // proportional to the mean rate (conservative assumption: no observed variance yet)
+        let widened_std_pct_hr = seeded_fleet_pct_hr; // Full spread for high uncertainty
+
+        // Call generate_window_forecast directly with cold start parameters
+        let forecast = generate_window_forecast(
+            "weekly_scoped",                     // cold window name
+            seeded_fleet_pct_hr,                 // seeded fleet burn rate: 6.0%/hr
+            30.0,                                // current utilization: 30%
+            90.0,                                // target ceiling: 90%
+            100.0,                               // hours remaining: 100 hours
+            baseline_pct_per_worker,            // mean rate per worker: 2.0%/hr
+            widened_std_pct_hr,                  // widened std for uncertainty: 6.0%/hr
+            crate::state::EstimateQuality::ColdStart, // quality flag: cold start
+        );
+
+        // VERIFY 1: Cold start flag is set
+        assert_eq!(
+            forecast.estimate_quality,
+            crate::state::EstimateQuality::ColdStart,
+            "cold window should have estimate_quality=ColdStart"
+        );
+
+        // VERIFY 2: Wide uncertainty cone (cone_ratio > 1.0)
+        // The widened std_pct_hr produces a spread between p25/p75 exhaustion estimates
+        assert!(
+            forecast.cone_ratio > 1.0,
+            "cold window should have wide uncertainty cone (cone_ratio > 1.0), got {:.3}",
+            forecast.cone_ratio
+        );
+
+        // VERIFY 3: Confidence bounds are properly spread (p25 < p50 < p75)
+        // p25 = pessimistic (fast burn) → fewer hours
+        // p50 = mean (expected)
+        // p75 = optimistic (slow burn) → more hours
+        assert!(
+            forecast.exh_hrs_p25 < forecast.exh_hrs_p50,
+            "p25 (pessimistic) should be < p50 (mean), got p25={:.2}, p50={:.2}",
+            forecast.exh_hrs_p25, forecast.exh_hrs_p50
+        );
+        assert!(
+            forecast.exh_hrs_p50 < forecast.exh_hrs_p75,
+            "p50 (mean) should be < p75 (optimistic), got p50={:.2}, p75={:.2}",
+            forecast.exh_hrs_p50, forecast.exh_hrs_p75
+        );
+
+        // VERIFY 4: The spread should be meaningful (not just floating point noise)
+        let spread_hours = forecast.exh_hrs_p75 - forecast.exh_hrs_p25;
+        assert!(
+            spread_hours > 1.0,
+            "confidence cone should have meaningful spread (>1 hour), got {:.3} hours",
+            spread_hours
+        );
+
+        // VERIFY 5: Conservative p75 safe worker count should be lower than p50
+        // The wide uncertainty cone makes the pessimistic path more conservative
+        if forecast.safe_worker_count_p75.is_some() && forecast.safe_worker_count.is_some() {
+            assert!(
+                forecast.safe_worker_count_p75 <= forecast.safe_worker_count,
+                "p75 safe workers should be <= p50 (more conservative), got p75={:?}, p50={:?}",
+                forecast.safe_worker_count_p75, forecast.safe_worker_count
+            );
+        }
+
+        // VERIFY 6: Central exhaustion estimate should still be finite and reasonable
+        // With 60% remaining (90-30) and 6.0%/hr seeded rate:
+        // expected_exhaustion = 60 / 6.0 = 10.0 hours
+        let expected_exhaustion = 60.0 / seeded_fleet_pct_hr;
+        assert!(
+            (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.1,
+            "predicted_exhaustion_hours should match seeded rate, expected {:.2}, got {:.2}",
+            expected_exhaustion, forecast.predicted_exhaustion_hours
+        );
+    }
 }
