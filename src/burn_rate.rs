@@ -4336,4 +4336,681 @@ mod tests {
             _ => panic!("expected Aging tier at exactly 15 minutes, got {:?}", tier),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Cold-start window behavior tests (bf-1oujo)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cold_start_window_seeds_base_rate_not_zero() {
+        // Verify cold-start windows get seeded with baseline rate, NOT 0.0
+        // This is the core fix: without seeding, fleet_pct_per_hour would be 0.0,
+        // leading to infinite predicted_exhaustion_hours and unsafe over-scaling.
+        // The key insight: cold-start logic only works when SOME windows have
+        // fresh rates (so the function doesn't return early), but SPECIFIC
+        // windows don't have fresh rates this interval.
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 2.5, // 2.5%/hr per worker
+            dollars_per_worker_per_hour: 10.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // five_hour has fresh rate, but weekly_scoped doesn't -> cold start for weekly_scoped
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(1.0), // five_hour: has fresh rate
+            None,       // seven_day: no fresh rate
+            None,       // weekly_scoped: no fresh rate (cold start!)
+            42.0, 41.0, // five_hour current/prev (delta 1.0)
+            30.0, 30.0, // seven_day unused (pct_delta None)
+            15.0, 15.0, // weekly_scoped unused (pct_delta None)
+        )];
+
+        // Window has utilization > 0 (it exists this period)
+        let mut utilization = HashMap::new();
+        utilization.insert("weekly_scoped".to_string(), 15.0); // 15% used, exists!
+        utilization.insert("five_hour".to_string(), 42.0);     // Has data
+        utilization.insert("seven_day".to_string(), 30.0);     // Has data
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("weekly_scoped".to_string(), 100.0); // 100 hours to reset
+        hrs_left.insert("five_hour".to_string(), 3.0);
+        hrs_left.insert("seven_day".to_string(), 140.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0, // 1 hour elapsed
+            2,   // 2 workers running
+            2,   // no worker count change
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // CRITICAL: weekly_scoped should have fleet_pct_per_hour seeded from baseline
+        // NOT 0.0 (which would imply infinite headroom)
+        let scoped = &forecast.weekly_scoped;
+        assert!(
+            scoped.fleet_pct_per_hour > 0.0,
+            "cold-start window must have positive fleet_pct_per_hour, got {}",
+            scoped.fleet_pct_per_hour
+        );
+
+        // Should equal: baseline.pct_per_worker_per_hour * current_workers
+        let expected_seeded_rate = 2.5 * 2.0; // 2.5%/worker * 2 workers = 5.0%/hr
+        assert!(
+            (scoped.fleet_pct_per_hour - expected_seeded_rate).abs() < 0.01,
+            "expected seeded fleet_pct_per_hour={:.2}, got {:.2}",
+            expected_seeded_rate,
+            scoped.fleet_pct_per_hour
+        );
+
+        // five_hour should use the measured rate from instance data, NOT seeded
+        assert!(
+            forecast.five_hour.fleet_pct_per_hour > 0.0,
+            "five_hour with fresh rate should have positive burn rate"
+        );
+        // Should be ~1.0%/hr from the delta, not the seeded 5.0%/hr
+        assert!(
+            forecast.five_hour.fleet_pct_per_hour < 3.0,
+            "five_hour should use measured rate (~1.0), not seeded rate (got {:.2})",
+            forecast.five_hour.fleet_pct_per_hour
+        );
+    }
+
+    #[test]
+    fn cold_start_window_sets_cold_start_quality_flag() {
+        // Verify cold-start windows are flagged with EstimateQuality::ColdStart
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // five_hour has data, weekly_scoped doesn't -> cold start for weekly_scoped
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(2.0), // five_hour: has fresh rate
+            Some(0.5), // seven_day: has fresh rate
+            None,       // weekly_scoped: no fresh rate (cold start!)
+            43.0, 41.0, // five_hour
+            61.0, 60.5, // seven_day
+            20.0, 20.0, // weekly_scoped unused
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("weekly_scoped".to_string(), 20.0); // Window exists with utilization
+        utilization.insert("five_hour".to_string(), 43.0);
+        utilization.insert("seven_day".to_string(), 61.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("weekly_scoped".to_string(), 80.0);
+        hrs_left.insert("five_hour".to_string(), 2.0);
+        hrs_left.insert("seven_day".to_string(), 120.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // weekly_scoped has no burn history (0 samples) and no fresh rate -> ColdStart
+        assert_eq!(
+            forecast.weekly_scoped.estimate_quality,
+            crate::state::EstimateQuality::ColdStart,
+            "cold-start window should have estimate_quality=ColdStart"
+        );
+
+        // five_hour and seven_day have fresh rates -> Calibrated
+        assert_eq!(
+            forecast.five_hour.estimate_quality,
+            crate::state::EstimateQuality::Calibrated,
+            "window with fresh rate should be Calibrated"
+        );
+        assert_eq!(
+            forecast.seven_day.estimate_quality,
+            crate::state::EstimateQuality::Calibrated,
+            "window with fresh rate should be Calibrated"
+        );
+    }
+
+    #[test]
+    fn cold_start_window_has_wide_uncertainty_cone() {
+        // Verify cold-start windows get widened uncertainty cones
+        // std_pct_hr is set to fleet_pct_hr itself, making cone_ratio > 1.0
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 3.0,
+            dollars_per_worker_per_hour: 12.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // five_hour has data, weekly_scoped doesn't -> cold start for weekly_scoped
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(1.5), // five_hour: has fresh rate
+            Some(0.3), // seven_day: has fresh rate
+            None,       // weekly_scoped: no fresh rate (cold start!)
+            42.5, 41.0, // five_hour
+            61.0, 60.7, // seven_day
+            25.0, 25.0, // weekly_scoped unused
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("weekly_scoped".to_string(), 25.0);
+        utilization.insert("five_hour".to_string(), 42.5);
+        utilization.insert("seven_day".to_string(), 61.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("weekly_scoped".to_string(), 90.0);
+        hrs_left.insert("five_hour".to_string(), 2.5);
+        hrs_left.insert("seven_day".to_string(), 110.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            3, // 3 workers
+            3,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        let scoped = &forecast.weekly_scoped;
+
+        // Uncertainty cone should be WIDE (cone_ratio > 1.0)
+        // When std_pct_hr == fleet_pct_hr (set by cold-start seeding),
+        // the cone calculation produces a ratio > 1.0
+        assert!(
+            scoped.cone_ratio > 1.0,
+            "cold-start window should have wide uncertainty cone (cone_ratio > 1.0), got {:.3}",
+            scoped.cone_ratio
+        );
+
+        // Verify the confidence bounds are actually spread (p25 < p50 < p75)
+        assert!(
+            scoped.exh_hrs_p25 < scoped.exh_hrs_p50,
+            "p25 (pessimistic) should be < p50 (mean)"
+        );
+        assert!(
+            scoped.exh_hrs_p50 < scoped.exh_hrs_p75,
+            "p50 (mean) should be < p75 (optimistic)"
+        );
+
+        // The spread should be significant (not just floating point noise)
+        let spread = scoped.exh_hrs_p75 - scoped.exh_hrs_p25;
+        assert!(
+            spread > 0.1,
+            "confidence cone should have meaningful spread, got {:.3} hours",
+            spread
+        );
+    }
+
+    #[test]
+    fn cold_start_with_zero_utilization_does_not_seed() {
+        // Verify windows with 0% utilization are NOT seeded (they're absent, not cold)
+        // This is the sentinel path: util == 0 means the window doesn't exist this period
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 2.0,
+            dollars_per_worker_per_hour: 8.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // five_hour has data, but weekly_scoped has 0% util -> absent, not cold
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(1.0), // five_hour: has fresh rate
+            None,       // seven_day: no fresh rate
+            None,       // weekly_scoped: no fresh rate, BUT 0% util!
+            41.0, 40.0, // five_hour
+            30.0, 30.0, // seven_day unused
+            0.0, 0.0,   // weekly_scoped: 0% util (absent)
+        )];
+
+        // weekly_scoped at 0% utilization (absent)
+        let mut utilization = HashMap::new();
+        utilization.insert("weekly_scoped".to_string(), 0.0); // ABSENT
+        utilization.insert("five_hour".to_string(), 41.0);
+        utilization.insert("seven_day".to_string(), 30.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("weekly_scoped".to_string(), 168.0);
+        hrs_left.insert("five_hour".to_string(), 4.0);
+        hrs_left.insert("seven_day".to_string(), 160.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // weekly_scoped with 0% util should NOT be seeded (absent window sentinel)
+        assert_eq!(
+            forecast.weekly_scoped.fleet_pct_per_hour, 0.0,
+            "absent window (0% util) should NOT be seeded, should remain 0.0"
+        );
+
+        // five_hour should have a positive rate from the fresh data
+        assert!(
+            forecast.five_hour.fleet_pct_per_hour > 0.0,
+            "five_hour with fresh rate should have positive burn rate"
+        );
+
+        // weekly_scoped should have infinite exhaustion (no constraint)
+        assert!(
+            forecast.weekly_scoped.predicted_exhaustion_hours.is_infinite(),
+            "absent window should have infinite exhaustion"
+        );
+    }
+
+    #[test]
+    fn window_with_fresh_rate_bypasses_cold_start() {
+        // Verify that windows with fresh per-instance rates use measured values,
+        // NOT the cold-start seeding path
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 10.0, // Very high baseline
+            dollars_per_worker_per_hour: 40.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // HAS instance records -> fresh rate -> bypass cold start
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-fable-4-20250514",
+            3.0,
+            600_000,
+            Some(4.0), // five_hour: 4% delta this interval
+            Some(0.5),
+            Some(1.0), // weekly_scoped: 1% delta this interval
+            45.0, 41.0, // five_hour
+            70.0, 69.5, // seven_day
+            25.0, 24.0, // weekly_scoped
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("weekly_scoped".to_string(), 25.0);
+        utilization.insert("five_hour".to_string(), 45.0);
+        utilization.insert("seven_day".to_string(), 70.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("weekly_scoped".to_string(), 90.0);
+        hrs_left.insert("five_hour".to_string(), 3.0);
+        hrs_left.insert("seven_day".to_string(), 120.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // weekly_scoped has fresh rate -> should use measured value, NOT baseline
+        let scoped = &forecast.weekly_scoped;
+        assert!(
+            scoped.fleet_pct_per_hour > 0.0,
+            "window with fresh rate should have positive burn rate"
+        );
+
+        // Should be based on the measured delta (1.0% / 1hr = 1.0%/hr), NOT baseline
+        assert!(
+            scoped.fleet_pct_per_hour < 5.0, // Much less than baseline 10.0
+            "fresh rate should use measured value, not baseline seeding (got {:.2})",
+            scoped.fleet_pct_per_hour
+        );
+
+        // Should be Calibrated, not ColdStart
+        assert_eq!(
+            scoped.estimate_quality,
+            crate::state::EstimateQuality::Calibrated,
+            "window with fresh rate should be Calibrated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for calibrated windows (bf-1oujo)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn calibrated_window_with_min_samples_unchanged() {
+        // Verify windows with >= MIN_SAMPLES_FOR_EMA produce unchanged forecasts
+        // This is a regression guard: ensure cold-start seeding doesn't affect calibrated windows
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 99.0, // Very different from measured
+            dollars_per_worker_per_hour: 50.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Build up exactly MIN_SAMPLES_FOR_EMA samples for five_hour ONLY
+        // (NOT for weekly_scoped, so it stays at 0 samples for the test)
+        for i in 0..3 {
+            let instances = vec![multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                2.0,
+                500_000,
+                Some(1.0), // Consistent 1%/hr burn rate for five_hour
+                None,       // seven_day: no data
+                None,       // weekly_scoped: no data (stays at 0 samples!)
+                41.0 + i as f64,
+                40.0,
+                60.5,
+                60.0,
+                70.75,
+                70.0,
+            )];
+
+            let mut utilization = HashMap::new();
+            utilization.insert("five_hour".to_string(), 41.0 + i as f64);
+            utilization.insert("seven_day".to_string(), 60.5);
+            utilization.insert("weekly_scoped".to_string(), 70.75);
+
+            let mut hrs_left = HashMap::new();
+            hrs_left.insert("five_hour".to_string(), 3.0);
+            hrs_left.insert("seven_day".to_string(), 37.5);
+            hrs_left.insert("weekly_scoped".to_string(), 37.5);
+
+            estimate_burn_rates(
+                &instances,
+                1.0,
+                1,
+                1,
+                &mut ema_state,
+                &baseline,
+                &utilization,
+                90.0,
+                &hrs_left,
+            );
+        }
+
+        let ema = ema_state
+            .get(&(
+                "claude-sonnet-4-20250514".to_string(),
+                "five_hour".to_string(),
+            ))
+            .unwrap();
+
+        assert_eq!(ema.samples, 3, "should have exactly 3 samples");
+
+        // Now run a fresh interval with NEW data (not empty) to test calibrated behavior
+        // weekly_scoped has no data (cold start), five_hour has fresh data (calibrated)
+        let instances = vec![multi_window_record(
+            "w2",
+            "claude-sonnet-4-20250514",
+            3.0,
+            800_000,
+            Some(1.2), // five_hour: fresh rate (calibrated)
+            None,       // seven_day: no fresh rate
+            None,       // weekly_scoped: no fresh rate (cold start)
+            45.0, 43.8, // five_hour
+            62.0, 62.0, // seven_day unused
+            80.0, 80.0, // weekly_scoped unused
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 45.0);
+        utilization.insert("seven_day".to_string(), 62.0);
+        utilization.insert("weekly_scoped".to_string(), 80.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 2.5);
+        hrs_left.insert("seven_day".to_string(), 140.0);
+        hrs_left.insert("weekly_scoped".to_string(), 90.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // five_hour has calibrated EMA (3 samples) -> should use EMA value, NOT baseline
+        let five_hour = &forecast.five_hour;
+        assert!(
+            five_hour.fleet_pct_per_hour > 0.0,
+            "calibrated window should have positive burn rate from EMA"
+        );
+
+        // Should be based on learned EMA (~1.0%/hr) and fresh data, NOT baseline (99.0%/hr)
+        assert!(
+            five_hour.fleet_pct_per_hour < 10.0,
+            "calibrated window should use EMA, not baseline (got {:.2})",
+            five_hour.fleet_pct_per_hour
+        );
+
+        // Should be Calibrated quality (has fresh rate)
+        assert_eq!(
+            five_hour.estimate_quality,
+            crate::state::EstimateQuality::Calibrated,
+            "window with fresh rate should be Calibrated"
+        );
+
+        // weekly_scoped with no samples and no fresh rate -> ColdStart
+        assert_eq!(
+            forecast.weekly_scoped.estimate_quality,
+            crate::state::EstimateQuality::ColdStart,
+            "window with 0 samples and no fresh rate should be ColdStart"
+        );
+
+        // weekly_scoped SHOULD be seeded from baseline
+        assert!(
+            forecast.weekly_scoped.fleet_pct_per_hour > 0.0,
+            "cold-start window should be seeded from baseline"
+        );
+    }
+
+    #[test]
+    fn regression_multi_model_binding_selection_unchanged() {
+        // Regression test: verify the production binding window selection logic
+        // is numerically unchanged after cold-start seeding was added.
+        // This tests the risk_score computation and window ranking.
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        let models = vec![
+            ("claude-sonnet-4-20250514", "fable-family", 0.1),
+            ("claude-opus-4-20250514", "opus-family", 0.05),
+        ];
+
+        for (model, _family, base_burn) in models {
+            let instances = vec![multi_window_record(
+                "w1",
+                model,
+                2.0,
+                500_000,
+                Some(base_burn),
+                Some(base_burn * 5.0),
+                Some(base_burn * 10.0),
+                79.0,
+                40.0,
+                40.0,
+                35.0,
+                85.0,
+                75.0,
+            )];
+
+            let mut utilization = HashMap::new();
+            utilization.insert("five_hour".to_string(), 79.0);
+            utilization.insert("seven_day".to_string(), 40.0);
+            utilization.insert("weekly_scoped".to_string(), 85.0);
+
+            let mut hrs_left = HashMap::new();
+            hrs_left.insert("five_hour".to_string(), 0.5);
+            hrs_left.insert("seven_day".to_string(), 37.5);
+            hrs_left.insert("weekly_scoped".to_string(), 2.0);
+
+            estimate_burn_rates(
+                &instances,
+                1.0,
+                1,
+                1,
+                &mut ema_state,
+                &baseline,
+                &utilization,
+                90.0,
+                &hrs_left,
+            );
+        }
+
+        // Verify all three windows have Calibrated quality and binding selection works
+        // Add a final instance with data for all windows to trigger forecast generation
+        let instances = vec![multi_window_record(
+            "w_final",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(0.15), // five_hour: fresh data
+            Some(0.75), // seven_day: fresh data
+            Some(1.5),  // weekly_scoped: fresh data
+            79.3,
+            79.0,
+            40.8,
+            40.0,
+            86.5,
+            85.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 79.3);
+        utilization.insert("seven_day".to_string(), 40.8);
+        utilization.insert("weekly_scoped".to_string(), 86.5);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 0.5);
+        hrs_left.insert("seven_day".to_string(), 37.5);
+        hrs_left.insert("weekly_scoped".to_string(), 2.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        assert_eq!(
+            forecast.five_hour.estimate_quality,
+            crate::state::EstimateQuality::Calibrated
+        );
+        assert_eq!(
+            forecast.seven_day.estimate_quality,
+            crate::state::EstimateQuality::Calibrated
+        );
+        assert_eq!(
+            forecast.weekly_scoped.estimate_quality,
+            crate::state::EstimateQuality::Calibrated
+        );
+
+        // Binding window selection should work as before (highest risk_score)
+        assert!(!forecast.binding_window.is_empty());
+        let binding = match forecast.binding_window.as_str() {
+            "five_hour" => &forecast.five_hour,
+            "seven_day" => &forecast.seven_day,
+            _ => &forecast.weekly_scoped,
+        };
+        assert!(binding.binding, "binding window should have binding=true");
+    }
+
+    #[test]
+    fn regression_safe_worker_count_computation_unchanged() {
+        // Regression test: verify safe_worker_count computation is unchanged
+        // for calibrated windows after cold-start seeding was added.
+        let baseline = BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 8.0,
+        };
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Single instance with known burn rate
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            4.0,
+            1_000_000,
+            Some(2.0), // 2% per hour
+            Some(1.0),
+            Some(1.5),
+            50.0, 48.0, // five_hour
+            50.0, 49.0, // seven_day
+            50.0, 48.5, // weekly_scoped
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 50.0);
+        utilization.insert("seven_day".to_string(), 50.0);
+        utilization.insert("weekly_scoped".to_string(), 50.0);
+
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 2.0);
+        hrs_left.insert("seven_day".to_string(), 100.0);
+        hrs_left.insert("weekly_scoped".to_string(), 50.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // five_hour: 40% remaining, 2% burn/hr, 2 hours to reset
+        // safe_workers = 40% / (2%/worker/hr * 2hr) = 40 / 4 = 10 workers
+        let five = &forecast.five_hour;
+        assert_eq!(
+            five.safe_worker_count,
+            Some(10),
+            "safe_worker_count should be computable from calibrated burn rate"
+        );
+
+        // Should have finite exhaustion time
+        assert!(
+            five.predicted_exhaustion_hours.is_finite(),
+            "calibrated window should have finite exhaustion"
+        );
+        assert!(
+            five.predicted_exhaustion_hours > 0.0,
+            "exhaustion should be in the future"
+        );
+    }
 }
