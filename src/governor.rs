@@ -4603,14 +4603,65 @@ pub fn run_governor_cycle(
             state::EstimateQuality::InsufficientSamples
         };
 
+        // --- Cold-start base-rate seeding for production path (bead bf-3ebgd) ---
+        //
+        // When a window has insufficient EMA samples (< MIN_SAMPLES_FOR_EMA) and no
+        // observed burn rate this interval (fleet_pct_hr == 0.0), it would otherwise
+        // carry a zero rate straight into generate_window_forecast, which interprets
+        // 0 as *infinite* headroom (predicted_exhaustion = +inf). This is dangerous
+        // for cold-start windows that are genuinely active but lack calibration history.
+        //
+        // Fix: seed the burn rate from the agent config's baseline_burn_rate (via
+        // baseline_burn_rate_or_default accessor) when the window is in cold start
+        // AND the API reports real utilization (util > 0.0, meaning the window exists
+        // this period rather than being the absent-window sentinel at 0%).
+        //
+        // Rationale for baseline_burn_rate as the seed:
+        // - Already present in AgentConfig, no new coupling
+        // - Conservative (1.5% per worker/hr by default)
+        // - Per-agent configurable for different models
+        // - Same source already used by the burn_rate module's fallback logic
+        //
+        // Keep uncertainty wide: the seeded rate uses a non-trivial fleet stddev
+        // (the full fleet rate itself) to widen the confidence cone, so the
+        // pessimistic p75 safe-worker path engages until real samples take over.
+        // Calibrated windows (>= MIN_SAMPLES_FOR_EMA) are unaffected.
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
+            if matches!(estimate_quality, state::EstimateQuality::ColdStart | state::EstimateQuality::InsufficientSamples)
+                && util > 0.0
+                && fleet_pct_hr == 0.0
+                && current_total > 0
+            {
+                let base_per_worker = baseline.pct_per_worker_per_hour;
+                let seeded_fleet_pct = base_per_worker * current_total as f64;
+                // Mark the estimate uncertain: a fleet stddev on the order of the rate
+                // itself widens the confidence cone (cone_ratio > 1) so the pessimistic
+                // p75 exhaustion / safe-worker path engages. Using the full fleet rate
+                // as the spread is deliberately conservative for a wholly unmeasured window.
+                let widened_std_pct = seeded_fleet_pct;
+                log::info!(
+                    "[governor] {}: cold-start (no burn samples yet, util={:.1}%) — \
+                     seeding conservative base rate {:.3}%/worker/hr across {} worker(s) \
+                     with widened uncertainty cone; estimate will self-correct as \
+                     real samples accumulate",
+                    window,
+                    util,
+                    base_per_worker,
+                    current_total,
+                );
+                (seeded_fleet_pct, base_per_worker, widened_std_pct)
+            } else {
+                (fleet_pct_hr, pct_per_worker, std_pct_hr)
+            };
+
         let forecast = generate_window_forecast(
             window,
-            fleet_pct_hr,
+            fleet_pct_hr_seeded,
             util,
             effective_target_ceiling,
             hrs_left,
-            pct_per_worker,
-            std_pct_hr,
+            pct_per_worker_seeded,
+            std_pct_hr_seeded,
             estimate_quality,
         );
 
@@ -6207,6 +6258,155 @@ mod tests {
         assert!(
             forecast.predicted_exhaustion_hours.is_finite(),
             "baseline fallback should produce a finite exhaustion estimate"
+        );
+    }
+
+    // --- Cold-start base-rate seeding (bead bf-3ebgd) ---
+
+    /// Verify cold-start seeding logic: when a window has no burn rate data
+    /// but exists this period (util > 0), it should be seeded from baseline
+    /// instead of using 0.0 (which would imply infinite headroom).
+    #[test]
+    fn cold_start_seeds_from_baseline_when_window_exists() {
+        use crate::state::EstimateQuality;
+
+        // Simulate cold-start conditions
+        let estimate_quality = EstimateQuality::ColdStart;
+        let util = 15.0; // window exists with 15% utilization
+        let fleet_pct_hr = 0.0; // no burn rate data yet
+        let current_total = 2; // 2 workers running
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5, // default baseline
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        // Apply the seeding logic (matches the inline code in governor.rs)
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
+            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
+                && util > 0.0
+                && fleet_pct_hr == 0.0
+                && current_total > 0
+            {
+                let base_per_worker = baseline.pct_per_worker_per_hour;
+                let seeded_fleet_pct = base_per_worker * current_total as f64;
+                let widened_std_pct = seeded_fleet_pct;
+                (seeded_fleet_pct, base_per_worker, widened_std_pct)
+            } else {
+                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+            };
+
+        // Verify seeding occurred
+        assert!(
+            (fleet_pct_hr_seeded - 3.0).abs() < 1e-9,
+            "expected fleet_pct_hr_seeded = 3.0 (1.5 * 2 workers), got {}",
+            fleet_pct_hr_seeded
+        );
+        assert!(
+            (pct_per_worker_seeded - 1.5).abs() < 1e-9,
+            "expected pct_per_worker_seeded = 1.5 (baseline), got {}",
+            pct_per_worker_seeded
+        );
+        assert!(
+            std_pct_hr_seeded > 0.0,
+            "expected widened std_pct_hr_seeded > 0 for uncertainty, got {}",
+            std_pct_hr_seeded
+        );
+
+        // Verify the forecast produces meaningful results (not infinite headroom)
+        let forecast = generate_window_forecast(
+            "weekly_scoped",
+            fleet_pct_hr_seeded,
+            util,
+            90.0, // target ceiling
+            24.0, // hours remaining
+            pct_per_worker_seeded,
+            std_pct_hr_seeded,
+            estimate_quality,
+        );
+
+        assert!(
+            forecast.safe_worker_count.is_some(),
+            "cold-start seeded forecast should produce a non-None safe_worker_count"
+        );
+        assert!(
+            forecast.predicted_exhaustion_hours.is_finite(),
+            "cold-start seeded forecast should produce a finite exhaustion estimate, got {}",
+            forecast.predicted_exhaustion_hours
+        );
+    }
+
+    /// Verify cold-start does NOT seed when window is absent (util == 0).
+    /// An absent window should stay at 0.0 pct/hr (genuinely empty).
+    #[test]
+    fn cold_start_does_not_seed_when_window_absent() {
+        use crate::state::EstimateQuality;
+
+        let estimate_quality = EstimateQuality::ColdStart;
+        let util = 0.0; // window absent (sentinel value)
+        let fleet_pct_hr = 0.0;
+        let current_total = 2;
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
+            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
+                && util > 0.0
+                && fleet_pct_hr == 0.0
+                && current_total > 0
+            {
+                let base_per_worker = baseline.pct_per_worker_per_hour;
+                let seeded_fleet_pct = base_per_worker * current_total as f64;
+                let widened_std_pct = seeded_fleet_pct;
+                (seeded_fleet_pct, base_per_worker, widened_std_pct)
+            } else {
+                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+            };
+
+        // Verify NO seeding occurred (util == 0 means absent window)
+        assert_eq!(
+            fleet_pct_hr_seeded, 0.0,
+            "absent window (util=0) should NOT be seeded, got {}",
+            fleet_pct_hr_seeded
+        );
+        assert_eq!(
+            pct_per_worker_seeded, 0.0,
+            "absent window pct_per_worker should stay 0.0, got {}",
+            pct_per_worker_seeded
+        );
+    }
+
+    /// Verify calibrated windows are never seeded (already have data).
+    #[test]
+    fn calibrated_windows_are_never_seeded() {
+        use crate::state::EstimateQuality;
+
+        let estimate_quality = EstimateQuality::Calibrated; // NOT cold-start
+        let util = 15.0;
+        let fleet_pct_hr = 4.2; // has observed burn rate
+        let current_total = 2;
+        let baseline = crate::state::BaselineBurnRates {
+            pct_per_worker_per_hour: 1.5,
+            dollars_per_worker_per_hour: 5.0,
+        };
+
+        let (fleet_pct_hr_seeded, _, _) =
+            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
+                && util > 0.0
+                && fleet_pct_hr == 0.0
+                && current_total > 0
+            {
+                panic!("calibrated window should never enter seeding logic");
+            } else {
+                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+            };
+
+        // Verify original values passed through unchanged
+        assert_eq!(
+            fleet_pct_hr_seeded, 4.2,
+            "calibrated window should keep original fleet_pct_hr, got {}",
+            fleet_pct_hr_seeded
         );
     }
 
