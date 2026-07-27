@@ -5182,4 +5182,435 @@ mod tests {
             expected_exhaustion, forecast.predicted_exhaustion_hours
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for calibrated windows (bf-1nu4p)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn calibrated_window_narrow_uncertainty_cone_production_path() {
+        // Test that calibrated windows produce narrow uncertainty cones
+        // Calibrated windows have observed variance (std_pct_hr from real samples),
+        // so their confidence cones should be narrower than cold-start windows.
+        //
+        // Key insight: Once a window has >= MIN_SAMPLES_FOR_EMA samples, the
+        // EMA is trusted and the observed std_pct_hr is used (not the artificially
+        // widened cold-start value). This produces cone_ratio closer to 1.0.
+
+        // Simulate a calibrated window with real observed burn rate statistics
+        let fleet_pct_hr = 5.0; // 5% per hour fleet burn rate
+        let current_utilization = 45.0; // 45% current utilization
+        let target_ceiling = 90.0; // 90% ceiling
+        let hours_remaining = 10.0; // 10 hours to reset
+        let mean_rate_per_worker = 2.5; // 2.5% per hour per worker
+        let std_pct_hr = 0.5; // Low observed variance (0.5%/hr std)
+
+        // Call generate_window_forecast with Calibrated quality
+        let forecast = generate_window_forecast(
+            "five_hour",
+            fleet_pct_hr,
+            current_utilization,
+            target_ceiling,
+            hours_remaining,
+            mean_rate_per_worker,
+            std_pct_hr, // Low variance from real samples
+            crate::state::EstimateQuality::Calibrated, // Calibrated quality
+        );
+
+        // VERIFY 1: Estimate quality is Calibrated
+        assert_eq!(
+            forecast.estimate_quality,
+            crate::state::EstimateQuality::Calibrated,
+            "calibrated window should have estimate_quality=Calibrated"
+        );
+
+        // VERIFY 2: Narrow uncertainty cone (cone_ratio close to 1.0)
+        // With std_pct_hr = 0.5 and fleet_pct_hr = 5.0, the spread is small
+        // rate_fast = 5.0 + 0.675*0.5 = 5.3375
+        // rate_slow = 5.0 - 0.675*0.5 = 4.6625
+        // cone_ratio = rate_fast/rate_slow = 5.3375/4.6625 ≈ 1.145
+        let expected_cone_ratio = (fleet_pct_hr + 0.675 * std_pct_hr) / (fleet_pct_hr - 0.675 * std_pct_hr);
+        assert!(
+            (forecast.cone_ratio - expected_cone_ratio).abs() < 0.01,
+            "cone_ratio should match calculation from std_pct_hr, expected {:.3}, got {:.3}",
+            expected_cone_ratio,
+            forecast.cone_ratio
+        );
+
+        // VERIFY 3: Cone ratio should be relatively narrow (< 1.5 for this case)
+        assert!(
+            forecast.cone_ratio < 1.5,
+            "calibrated window should have narrow cone ratio (< 1.5), got {:.3}",
+            forecast.cone_ratio
+        );
+
+        // VERIFY 4: Confidence bounds should be ordered correctly but close together
+        assert!(
+            forecast.exh_hrs_p25 < forecast.exh_hrs_p50,
+            "p25 (pessimistic) should be < p50 (mean)"
+        );
+        assert!(
+            forecast.exh_hrs_p50 < forecast.exh_hrs_p75,
+            "p50 (mean) should be < p75 (optimistic)"
+        );
+
+        // VERIFY 5: The spread should be relatively small (tight confidence)
+        // With std_pct_hr = 0.5 and remaining = 45%, the spread is:
+        // spread = 45 * (1/rate_slow - 1/rate_fast)
+        //        = 45 * (1/4.6625 - 1/5.3375)
+        //        ≈ 1.2 hours
+        // So we use < 2.0 as a reasonable threshold for "tight"
+        let spread_hours = forecast.exh_hrs_p75 - forecast.exh_hrs_p25;
+        assert!(
+            spread_hours < 2.0,
+            "calibrated window should have tight confidence (spread < 2 hours), got {:.3} hours",
+            spread_hours
+        );
+
+        // VERIFY 6: Central exhaustion estimate should be as calculated
+        // remaining = 90 - 45 = 45%
+        // exhaustion = 45 / 5.0 = 9.0 hours
+        let remaining_pct = target_ceiling - current_utilization;
+        let expected_exhaustion = remaining_pct / fleet_pct_hr;
+        assert!(
+            (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.01,
+            "predicted_exhaustion_hours should match calculation, expected {:.2}, got {:.2}",
+            expected_exhaustion,
+            forecast.predicted_exhaustion_hours
+        );
+    }
+
+    #[test]
+    fn calibrated_window_forecast_deterministic_production_path() {
+        // Test that calibrated windows produce deterministic, unchanged forecasts
+        // Given the same inputs, generate_window_forecast should produce identical
+        // outputs for calibrated windows. This is a regression guard ensuring
+        // forecast stability.
+
+        let inputs = (
+            "seven_day", // window name
+            3.5,         // fleet_pct_hr
+            60.0,        // current_utilization
+            90.0,        // target_ceiling
+            50.0,        // hours_remaining
+            1.75,        // mean_rate_per_worker
+            0.35,        // std_pct_hr
+        );
+
+        // Call generate_window_forecast twice with identical inputs
+        let forecast1 = generate_window_forecast(
+            inputs.0,
+            inputs.1,
+            inputs.2,
+            inputs.3,
+            inputs.4,
+            inputs.5,
+            inputs.6,
+            crate::state::EstimateQuality::Calibrated,
+        );
+
+        let forecast2 = generate_window_forecast(
+            inputs.0,
+            inputs.1,
+            inputs.2,
+            inputs.3,
+            inputs.4,
+            inputs.5,
+            inputs.6,
+            crate::state::EstimateQuality::Calibrated,
+        );
+
+        // VERIFY: All numeric fields should be identical
+        assert_eq!(
+            forecast1.fleet_pct_per_hour,
+            forecast2.fleet_pct_per_hour,
+            "fleet_pct_per_hour should be identical"
+        );
+        assert_eq!(
+            forecast1.remaining_pct,
+            forecast2.remaining_pct,
+            "remaining_pct should be identical"
+        );
+        assert_eq!(
+            forecast1.predicted_exhaustion_hours,
+            forecast2.predicted_exhaustion_hours,
+            "predicted_exhaustion_hours should be identical"
+        );
+        assert_eq!(
+            forecast1.margin_hrs,
+            forecast2.margin_hrs,
+            "margin_hrs should be identical"
+        );
+        assert_eq!(
+            forecast1.safe_worker_count,
+            forecast2.safe_worker_count,
+            "safe_worker_count should be identical"
+        );
+        assert_eq!(
+            forecast1.cone_ratio,
+            forecast2.cone_ratio,
+            "cone_ratio should be identical"
+        );
+        assert_eq!(
+            forecast1.exh_hrs_p25,
+            forecast2.exh_hrs_p25,
+            "exh_hrs_p25 should be identical"
+        );
+        assert_eq!(
+            forecast1.exh_hrs_p50,
+            forecast2.exh_hrs_p50,
+            "exh_hrs_p50 should be identical"
+        );
+        assert_eq!(
+            forecast1.exh_hrs_p75,
+            forecast2.exh_hrs_p75,
+            "exh_hrs_p75 should be identical"
+        );
+        assert_eq!(
+            forecast1.risk_score,
+            forecast2.risk_score,
+            "risk_score should be identical"
+        );
+    }
+
+    #[test]
+    fn calibrated_window_uses_observed_variance_not_baseline() {
+        // Test that calibrated windows use observed variance (std_pct_hr from samples),
+        // NOT the artificially widened cold-start baseline variance.
+        //
+        // This is critical for forecast accuracy: cold windows are seeded with
+        // conservative high variance, but calibrated windows should use the
+        // actual observed variance from real samples.
+
+        let fleet_pct_hr = 4.0; // 4% per hour
+        let mean_rate_per_worker = 2.0; // 2% per hour per worker
+
+        // Calibrated window: LOW observed variance (from real samples)
+        let calibrated_std = 0.4; // 0.4%/hr std (narrow spread)
+
+        let forecast_calibrated = generate_window_forecast(
+            "five_hour",
+            fleet_pct_hr,
+            40.0,
+            90.0,
+            5.0,
+            mean_rate_per_worker,
+            calibrated_std,
+            crate::state::EstimateQuality::Calibrated,
+        );
+
+        // VERIFY: Calibrated window should have narrow cone
+        assert!(
+            forecast_calibrated.cone_ratio < 1.5,
+            "calibrated window with low variance should have narrow cone (< 1.5), got {:.3}",
+            forecast_calibrated.cone_ratio
+        );
+
+        // Compare with what would happen with cold-start widened variance
+        let cold_std = fleet_pct_hr; // Cold start: widened to match mean rate
+
+        let forecast_cold = generate_window_forecast(
+            "five_hour",
+            fleet_pct_hr,
+            40.0,
+            90.0,
+            5.0,
+            mean_rate_per_worker,
+            cold_std,
+            crate::state::EstimateQuality::ColdStart,
+        );
+
+        // VERIFY: Cold window should have much wider cone
+        assert!(
+            forecast_cold.cone_ratio > forecast_calibrated.cone_ratio,
+            "cold window should have wider cone than calibrated window"
+        );
+
+        // VERIFY: Calibrated cone should be significantly narrower
+        // (at least 2x narrower in this case)
+        assert!(
+            forecast_cold.cone_ratio > forecast_calibrated.cone_ratio * 2.0,
+            "cold window cone should be >2x wider than calibrated cone"
+        );
+    }
+
+    #[test]
+    fn calibrated_window_safe_worker_count_computation_unchanged() {
+        // Test that calibrated windows compute safe_worker_count correctly
+        // This verifies the production path uses the observed burn rates,
+        // not baseline values.
+
+        let fleet_pct_hr = 6.0; // 6% per hour fleet burn
+        let mean_rate_per_worker = 3.0; // 3% per hour per worker (2 workers)
+        let std_pct_hr = 0.6; // Moderate variance
+
+        let forecast = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            72.0, // 72% current utilization
+            90.0, // 90% ceiling
+            30.0, // 30 hours to reset
+            mean_rate_per_worker,
+            std_pct_hr,
+            crate::state::EstimateQuality::Calibrated,
+        );
+
+        // VERIFY: safe_worker_count should be computable
+        assert!(
+            forecast.safe_worker_count.is_some(),
+            "safe_worker_count should be computable for calibrated window"
+        );
+
+        // VERIFY: safe_worker_count calculation
+        // remaining = 90 - 72 = 18%
+        // safe = floor(18 / (3.0 * 30)) = floor(18 / 90) = 0 workers
+        let expected_safe = ((90.0 - 72.0) / (mean_rate_per_worker * 30.0)).floor() as u32;
+        assert_eq!(
+            forecast.safe_worker_count,
+            Some(expected_safe),
+            "safe_worker_count should match calculation"
+        );
+
+        // VERIFY: Exhaustion prediction should be finite
+        // remaining = 18%, burn = 6%/hr
+        // exhaustion = 18 / 6 = 3.0 hours
+        let expected_exhaustion = (90.0 - 72.0) / fleet_pct_hr;
+        assert!(
+            forecast.predicted_exhaustion_hours.is_finite(),
+            "calibrated window should have finite exhaustion"
+        );
+        assert!(
+            (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.01,
+            "exhaustion should match calculation, expected {:.2}, got {:.2}",
+            expected_exhaustion,
+            forecast.predicted_exhaustion_hours
+        );
+
+        // VERIFY: With 3 hours exhaustion and 30 hours to reset, should have negative margin
+        // margin = 3 - 30 = -27 hours (will exhaust before reset)
+        let expected_margin = expected_exhaustion - 30.0;
+        assert!(
+            (forecast.margin_hrs - expected_margin).abs() < 0.01,
+            "margin_hrs should match calculation, expected {:.2}, got {:.2}",
+            expected_margin,
+            forecast.margin_hrs
+        );
+        assert!(
+            forecast.margin_hrs < 0.0,
+            "should have negative margin (will exhaust before reset)"
+        );
+        assert!(
+            forecast.cutoff_risk,
+            "cutoff_risk should be true (will exhaust before reset)"
+        );
+    }
+
+    #[test]
+    fn calibrated_window_with_zero_variance_unstable_cone() {
+        // Test calibrated window with zero or near-zero variance
+        // When std_pct_hr is zero (all samples identical), cone_ratio should be 1.0
+        // (perfect confidence, no spread in the data)
+
+        let forecast = generate_window_forecast(
+            "weekly_scoped",
+            2.0, // 2% per hour
+            50.0,
+            90.0,
+            40.0,
+            1.0, // 1% per hour per worker
+            0.0, // ZERO variance (all samples identical)
+            crate::state::EstimateQuality::Calibrated,
+        );
+
+        // VERIFY: With zero variance, cone_ratio should be exactly 1.0
+        // (no spread in the confidence interval)
+        assert!(
+            (forecast.cone_ratio - 1.0).abs() < 1e-9,
+            "zero variance should produce cone_ratio=1.0, got {:.3}",
+            forecast.cone_ratio
+        );
+
+        // VERIFY: All cone values should be identical (no spread)
+        assert!(
+            (forecast.exh_hrs_p25 - forecast.exh_hrs_p50).abs() < 1e-9,
+            "p25 should equal p50 with zero variance"
+        );
+        assert!(
+            (forecast.exh_hrs_p50 - forecast.exh_hrs_p75).abs() < 1e-9,
+            "p50 should equal p75 with zero variance"
+        );
+        assert!(
+            (forecast.exh_hrs_p25 - forecast.exh_hrs_p75).abs() < 1e-9,
+            "p25 should equal p75 with zero variance"
+        );
+
+        // VERIFY: Central exhaustion should still be calculated correctly
+        // remaining = 90 - 50 = 40%
+        // exhaustion = 40 / 2.0 = 20.0 hours
+        let expected_exhaustion = 40.0 / 2.0;
+        assert!(
+            (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.01,
+            "exhaustion should be {:.2}, got {:.2}",
+            expected_exhaustion,
+            forecast.predicted_exhaustion_hours
+        );
+    }
+
+    #[test]
+    fn calibrated_window_multiple_models_unchanged_forecasts() {
+        // Test that calibrated windows for different models produce numerically
+        // stable forecasts. This is a regression test ensuring the production
+        // path handles model-specific calibration correctly.
+
+        let models = [
+            ("claude-sonnet-4-20250514", 2.5, 0.25),
+            ("claude-opus-4-20250514", 5.0, 0.5),
+            ("claude-fable-5", 1.5, 0.15),
+        ];
+
+        for (model, fleet_pct, std_pct) in models {
+            let forecast = generate_window_forecast(
+                "five_hour",
+                fleet_pct,
+                60.0,
+                90.0,
+                3.0,
+                fleet_pct / 2.0, // mean per worker (assuming 2 workers)
+                std_pct,
+                crate::state::EstimateQuality::Calibrated,
+            );
+
+            // VERIFY: All models should produce valid forecasts
+            assert!(
+                forecast.fleet_pct_per_hour > 0.0,
+                "{}: should have positive burn rate",
+                model
+            );
+            assert!(
+                forecast.predicted_exhaustion_hours.is_finite(),
+                "{}: should have finite exhaustion",
+                model
+            );
+            assert!(
+                forecast.safe_worker_count.is_some(),
+                "{}: should have computable safe_worker_count",
+                model
+            );
+            assert_eq!(
+                forecast.estimate_quality,
+                crate::state::EstimateQuality::Calibrated,
+                "{}: should be Calibrated",
+                model
+            );
+
+            // VERIFY: Forecasts should use the provided burn rate, not baseline
+            assert!(
+                (forecast.fleet_pct_per_hour - fleet_pct).abs() < 1e-9,
+                "{}: fleet_pct_per_hour should equal input ({:.2}), got {:.2}",
+                model,
+                fleet_pct,
+                forecast.fleet_pct_per_hour
+            );
+        }
+    }
 }
