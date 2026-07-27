@@ -15,7 +15,7 @@ use chrono::{Utc, Duration};
 use anyhow::Result;
 
 use claude_governor::config::{GovernorConfig, AlertConfig, DaemonConfig, PricingConfig, SprintConfig, CompositeRiskConfig, ConeScalingConfig, ModelPricing};
-use claude_governor::governor::{UsageSnapshot, WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_SEVEN_DAY_SONNET};
+use claude_governor::governor::{UsageSnapshot, WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED};
 use claude_governor::poller::UsageData;
 use claude_governor::state::{self, GovernorState, WorkerState};
 
@@ -50,11 +50,11 @@ impl SimpleMockPoller {
     }
 
     /// Create a mock poller with custom utilization values
-    pub fn with_utilization(five_hour_util: f64, seven_day_util: f64, seven_day_sonnet_util: f64) -> Self {
+    pub fn with_utilization(five_hour_util: f64, seven_day_util: f64, weekly_scoped_util: f64) -> Self {
         let mut data = Self::default_usage_data();
         data.five_hour_utilization = five_hour_util;
         data.seven_day_utilization = seven_day_util;
-        data.seven_day_sonnet_utilization = seven_day_sonnet_util;
+        data.weekly_scoped_utilization = weekly_scoped_util;
 
         Self {
             usage_data: Some(data),
@@ -93,9 +93,10 @@ impl SimpleMockPoller {
             seven_day_utilization: 60.0,
             seven_day_resets_at: seven_day_reset.to_rfc3339(),
             seven_day_hours_remaining: 120.0,
-            seven_day_sonnet_utilization: 55.0,
-            seven_day_sonnet_resets_at: seven_day_reset.to_rfc3339(),
-            seven_day_sonnet_hours_remaining: 120.0,
+            weekly_scoped_utilization: 55.0,
+            weekly_scoped_resets_at: seven_day_reset.to_rfc3339(),
+            weekly_scoped_hours_remaining: 120.0,
+            weekly_scoped_model: None,
             limits: vec![],
             timestamp: now,
             stale: false,
@@ -297,7 +298,7 @@ fn test_poller_data_processed_to_snapshot() {
     let snapshot = UsageSnapshot::from_windows(
         poll_result.five_hour_utilization,
         poll_result.seven_day_utilization,
-        poll_result.seven_day_sonnet_utilization,
+        poll_result.weekly_scoped_utilization,
     );
 
     // Verify snapshot contains correct data
@@ -312,7 +313,7 @@ fn test_poller_data_processed_to_snapshot() {
         "7-day utilization should be 70%"
     );
     assert_eq!(
-        snapshot.get(WINDOW_SEVEN_DAY_SONNET),
+        snapshot.get(WINDOW_WEEKLY_SCOPED),
         Some(68.0),
         "7-day Sonnet utilization should be 68%"
     );
@@ -333,7 +334,7 @@ fn test_emergency_brake_at_98_percent() {
 
     // Update state with high utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Verify utilization is above emergency brake threshold
@@ -376,7 +377,7 @@ fn test_no_emergency_brake_below_98_percent() {
 
     // Update state with moderate utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Verify utilization is below emergency brake threshold
@@ -413,7 +414,7 @@ fn test_state_updated_after_cycle() {
 
     // Simulate cycle: update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Update worker targets (simulate scaling decision)
@@ -566,7 +567,7 @@ fn test_stale_data_handling() {
     // In a real cycle, stale data would still update state but with a warning
     // Simulate updating state with stale data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // State should still be updated (stale data is better than no data)
@@ -604,7 +605,7 @@ fn test_complete_governor_cycle() {
 
     // 3. Update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Simulate scaling decision: scale up due to high utilization
@@ -683,7 +684,7 @@ fn test_emergency_brake_exact_threshold() {
 
     // Update state with threshold utilization
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
-    state.usage.sonnet_pct = poll_result.seven_day_sonnet_utilization;
+    state.usage.sonnet_pct = poll_result.weekly_scoped_utilization;
     state.usage.all_models_pct = poll_result.seven_day_utilization;
 
     // Verify utilization is exactly at threshold

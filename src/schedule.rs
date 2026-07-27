@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};
 
-    // Test promotion: March 15-25, 2026 with 2x off-peak for seven_day_sonnet only
+    // Test promotion: March 15-25, 2026 with 2x off-peak for weekly_scoped only
     fn test_promo() -> Promotion {
         Promotion {
             name: "March 2026 Promo".to_string(),
@@ -317,7 +317,7 @@ mod tests {
             peak_start_hour_et: 8,
             peak_end_hour_et: 14,
             offpeak_multiplier: 2.0,
-            applies_to: vec!["seven_day_sonnet".to_string()],
+            applies_to: vec!["weekly_scoped".to_string()],
         }
     }
 
@@ -377,7 +377,7 @@ mod tests {
         let promos = vec![test_promo()];
         // Monday March 16, 2026 at 10:00 AM ET (peak, during promo)
         let t = et_to_utc(2026, 3, 16, 10, 0);
-        assert!((get_multiplier_at(t, &promos, "seven_day_sonnet") - 1.0).abs() < 1e-9);
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -385,7 +385,7 @@ mod tests {
         let promos = vec![test_promo()];
         // Monday March 16, 2026 at 6:00 AM ET (off-peak, during promo)
         let t = et_to_utc(2026, 3, 16, 6, 0);
-        assert!((get_multiplier_at(t, &promos, "seven_day_sonnet") - 2.0).abs() < 1e-9);
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -393,7 +393,7 @@ mod tests {
         let promos = vec![test_promo()];
         // March 26, 2026 at 6:00 AM ET (after promo ended on 25th)
         let t = et_to_utc(2026, 3, 26, 6, 0);
-        assert!((get_multiplier_at(t, &promos, "seven_day_sonnet") - 1.0).abs() < 1e-9);
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -401,21 +401,21 @@ mod tests {
         let promos = vec![test_promo()];
         // March 14, 2026 at 6:00 AM ET (before promo starts on 15th)
         let t = et_to_utc(2026, 3, 14, 6, 0);
-        assert!((get_multiplier_at(t, &promos, "seven_day_sonnet") - 1.0).abs() < 1e-9);
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9);
     }
 
     /// Regression test: applies_to filtering — only listed windows get the boost
     #[test]
     fn multiplier_applies_to_filtering() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
         // Monday March 16, 2026 at 6:00 AM ET (off-peak, during promo)
         let t = et_to_utc(2026, 3, 16, 6, 0);
 
         // Listed window gets 2x
         assert!(
-            (get_multiplier_at(t, &promos, "seven_day_sonnet") - 2.0).abs() < 1e-9,
-            "seven_day_sonnet should get 2x (in applies_to)"
+            (get_multiplier_at(t, &promos, "weekly_scoped") - 2.0).abs() < 1e-9,
+            "weekly_scoped should get 2x (in applies_to)"
         );
         // Unlisted windows always get 1.0x
         assert!(
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn effective_hours_with_offpeak_promo_is_greater() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Start: Monday March 16, 2026 at 6:00 AM ET (off-peak)
@@ -448,8 +448,8 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 6, 0);
         let reset = start + Duration::hours(48);
 
-        // seven_day_sonnet gets the 2x boost
-        let effective = effective_hours_remaining_from(start, reset, &promos, "seven_day_sonnet");
+        // weekly_scoped gets the 2x boost
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
         assert!(effective > 48.0, "expected > 48, got {}", effective);
         assert!(
             effective > 70.0,
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn effective_hours_with_transition() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Start: Monday March 16, 2026 at 13:30 ET (peak)
@@ -476,7 +476,7 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 13, 30);
         let reset = et_to_utc(2026, 3, 16, 15, 30);
 
-        let effective = effective_hours_remaining_from(start, reset, &promos, "seven_day_sonnet");
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
 
         // 0.5h peak * 1x + 1.5h off-peak * 2x = 0.5 + 3.0 = 3.5
         assert!(
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn find_transition_detects_peak_to_offpeak() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Start: Monday March 16, 2026 at 13:00 ET (peak)
@@ -496,7 +496,7 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 13, 0);
         let end = et_to_utc(2026, 3, 16, 15, 0);
 
-        let transition = find_next_transition(start, end, &promos, "seven_day_sonnet");
+        let transition = find_next_transition(start, end, &promos, "weekly_scoped");
         assert!(transition.is_some());
 
         let (t, before, after) = transition.unwrap();
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn find_transition_detects_offpeak_to_peak() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Start: Monday March 16, 2026 at 7:00 ET (off-peak)
@@ -518,7 +518,7 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 7, 0);
         let end = et_to_utc(2026, 3, 16, 9, 0);
 
-        let transition = find_next_transition(start, end, &promos, "seven_day_sonnet");
+        let transition = find_next_transition(start, end, &promos, "weekly_scoped");
         assert!(transition.is_some());
 
         let (t, before, after) = transition.unwrap();
@@ -533,17 +533,17 @@ mod tests {
     /// Regression: windows not in applies_to see no transition (multiplier always 1.0)
     #[test]
     fn no_transition_for_excluded_window() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Peak-to-off-peak boundary
         let start = et_to_utc(2026, 3, 16, 13, 0);
         let end = et_to_utc(2026, 3, 16, 15, 0);
 
-        // seven_day_sonnet sees a transition
+        // weekly_scoped sees a transition
         assert!(
-            find_next_transition(start, end, &promos, "seven_day_sonnet").is_some(),
-            "seven_day_sonnet should see transition"
+            find_next_transition(start, end, &promos, "weekly_scoped").is_some(),
+            "weekly_scoped should see transition"
         );
         // five_hour does NOT (promo doesn't apply)
         assert!(
@@ -565,7 +565,7 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 9, 0);
         let end = et_to_utc(2026, 3, 16, 11, 0);
 
-        let transition = find_next_transition(start, end, &promos, "seven_day_sonnet");
+        let transition = find_next_transition(start, end, &promos, "weekly_scoped");
         assert!(transition.is_none());
     }
 
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn effective_hours_40h_with_30h_offpeak_exceeds_40() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Start: Monday March 16, 2026 at 6:00 PM ET (off-peak)
@@ -591,7 +591,7 @@ mod tests {
         let start = et_to_utc(2026, 3, 16, 18, 0);
         let reset = start + Duration::hours(40);
 
-        let effective = effective_hours_remaining_from(start, reset, &promos, "seven_day_sonnet");
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
 
         // With 2x off-peak multiplier, effective hours should exceed raw 40h
         assert!(
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn next_transition_returns_transition_info() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // Monday March 16, 2026 at 7:00 ET (off-peak, 1 hour before peak)
@@ -656,7 +656,7 @@ mod tests {
         // Deadline: 2 hours later
         let deadline = now + Duration::hours(2);
 
-        let transition = next_transition_from(now, deadline, &promos, "seven_day_sonnet");
+        let transition = next_transition_from(now, deadline, &promos, "weekly_scoped");
         assert!(transition.is_some());
 
         let t = transition.unwrap();
@@ -677,13 +677,13 @@ mod tests {
         let now = et_to_utc(2026, 3, 16, 9, 0);
         let deadline = et_to_utc(2026, 3, 16, 11, 0);
 
-        let transition = next_transition_from(now, deadline, &promos, "seven_day_sonnet");
+        let transition = next_transition_from(now, deadline, &promos, "weekly_scoped");
         assert!(transition.is_none());
     }
 
     #[test]
     fn next_transition_detects_losing_bonus_offpeak_to_peak() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // 07:35 ET during promo - 25 minutes before peak starts
@@ -691,7 +691,7 @@ mod tests {
         // Look ahead 1 hour
         let deadline = now + Duration::hours(1);
 
-        let transition = next_transition_from(now, deadline, &promos, "seven_day_sonnet");
+        let transition = next_transition_from(now, deadline, &promos, "weekly_scoped");
         assert!(transition.is_some());
 
         let t = transition.unwrap();
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn next_transition_detects_gaining_bonus_peak_to_offpeak() {
-        // test_promo applies_to: ["seven_day_sonnet"]
+        // test_promo applies_to: ["weekly_scoped"]
         let promos = vec![test_promo()];
 
         // 13:30 ET during promo - 30 minutes before peak ends
@@ -713,7 +713,7 @@ mod tests {
         // Look ahead 1 hour
         let deadline = now + Duration::hours(1);
 
-        let transition = next_transition_from(now, deadline, &promos, "seven_day_sonnet");
+        let transition = next_transition_from(now, deadline, &promos, "weekly_scoped");
         assert!(transition.is_some());
 
         let t = transition.unwrap();

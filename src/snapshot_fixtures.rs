@@ -23,7 +23,7 @@ use crate::state::PrevUsageSnapshot;
 /// - `taken_at`: Timestamp when the snapshot was taken
 /// - `five_hour_pct`: 5-hour window utilization percentage
 /// - `seven_day_pct`: 7-day window utilization percentage (all models)
-/// - `seven_day_sonnet_pct`: 7-day window utilization percentage (Sonnet only)
+/// - `weekly_scoped_pct`: 7-day window utilization percentage (Sonnet only)
 ///
 /// # Returns
 /// A `PrevUsageSnapshot` struct with the specified values.
@@ -42,13 +42,13 @@ pub fn make_snapshot(
     taken_at: DateTime<Utc>,
     five_hour_pct: f64,
     seven_day_pct: f64,
-    seven_day_sonnet_pct: f64,
+    weekly_scoped_pct: f64,
 ) -> PrevUsageSnapshot {
     PrevUsageSnapshot {
         taken_at,
         five_hour_pct,
         seven_day_pct,
-        seven_day_sonnet_pct,
+        weekly_scoped_pct,
     }
 }
 
@@ -77,7 +77,7 @@ pub fn make_snapshot(
 /// let snapshot = baseline_snapshot();
 /// assert_eq!(snapshot.five_hour_pct, 12.5);
 /// assert_eq!(snapshot.seven_day_pct, 45.2);
-/// assert_eq!(snapshot.seven_day_sonnet_pct, 38.7);
+/// assert_eq!(snapshot.weekly_scoped_pct, 38.7);
 /// ```
 pub fn baseline_snapshot() -> PrevUsageSnapshot {
     // Wednesday, March 18, 2026 at 10:00:00 UTC
@@ -87,7 +87,7 @@ pub fn baseline_snapshot() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 12.5,
         seven_day_pct: 45.2,
-        seven_day_sonnet_pct: 38.7,
+        weekly_scoped_pct: 38.7,
     }
 }
 
@@ -125,7 +125,7 @@ pub fn snapshot_after_5h() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 18.2,      // +5.7% from baseline
         seven_day_pct: 46.8,       // +1.6% from baseline
-        seven_day_sonnet_pct: 40.3, // +1.6% from baseline
+        weekly_scoped_pct: 40.3, // +1.6% from baseline
     }
 }
 
@@ -163,7 +163,7 @@ pub fn snapshot_after_7d() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 15.8,       // New 5-hour window (reset occurred)
         seven_day_pct: 52.4,       // +7.2% from baseline
-        seven_day_sonnet_pct: 46.1, // +7.4% from baseline
+        weekly_scoped_pct: 46.1, // +7.4% from baseline
     }
 }
 
@@ -227,7 +227,7 @@ pub fn idle_snapshot() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 0.3,
         seven_day_pct: 0.2,
-        seven_day_sonnet_pct: 0.5,
+        weekly_scoped_pct: 0.5,
     }
 }
 
@@ -250,7 +250,7 @@ pub fn high_utilization_snapshot() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 82.4,
         seven_day_pct: 91.7,
-        seven_day_sonnet_pct: 94.2,
+        weekly_scoped_pct: 94.2,
     }
 }
 
@@ -274,7 +274,7 @@ pub fn post_reset_snapshot() -> PrevUsageSnapshot {
         taken_at,
         five_hour_pct: 2.1,        // Just reset
         seven_day_pct: 48.3,       // Still accumulating
-        seven_day_sonnet_pct: 42.8, // Still accumulating
+        weekly_scoped_pct: 42.8, // Still accumulating
     }
 }
 
@@ -325,7 +325,7 @@ mod tests {
 
         assert_eq!(snapshot.five_hour_pct, 12.5);
         assert_eq!(snapshot.seven_day_pct, 45.2);
-        assert_eq!(snapshot.seven_day_sonnet_pct, 38.7);
+        assert_eq!(snapshot.weekly_scoped_pct, 38.7);
 
         // Verify timestamp is correct
         let expected_time: DateTime<Utc> = "2026-03-18T10:00:00Z".parse().unwrap();
@@ -347,7 +347,7 @@ mod tests {
         // Verify utilization increased
         assert!(curr.five_hour_pct > prev.five_hour_pct);
         assert!(curr.seven_day_pct > prev.seven_day_pct);
-        assert!(curr.seven_day_sonnet_pct > prev.seven_day_sonnet_pct);
+        assert!(curr.weekly_scoped_pct > prev.weekly_scoped_pct);
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
 
         // Verify utilization increased
         assert!(curr.seven_day_pct > prev.seven_day_pct);
-        assert!(curr.seven_day_sonnet_pct > prev.seven_day_sonnet_pct);
+        assert!(curr.weekly_scoped_pct > prev.weekly_scoped_pct);
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
 
         assert!(snapshot.five_hour_pct < 1.0);
         assert!(snapshot.seven_day_pct < 1.0);
-        assert!(snapshot.seven_day_sonnet_pct < 1.0);
+        assert!(snapshot.weekly_scoped_pct < 1.0);
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
 
         assert!(snapshot.five_hour_pct > 80.0);
         assert!(snapshot.seven_day_pct > 90.0);
-        assert!(snapshot.seven_day_sonnet_pct > 90.0);
+        assert!(snapshot.weekly_scoped_pct > 90.0);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
 
         // 7-day windows should not have reset (lower drop)
         assert!(curr.seven_day_pct < prev.seven_day_pct);
-        assert!(curr.seven_day_sonnet_pct < prev.seven_day_sonnet_pct);
+        assert!(curr.weekly_scoped_pct < prev.weekly_scoped_pct);
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(snapshot.taken_at, now);
         assert_eq!(snapshot.five_hour_pct, 10.0);
         assert_eq!(snapshot.seven_day_pct, 20.0);
-        assert_eq!(snapshot.seven_day_sonnet_pct, 15.0);
+        assert_eq!(snapshot.weekly_scoped_pct, 15.0);
     }
 
     #[test]
@@ -472,8 +472,8 @@ mod tests {
                 "five_hour_pct out of range: {}", snapshot.five_hour_pct);
             assert!(snapshot.seven_day_pct >= 0.0 && snapshot.seven_day_pct <= 100.0,
                 "seven_day_pct out of range: {}", snapshot.seven_day_pct);
-            assert!(snapshot.seven_day_sonnet_pct >= 0.0 && snapshot.seven_day_sonnet_pct <= 100.0,
-                "seven_day_sonnet_pct out of range: {}", snapshot.seven_day_sonnet_pct);
+            assert!(snapshot.weekly_scoped_pct >= 0.0 && snapshot.weekly_scoped_pct <= 100.0,
+                "weekly_scoped_pct out of range: {}", snapshot.weekly_scoped_pct);
         }
     }
 
@@ -510,13 +510,13 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.10,        // 12.5% → 13.75%
             prev.seven_day_pct * 1.10,        // 45.2% → 49.72%
-            prev.seven_day_sonnet_pct * 1.10, // 38.7% → 42.57%
+            prev.weekly_scoped_pct * 1.10, // 38.7% → 42.57%
         );
 
         // Compute deltas using the standard formula: delta = current - previous
         let delta_5h = curr.five_hour_pct - prev.five_hour_pct;
         let delta_7d = curr.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds = curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
         assert!(delta_5h > 0.0, "5h delta should be positive with +10% increase");
@@ -540,7 +540,7 @@ mod tests {
             "Current 5h should be 10% higher than previous");
         assert!((curr.seven_day_pct - prev.seven_day_pct * 1.10).abs() < DELTA_TOLERANCE,
             "Current 7d should be 10% higher than previous");
-        assert!((curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct * 1.10).abs() < DELTA_TOLERANCE,
+        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.10).abs() < DELTA_TOLERANCE,
             "Current 7ds should be 10% higher than previous");
     }
 
@@ -567,13 +567,13 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.25,        // 12.5% → 15.625%
             prev.seven_day_pct * 1.25,        // 45.2% → 56.5%
-            prev.seven_day_sonnet_pct * 1.25, // 38.7% → 48.375%
+            prev.weekly_scoped_pct * 1.25, // 38.7% → 48.375%
         );
 
         // Compute deltas using the standard formula: delta = current - previous
         let delta_5h = curr.five_hour_pct - prev.five_hour_pct;
         let delta_7d = curr.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds = curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
         assert!(delta_5h > 0.0, "5h delta should be positive with +25% increase");
@@ -597,7 +597,7 @@ mod tests {
             "Current 5h should be 25% higher than previous");
         assert!((curr.seven_day_pct - prev.seven_day_pct * 1.25).abs() < DELTA_TOLERANCE,
             "Current 7d should be 25% higher than previous");
-        assert!((curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct * 1.25).abs() < DELTA_TOLERANCE,
+        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.25).abs() < DELTA_TOLERANCE,
             "Current 7ds should be 25% higher than previous");
     }
 
@@ -624,13 +624,13 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.50,        // 12.5% → 18.75%
             prev.seven_day_pct * 1.50,        // 45.2% → 67.8%
-            prev.seven_day_sonnet_pct * 1.50, // 38.7% → 58.05%
+            prev.weekly_scoped_pct * 1.50, // 38.7% → 58.05%
         );
 
         // Compute deltas using the standard formula: delta = current - previous
         let delta_5h = curr.five_hour_pct - prev.five_hour_pct;
         let delta_7d = curr.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds = curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased significantly)
         assert!(delta_5h > 0.0, "5h delta should be positive with +50% increase");
@@ -654,7 +654,7 @@ mod tests {
             "Current 5h should be 50% higher than previous");
         assert!((curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
             "Current 7d should be 50% higher than previous");
-        assert!((curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct * 1.50).abs() < DELTA_TOLERANCE,
+        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.50).abs() < DELTA_TOLERANCE,
             "Current 7ds should be 50% higher than previous");
 
         // Verify the +50% increase is significant (larger than +10% and +25%)
@@ -686,13 +686,13 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.15,        // 12.5% → 14.375% (+15%)
             prev.seven_day_pct * 1.20,        // 45.2% → 54.24% (+20%)
-            prev.seven_day_sonnet_pct * 1.30, // 38.7% → 50.31% (+30%)
+            prev.weekly_scoped_pct * 1.30, // 38.7% → 50.31% (+30%)
         );
 
         // Compute deltas using the standard formula: delta = current - previous
         let delta_5h = curr.five_hour_pct - prev.five_hour_pct;
         let delta_7d = curr.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds = curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
         assert!(delta_5h > 0.0, "5h delta should be positive with +15% increase");
@@ -716,7 +716,7 @@ mod tests {
             "Current 5h should be 15% higher than previous");
         assert!((curr.seven_day_pct - prev.seven_day_pct * 1.20).abs() < DELTA_TOLERANCE,
             "Current 7d should be 20% higher than previous");
-        assert!((curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct * 1.30).abs() < DELTA_TOLERANCE,
+        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.30).abs() < DELTA_TOLERANCE,
             "Current 7ds should be 30% higher than previous");
 
         // Verify deltas increase with the percentage increase
@@ -736,7 +736,7 @@ mod tests {
         let (prev_5h, curr_5h) = snapshot_pair_5h();
         let delta_5h = curr_5h.five_hour_pct - prev_5h.five_hour_pct;
         let delta_7d = curr_5h.seven_day_pct - prev_5h.seven_day_pct;
-        let delta_7ds = curr_5h.seven_day_sonnet_pct - prev_5h.seven_day_sonnet_pct;
+        let delta_7ds = curr_5h.weekly_scoped_pct - prev_5h.weekly_scoped_pct;
 
         assert!(delta_5h > 0.0, "5h window should show positive increase after 5 hours");
         assert!((delta_5h - 5.7).abs() < DELTA_TOLERANCE,
@@ -754,7 +754,7 @@ mod tests {
         let (prev_7d, curr_7d) = snapshot_pair_7d();
         let delta_5h_7d = curr_7d.five_hour_pct - prev_7d.five_hour_pct;
         let delta_7d_7d = curr_7d.seven_day_pct - prev_7d.seven_day_pct;
-        let delta_7ds_7d = curr_7d.seven_day_sonnet_pct - prev_7d.seven_day_sonnet_pct;
+        let delta_7ds_7d = curr_7d.weekly_scoped_pct - prev_7d.weekly_scoped_pct;
 
         // 5-hour window reset, so we verify it changed (not necessarily positive)
         assert!((delta_5h_7d - 3.3).abs() < DELTA_TOLERANCE,
@@ -771,7 +771,7 @@ mod tests {
         // Test baseline → after_7ds (same as after_7d)
         let (prev_7ds, curr_7ds) = snapshot_pair_7ds();
         let delta_7d_7ds = curr_7ds.seven_day_pct - prev_7ds.seven_day_pct;
-        let delta_7ds_7ds = curr_7ds.seven_day_sonnet_pct - prev_7ds.seven_day_sonnet_pct;
+        let delta_7ds_7ds = curr_7ds.weekly_scoped_pct - prev_7ds.weekly_scoped_pct;
 
         assert!((delta_7d_7ds - delta_7d_7d).abs() < DELTA_TOLERANCE,
             "7ds snapshot should produce same 7d delta as 7d snapshot");
@@ -793,12 +793,12 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.75,
             prev.seven_day_pct * 1.75,
-            prev.seven_day_sonnet_pct * 1.75,
+            prev.weekly_scoped_pct * 1.75,
         );
 
         let delta_5h_75 = curr_75.five_hour_pct - prev.five_hour_pct;
         let delta_7d_75 = curr_75.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds_75 = curr_75.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds_75 = curr_75.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         assert!((delta_5h_75 - 9.375).abs() < DELTA_TOLERANCE,
             "75% increase 5h delta should be +9.375%, got {delta_5h_75}");
@@ -812,12 +812,12 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 2.0,
             prev.seven_day_pct * 2.0,
-            prev.seven_day_sonnet_pct * 2.0,
+            prev.weekly_scoped_pct * 2.0,
         );
 
         let delta_5h_100 = curr_100.five_hour_pct - prev.five_hour_pct;
         let delta_7d_100 = curr_100.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds_100 = curr_100.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds_100 = curr_100.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         assert!((delta_5h_100 - 12.5).abs() < DELTA_TOLERANCE,
             "100% increase 5h delta should be +12.5%, got {delta_5h_100}");
@@ -850,29 +850,29 @@ mod tests {
             prev.taken_at + chrono::Duration::hours(5),
             prev.five_hour_pct * 1.25,        // +25% at step 1
             prev.seven_day_pct * 1.20,        // +20% at step 1
-            prev.seven_day_sonnet_pct * 1.15, // +15% at step 1
+            prev.weekly_scoped_pct * 1.15, // +15% at step 1
         );
 
         let curr = make_snapshot(
             mid.taken_at + chrono::Duration::hours(5),
             mid.five_hour_pct * 1.20,        // Additional +20% at step 2
             mid.seven_day_pct * 1.25,        // Additional +25% at step 2
-            mid.seven_day_sonnet_pct * 1.30, // Additional +30% at step 2
+            mid.weekly_scoped_pct * 1.30, // Additional +30% at step 2
         );
 
         // Compute step-by-step deltas
         let delta_5h_step1 = mid.five_hour_pct - prev.five_hour_pct;
         let delta_7d_step1 = mid.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds_step1 = mid.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds_step1 = mid.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         let delta_5h_step2 = curr.five_hour_pct - mid.five_hour_pct;
         let delta_7d_step2 = curr.seven_day_pct - mid.seven_day_pct;
-        let delta_7ds_step2 = curr.seven_day_sonnet_pct - mid.seven_day_sonnet_pct;
+        let delta_7ds_step2 = curr.weekly_scoped_pct - mid.weekly_scoped_pct;
 
         // Compute total delta (prev → curr)
         let delta_5h_total = curr.five_hour_pct - prev.five_hour_pct;
         let delta_7d_total = curr.seven_day_pct - prev.seven_day_pct;
-        let delta_7ds_total = curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct;
+        let delta_7ds_total = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify additivity: total = step1 + step2
         assert!((delta_5h_total - (delta_5h_step1 + delta_5h_step2)).abs() < DELTA_TOLERANCE,
@@ -890,7 +890,7 @@ mod tests {
         assert!((curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
             "Compounded 7d increase should be +50%");
         // 7ds: 1.15 * 1.30 = 1.495 (total +49.5%)
-        assert!((curr.seven_day_sonnet_pct - prev.seven_day_sonnet_pct * 1.495).abs() < DELTA_TOLERANCE,
+        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.495).abs() < DELTA_TOLERANCE,
             "Compounded 7ds increase should be +49.5%");
     }
 }

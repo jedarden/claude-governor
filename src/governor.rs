@@ -58,7 +58,7 @@ const SAFE_MODE_HYSTERESIS_MULTIPLIER: f64 = 2.0;
 /// Window names for utilization tracking
 pub const WINDOW_FIVE_HOUR: &str = "five_hour";
 pub const WINDOW_SEVEN_DAY: &str = "seven_day";
-pub const WINDOW_SEVEN_DAY_SONNET: &str = "seven_day_sonnet";
+pub const WINDOW_WEEKLY_SCOPED: &str = "weekly_scoped";
 
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
@@ -76,11 +76,11 @@ impl UsageSnapshot {
     }
 
     /// Create a snapshot from individual window values
-    pub fn from_windows(five_hour: f64, seven_day: f64, seven_day_sonnet: f64) -> Self {
+    pub fn from_windows(five_hour: f64, seven_day: f64, weekly_scoped: f64) -> Self {
         let mut windows = HashMap::new();
         windows.insert(WINDOW_FIVE_HOUR.to_string(), five_hour);
         windows.insert(WINDOW_SEVEN_DAY.to_string(), seven_day);
-        windows.insert(WINDOW_SEVEN_DAY_SONNET.to_string(), seven_day_sonnet);
+        windows.insert(WINDOW_WEEKLY_SCOPED.to_string(), weekly_scoped);
         Self { windows }
     }
 
@@ -122,7 +122,7 @@ pub struct Agent {
 /// Window context for sprint eligibility evaluation
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowContext {
-    /// Window name (five_hour, seven_day, seven_day_sonnet)
+    /// Window name (five_hour, seven_day, weekly_scoped)
     pub name: String,
     /// Hours remaining until window reset
     pub hours_remaining: f64,
@@ -926,8 +926,8 @@ fn get_sonnet_baseline_config(
 /// ```
 /// use claude_governor::db::WindowPctSnapshot;
 /// use claude_governor::governor::calculate_window_pct_delta;
-/// let prev = WindowPctSnapshot { five_hour: 10.0, seven_day: 20.0, seven_day_sonnet: 15.0 };
-/// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, seven_day_sonnet: 18.0 };
+/// let prev = WindowPctSnapshot { five_hour: 10.0, seven_day: 20.0, weekly_scoped: 15.0 };
+/// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, weekly_scoped: 18.0 };
 /// let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
 /// assert_eq!(d5h, 2.5);  // 12.5 - 10.0
 /// assert_eq!(d7d, 2.0);   // 22.0 - 20.0
@@ -939,7 +939,7 @@ pub fn calculate_window_pct_delta(
 ) -> (f64, f64, f64) {
     let delta_5h = current_snapshot.five_hour - previous_snapshot.five_hour;
     let delta_7d = current_snapshot.seven_day - previous_snapshot.seven_day;
-    let delta_7ds = current_snapshot.seven_day_sonnet - previous_snapshot.seven_day_sonnet;
+    let delta_7ds = current_snapshot.weekly_scoped - previous_snapshot.weekly_scoped;
     (delta_5h, delta_7d, delta_7ds)
 }
 
@@ -982,12 +982,12 @@ mod window_delta_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 10.0,
             seven_day: 20.0,
-            seven_day_sonnet: 15.0,
+            weekly_scoped: 15.0,
         };
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 12.5,
             seven_day: 22.0,
-            seven_day_sonnet: 18.0,
+            weekly_scoped: 18.0,
         };
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
         assert!((d5h - 2.5).abs() < f64::EPSILON);
@@ -1000,12 +1000,12 @@ mod window_delta_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 30.0,
-            seven_day_sonnet: 25.0,
+            weekly_scoped: 25.0,
         };
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 15.0,
             seven_day: 22.0,
-            seven_day_sonnet: 18.0,
+            weekly_scoped: 18.0,
         };
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
         assert!((d5h - (-5.0)).abs() < f64::EPSILON);
@@ -1018,12 +1018,12 @@ mod window_delta_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 0.0,
             seven_day: 0.0,
-            seven_day_sonnet: 0.0,
+            weekly_scoped: 0.0,
         };
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 5.0,
             seven_day: 10.0,
-            seven_day_sonnet: 7.5,
+            weekly_scoped: 7.5,
         };
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
         assert!((d5h - 5.0).abs() < f64::EPSILON);
@@ -1091,26 +1091,26 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         };
 
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 12.5,
             seven_day_pct: 22.0,
-            seven_day_sonnet_pct: 18.0,
+            weekly_scoped_pct: 18.0,
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -1139,20 +1139,20 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 25.0,
             seven_day_pct: 35.0,
-            seven_day_sonnet_pct: 28.0,
+            weekly_scoped_pct: 28.0,
         };
 
         // Previous and current are identical
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: snapshot.five_hour_pct,
             seven_day: snapshot.seven_day_pct,
-            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+            weekly_scoped: snapshot.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: snapshot.five_hour_pct,
             seven_day: snapshot.seven_day_pct,
-            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+            weekly_scoped: snapshot.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -1178,7 +1178,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         });
 
         let previous: Option<PrevUsageSnapshot> = None;
@@ -1200,12 +1200,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 "delta_computed"
@@ -1241,7 +1241,7 @@ mod window_delta_tests {
     /// Verifies that the delta calculation correctly pairs:
     /// - five_hour_pct -> five_hour
     /// - seven_day_pct -> seven_day
-    /// - seven_day_sonnet_pct -> seven_day_sonnet
+    /// - weekly_scoped_pct -> weekly_scoped
     #[test]
     fn test_delta_uses_correct_window_fields() {
         use crate::state::PrevUsageSnapshot;
@@ -1251,7 +1251,7 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         };
 
         let curr = PrevUsageSnapshot {
@@ -1259,19 +1259,19 @@ mod window_delta_tests {
             // Each window changes differently
             five_hour_pct: 15.0,      // +5.0
             seven_day_pct: 25.0,      // +5.0
-            seven_day_sonnet_pct: 20.0, // +5.0
+            weekly_scoped_pct: 20.0, // +5.0
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -1294,7 +1294,7 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 80.0,
             seven_day_pct: 90.0,
-            seven_day_sonnet_pct: 85.0,
+            weekly_scoped_pct: 85.0,
         };
 
         let curr = PrevUsageSnapshot {
@@ -1302,19 +1302,19 @@ mod window_delta_tests {
             // Window reset - utilization drops
             five_hour_pct: 5.0,   // -75.0 (reset)
             seven_day_pct: 15.0,  // -75.0 (reset)
-            seven_day_sonnet_pct: 8.0, // -77.0 (reset)
+            weekly_scoped_pct: 8.0, // -77.0 (reset)
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -1342,26 +1342,26 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 50.0,
             seven_day_pct: 60.0,
-            seven_day_sonnet_pct: 55.0,
+            weekly_scoped_pct: 55.0,
         };
 
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 55.0,      // +5.0 (increasing)
             seven_day_pct: 58.0,      // -2.0 (slight decrease)
-            seven_day_sonnet_pct: 62.0, // +7.0 (increasing)
+            weekly_scoped_pct: 62.0, // +7.0 (increasing)
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -1380,13 +1380,13 @@ mod window_delta_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 50.0,
             seven_day: 60.0,
-            seven_day_sonnet: 55.0,
+            weekly_scoped: 55.0,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 50.1,
             seven_day: 60.05,
-            seven_day_sonnet: 55.001,
+            weekly_scoped: 55.001,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -1410,7 +1410,7 @@ mod window_delta_tests {
     /// # Arguments
     /// - `five_hour`: 5-hour window utilization percentage
     /// - `seven_day`: 7-day window utilization percentage (all models)
-    /// - `seven_day_sonnet`: 7-day window utilization percentage (Sonnet only)
+    /// - `weekly_scoped`: 7-day window utilization percentage (Sonnet only)
     ///
     /// # Returns
     /// A WindowPctSnapshot struct with the specified values.
@@ -1422,17 +1422,17 @@ mod window_delta_tests {
     /// let snapshot = make_window_pct_snapshot(25.5, 45.0, 38.2);
     /// assert_eq!(snapshot.five_hour, 25.5);
     /// assert_eq!(snapshot.seven_day, 45.0);
-    /// assert_eq!(snapshot.seven_day_sonnet, 38.2);
+    /// assert_eq!(snapshot.weekly_scoped, 38.2);
     /// ```
     pub fn make_window_pct_snapshot(
         five_hour: f64,
         seven_day: f64,
-        seven_day_sonnet: f64,
+        weekly_scoped: f64,
     ) -> crate::db::WindowPctSnapshot {
         crate::db::WindowPctSnapshot {
             five_hour,
             seven_day,
-            seven_day_sonnet,
+            weekly_scoped,
         }
     }
 
@@ -1444,7 +1444,7 @@ mod window_delta_tests {
     /// # Arguments
     /// - `five_hour_pct`: 5-hour window utilization percentage
     /// - `seven_day_pct`: 7-day window utilization percentage (all models)
-    /// - `seven_day_sonnet_pct`: 7-day window utilization percentage (Sonnet only)
+    /// - `weekly_scoped_pct`: 7-day window utilization percentage (Sonnet only)
     ///
     /// # Returns
     /// A PrevUsageSnapshot struct with the specified values and current timestamp.
@@ -1456,19 +1456,19 @@ mod window_delta_tests {
     /// let snapshot = make_usage_snapshot(12.5, 35.0, 28.5);
     /// assert_eq!(snapshot.five_hour_pct, 12.5);
     /// assert_eq!(snapshot.seven_day_pct, 35.0);
-    /// assert_eq!(snapshot.seven_day_sonnet_pct, 28.5);
+    /// assert_eq!(snapshot.weekly_scoped_pct, 28.5);
     /// // timestamp is set to Utc::now()
     /// ```
     pub fn make_usage_snapshot(
         five_hour_pct: f64,
         seven_day_pct: f64,
-        seven_day_sonnet_pct: f64,
+        weekly_scoped_pct: f64,
     ) -> crate::state::PrevUsageSnapshot {
         crate::state::PrevUsageSnapshot {
             taken_at: chrono::Utc::now(),
             five_hour_pct,
             seven_day_pct,
-            seven_day_sonnet_pct,
+            weekly_scoped_pct,
         }
     }
 
@@ -1481,7 +1481,7 @@ mod window_delta_tests {
     /// - `taken_at`: The timestamp when the snapshot was taken
     /// - `five_hour_pct`: 5-hour window utilization percentage
     /// - `seven_day_pct`: 7-day window utilization percentage (all models)
-    /// - `seven_day_sonnet_pct`: 7-day window utilization percentage (Sonnet only)
+    /// - `weekly_scoped_pct`: 7-day window utilization percentage (Sonnet only)
     ///
     /// # Returns
     /// A PrevUsageSnapshot struct with the specified values and custom timestamp.
@@ -1500,13 +1500,13 @@ mod window_delta_tests {
         taken_at: chrono::DateTime<chrono::Utc>,
         five_hour_pct: f64,
         seven_day_pct: f64,
-        seven_day_sonnet_pct: f64,
+        weekly_scoped_pct: f64,
     ) -> crate::state::PrevUsageSnapshot {
         crate::state::PrevUsageSnapshot {
             taken_at,
             five_hour_pct,
             seven_day_pct,
-            seven_day_sonnet_pct,
+            weekly_scoped_pct,
         }
     }
 
@@ -1520,13 +1520,13 @@ mod window_delta_tests {
         let window_snap = make_window_pct_snapshot(10.5, 25.0, 18.75);
         assert!((window_snap.five_hour - 10.5).abs() < f64::EPSILON);
         assert!((window_snap.seven_day - 25.0).abs() < f64::EPSILON);
-        assert!((window_snap.seven_day_sonnet - 18.75).abs() < f64::EPSILON);
+        assert!((window_snap.weekly_scoped - 18.75).abs() < f64::EPSILON);
 
         // Test make_usage_snapshot (with current timestamp)
         let usage_snap = make_usage_snapshot(12.5, 30.0, 22.5);
         assert!((usage_snap.five_hour_pct - 12.5).abs() < f64::EPSILON);
         assert!((usage_snap.seven_day_pct - 30.0).abs() < f64::EPSILON);
-        assert!((usage_snap.seven_day_sonnet_pct - 22.5).abs() < f64::EPSILON);
+        assert!((usage_snap.weekly_scoped_pct - 22.5).abs() < f64::EPSILON);
         // Timestamp should be recent (within last second)
         let age = (chrono::Utc::now() - usage_snap.taken_at).num_seconds();
         assert!(age >= 0 && age <= 1, "timestamp should be current");
@@ -1536,7 +1536,7 @@ mod window_delta_tests {
         let custom_snap = make_usage_snapshot_with_time(custom_time, 8.0, 20.0, 15.0);
         assert!((custom_snap.five_hour_pct - 8.0).abs() < f64::EPSILON);
         assert!((custom_snap.seven_day_pct - 20.0).abs() < f64::EPSILON);
-        assert!((custom_snap.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON);
+        assert!((custom_snap.weekly_scoped_pct - 15.0).abs() < f64::EPSILON);
         assert_eq!(custom_snap.taken_at, custom_time);
     }
 
@@ -1561,7 +1561,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         });
 
         // Simulate the delta computation logic from run_governor_cycle
@@ -1577,12 +1577,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
@@ -1627,13 +1627,13 @@ mod window_delta_tests {
             (0.0, 0.0, 0.0),     // Zero utilization
         ];
 
-        for (five_hour, seven_day, seven_day_sonnet) in test_cases {
+        for (five_hour, seven_day, weekly_scoped) in test_cases {
             let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
             let current_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
                 taken_at: Utc::now(),
                 five_hour_pct: five_hour,
                 seven_day_pct: seven_day,
-                seven_day_sonnet_pct: seven_day_sonnet,
+                weekly_scoped_pct: weekly_scoped,
             });
 
             let mut p5h_delta: Option<f64> = None;
@@ -1645,12 +1645,12 @@ mod window_delta_tests {
                     let prev_pct = crate::db::WindowPctSnapshot {
                         five_hour: prev.five_hour_pct,
                         seven_day: prev.seven_day_pct,
-                        seven_day_sonnet: prev.seven_day_sonnet_pct,
+                        weekly_scoped: prev.weekly_scoped_pct,
                     };
                     let curr_pct = crate::db::WindowPctSnapshot {
                         five_hour: curr.five_hour_pct,
                         seven_day: curr.seven_day_pct,
-                        seven_day_sonnet: curr.seven_day_sonnet_pct,
+                        weekly_scoped: curr.weekly_scoped_pct,
                     };
                     let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                     p5h_delta = Some(delta_5h);
@@ -1671,19 +1671,19 @@ mod window_delta_tests {
                 p5h_delta,
                 Some(0.0),
                 "5h delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, seven_day_sonnet
+                five_hour, seven_day, weekly_scoped
             );
             assert_eq!(
                 p7d_delta,
                 Some(0.0),
                 "7d delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, seven_day_sonnet
+                five_hour, seven_day, weekly_scoped
             );
             assert_eq!(
                 p7ds_delta,
                 Some(0.0),
                 "7ds delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, seven_day_sonnet
+                five_hour, seven_day, weekly_scoped
             );
         }
     }
@@ -1703,7 +1703,7 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         });
 
         let mut p5h_delta: Option<f64> = None;
@@ -1715,12 +1715,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
@@ -1745,7 +1745,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 12.5,  // +2.5
             seven_day_pct: 22.0,  // +2.0
-            seven_day_sonnet_pct: 18.0, // +3.0
+            weekly_scoped_pct: 18.0, // +3.0
         });
 
         p5h_delta = None;
@@ -1757,12 +1757,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
@@ -1805,12 +1805,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
@@ -1850,7 +1850,7 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         });
         let current_api_snapshot: Option<PrevUsageSnapshot> = None;
 
@@ -1864,12 +1864,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
@@ -1909,7 +1909,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 25.0,
             seven_day_pct: 45.0,
-            seven_day_sonnet_pct: 35.0,
+            weekly_scoped_pct: 35.0,
         });
 
         let mut delta_computation_attempted = false;
@@ -1922,12 +1922,12 @@ mod window_delta_tests {
                 let _prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let _curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&_prev_pct, &_curr_pct);
             }
@@ -1958,26 +1958,26 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 98.0,
             seven_day_pct: 98.0,
-            seven_day_sonnet_pct: 98.0,
+            weekly_scoped_pct: 98.0,
         };
 
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 98.0,
             seven_day_pct: 98.0,
-            seven_day_sonnet_pct: 98.0,
+            weekly_scoped_pct: 98.0,
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         // Should not panic with values at threshold
@@ -1991,26 +1991,26 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 0.0,
             seven_day_pct: 0.0,
-            seven_day_sonnet_pct: 0.0,
+            weekly_scoped_pct: 0.0,
         };
 
         let curr_zero = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 0.0,
             seven_day_pct: 0.0,
-            seven_day_sonnet_pct: 0.0,
+            weekly_scoped_pct: 0.0,
         };
 
         let prev_pct_zero = crate::db::WindowPctSnapshot {
             five_hour: prev_zero.five_hour_pct,
             seven_day: prev_zero.seven_day_pct,
-            seven_day_sonnet: prev_zero.seven_day_sonnet_pct,
+            weekly_scoped: prev_zero.weekly_scoped_pct,
         };
 
         let curr_pct_zero = crate::db::WindowPctSnapshot {
             five_hour: curr_zero.five_hour_pct,
             seven_day: curr_zero.seven_day_pct,
-            seven_day_sonnet: curr_zero.seven_day_sonnet_pct,
+            weekly_scoped: curr_zero.weekly_scoped_pct,
         };
 
         // Should not panic with zero values
@@ -2035,7 +2035,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 30.0,
             seven_day_pct: 50.0,
-            seven_day_sonnet_pct: 40.0,
+            weekly_scoped_pct: 40.0,
         });
 
         let mut p5h_delta: Option<f64> = None;
@@ -2047,12 +2047,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
@@ -2086,12 +2086,12 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta_none = Some(delta_5h);
@@ -2167,7 +2167,7 @@ mod window_delta_tests {
             taken_at: first_poll_time,
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         };
 
         // Set the first snapshot as current (simulates successful API poll in cycle 1)
@@ -2188,7 +2188,7 @@ mod window_delta_tests {
         assert!((current.five_hour_pct - 10.0).abs() < f64::EPSILON, "First snapshot 5h");
         assert!((current.seven_day_pct - 20.0).abs() < f64::EPSILON, "First snapshot 7d");
         assert!(
-            (current.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON,
+            (current.weekly_scoped_pct - 15.0).abs() < f64::EPSILON,
             "First snapshot 7ds"
         );
 
@@ -2198,7 +2198,7 @@ mod window_delta_tests {
             taken_at: second_poll_time,
             five_hour_pct: 12.5,  // +2.5 from first
             seven_day_pct: 22.0, // +2.0 from first
-            seven_day_sonnet_pct: 18.0, // +3.0 from first
+            weekly_scoped_pct: 18.0, // +3.0 from first
         };
 
         // Shift snapshots: current becomes previous (simulates cycle 2 start)
@@ -2222,7 +2222,7 @@ mod window_delta_tests {
         assert!((previous.five_hour_pct - 10.0).abs() < f64::EPSILON, "Previous 5h value");
         assert!((previous.seven_day_pct - 20.0).abs() < f64::EPSILON, "Previous 7d value");
         assert!(
-            (previous.seven_day_sonnet_pct - 15.0).abs() < f64::EPSILON,
+            (previous.weekly_scoped_pct - 15.0).abs() < f64::EPSILON,
             "Previous 7ds value"
         );
 
@@ -2232,7 +2232,7 @@ mod window_delta_tests {
         assert!((current.five_hour_pct - 12.5).abs() < f64::EPSILON, "Current 5h value");
         assert!((current.seven_day_pct - 22.0).abs() < f64::EPSILON, "Current 7d value");
         assert!(
-            (current.seven_day_sonnet_pct - 18.0).abs() < f64::EPSILON,
+            (current.weekly_scoped_pct - 18.0).abs() < f64::EPSILON,
             "Current 7ds value"
         );
 
@@ -2244,12 +2244,12 @@ mod window_delta_tests {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
@@ -2286,7 +2286,7 @@ mod window_delta_tests {
             // Calculate expected delta values manually from known snapshot inputs
             let expected_5h_delta = snapshot2.five_hour_pct - snapshot1.five_hour_pct;
             let expected_7d_delta = snapshot2.seven_day_pct - snapshot1.seven_day_pct;
-            let expected_7ds_delta = snapshot2.seven_day_sonnet_pct - snapshot1.seven_day_sonnet_pct;
+            let expected_7ds_delta = snapshot2.weekly_scoped_pct - snapshot1.weekly_scoped_pct;
 
             // Document the expected calculations for clarity
             assert!(
@@ -2332,8 +2332,8 @@ mod window_delta_tests {
                 "Computed 7ds delta ({}) should match expected 7ds delta ({}) from formula: current ({}) - previous ({})",
                 computed_7ds_delta,
                 expected_7ds_delta,
-                snapshot2.seven_day_sonnet_pct,
-                snapshot1.seven_day_sonnet_pct
+                snapshot2.weekly_scoped_pct,
+                snapshot1.weekly_scoped_pct
             );
         } else {
             panic!("Both snapshots should be Some after consecutive polls");
@@ -2354,15 +2354,15 @@ mod window_delta_tests {
             "last_fleet_aggregate.window_pct_deltas.seven_day field should exist and be valid"
         );
         assert!(
-            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet >= 0.0,
-            "last_fleet_aggregate.window_pct_deltas.seven_day_sonnet field should exist and be valid"
+            state.last_fleet_aggregate.window_pct_deltas.weekly_scoped >= 0.0,
+            "last_fleet_aggregate.window_pct_deltas.weekly_scoped field should exist and be valid"
         );
 
         // After computing deltas from consecutive snapshots, update last_fleet_aggregate
         // This simulates what run_governor_cycle does when it stores fleet aggregate deltas
         state.last_fleet_aggregate.window_pct_deltas.five_hour = state.p5h_delta.unwrap();
         state.last_fleet_aggregate.window_pct_deltas.seven_day = state.p7d_delta.unwrap();
-        state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet = state.p7ds_delta.unwrap();
+        state.last_fleet_aggregate.window_pct_deltas.weekly_scoped = state.p7ds_delta.unwrap();
 
         // Now verify window_pct_deltas fields are non-zero after two snapshots
         assert!(
@@ -2376,9 +2376,9 @@ mod window_delta_tests {
             state.last_fleet_aggregate.window_pct_deltas.seven_day
         );
         assert!(
-            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet != 0.0,
-            "last_fleet_aggregate.window_pct_deltas.seven_day_sonnet should be non-zero after two snapshots (got {})",
-            state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet
+            state.last_fleet_aggregate.window_pct_deltas.weekly_scoped != 0.0,
+            "last_fleet_aggregate.window_pct_deltas.weekly_scoped should be non-zero after two snapshots (got {})",
+            state.last_fleet_aggregate.window_pct_deltas.weekly_scoped
         );
 
         // Verify window_pct_deltas structure matches expected delta values
@@ -2391,8 +2391,8 @@ mod window_delta_tests {
             "window_pct_deltas.seven_day should match computed delta (2.0)"
         );
         assert!(
-            (state.last_fleet_aggregate.window_pct_deltas.seven_day_sonnet - 3.0).abs() < f64::EPSILON,
-            "window_pct_deltas.seven_day_sonnet should match computed delta (3.0)"
+            (state.last_fleet_aggregate.window_pct_deltas.weekly_scoped - 3.0).abs() < f64::EPSILON,
+            "window_pct_deltas.weekly_scoped should match computed delta (3.0)"
         );
 
         // === Verify consecutive polling through state transitions ===
@@ -2478,7 +2478,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 35.0,
             seven_day_pct: 55.0,
-            seven_day_sonnet_pct: 45.0,
+            weekly_scoped_pct: 45.0,
         };
 
         // Set current_api_snapshot (simulates first poll completing)
@@ -2506,12 +2506,12 @@ mod window_delta_tests {
                 let _prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let _curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&_prev_pct, &_curr_pct);
             }
@@ -2563,7 +2563,7 @@ mod window_delta_tests {
             "First poll 7d utilization should be preserved"
         );
         assert_eq!(
-            current.seven_day_sonnet_pct, 45.0,
+            current.weekly_scoped_pct, 45.0,
             "First poll 7ds utilization should be preserved"
         );
     }
@@ -2587,13 +2587,13 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2625,13 +2625,13 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2662,13 +2662,13 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2693,13 +2693,13 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: snapshot.five_hour_pct,
             seven_day: snapshot.seven_day_pct,
-            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+            weekly_scoped: snapshot.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: snapshot.five_hour_pct,
             seven_day: snapshot.seven_day_pct,
-            seven_day_sonnet: snapshot.seven_day_sonnet_pct,
+            weekly_scoped: snapshot.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2723,12 +2723,12 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev_5h.five_hour_pct,
             seven_day: prev_5h.seven_day_pct,
-            seven_day_sonnet: prev_5h.seven_day_sonnet_pct,
+            weekly_scoped: prev_5h.weekly_scoped_pct,
         };
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr_5h.five_hour_pct,
             seven_day: curr_5h.seven_day_pct,
-            seven_day_sonnet: curr_5h.seven_day_sonnet_pct,
+            weekly_scoped: curr_5h.weekly_scoped_pct,
         };
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
         assert!((delta_5h - 5.7).abs() < 1e-9, "5h pair should produce +5.7% delta");
@@ -2740,12 +2740,12 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev_7d.five_hour_pct,
             seven_day: prev_7d.seven_day_pct,
-            seven_day_sonnet: prev_7d.seven_day_sonnet_pct,
+            weekly_scoped: prev_7d.weekly_scoped_pct,
         };
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr_7d.five_hour_pct,
             seven_day: curr_7d.seven_day_pct,
-            seven_day_sonnet: curr_7d.seven_day_sonnet_pct,
+            weekly_scoped: curr_7d.weekly_scoped_pct,
         };
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
         assert!((delta_5h - 3.3).abs() < 1e-9, "7d pair should produce +3.3% 5h delta");
@@ -2757,12 +2757,12 @@ mod window_delta_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev_7ds.five_hour_pct,
             seven_day: prev_7ds.seven_day_pct,
-            seven_day_sonnet: prev_7ds.seven_day_sonnet_pct,
+            weekly_scoped: prev_7ds.weekly_scoped_pct,
         };
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr_7ds.five_hour_pct,
             seven_day: curr_7ds.seven_day_pct,
-            seven_day_sonnet: curr_7ds.seven_day_sonnet_pct,
+            weekly_scoped: curr_7ds.weekly_scoped_pct,
         };
         let (delta_5h_7ds, delta_7d_7ds, delta_7ds_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
         assert!((delta_5h_7ds - delta_5h).abs() < 1e-9, "7ds pair should match 7d 5h delta");
@@ -2793,19 +2793,19 @@ mod window_delta_tests {
                 now + chrono::Duration::hours(5),
                 baseline.five_hour_pct * multiplier,
                 baseline.seven_day_pct * multiplier,
-                baseline.seven_day_sonnet_pct * multiplier,
+                baseline.weekly_scoped_pct * multiplier,
             );
 
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: baseline.five_hour_pct,
                 seven_day: baseline.seven_day_pct,
-                seven_day_sonnet: baseline.seven_day_sonnet_pct,
+                weekly_scoped: baseline.weekly_scoped_pct,
             };
 
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: increased.five_hour_pct,
                 seven_day: increased.seven_day_pct,
-                seven_day_sonnet: increased.seven_day_sonnet_pct,
+                weekly_scoped: increased.weekly_scoped_pct,
             };
 
             let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2818,7 +2818,7 @@ mod window_delta_tests {
             // Verify delta magnitude matches expected percentage
             let expected_5h_delta = baseline.five_hour_pct * (multiplier - 1.0);
             let expected_7d_delta = baseline.seven_day_pct * (multiplier - 1.0);
-            let expected_7ds_delta = baseline.seven_day_sonnet_pct * (multiplier - 1.0);
+            let expected_7ds_delta = baseline.weekly_scoped_pct * (multiplier - 1.0);
 
             assert!((delta_5h - expected_5h_delta).abs() < 1e-9,
                 "5h delta should match expected increase for +{}%", expected_percent_increase);
@@ -2844,13 +2844,13 @@ mod window_delta_tests {
         let idle_pct = crate::db::WindowPctSnapshot {
             five_hour: idle.five_hour_pct,
             seven_day: idle.seven_day_pct,
-            seven_day_sonnet: idle.seven_day_sonnet_pct,
+            weekly_scoped: idle.weekly_scoped_pct,
         };
 
         let high_pct = crate::db::WindowPctSnapshot {
             five_hour: high.five_hour_pct,
             seven_day: high.seven_day_pct,
-            seven_day_sonnet: high.seven_day_sonnet_pct,
+            weekly_scoped: high.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&idle_pct, &high_pct);
@@ -2866,7 +2866,7 @@ mod window_delta_tests {
         let reset_pct = crate::db::WindowPctSnapshot {
             five_hour: reset.five_hour_pct,
             seven_day: reset.seven_day_pct,
-            seven_day_sonnet: reset.seven_day_sonnet_pct,
+            weekly_scoped: reset.weekly_scoped_pct,
         };
 
         let (delta_5h_reset, delta_7d_reset, delta_7ds_reset) = calculate_window_pct_delta(&high_pct, &reset_pct);
@@ -2922,19 +2922,19 @@ mod window_delta_tests {
             baseline.taken_at + chrono::Duration::hours(5),
             baseline.five_hour_pct + 0.1,  // Small increment
             baseline.seven_day_pct + 0.05,
-            baseline.seven_day_sonnet_pct + 0.075,
+            baseline.weekly_scoped_pct + 0.075,
         );
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: baseline.five_hour_pct,
             seven_day: baseline.seven_day_pct,
-            seven_day_sonnet: baseline.seven_day_sonnet_pct,
+            weekly_scoped: baseline.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -2969,7 +2969,7 @@ mod window_delta_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,
             seven_day_pct: 20.0,
-            seven_day_sonnet_pct: 15.0,
+            weekly_scoped_pct: 15.0,
         });
 
         let first_poll_previous: Option<PrevUsageSnapshot> = None;
@@ -3001,7 +3001,7 @@ mod window_delta_tests {
             taken_at: Utc::now(),
             five_hour_pct: 12.5,      // +2.5 from previous
             seven_day_pct: 22.0,      // +2.0 from previous
-            seven_day_sonnet_pct: 18.0, // +3.0 from previous
+            weekly_scoped_pct: 18.0, // +3.0 from previous
         });
 
         // ASSERTION 2: Verify second poll state (both snapshots exist)
@@ -3021,13 +3021,13 @@ mod window_delta_tests {
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
 
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
 
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -3326,7 +3326,7 @@ pub fn compute_target_workers(
     let windows = [
         (&WINDOW_FIVE_HOUR, &forecast.five_hour),
         (&WINDOW_SEVEN_DAY, &forecast.seven_day),
-        (&WINDOW_SEVEN_DAY_SONNET, &forecast.seven_day_sonnet),
+        (&WINDOW_WEEKLY_SCOPED, &forecast.weekly_scoped),
     ];
 
     for (_name, win) in &windows {
@@ -3351,7 +3351,7 @@ pub fn compute_target_workers(
     let binding_forecast = match forecast.binding_window.as_str() {
         WINDOW_FIVE_HOUR => &forecast.five_hour,
         WINDOW_SEVEN_DAY => &forecast.seven_day,
-        _ => &forecast.seven_day_sonnet,
+        _ => &forecast.weekly_scoped,
     };
 
     // Select safe worker count based on cone_ratio vs narrow_threshold.
@@ -3378,7 +3378,7 @@ pub fn compute_target_workers(
         let all_forecasts = &[
             forecast.five_hour.clone(),
             forecast.seven_day.clone(),
-            forecast.seven_day_sonnet.clone(),
+            forecast.weekly_scoped.clone(),
         ];
 
         match compute_composite_safe_workers(
@@ -3647,7 +3647,7 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
             let any_window_genuine = [
                 &forecast.five_hour,
                 &forecast.seven_day,
-                &forecast.seven_day_sonnet,
+                &forecast.weekly_scoped,
             ]
             .iter()
             .any(|w| w.hard_limit_margin_hrs < 0.0 && w.hard_limit_remaining_pct <= 5.0);
@@ -3656,7 +3656,7 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
         AlertType::EmergencyBrakeActivated => {
             // True positive if any window is actually at 98%+
             let forecast = &state.capacity_forecast;
-            [&forecast.five_hour, &forecast.seven_day, &forecast.seven_day_sonnet]
+            [&forecast.five_hour, &forecast.seven_day, &forecast.weekly_scoped]
                 .iter()
                 .any(|w| w.current_utilization >= 98.0)
         }
@@ -3712,18 +3712,19 @@ pub fn run_governor_cycle(
         Ok(usage_data) => {
             log::info!(
                 "[governor] polled usage: sonnet={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
-                usage_data.seven_day_sonnet_utilization,
+                usage_data.weekly_scoped_utilization,
                 usage_data.seven_day_utilization,
                 usage_data.five_hour_utilization,
                 if usage_data.stale { " (stale)" } else { "" },
             );
             state.usage = state::UsageState {
-                sonnet_pct: usage_data.seven_day_sonnet_utilization,
+                sonnet_pct: usage_data.weekly_scoped_utilization,
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
-                sonnet_resets_at: usage_data.seven_day_sonnet_resets_at,
+                sonnet_resets_at: usage_data.weekly_scoped_resets_at,
                 five_hour_resets_at: usage_data.five_hour_resets_at,
                 stale: usage_data.stale,
+                weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
             };
             state.token_refresh_failing = usage_data.stale;
 
@@ -3732,7 +3733,7 @@ pub fn run_governor_cycle(
                 taken_at: now,
                 five_hour_pct: usage_data.five_hour_utilization,
                 seven_day_pct: usage_data.seven_day_utilization,
-                seven_day_sonnet_pct: usage_data.seven_day_sonnet_utilization,
+                weekly_scoped_pct: usage_data.weekly_scoped_utilization,
             });
 
             // Calculate window deltas from consecutive API snapshots
@@ -3742,12 +3743,12 @@ pub fn run_governor_cycle(
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
-                    seven_day_sonnet: prev.seven_day_sonnet_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
                 };
                 let curr_pct = crate::db::WindowPctSnapshot {
                     five_hour: curr.five_hour_pct,
                     seven_day: curr.seven_day_pct,
-                    seven_day_sonnet: curr.seven_day_sonnet_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
@@ -3755,8 +3756,8 @@ pub fn run_governor_cycle(
                 log::info!(
                     "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}% (previous: {:.1}/{:.1}/{:.1}%, current: {:.1}/{:.1}/{:.1}%)",
                     delta_5h, delta_7d, delta_7ds,
-                    prev_pct.five_hour, prev_pct.seven_day, prev_pct.seven_day_sonnet,
-                    curr_pct.five_hour, curr_pct.seven_day, curr_pct.seven_day_sonnet,
+                    prev_pct.five_hour, prev_pct.seven_day, prev_pct.weekly_scoped,
+                    curr_pct.five_hour, curr_pct.seven_day, curr_pct.weekly_scoped,
                 );
 
                 // Store computed deltas in governor state
@@ -3796,7 +3797,7 @@ pub fn run_governor_cycle(
         let max_util = [
             state.capacity_forecast.five_hour.current_utilization,
             state.capacity_forecast.seven_day.current_utilization,
-            state.capacity_forecast.seven_day_sonnet.current_utilization,
+            state.capacity_forecast.weekly_scoped.current_utilization,
         ]
         .into_iter()
         .fold(0.0_f64, f64::max);
@@ -3904,7 +3905,7 @@ pub fn run_governor_cycle(
                         window_pct_deltas: state::WindowPctDeltas {
                             five_hour: p5h,
                             seven_day: p7d,
-                            seven_day_sonnet: p7ds,
+                            weekly_scoped: p7ds,
                         },
                         fleet_cache_eff,
                         cache_eff_p25,
@@ -4040,7 +4041,7 @@ pub fn run_governor_cycle(
         if !state.usage.stale {
             let new_five_hour = state.usage.five_hour_pct;
             let new_seven_day = state.usage.all_models_pct;
-            let new_seven_day_sonnet = state.usage.sonnet_pct;
+            let new_weekly_scoped = state.usage.sonnet_pct;
             if let Some(snap) = old_snapshot.clone() {
                 let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
@@ -4050,12 +4051,12 @@ pub fn run_governor_cycle(
                     let old_pct = crate::db::WindowPctSnapshot {
                         five_hour: snap.five_hour_pct,
                         seven_day: snap.seven_day_pct,
-                        seven_day_sonnet: snap.seven_day_sonnet_pct,
+                        weekly_scoped: snap.weekly_scoped_pct,
                     };
                     let new_pct = crate::db::WindowPctSnapshot {
                         five_hour: new_five_hour,
                         seven_day: new_seven_day,
-                        seven_day_sonnet: new_seven_day_sonnet,
+                        weekly_scoped: new_weekly_scoped,
                     };
                     let (delta_5h, delta_7d, delta_7ds) =
                         calculate_window_pct_delta(&old_pct, &new_pct);
@@ -4114,21 +4115,21 @@ pub fn run_governor_cycle(
                     if delta_7ds > 0.0 {
                         let rate = delta_7ds / elapsed_hours_snap;
                         if samples == 0 {
-                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet = rate;
+                            state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
                         } else {
-                            state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet = EMA_ALPHA * rate
+                            state.burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate
                                 + (1.0 - EMA_ALPHA)
-                                    * state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet;
+                                    * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
                         }
                         if fleet_usd_hr > 0.0 {
                             let ratio = fleet_usd_hr / rate;
                             if samples == 0 {
-                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet = ratio;
+                                state.burn_rate.usd_per_pct_ema_weekly_scoped = ratio;
                             } else {
-                                state.burn_rate.usd_per_pct_ema_seven_day_sonnet = EMA_ALPHA
+                                state.burn_rate.usd_per_pct_ema_weekly_scoped = EMA_ALPHA
                                     * ratio
                                     + (1.0 - EMA_ALPHA)
-                                        * state.burn_rate.usd_per_pct_ema_seven_day_sonnet;
+                                        * state.burn_rate.usd_per_pct_ema_weekly_scoped;
                             }
                         }
                         updated_any = true;
@@ -4149,7 +4150,7 @@ pub fn run_governor_cycle(
                         delta_7ds,
                         state.burn_rate.fleet_pct_hr_ema.five_hour,
                         state.burn_rate.fleet_pct_hr_ema.seven_day,
-                        state.burn_rate.fleet_pct_hr_ema.seven_day_sonnet,
+                        state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
                         state.burn_rate.fleet_pct_ema_samples,
                     );
                 }
@@ -4160,7 +4161,7 @@ pub fn run_governor_cycle(
                 taken_at: now,
                 five_hour_pct: new_five_hour,
                 seven_day_pct: new_seven_day,
-                seven_day_sonnet_pct: new_seven_day_sonnet,
+                weekly_scoped_pct: new_weekly_scoped,
             });
         }
     }
@@ -4187,12 +4188,12 @@ pub fn run_governor_cycle(
             let old_pct = db::WindowPctSnapshot {
                 five_hour: prev_snap.five_hour_pct,
                 seven_day: prev_snap.seven_day_pct,
-                seven_day_sonnet: prev_snap.seven_day_sonnet_pct,
+                weekly_scoped: prev_snap.weekly_scoped_pct,
             };
             let new_pct = db::WindowPctSnapshot {
                 five_hour: state.usage.five_hour_pct,
                 seven_day: state.usage.all_models_pct,
-                seven_day_sonnet: state.usage.sonnet_pct,
+                weekly_scoped: state.usage.sonnet_pct,
             };
 
             // Guard 1: Elapsed time < 2 minutes - too noisy for reliable annotation
@@ -4215,14 +4216,14 @@ pub fn run_governor_cycle(
                 let reset_threshold = 1.0;
                 let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
                 let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-                let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+                let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
-                if five_hour_reset || seven_day_reset || seven_day_sonnet_reset {
+                if five_hour_reset || seven_day_reset || weekly_scoped_reset {
                     log::warn!(
                         "[governor] skipping window delta annotation: interval spans window reset (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
                         old_pct.five_hour, new_pct.five_hour,
                         old_pct.seven_day, new_pct.seven_day,
-                        old_pct.seven_day_sonnet, new_pct.seven_day_sonnet
+                        old_pct.weekly_scoped, new_pct.weekly_scoped
                     );
                 } else {
                     // All guards passed - proceed with annotation
@@ -4246,7 +4247,7 @@ pub fn run_governor_cycle(
     let mut current_utilization = HashMap::new();
     current_utilization.insert("five_hour".to_string(), state.usage.five_hour_pct);
     current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
-    current_utilization.insert("seven_day_sonnet".to_string(), state.usage.sonnet_pct);
+    current_utilization.insert("weekly_scoped".to_string(), state.usage.sonnet_pct);
 
     // 5a-pre. Detect window resets and score predictions for calibration.
     //
@@ -4265,13 +4266,13 @@ pub fn run_governor_cycle(
         // Previous utilizations (from before the snapshot update)
         let prev_5h = prev_snap.five_hour_pct;
         let prev_7d = prev_snap.seven_day_pct;
-        let prev_7ds = prev_snap.seven_day_sonnet_pct;
+        let prev_7ds = prev_snap.weekly_scoped_pct;
 
         // Check for resets in each window
         let windows_to_check = [
             ("five_hour", cur_5h, prev_5h),
             ("seven_day", cur_7d, prev_7d),
-            ("seven_day_sonnet", cur_7ds, prev_7ds),
+            ("weekly_scoped", cur_7ds, prev_7ds),
         ];
 
         for (window_name, current, previous) in windows_to_check {
@@ -4349,15 +4350,15 @@ pub fn run_governor_cycle(
     }
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
         hours_remaining.insert(
-            "seven_day_sonnet".to_string(),
+            "weekly_scoped".to_string(),
             schedule::effective_hours_remaining_from(
                 now,
                 reset_time,
                 promotions,
-                "seven_day_sonnet",
+                "weekly_scoped",
             ),
         );
-        // Approximate seven_day reset time as same as seven_day_sonnet
+        // Approximate seven_day reset time as same as weekly_scoped
         hours_remaining.insert(
             "seven_day".to_string(),
             schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
@@ -4414,10 +4415,10 @@ pub fn run_governor_cycle(
             rate_for(ema.seven_day, state.burn_rate.usd_per_pct_ema_seven_day),
         );
         map.insert(
-            "seven_day_sonnet".to_string(),
+            "weekly_scoped".to_string(),
             rate_for(
-                ema.seven_day_sonnet,
-                state.burn_rate.usd_per_pct_ema_seven_day_sonnet,
+                ema.weekly_scoped,
+                state.burn_rate.usd_per_pct_ema_weekly_scoped,
             ),
         );
 
@@ -4430,7 +4431,7 @@ pub fn run_governor_cycle(
                 baseline_usd_per_pct,
                 map["five_hour"],
                 map["seven_day"],
-                map["seven_day_sonnet"],
+                map["weekly_scoped"],
             );
         }
 
@@ -4442,7 +4443,7 @@ pub fn run_governor_cycle(
     // For each window, predict the final utilization percentage when the window resets.
     // The prediction is: current_utilization + (fleet_pct_per_hour * hours_remaining).
     // This prediction will be scored when the window resets (utilization drops).
-    for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
+    for window in &["five_hour", "seven_day", "weekly_scoped"] {
         let util = current_utilization.get(*window).copied().unwrap_or(0.0);
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
         let pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
@@ -4533,12 +4534,12 @@ pub fn run_governor_cycle(
     // Build capacity forecast for each window using burn_rate module
     let mut five_hour_forecast = state::WindowForecast::default();
     let mut seven_day_forecast = state::WindowForecast::default();
-    let mut seven_day_sonnet_forecast = state::WindowForecast::default();
+    let mut weekly_scoped_forecast = state::WindowForecast::default();
 
     // Track effective target ceilings per window (after safe mode reduction)
     let mut effective_target_ceilings = std::collections::HashMap::new();
 
-    for window in &["five_hour", "seven_day", "seven_day_sonnet"] {
+    for window in &["five_hour", "seven_day", "weekly_scoped"] {
         let util = current_utilization.get(*window).copied().unwrap_or(0.0);
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
         let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
@@ -4577,7 +4578,7 @@ pub fn run_governor_cycle(
         let usd_per_pct = match *window {
             "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
             "seven_day" => state.burn_rate.usd_per_pct_ema_seven_day,
-            "seven_day_sonnet" => state.burn_rate.usd_per_pct_ema_seven_day_sonnet,
+            "weekly_scoped" => state.burn_rate.usd_per_pct_ema_weekly_scoped,
             _ => 0.0,
         };
         let effective_usd_per_pct = if usd_per_pct > 0.0 {
@@ -4600,7 +4601,7 @@ pub fn run_governor_cycle(
         match *window {
             "five_hour" => five_hour_forecast = forecast,
             "seven_day" => seven_day_forecast = forecast,
-            "seven_day_sonnet" => seven_day_sonnet_forecast = forecast,
+            "weekly_scoped" => weekly_scoped_forecast = forecast,
             _ => {}
         }
     }
@@ -4611,7 +4612,7 @@ pub fn run_governor_cycle(
     let windows = [
         ("five_hour", &five_hour_forecast),
         ("seven_day", &seven_day_forecast),
-        ("seven_day_sonnet", &seven_day_sonnet_forecast),
+        ("weekly_scoped", &weekly_scoped_forecast),
     ];
 
     let binding_window = windows
@@ -4629,15 +4630,15 @@ pub fn run_governor_cycle(
         five_hour_forecast.binding = true;
     } else if binding_window == "seven_day" {
         seven_day_forecast.binding = true;
-    } else if binding_window == "seven_day_sonnet" {
-        seven_day_sonnet_forecast.binding = true;
+    } else if binding_window == "weekly_scoped" {
+        weekly_scoped_forecast.binding = true;
     }
 
     // Update state with new capacity forecast
     state.capacity_forecast = state::CapacityForecast {
         five_hour: five_hour_forecast,
         seven_day: seven_day_forecast,
-        seven_day_sonnet: seven_day_sonnet_forecast,
+        weekly_scoped: weekly_scoped_forecast,
         binding_window: binding_window.clone(),
         dollars_per_pct_7d_s: 0.0,
         estimated_remaining_dollars: 0.0,
@@ -4720,11 +4721,11 @@ pub fn run_governor_cycle(
             1.0
         }
     };
-    let mult_seven_day_sonnet = if is_peak {
+    let mult_weekly_scoped = if is_peak {
         1.0
     } else {
         let applies = promotions.iter().any(|p| {
-            p.applies_to.iter().any(|w| w == "seven_day_sonnet")
+            p.applies_to.iter().any(|w| w == "weekly_scoped")
                 && schedule::is_promo_active_at(now, p)
         });
         if applies {
@@ -4735,15 +4736,15 @@ pub fn run_governor_cycle(
     };
     let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
     let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);
-    let eff_seven_day_sonnet = hours_remaining
-        .get("seven_day_sonnet")
+    let eff_weekly_scoped = hours_remaining
+        .get("weekly_scoped")
         .copied()
         .unwrap_or(0.0);
     // Effective hours for display: use the binding window's value
     let eff_display = match binding_window.as_str() {
         "five_hour" => eff_five_hour,
         "seven_day" => eff_seven_day,
-        _ => eff_seven_day_sonnet,
+        _ => eff_weekly_scoped,
     };
     // Raw hours remaining: wall-clock hours until seven_day reset (approx)
     let raw_hours = state
@@ -4757,15 +4758,15 @@ pub fn run_governor_cycle(
         is_promo_active: schedule::is_any_promo_active_at(now, promotions),
         promo_multiplier_five_hour: mult_five_hour,
         promo_multiplier_seven_day: mult_seven_day,
-        promo_multiplier_seven_day_sonnet: mult_seven_day_sonnet,
+        promo_multiplier_weekly_scoped: mult_weekly_scoped,
         // max across windows for backward-compatible display
-        promo_multiplier: [mult_five_hour, mult_seven_day, mult_seven_day_sonnet]
+        promo_multiplier: [mult_five_hour, mult_seven_day, mult_weekly_scoped]
             .iter()
             .cloned()
             .fold(1.0_f64, f64::max),
         effective_hours_remaining_five_hour: eff_five_hour,
         effective_hours_remaining_seven_day: eff_seven_day,
-        effective_hours_remaining_seven_day_sonnet: eff_seven_day_sonnet,
+        effective_hours_remaining_weekly_scoped: eff_weekly_scoped,
         effective_hours_remaining: eff_display,
         raw_hours_remaining: raw_hours,
     };
@@ -4773,7 +4774,7 @@ pub fn run_governor_cycle(
     // Update burn_rate from fleet aggregate if we have valid data
     if elapsed_hours > 0.0 && current_total > 0 {
         let deltas = &state.last_fleet_aggregate.window_pct_deltas;
-        let total_pct_delta = deltas.five_hour + deltas.seven_day + deltas.seven_day_sonnet;
+        let total_pct_delta = deltas.five_hour + deltas.seven_day + deltas.weekly_scoped;
         let avg_pct_per_hour = total_pct_delta / (elapsed_hours * 3.0); // Average across windows
 
         // Get baseline before mutable borrow (for staleness checking)
@@ -4852,7 +4853,7 @@ pub fn run_governor_cycle(
                 reset_time,
                 target,
                 current_total,
-                "seven_day_sonnet",
+                "weekly_scoped",
             )
         });
 
@@ -4884,7 +4885,7 @@ pub fn run_governor_cycle(
                 let cutoff_risk = match state.capacity_forecast.binding_window.as_str() {
                     WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
                     WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                    _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
                 };
                 let mut current_workers_map: HashMap<String, u32> = HashMap::new();
                 for (name, ws) in &state.workers {
@@ -4958,7 +4959,7 @@ pub fn run_governor_cycle(
                 let cutoff_risk = match binding_window.as_str() {
                     WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
                     WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                    _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
                 };
 
                 // Build current workers map
@@ -5012,7 +5013,7 @@ pub fn run_governor_cycle(
                 let cutoff_risk = match binding_window.as_str() {
                     WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
                     WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-                    _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+                    _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
                 };
 
                 // Build current workers map
@@ -5104,7 +5105,7 @@ pub fn run_governor_cycle(
     let cutoff_risk = match binding_window.as_str() {
         WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
         WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-        _ => state.capacity_forecast.seven_day_sonnet.cutoff_risk,
+        _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
     };
 
     match &decision {
@@ -5338,7 +5339,7 @@ mod tests {
     /// # Arguments
     /// - `five_hour`: 5-hour window utilization percentage
     /// - `seven_day`: 7-day window utilization percentage (all models)
-    /// - `seven_day_sonnet`: 7-day window utilization percentage (Sonnet only)
+    /// - `weekly_scoped`: 7-day window utilization percentage (Sonnet only)
     ///
     /// # Returns
     /// A UsageSnapshot struct with the specified window values.
@@ -5350,14 +5351,14 @@ mod tests {
     /// let snapshot = make_usage_snapshot(75.5, 45.0, 38.2);
     /// assert_eq!(snapshot.get("five_hour"), Some(75.5));
     /// assert_eq!(snapshot.get("seven_day"), Some(45.0));
-    /// assert_eq!(snapshot.get("seven_day_sonnet"), Some(38.2));
+    /// assert_eq!(snapshot.get("weekly_scoped"), Some(38.2));
     /// ```
     pub fn make_usage_snapshot(
         five_hour: f64,
         seven_day: f64,
-        seven_day_sonnet: f64,
+        weekly_scoped: f64,
     ) -> UsageSnapshot {
-        UsageSnapshot::from_windows(five_hour, seven_day, seven_day_sonnet)
+        UsageSnapshot::from_windows(five_hour, seven_day, weekly_scoped)
     }
 
     /// Create a UsageSnapshot with custom window values.
@@ -5379,7 +5380,7 @@ mod tests {
     /// let mut windows = HashMap::new();
     /// windows.insert("five_hour".to_string(), 80.0);
     /// windows.insert("seven_day".to_string(), 50.0);
-    /// windows.insert("seven_day_sonnet".to_string(), 45.0);
+    /// windows.insert("weekly_scoped".to_string(), 45.0);
     ///
     /// let snapshot = make_usage_snapshot_from_map(windows);
     /// assert_eq!(snapshot.get("five_hour"), Some(80.0));
@@ -5426,18 +5427,18 @@ mod tests {
         let snapshot = make_usage_snapshot(75.5, 45.0, 38.2);
         assert_eq!(snapshot.get("five_hour"), Some(75.5));
         assert_eq!(snapshot.get("seven_day"), Some(45.0));
-        assert_eq!(snapshot.get("seven_day_sonnet"), Some(38.2));
+        assert_eq!(snapshot.get("weekly_scoped"), Some(38.2));
 
         // Test make_usage_snapshot_from_map
         let mut windows = std::collections::HashMap::new();
         windows.insert("five_hour".to_string(), 80.0);
         windows.insert("seven_day".to_string(), 50.0);
-        windows.insert("seven_day_sonnet".to_string(), 45.0);
+        windows.insert("weekly_scoped".to_string(), 45.0);
 
         let custom_snapshot = make_usage_snapshot_from_map(windows);
         assert_eq!(custom_snapshot.get("five_hour"), Some(80.0));
         assert_eq!(custom_snapshot.get("seven_day"), Some(50.0));
-        assert_eq!(custom_snapshot.get("seven_day_sonnet"), Some(45.0));
+        assert_eq!(custom_snapshot.get("weekly_scoped"), Some(45.0));
     }
 
     // --- Core emergency brake tests ---
@@ -5543,12 +5544,12 @@ mod tests {
 
     #[test]
     fn test_brake_triggers_on_any_window() {
-        // Test seven_day_sonnet window
+        // Test weekly_scoped window
         let mut state = governor_with_agents();
         let usage = make_usage_snapshot(50.0, 50.0, 98.0);
         let result = state.check_emergency_brake(&usage);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().triggered_window, WINDOW_SEVEN_DAY_SONNET);
+        assert_eq!(result.unwrap().triggered_window, WINDOW_WEEKLY_SCOPED);
 
         // Test seven_day window
         let mut state2 = governor_with_agents();
@@ -5615,7 +5616,7 @@ mod tests {
 
         assert_eq!(snap.get(WINDOW_FIVE_HOUR), Some(10.0));
         assert_eq!(snap.get(WINDOW_SEVEN_DAY), Some(20.0));
-        assert_eq!(snap.get(WINDOW_SEVEN_DAY_SONNET), Some(30.0));
+        assert_eq!(snap.get(WINDOW_WEEKLY_SCOPED), Some(30.0));
         assert_eq!(snap.get("unknown"), None);
     }
 
@@ -5773,7 +5774,7 @@ mod tests {
             peak_start_hour_et: 8,
             peak_end_hour_et: 14,
             offpeak_multiplier: 2.0,
-            applies_to: vec!["seven_day_sonnet".to_string()],
+            applies_to: vec!["weekly_scoped".to_string()],
         }
     }
 
@@ -5794,7 +5795,7 @@ mod tests {
         let now = et(2026, 3, 16, 7, 35);
         let deadline = now + chrono::Duration::hours(2);
 
-        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet")
+        let t = schedule::next_transition_from(now, deadline, &promos, "weekly_scoped")
             .expect("Should detect off-peak → peak transition");
 
         assert_eq!(t.minutes_until, 25);
@@ -5817,7 +5818,7 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2); // well past transition
 
         let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_some(),
@@ -5838,7 +5839,7 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2);
 
         let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_none(),
@@ -5855,7 +5856,7 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2);
 
         let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "seven_day_sonnet");
+            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_none(),
@@ -5875,13 +5876,13 @@ mod tests {
         // Actually: post_target=0 < current_total=1, so effective_target = max(0, 0) = 0
         // Let's use current_total=2, target=2: post_target=1, effective=max(1,1)=1
         let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "seven_day_sonnet");
+            compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "weekly_scoped");
         // post_target = floor(2 * 0.5) = 1, effective = max(1, 2-1) = max(1,1) = 1
         assert_eq!(result, Some(1));
 
         // Now test where current_total already equals post_transition_target: no trigger
         let result_at_target =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0, "seven_day_sonnet");
+            compute_pre_scale_target(now, 30, &promos, reset_time, 0, 0, "weekly_scoped");
         // post_target = 0, current_total = 0: post_target >= current_total → None
         assert!(
             result_at_target.is_none(),
@@ -5897,7 +5898,7 @@ mod tests {
 
         // pre_scale_minutes = 0 disables pre-scaling entirely
         let result =
-            compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "seven_day_sonnet");
+            compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "weekly_scoped");
         assert!(
             result.is_none(),
             "pre_scale_minutes=0 should disable pre-scaling"
@@ -5910,7 +5911,7 @@ mod tests {
         let now = et(2026, 3, 16, 6, 0);
         let deadline = now + chrono::Duration::hours(3);
 
-        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet").unwrap();
+        let t = schedule::next_transition_from(now, deadline, &promos, "weekly_scoped").unwrap();
         assert_eq!(t.minutes_until, 120);
         assert!(t.minutes_until > 30, "outside 30-minute window");
     }
@@ -5921,7 +5922,7 @@ mod tests {
         let now = et(2026, 3, 16, 13, 45);
         let deadline = now + chrono::Duration::hours(1);
 
-        let t = schedule::next_transition_from(now, deadline, &promos, "seven_day_sonnet").unwrap();
+        let t = schedule::next_transition_from(now, deadline, &promos, "weekly_scoped").unwrap();
         assert!(t.multiplier_after > t.multiplier_before, "gaining bonus");
         assert!(t.minutes_until <= 30, "within window");
         // Conservative: multiplier_after > multiplier_before → no pre-scale
@@ -5950,7 +5951,7 @@ mod tests {
 
         let mult_five = schedule::get_multiplier_at(t, &promos, "five_hour");
         let mult_7d = schedule::get_multiplier_at(t, &promos, "seven_day");
-        let mult_7ds = schedule::get_multiplier_at(t, &promos, "seven_day_sonnet");
+        let mult_7ds = schedule::get_multiplier_at(t, &promos, "weekly_scoped");
 
         assert!(
             (mult_five - 2.0).abs() < 1e-9,
@@ -5962,7 +5963,7 @@ mod tests {
         );
         assert!(
             (mult_7ds - 1.0).abs() < 1e-9,
-            "seven_day_sonnet should get 1.0x (not in applies_to), got {mult_7ds}"
+            "weekly_scoped should get 1.0x (not in applies_to), got {mult_7ds}"
         );
 
         // is_any_promo_active_at should be true (we are inside the date range)
@@ -6168,7 +6169,7 @@ mod tests {
 
         // Verify that generate_window_forecast produces usable output with this rate
         let forecast = generate_window_forecast(
-            "seven_day_sonnet",
+            "weekly_scoped",
             estimated_pct_hr,
             50.0,                   // current utilization
             90.0,                   // target ceiling
@@ -6242,7 +6243,7 @@ mod tests {
                 max: 6,
             },
         );
-        state.capacity_forecast.binding_window = "seven_day_sonnet".to_string();
+        state.capacity_forecast.binding_window = "weekly_scoped".to_string();
         // Leave safe_worker_count as None (default)
 
         let target = compute_target_workers(
@@ -6277,7 +6278,7 @@ mod tests {
                 max: 4,
             },
         );
-        state.capacity_forecast.binding_window = "seven_day_sonnet".to_string();
+        state.capacity_forecast.binding_window = "weekly_scoped".to_string();
         // Leave safe_worker_count as None (default) — mirrors a restart with zero samples
 
         let target = compute_target_workers(
@@ -6759,14 +6760,14 @@ mod tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.0,    // 5-hour window at 10%
             seven_day_pct: 20.0,    // 7-day window at 20%
-            seven_day_sonnet_pct: 15.0,  // 7-day-sonnet window at 15%
+            weekly_scoped_pct: 15.0,  // 7-day-sonnet window at 15%
         };
 
         let current_snapshot = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 12.5,    // 5-hour window increased by 2.5%
             seven_day_pct: 22.0,    // 7-day window increased by 2.0%
-            seven_day_sonnet_pct: 18.0,  // 7-day-sonnet window increased by 3.0%
+            weekly_scoped_pct: 18.0,  // 7-day-sonnet window increased by 3.0%
         };
 
         // Step 1: Convert snapshots to WindowPctSnapshot format for delta calculation
@@ -6774,13 +6775,13 @@ mod tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: previous_snapshot.five_hour_pct,
             seven_day: previous_snapshot.seven_day_pct,
-            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: previous_snapshot.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: current_snapshot.five_hour_pct,
             seven_day: current_snapshot.seven_day_pct,
-            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: current_snapshot.weekly_scoped_pct,
         };
 
         // Step 2: Compute deltas from consecutive snapshots
@@ -6792,7 +6793,7 @@ mod tests {
         // This represents the percentage change in utilization between consecutive API polls
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
+        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Step 4: Verify computed deltas match expected calculation
         // The delta formula: current_pct - previous_pct = delta_pct
@@ -6804,7 +6805,7 @@ mod tests {
             delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
         assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
 
         // Step 5: Verify the specific expected values for this test case
         assert!((expected_delta_5h - 2.5).abs() < f64::EPSILON,
@@ -6820,7 +6821,7 @@ mod tests {
         let window_pct_deltas = WindowPctDeltas {
             five_hour: delta_5h,
             seven_day: delta_7d,
-            seven_day_sonnet: delta_7ds,
+            weekly_scoped: delta_7ds,
         };
 
         // Step 7: Assert that delta fields are correctly populated with expected values
@@ -6830,9 +6831,9 @@ mod tests {
         assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
             "State seven_day delta should be {} (from {} - {})",
             expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((window_pct_deltas.seven_day_sonnet - expected_delta_7ds).abs() < f64::EPSILON,
-            "State seven_day_sonnet delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+        assert!((window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
+            "State weekly_scoped delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
 
         // Verify all deltas are non-zero (indicating active consumption)
         assert!(delta_5h > 0.0, "5-hour delta should be positive (increasing)");
@@ -6855,7 +6856,7 @@ mod tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 80.0,     // 5-hour window at 80% (near exhaustion)
             seven_day_pct: 90.0,     // 7-day window at 90% (near exhaustion)
-            seven_day_sonnet_pct: 85.0,  // 7-day-sonnet at 85%
+            weekly_scoped_pct: 85.0,  // 7-day-sonnet at 85%
         };
 
         // Current snapshot shows window reset (utilization dropped)
@@ -6863,20 +6864,20 @@ mod tests {
             taken_at: Utc::now(),
             five_hour_pct: 5.0,      // Window reset: 80% -> 5% (delta: -75.0)
             seven_day_pct: 15.0,     // Window reset: 90% -> 15% (delta: -75.0)
-            seven_day_sonnet_pct: 8.0,  // Window reset: 85% -> 8% (delta: -77.0)
+            weekly_scoped_pct: 8.0,  // Window reset: 85% -> 8% (delta: -77.0)
         };
 
         // Compute deltas
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: previous_snapshot.five_hour_pct,
             seven_day: previous_snapshot.seven_day_pct,
-            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: previous_snapshot.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: current_snapshot.five_hour_pct,
             seven_day: current_snapshot.seven_day_pct,
-            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: current_snapshot.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -6885,7 +6886,7 @@ mod tests {
         // Delta formula: delta = current - previous (negative when window resets)
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
+        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Verify computed deltas match expected calculation (negative for window reset)
         assert!((delta_5h - expected_delta_5h).abs() < f64::EPSILON,
@@ -6896,7 +6897,7 @@ mod tests {
             delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
         assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
 
         // Verify the specific expected values for this window reset test case
         assert!((expected_delta_5h - (-75.0)).abs() < f64::EPSILON,
@@ -6910,7 +6911,7 @@ mod tests {
         let window_pct_deltas = WindowPctDeltas {
             five_hour: delta_5h,
             seven_day: delta_7d,
-            seven_day_sonnet: delta_7ds,
+            weekly_scoped: delta_7ds,
         };
 
         // Verify state correctly captures negative deltas (matching expected calculation)
@@ -6920,17 +6921,17 @@ mod tests {
         assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
             "State seven_day delta should be {} (from {} - {})",
             expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((window_pct_deltas.seven_day_sonnet - expected_delta_7ds).abs() < f64::EPSILON,
-            "State seven_day_sonnet delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+        assert!((window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
+            "State weekly_scoped delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
 
         // Verify all deltas are negative (window reset condition)
         assert!(window_pct_deltas.five_hour < 0.0,
             "State five_hour delta should be negative (window reset)");
         assert!(window_pct_deltas.seven_day < 0.0,
             "State seven_day delta should be negative (window reset)");
-        assert!(window_pct_deltas.seven_day_sonnet < 0.0,
-            "State seven_day_sonnet delta should be negative (window reset)");
+        assert!(window_pct_deltas.weekly_scoped < 0.0,
+            "State weekly_scoped delta should be negative (window reset)");
     }
 
     /// Test consecutive snapshot delta computation with identical values (zero deltas).
@@ -6948,7 +6949,7 @@ mod tests {
             taken_at: Utc::now(),
             five_hour_pct: 25.0,
             seven_day_pct: 35.0,
-            seven_day_sonnet_pct: 28.0,
+            weekly_scoped_pct: 28.0,
         };
 
         // Previous and current are identical
@@ -6959,13 +6960,13 @@ mod tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: previous_snapshot.five_hour_pct,
             seven_day: previous_snapshot.seven_day_pct,
-            seven_day_sonnet: previous_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: previous_snapshot.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: current_snapshot.five_hour_pct,
             seven_day: current_snapshot.seven_day_pct,
-            seven_day_sonnet: current_snapshot.seven_day_sonnet_pct,
+            weekly_scoped: current_snapshot.weekly_scoped_pct,
         };
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -6974,7 +6975,7 @@ mod tests {
         // Delta formula: delta = current - previous (both are identical here)
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.seven_day_sonnet_pct - previous_snapshot.seven_day_sonnet_pct;
+        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Verify computed deltas match expected calculation (should be zero for identical snapshots)
         assert_eq!(delta_5h, expected_delta_5h,
@@ -6985,7 +6986,7 @@ mod tests {
             delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
         assert_eq!(delta_7ds, expected_delta_7ds,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
 
         // Verify all expected deltas are exactly zero (identical snapshots)
         assert_eq!(expected_delta_5h, 0.0,
@@ -6999,7 +7000,7 @@ mod tests {
         let window_pct_deltas = WindowPctDeltas {
             five_hour: delta_5h,
             seven_day: delta_7d,
-            seven_day_sonnet: delta_7ds,
+            weekly_scoped: delta_7ds,
         };
 
         // Verify state correctly shows zero deltas (matching expected calculation)
@@ -7009,9 +7010,9 @@ mod tests {
         assert_eq!(window_pct_deltas.seven_day, expected_delta_7d,
             "State seven_day delta should be {} (from {} - {})",
             expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert_eq!(window_pct_deltas.seven_day_sonnet, expected_delta_7ds,
-            "State seven_day_sonnet delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.seven_day_sonnet_pct, previous_snapshot.seven_day_sonnet_pct);
+        assert_eq!(window_pct_deltas.weekly_scoped, expected_delta_7ds,
+            "State weekly_scoped delta should be {} (from {} - {})",
+            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
     }
 
     // ---------------------------------------------------------------------------
@@ -7048,7 +7049,7 @@ mod tests {
         let snapshot = crate::db::WindowPctSnapshot {
             five_hour: usage.get(WINDOW_FIVE_HOUR).unwrap_or(0.0),
             seven_day: usage.get(WINDOW_SEVEN_DAY).unwrap_or(0.0),
-            seven_day_sonnet: usage.get(WINDOW_SEVEN_DAY_SONNET).unwrap_or(0.0),
+            weekly_scoped: usage.get(WINDOW_WEEKLY_SCOPED).unwrap_or(0.0),
         };
 
         // Simulate minimal capacity forecast
@@ -7065,13 +7066,13 @@ mod tests {
                 safe_worker_count_p75: Some(5),
                 ..Default::default()
             },
-            seven_day_sonnet: state::WindowForecast {
-                current_utilization: snapshot.seven_day_sonnet,
+            weekly_scoped: state::WindowForecast {
+                current_utilization: snapshot.weekly_scoped,
                 safe_worker_count: Some(7),
                 safe_worker_count_p75: Some(6),
                 ..Default::default()
             },
-            binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+            binding_window: WINDOW_WEEKLY_SCOPED.to_string(),
             ..Default::default()
         };
 
@@ -7150,7 +7151,7 @@ mod tests {
                 safe_worker_count: Some(5),
                 ..Default::default()
             },
-            seven_day_sonnet: state::WindowForecast {
+            weekly_scoped: state::WindowForecast {
                 current_utilization: 50.0,
                 safe_worker_count: Some(5),
                 ..Default::default()
@@ -7204,12 +7205,12 @@ mod tests {
                 safe_worker_count: Some(5),
                 ..Default::default()
             },
-            seven_day_sonnet: state::WindowForecast {
+            weekly_scoped: state::WindowForecast {
                 current_utilization: 50.0,
                 safe_worker_count: Some(5),
                 ..Default::default()
             },
-            binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+            binding_window: WINDOW_WEEKLY_SCOPED.to_string(),
             ..Default::default()
         };
 
@@ -7296,16 +7297,16 @@ impl MockPoller {
     /// # Arguments
     /// - `five_hour_util`: 5-hour window utilization percentage
     /// - `seven_day_util`: 7-day window utilization percentage (all models)
-    /// - `seven_day_sonnet_util`: 7-day window utilization percentage (Sonnet only)
+    /// - `weekly_scoped_util`: 7-day window utilization percentage (Sonnet only)
     pub fn with_utilization(
         five_hour_util: f64,
         seven_day_util: f64,
-        seven_day_sonnet_util: f64,
+        weekly_scoped_util: f64,
     ) -> Self {
         let mut data = Self::default_usage_data();
         data.five_hour_utilization = five_hour_util;
         data.seven_day_utilization = seven_day_util;
-        data.seven_day_sonnet_utilization = seven_day_sonnet_util;
+        data.weekly_scoped_utilization = weekly_scoped_util;
 
         Self {
             usage_data: Some(data),
@@ -7357,9 +7358,10 @@ impl MockPoller {
             seven_day_utilization: 60.0,
             seven_day_resets_at: seven_day_reset.to_rfc3339(),
             seven_day_hours_remaining: 120.0,
-            seven_day_sonnet_utilization: 55.0,
-            seven_day_sonnet_resets_at: seven_day_reset.to_rfc3339(),
-            seven_day_sonnet_hours_remaining: 120.0,
+            weekly_scoped_utilization: 55.0,
+            weekly_scoped_resets_at: seven_day_reset.to_rfc3339(),
+            weekly_scoped_hours_remaining: 120.0,
+            weekly_scoped_model: None,
             limits: vec![],
             timestamp: now,
             stale: false,
@@ -7438,7 +7440,7 @@ mod mock_poller_tests {
         assert!(!data.stale, "Default data should not be stale");
         assert_eq!(data.five_hour_utilization, 50.0);
         assert_eq!(data.seven_day_utilization, 60.0);
-        assert_eq!(data.seven_day_sonnet_utilization, 55.0);
+        assert_eq!(data.weekly_scoped_utilization, 55.0);
     }
 
     /// Test that MockPoller can return error responses.
@@ -7478,7 +7480,7 @@ mod mock_poller_tests {
         let data = result.unwrap();
         assert_eq!(data.five_hour_utilization, 75.0);
         assert_eq!(data.seven_day_utilization, 80.0);
-        assert_eq!(data.seven_day_sonnet_utilization, 77.5);
+        assert_eq!(data.weekly_scoped_utilization, 77.5);
         assert!(!data.stale, "Custom data should not be stale");
     }
 
@@ -7493,7 +7495,7 @@ mod mock_poller_tests {
         let data = result.unwrap();
         assert_eq!(data.five_hour_utilization, 99.0);
         assert_eq!(data.seven_day_utilization, 99.0);
-        assert_eq!(data.seven_day_sonnet_utilization, 99.0);
+        assert_eq!(data.weekly_scoped_utilization, 99.0);
     }
 
     /// Test that MockPoller low utilization scenario returns low values.
@@ -7507,7 +7509,7 @@ mod mock_poller_tests {
         let data = result.unwrap();
         assert!(data.five_hour_utilization <= 25.0);
         assert!(data.seven_day_utilization <= 25.0);
-        assert!(data.seven_day_sonnet_utilization <= 25.0);
+        assert!(data.weekly_scoped_utilization <= 25.0);
     }
 
     /// Test that MockPoller high utilization scenario returns high values.
@@ -7521,7 +7523,7 @@ mod mock_poller_tests {
         let data = result.unwrap();
         assert!(data.five_hour_utilization >= 90.0);
         assert!(data.seven_day_utilization >= 90.0);
-        assert!(data.seven_day_sonnet_utilization >= 90.0);
+        assert!(data.weekly_scoped_utilization >= 90.0);
     }
 
     /// Test that poll_count tracks invocations.
@@ -7578,9 +7580,10 @@ mod mock_poller_tests {
             seven_day_utilization: 75.0,
             seven_day_resets_at: (now + Duration::hours(96)).to_rfc3339(),
             seven_day_hours_remaining: 96.0,
-            seven_day_sonnet_utilization: 72.0,
-            seven_day_sonnet_resets_at: (now + Duration::hours(96)).to_rfc3339(),
-            seven_day_sonnet_hours_remaining: 96.0,
+            weekly_scoped_utilization: 72.0,
+            weekly_scoped_resets_at: (now + Duration::hours(96)).to_rfc3339(),
+            weekly_scoped_hours_remaining: 96.0,
+            weekly_scoped_model: None,
             limits: vec![],
             timestamp: now,
             stale: false,
@@ -8054,26 +8057,26 @@ mod mock_poller_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(120),
             five_hour_pct: 8.0,
             seven_day_pct: 42.0,
-            seven_day_sonnet_pct: 35.0,
+            weekly_scoped_pct: 35.0,
         };
 
         let poll2 = PrevUsageSnapshot {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 10.5,
             seven_day_pct: 43.0,
-            seven_day_sonnet_pct: 36.5,
+            weekly_scoped_pct: 36.5,
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: poll1.five_hour_pct,
             seven_day: poll1.seven_day_pct,
-            seven_day_sonnet: poll1.seven_day_sonnet_pct,
+            weekly_scoped: poll1.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: poll2.five_hour_pct,
             seven_day: poll2.seven_day_pct,
-            seven_day_sonnet: poll2.seven_day_sonnet_pct,
+            weekly_scoped: poll2.weekly_scoped_pct,
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -8098,13 +8101,13 @@ mod mock_poller_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 50.0,
             seven_day: 60.0,
-            seven_day_sonnet: 55.0,
+            weekly_scoped: 55.0,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 50.01,   // +0.01%
             seven_day: 60.01,   // +0.01%
-            seven_day_sonnet: 55.01,  // +0.01%
+            weekly_scoped: 55.01,  // +0.01%
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -8125,13 +8128,13 @@ mod mock_poller_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 0.0,
             seven_day: 0.0,
-            seven_day_sonnet: 0.0,
+            weekly_scoped: 0.0,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 95.0,
             seven_day: 88.0,
-            seven_day_sonnet: 92.0,
+            weekly_scoped: 92.0,
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -8162,26 +8165,26 @@ mod mock_poller_tests {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 98.0,
             seven_day_pct: 95.0,
-            seven_day_sonnet_pct: 97.0,
+            weekly_scoped_pct: 97.0,
         };
 
         let post_reset = PrevUsageSnapshot {
             taken_at: Utc::now(),
             five_hour_pct: 2.0,
             seven_day_pct: 3.0,
-            seven_day_sonnet_pct: 1.5,
+            weekly_scoped_pct: 1.5,
         };
 
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: pre_reset.five_hour_pct,
             seven_day: pre_reset.seven_day_pct,
-            seven_day_sonnet: pre_reset.seven_day_sonnet_pct,
+            weekly_scoped: pre_reset.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: post_reset.five_hour_pct,
             seven_day: post_reset.seven_day_pct,
-            seven_day_sonnet: post_reset.seven_day_sonnet_pct,
+            weekly_scoped: post_reset.weekly_scoped_pct,
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -8229,13 +8232,13 @@ mod mock_poller_tests {
         let prev_pct = crate::db::WindowPctSnapshot {
             five_hour: prev.five_hour_pct,
             seven_day: prev.seven_day_pct,
-            seven_day_sonnet: prev.seven_day_sonnet_pct,
+            weekly_scoped: prev.weekly_scoped_pct,
         };
 
         let curr_pct = crate::db::WindowPctSnapshot {
             five_hour: curr.five_hour_pct,
             seven_day: curr.seven_day_pct,
-            seven_day_sonnet: curr.seven_day_sonnet_pct,
+            weekly_scoped: curr.weekly_scoped_pct,
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -8255,13 +8258,13 @@ mod mock_poller_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 10.0,
             seven_day: 70.0,
-            seven_day_sonnet: 65.0,
+            weekly_scoped: 65.0,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 25.0,   // +15.0 (rapid burn)
             seven_day: 70.5,   // +0.5 (nearly flat)
-            seven_day_sonnet: 64.0,  // -1.0 (slight decrease due to older consumption rolling off)
+            weekly_scoped: 64.0,  // -1.0 (slight decrease due to older consumption rolling off)
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -8283,13 +8286,13 @@ mod mock_poller_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 1e308,
             seven_day: 1e308,
-            seven_day_sonnet: 1e308,
+            weekly_scoped: 1e308,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 1e308 - 1.0,
             seven_day: 1e308 - 1.0,
-            seven_day_sonnet: 1e308 - 1.0,
+            weekly_scoped: 1e308 - 1.0,
         };
 
         // Should not panic
@@ -8310,13 +8313,13 @@ mod mock_poller_tests {
         let prev = crate::db::WindowPctSnapshot {
             five_hour: 10.0,
             seven_day: 20.0,
-            seven_day_sonnet: 15.0,
+            weekly_scoped: 15.0,
         };
 
         let curr = crate::db::WindowPctSnapshot {
             five_hour: 12.5,
             seven_day: 22.0,
-            seven_day_sonnet: 18.0,
+            weekly_scoped: 18.0,
         };
 
         let start = std::time::Instant::now();
@@ -8340,7 +8343,7 @@ mod mock_poller_tests {
 
         // Fixture based on actual API data (high Sonnet usage scenario)
         let fixtures = vec![
-            // (time_offset, five_hr, seven_day, seven_day_sonnet)
+            // (time_offset, five_hr, seven_day, weekly_scoped)
             (0, 12.5, 45.2, 38.7),
             (60, 14.8, 46.1, 40.2),
             (120, 17.2, 47.3, 42.1),
@@ -8353,7 +8356,7 @@ mod mock_poller_tests {
                 taken_at: Utc::now() + chrono::Duration::seconds(offset),
                 five_hour_pct: p5h,
                 seven_day_pct: p7d,
-                seven_day_sonnet_pct: p7ds,
+                weekly_scoped_pct: p7ds,
             });
         }
 
@@ -8365,13 +8368,13 @@ mod mock_poller_tests {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
 
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
 
             let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -8443,23 +8446,23 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 18.5,  // Dropped 1.5% - should trigger
             seven_day: 46.0,
-            seven_day_sonnet: 36.0,
+            weekly_scoped: 36.0,
         };
 
         let reset_threshold = 1.0;
 
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
         let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
         // At least one guard should trigger (5h dropped > 1%)
-        assert!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset,
+        assert!(five_hour_reset || seven_day_reset || weekly_scoped_reset,
                 "Test setup: at least one window should show reset");
     }
 
@@ -8469,23 +8472,23 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 21.5,  // Increased 1.5% - normal
             seven_day: 46.0,
-            seven_day_sonnet: 36.5,
+            weekly_scoped: 36.5,
         };
 
         let reset_threshold = 1.0;
 
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
         let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
         // No guard should trigger - all increased or stable
-        assert!(!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset),
+        assert!(!(five_hour_reset || seven_day_reset || weekly_scoped_reset),
                 "Test setup: no window should show reset");
     }
 
@@ -8495,25 +8498,25 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 25.0,
             seven_day: 50.0,
-            seven_day_sonnet: 40.0,
+            weekly_scoped: 40.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 22.0,   // Dropped 3%
             seven_day: 48.0,   // Dropped 2%
-            seven_day_sonnet: 38.5,  // Dropped 1.5%
+            weekly_scoped: 38.5,  // Dropped 1.5%
         };
 
         let reset_threshold = 1.0;
 
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
         let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
+        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
         // Multiple guards should trigger
         assert!(five_hour_reset, "5h window should show reset");
         assert!(seven_day_reset, "7d window should show reset");
-        assert!(seven_day_sonnet_reset, "7ds window should show reset");
+        assert!(weekly_scoped_reset, "7ds window should show reset");
     }
 
     /// Test all guards pass: Ideal conditions for annotation
@@ -8528,13 +8531,13 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 22.0,   // Increased 2% - no reset
             seven_day: 46.5,   // Increased 1.5%
-            seven_day_sonnet: 36.5,  // Increased 1.5%
+            weekly_scoped: 36.5,  // Increased 1.5%
         };
 
         // Guard 1: Check interval
@@ -8548,8 +8551,8 @@ mod annotation_guard_tests {
         let reset_threshold = 1.0;
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
         let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let seven_day_sonnet_reset = new_pct.seven_day_sonnet < old_pct.seven_day_sonnet - reset_threshold;
-        assert!(!(five_hour_reset || seven_day_reset || seven_day_sonnet_reset),
+        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
+        assert!(!(five_hour_reset || seven_day_reset || weekly_scoped_reset),
                 "Guard 3: no window reset should occur");
     }
 
@@ -8559,13 +8562,13 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 18.99,  // Dropped 1.01% - just over threshold
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let reset_threshold = 1.0;
@@ -8582,13 +8585,13 @@ mod annotation_guard_tests {
         let old_pct = db::WindowPctSnapshot {
             five_hour: 20.0,
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let new_pct = db::WindowPctSnapshot {
             five_hour: 19.01,  // Dropped 0.99% - just under threshold
             seven_day: 45.0,
-            seven_day_sonnet: 35.0,
+            weekly_scoped: 35.0,
         };
 
         let reset_threshold = 1.0;

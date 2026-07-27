@@ -300,7 +300,7 @@ pub fn create_state_file_with_workers(
 /// * `temp_dir` - Path to temporary directory
 /// * `five_hour_pct` - 5-hour window utilization percentage
 /// * `seven_day_pct` - 7-day window utilization percentage
-/// * `seven_day_sonnet_pct` - 7-day Sonnet window utilization percentage
+/// * `weekly_scoped_pct` - 7-day Sonnet window utilization percentage
 ///
 /// # Returns
 /// Path to the created state file
@@ -325,13 +325,13 @@ pub fn create_state_file_with_utilization(
     temp_dir: &Path,
     five_hour_pct: f64,
     seven_day_pct: f64,
-    seven_day_sonnet_pct: f64,
+    weekly_scoped_pct: f64,
 ) -> std::path::PathBuf {
     let state_path = temp_dir.join("governor-state.json");
 
     let mut state = state::GovernorState::new();
     state.usage.five_hour_pct = five_hour_pct;
-    state.usage.sonnet_pct = seven_day_sonnet_pct;
+    state.usage.sonnet_pct = weekly_scoped_pct;
     state.usage.all_models_pct = seven_day_pct;
 
     let json = serde_json::to_string_pretty(&state).unwrap();
@@ -350,7 +350,7 @@ pub fn create_state_file_with_utilization(
 /// * `workers` - HashMap of agent names to (current, min, max) worker counts
 /// * `five_hour_pct` - 5-hour window utilization percentage
 /// * `seven_day_pct` - 7-day window utilization percentage
-/// * `seven_day_sonnet_pct` - 7-day Sonnet window utilization percentage
+/// * `weekly_scoped_pct` - 7-day Sonnet window utilization percentage
 ///
 /// # Returns
 /// Path to the created state file
@@ -381,7 +381,7 @@ pub fn create_full_state_file(
     workers: &HashMap<String, (u32, u32, u32)>,
     five_hour_pct: f64,
     seven_day_pct: f64,
-    seven_day_sonnet_pct: f64,
+    weekly_scoped_pct: f64,
 ) -> std::path::PathBuf {
     let state_path = temp_dir.join("governor-state.json");
 
@@ -402,7 +402,7 @@ pub fn create_full_state_file(
 
     // Set utilization
     state.usage.five_hour_pct = five_hour_pct;
-    state.usage.sonnet_pct = seven_day_sonnet_pct;
+    state.usage.sonnet_pct = weekly_scoped_pct;
     state.usage.all_models_pct = seven_day_pct;
 
     // Set up capacity forecast with safe worker counts
@@ -419,13 +419,13 @@ pub fn create_full_state_file(
             safe_worker_count_p75: Some(5),
             ..Default::default()
         },
-        seven_day_sonnet: state::WindowForecast {
-            current_utilization: seven_day_sonnet_pct,
+        weekly_scoped: state::WindowForecast {
+            current_utilization: weekly_scoped_pct,
             safe_worker_count: Some(7),
             safe_worker_count_p75: Some(6),
             ..Default::default()
         },
-        binding_window: "seven_day_sonnet".to_string(),
+        binding_window: "weekly_scoped".to_string(),
         ..Default::default()
     };
 
@@ -581,10 +581,10 @@ mod tests {
             40.0
         );
         assert_eq!(
-            loaded.capacity_forecast.seven_day_sonnet.current_utilization,
+            loaded.capacity_forecast.weekly_scoped.current_utilization,
             35.0
         );
-        assert_eq!(loaded.capacity_forecast.binding_window, "seven_day_sonnet");
+        assert_eq!(loaded.capacity_forecast.binding_window, "weekly_scoped");
     }
 
     #[test]

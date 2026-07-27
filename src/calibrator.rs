@@ -16,7 +16,7 @@
 //!
 //! Prediction accuracy scores are stored in `prediction-accuracy.jsonl`:
 //! ```json
-//! {"ts":"2026-03-20T10:00:00Z","win":"seven_day_sonnet","predicted":5.2,"actual":4.8,"error":-0.4,"pct_error":-8.3}
+//! {"ts":"2026-03-20T10:00:00Z","win":"weekly_scoped","predicted":5.2,"actual":4.8,"error":-0.4,"pct_error":-8.3}
 //! ```
 
 use chrono::{DateTime, Utc};
@@ -59,7 +59,7 @@ pub struct PredictionScore {
     /// ISO 8601 timestamp when the prediction was made
     pub ts: DateTime<Utc>,
 
-    /// Window name (five_hour, seven_day, seven_day_sonnet)
+    /// Window name (five_hour, seven_day, weekly_scoped)
     pub win: String,
 
     /// Predicted utilization change (percentage points)
@@ -96,7 +96,7 @@ pub struct CalibrationStats {
     /// Mean absolute percentage error (MAPE)
     pub mape: f64,
 
-    /// Median error for seven_day_sonnet specifically
+    /// Median error for weekly_scoped specifically
     pub median_error_7ds: f64,
 
     /// Systematic bias indicator:
@@ -184,10 +184,10 @@ pub fn compute_stats(scores: &[PredictionScore]) -> CalibrationStats {
         errors[errors.len() / 2]
     };
 
-    // Compute median error for seven_day_sonnet specifically
+    // Compute median error for weekly_scoped specifically
     let errors_7ds: Vec<f64> = scores
         .iter()
-        .filter(|s| s.win == "seven_day_sonnet")
+        .filter(|s| s.win == "weekly_scoped")
         .map(|s| s.error)
         .collect();
     if !errors_7ds.is_empty() {
@@ -385,9 +385,9 @@ mod tests {
     #[test]
     fn score_prediction_computes_error_correctly() {
         let now = Utc::now();
-        let score = score_prediction("seven_day_sonnet", 5.0, 4.5, now);
+        let score = score_prediction("weekly_scoped", 5.0, 4.5, now);
 
-        assert_eq!(score.win, "seven_day_sonnet");
+        assert_eq!(score.win, "weekly_scoped");
         assert!((score.predicted - 5.0).abs() < 1e-9);
         assert!((score.actual - 4.5).abs() < 1e-9);
         assert!((score.error - (-0.5)).abs() < 1e-9); // actual - predicted
@@ -435,7 +435,7 @@ mod tests {
     fn compute_stats_single_sample() {
         let scores = vec![PredictionScore {
             ts: Utc::now(),
-            win: "seven_day_sonnet".to_string(),
+            win: "weekly_scoped".to_string(),
             predicted: 5.0,
             actual: 4.0,
             error: -1.0,
@@ -454,7 +454,7 @@ mod tests {
         let scores = vec![
             PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 5.0,
                 actual: 4.0,
                 error: -1.0,
@@ -462,7 +462,7 @@ mod tests {
             },
             PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 3.0,
                 actual: 4.0,
                 error: 1.0,
@@ -470,7 +470,7 @@ mod tests {
             },
             PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 2.0,
                 actual: 3.0,
                 error: 1.0,
@@ -480,7 +480,7 @@ mod tests {
 
         let stats = compute_stats(&scores);
         assert_eq!(stats.total_samples, 3);
-        assert_eq!(stats.samples_by_window.get("seven_day_sonnet"), Some(&3));
+        assert_eq!(stats.samples_by_window.get("weekly_scoped"), Some(&3));
 
         // Mean error = (-1 + 1 + 1) / 3 = 0.333
         assert!((stats.mean_error - 0.333).abs() < 0.01);
@@ -498,7 +498,7 @@ mod tests {
         let scores: Vec<PredictionScore> = (0..5)
             .map(|i| PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 3.0,
                 actual: 5.0 + i as f64 * 0.1,
                 error: 2.0 + i as f64 * 0.1,
@@ -526,7 +526,7 @@ mod tests {
             },
             PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 3.0,
                 actual: 4.0,
                 error: 1.0,
@@ -534,7 +534,7 @@ mod tests {
             },
             PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: 2.0,
                 actual: 3.5,
                 error: 1.5,
@@ -706,7 +706,7 @@ mod tests {
 
         let score = PredictionScore {
             ts: Utc::now(),
-            win: "seven_day_sonnet".to_string(),
+            win: "weekly_scoped".to_string(),
             predicted: 5.0,
             actual: 4.5,
             error: -0.5,
@@ -729,7 +729,7 @@ mod tests {
         for i in 0..5 {
             let score = PredictionScore {
                 ts: Utc::now(),
-                win: "seven_day_sonnet".to_string(),
+                win: "weekly_scoped".to_string(),
                 predicted: i as f64,
                 actual: (i + 1) as f64,
                 error: 1.0,
@@ -752,7 +752,7 @@ mod tests {
 
         let score = PredictionScore {
             ts: "2026-03-20T10:00:00Z".parse().unwrap(),
-            win: "seven_day_sonnet".to_string(),
+            win: "weekly_scoped".to_string(),
             predicted: 5.0,
             actual: 4.5,
             error: -0.5,
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
 
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(parsed.get("win").unwrap(), "seven_day_sonnet");
+        assert_eq!(parsed.get("win").unwrap(), "weekly_scoped");
         assert_eq!(parsed.get("predicted").unwrap(), 5.0);
     }
 

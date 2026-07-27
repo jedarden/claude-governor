@@ -30,7 +30,7 @@ use std::collections::HashMap;
 /// Per-window utilization data for burn rate computation
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowUtilization {
-    /// Window name: "five_hour", "seven_day", "seven_day_sonnet"
+    /// Window name: "five_hour", "seven_day", "weekly_scoped"
     pub window: String,
 
     /// Pct change this interval (None = not yet annotated by governor)
@@ -80,7 +80,7 @@ impl From<crate::db::DbInstanceRecord> for InstanceRecord {
                 db_rec.prev_p7d,
             ),
             WindowUtilization::from_pct_delta(
-                "seven_day_sonnet",
+                "weekly_scoped",
                 db_rec.p7ds,
                 db_rec.current_p7ds,
                 db_rec.prev_p7ds,
@@ -929,7 +929,7 @@ pub fn check_staleness(last_update: DateTime<Utc>) -> StalenessTier {
 const EMA_ALPHA: f64 = 0.2;
 
 /// Known window names
-const WINDOWS: &[&str] = &["five_hour", "seven_day", "seven_day_sonnet"];
+const WINDOWS: &[&str] = &["five_hour", "seven_day", "weekly_scoped"];
 
 /// Fleet-level per-worker statistics for one window
 #[derive(Debug, Clone)]
@@ -1096,7 +1096,7 @@ fn effective_burn_rate(ema: &ModelWindowEma, baseline: &BaselineBurnRates) -> (f
 fn duration_weight(window: &str) -> f64 {
     match window {
         "five_hour" => 3.0,        // 5h window: highest urgency (resets every 5 hours)
-        "seven_day_sonnet" => 1.5, // 7d sonnet: medium urgency
+        "weekly_scoped" => 1.5, // 7d sonnet: medium urgency
         "seven_day" => 1.0,        // 7d: lowest urgency (resets every 7 days)
         _ => 1.0,
     }
@@ -1422,8 +1422,8 @@ pub fn estimate_burn_rates(
     let capacity_forecast = crate::state::CapacityForecast {
         five_hour: forecasts.get("five_hour").cloned().unwrap_or_default(),
         seven_day: forecasts.get("seven_day").cloned().unwrap_or_default(),
-        seven_day_sonnet: forecasts
-            .get("seven_day_sonnet")
+        weekly_scoped: forecasts
+            .get("weekly_scoped")
             .cloned()
             .unwrap_or_default(),
         binding_window: binding_window.clone(),
@@ -1539,7 +1539,7 @@ pub fn build_burn_rate_state(
         fleet_pct_hr_ema: crate::state::WindowPctDeltas::default(),
         usd_per_pct_ema_five_hour: 0.0,
         usd_per_pct_ema_seven_day: 0.0,
-        usd_per_pct_ema_seven_day_sonnet: 0.0,
+        usd_per_pct_ema_weekly_scoped: 0.0,
         fleet_pct_ema_samples: 0,
         prev_usage_snapshot: None,
     }
@@ -1610,7 +1610,7 @@ pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
     let windows = [
         ("5h", &forecast.five_hour),
         ("7d", &forecast.seven_day),
-        ("7d-sonnet", &forecast.seven_day_sonnet),
+        ("7d-sonnet", &forecast.weekly_scoped),
     ];
 
     for (label, f) in &windows {
@@ -1637,7 +1637,7 @@ pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
         let binding_forecast = match forecast.binding_window.as_str() {
             "five_hour" => &forecast.five_hour,
             "seven_day" => &forecast.seven_day,
-            _ => &forecast.seven_day_sonnet,
+            _ => &forecast.weekly_scoped,
         };
         match binding_forecast.safe_worker_count {
             None => log::info!(
@@ -1753,7 +1753,7 @@ mod tests {
             windows: vec![
                 win("five_hour", None, 42.0, 40.0),
                 win("seven_day", Some(3.0), 65.0, 62.0),
-                win("seven_day_sonnet", None, 70.0, 68.0),
+                win("weekly_scoped", None, 70.0, 68.0),
             ],
         };
 
@@ -1865,7 +1865,7 @@ mod tests {
             windows: vec![
                 win("five_hour", Some(1.0), 41.0, 40.0),
                 win("seven_day", Some(3.0), 63.0, 60.0),
-                win("seven_day_sonnet", Some(5.0), 75.0, 70.0),
+                win("weekly_scoped", Some(5.0), 75.0, 70.0),
             ],
         };
 
@@ -1901,9 +1901,9 @@ mod tests {
             by_window["seven_day"].pct_per_hour
         );
         assert!(
-            (by_window["seven_day_sonnet"].pct_per_hour - 2.5).abs() < 1e-9,
-            "seven_day_sonnet: expected 2.5, got {}",
-            by_window["seven_day_sonnet"].pct_per_hour
+            (by_window["weekly_scoped"].pct_per_hour - 2.5).abs() < 1e-9,
+            "weekly_scoped: expected 2.5, got {}",
+            by_window["weekly_scoped"].pct_per_hour
         );
     }
 
@@ -1918,13 +1918,13 @@ mod tests {
             windows: vec![
                 win("five_hour", None, 41.0, 40.0),      // null pct_delta -> skip
                 win("seven_day", Some(0.0), 63.0, 63.0), // zero pct + tokens -> skip
-                win("seven_day_sonnet", Some(2.0), 72.0, 70.0), // valid
+                win("weekly_scoped", Some(2.0), 72.0, 70.0), // valid
             ],
         };
 
         let rates = compute_instance_burn(&record, 1.0);
         assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].window, "seven_day_sonnet");
+        assert_eq!(rates[0].window, "weekly_scoped");
     }
 
     #[test]
@@ -2330,7 +2330,7 @@ mod tests {
                 win("five_hour", five_hour_delta, five_current, five_prev),
                 win("seven_day", seven_day_delta, seven_current, seven_prev),
                 win(
-                    "seven_day_sonnet",
+                    "weekly_scoped",
                     seven_ds_delta,
                     seven_ds_current,
                     seven_ds_prev,
@@ -2383,11 +2383,11 @@ mod tests {
         let mut utilization = HashMap::new();
         utilization.insert("five_hour".to_string(), 42.0);
         utilization.insert("seven_day".to_string(), 61.0);
-        utilization.insert("seven_day_sonnet".to_string(), 71.5);
+        utilization.insert("weekly_scoped".to_string(), 71.5);
         let mut hrs_left = HashMap::new();
         hrs_left.insert("five_hour".to_string(), 3.0);
         hrs_left.insert("seven_day".to_string(), 37.5);
-        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+        hrs_left.insert("weekly_scoped".to_string(), 37.5);
 
         let (estimate, _forecast) = estimate_burn_rates(
             &instances,
@@ -2515,11 +2515,11 @@ mod tests {
         let mut utilization = HashMap::new();
         utilization.insert("five_hour".to_string(), 45.0);
         utilization.insert("seven_day".to_string(), 60.5);
-        utilization.insert("seven_day_sonnet".to_string(), 72.0);
+        utilization.insert("weekly_scoped".to_string(), 72.0);
         let mut hrs_left = HashMap::new();
         hrs_left.insert("five_hour".to_string(), 100.0); // plenty of time
         hrs_left.insert("seven_day".to_string(), 3.0); // very constrained
-        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+        hrs_left.insert("weekly_scoped".to_string(), 37.5);
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
@@ -2535,11 +2535,11 @@ mod tests {
 
         // five_hour: fleet_pct_hr=5.0, remain=45, exh=9, margin=9-100=-91 (most negative, highest risk)
         // seven_day: fleet_pct_hr=0.5, remain=29.5, exh=59, margin=59-3=+56 (positive=safe, lowest risk)
-        // seven_day_sonnet: fleet_pct_hr=2.0, remain=18, exh=9, margin=9-37.5=-28.5
+        // weekly_scoped: fleet_pct_hr=2.0, remain=18, exh=9, margin=9-37.5=-28.5
         assert_eq!(forecast.binding_window, "five_hour");
         assert!(forecast.five_hour.binding);
         assert!(!forecast.seven_day.binding);
-        assert!(!forecast.seven_day_sonnet.binding);
+        assert!(!forecast.weekly_scoped.binding);
     }
 
     #[test]
@@ -2566,11 +2566,11 @@ mod tests {
         let mut utilization = HashMap::new();
         utilization.insert("five_hour".to_string(), 42.0);
         utilization.insert("seven_day".to_string(), 61.0);
-        utilization.insert("seven_day_sonnet".to_string(), 71.5);
+        utilization.insert("weekly_scoped".to_string(), 71.5);
         let mut hrs_left = HashMap::new();
         hrs_left.insert("five_hour".to_string(), 3.0);
         hrs_left.insert("seven_day".to_string(), 37.5);
-        hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+        hrs_left.insert("weekly_scoped".to_string(), 37.5);
 
         // Cycle 1: first sample, EMA initializes directly
         estimate_burn_rates(
@@ -2664,11 +2664,11 @@ mod tests {
             let mut utilization = HashMap::new();
             utilization.insert("five_hour".to_string(), 41.0 + i as f64);
             utilization.insert("seven_day".to_string(), 60.5);
-            utilization.insert("seven_day_sonnet".to_string(), 70.75);
+            utilization.insert("weekly_scoped".to_string(), 70.75);
             let mut hrs_left = HashMap::new();
             hrs_left.insert("five_hour".to_string(), 3.0);
             hrs_left.insert("seven_day".to_string(), 37.5);
-            hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+            hrs_left.insert("weekly_scoped".to_string(), 37.5);
 
             estimate_burn_rates(
                 &instances,
@@ -2726,11 +2726,11 @@ mod tests {
             let mut utilization = HashMap::new();
             utilization.insert("five_hour".to_string(), 41.0 + i as f64);
             utilization.insert("seven_day".to_string(), 60.5);
-            utilization.insert("seven_day_sonnet".to_string(), 70.75);
+            utilization.insert("weekly_scoped".to_string(), 70.75);
             let mut hrs_left = HashMap::new();
             hrs_left.insert("five_hour".to_string(), 3.0);
             hrs_left.insert("seven_day".to_string(), 37.5);
-            hrs_left.insert("seven_day_sonnet".to_string(), 37.5);
+            hrs_left.insert("weekly_scoped".to_string(), 37.5);
 
             estimate_burn_rates(
                 &instances,
@@ -2765,7 +2765,7 @@ mod tests {
         let baseline = BaselineBurnRates::default();
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
 
-        // Only five_hour has valid data; seven_day and seven_day_sonnet are null
+        // Only five_hour has valid data; seven_day and weekly_scoped are null
         let instances = vec![multi_window_record(
             "w1",
             "claude-sonnet-4-20250514",
@@ -2865,7 +2865,7 @@ mod tests {
     #[test]
     fn generate_window_forecast_basic() {
         let f = generate_window_forecast(
-            "seven_day_sonnet",
+            "weekly_scoped",
             2.0,  // fleet_pct_hr
             72.0, // current utilization
             90.0, // target ceiling
@@ -2976,7 +2976,7 @@ mod tests {
                 safe_worker_count: None,
                 ..Default::default()
             },
-            seven_day_sonnet: crate::state::WindowForecast {
+            weekly_scoped: crate::state::WindowForecast {
                 target_ceiling: 90.0,
                 current_utilization: 63.5,
                 remaining_pct: 26.5,
@@ -2989,7 +2989,7 @@ mod tests {
                 safe_worker_count: Some(2),
                 ..Default::default()
             },
-            binding_window: "seven_day_sonnet".to_string(),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 1.648,
             estimated_remaining_dollars: 46.1,
         };
@@ -3369,7 +3369,7 @@ mod tests {
         let risk_5h =
             compute_risk_score("five_hour", margin_hrs, hours_remaining, cone_ratio).unwrap();
         let risk_7ds =
-            compute_risk_score("seven_day_sonnet", margin_hrs, hours_remaining, cone_ratio)
+            compute_risk_score("weekly_scoped", margin_hrs, hours_remaining, cone_ratio)
                 .unwrap();
         let risk_7d =
             compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
@@ -3681,12 +3681,12 @@ mod tests {
         let old_pct = WindowPctSnapshot {
             five_hour: 40.0,
             seven_day: 70.0,
-            seven_day_sonnet: 70.0,
+            weekly_scoped: 70.0,
         };
         let new_pct = WindowPctSnapshot {
             five_hour: 41.0,   // delta_5h = 1.0
             seven_day: 71.0,  // delta_7d = 1.0
-            seven_day_sonnet: 71.0,  // delta_7ds = 1.0
+            weekly_scoped: 71.0,  // delta_7ds = 1.0
         };
 
         let result = annotate_window_pct_deltas(
@@ -3749,7 +3749,7 @@ mod tests {
                     previous_utilization: 60.0,
                 },
                 WindowUtilization {
-                    window: "seven_day_sonnet".to_string(),
+                    window: "weekly_scoped".to_string(),
                     pct_delta: None, // NOT YET ANNOTATED
                     current_utilization: 70.0,
                     previous_utilization: 65.0,
@@ -3783,7 +3783,7 @@ mod tests {
                     previous_utilization: 60.0,
                 },
                 WindowUtilization {
-                    window: "seven_day_sonnet".to_string(),
+                    window: "weekly_scoped".to_string(),
                     pct_delta: None, // NULL - should be skipped
                     current_utilization: 70.0,
                     previous_utilization: 65.0,

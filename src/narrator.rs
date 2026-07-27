@@ -97,7 +97,7 @@ pub struct DecisionEntry {
     /// Human-readable explanation with specific data points
     pub reason: String,
 
-    /// What triggered this decision (e.g., "seven_day_sonnet margin_hrs=-2.5")
+    /// What triggered this decision (e.g., "weekly_scoped margin_hrs=-2.5")
     pub trigger: String,
 
     /// The binding window at decision time
@@ -167,7 +167,7 @@ fn get_margin_for_window(state: &GovernorState, window: &str) -> f64 {
     match window {
         "five_hour" => forecast.five_hour.margin_hrs,
         "seven_day" => forecast.seven_day.margin_hrs,
-        "seven_day_sonnet" => forecast.seven_day_sonnet.margin_hrs,
+        "weekly_scoped" => forecast.weekly_scoped.margin_hrs,
         _ => 0.0,
     }
 }
@@ -178,7 +178,7 @@ fn get_window_forecast<'a>(state: &'a GovernorState, window: &str) -> Option<&'a
     match window {
         "five_hour" => Some(&forecast.five_hour),
         "seven_day" => Some(&forecast.seven_day),
-        "seven_day_sonnet" => Some(&forecast.seven_day_sonnet),
+        "weekly_scoped" => Some(&forecast.weekly_scoped),
         _ => None,
     }
 }
@@ -547,7 +547,7 @@ mod tests {
                 } else {
                     WindowForecast::default()
                 },
-                seven_day_sonnet: if binding_window == "seven_day_sonnet" {
+                weekly_scoped: if binding_window == "weekly_scoped" {
                     window.clone()
                 } else {
                     WindowForecast::default()
@@ -597,8 +597,8 @@ mod tests {
 
     #[test]
     fn test_narrate_scale_up() {
-        let before = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
-        let after = make_test_state("seven_day_sonnet", 3.0, 65.0, 37.5, false);
+        let before = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
+        let after = make_test_state("weekly_scoped", 3.0, 65.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &before,
@@ -616,9 +616,9 @@ mod tests {
         assert_eq!(entry.from, 2);
         assert_eq!(entry.to, 3);
         assert!(entry.reason.contains("Scaled up from 2 to 3 workers"));
-        assert!(entry.reason.contains("seven_day_sonnet"));
+        assert!(entry.reason.contains("weekly_scoped"));
         assert!(entry.reason.contains("65.0% utilization"));
-        assert!(entry.binding_window == "seven_day_sonnet");
+        assert!(entry.binding_window == "weekly_scoped");
         assert!((entry.margin_before - 5.0).abs() < 0.01);
         assert!((entry.margin_after - 3.0).abs() < 0.01);
     }
@@ -676,8 +676,8 @@ mod tests {
 
     #[test]
     fn test_narrate_emergency_brake() {
-        let before = make_test_state("seven_day_sonnet", -2.0, 98.5, 37.5, true);
-        let after = make_test_state("seven_day_sonnet", -2.0, 98.5, 37.5, true);
+        let before = make_test_state("weekly_scoped", -2.0, 98.5, 37.5, true);
+        let after = make_test_state("weekly_scoped", -2.0, 98.5, 37.5, true);
 
         let ctx = DecisionContext {
             before: &before,
@@ -725,8 +725,8 @@ mod tests {
 
     #[test]
     fn test_narrate_cutoff_risk_to_safe() {
-        let before = make_test_state("seven_day_sonnet", -1.0, 85.0, 30.0, true);
-        let after = make_test_state("seven_day_sonnet", 5.0, 75.0, 30.0, false);
+        let before = make_test_state("weekly_scoped", -1.0, 85.0, 30.0, true);
+        let after = make_test_state("weekly_scoped", 5.0, 75.0, 30.0, false);
 
         let ctx = DecisionContext {
             before: &before,
@@ -751,8 +751,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test-decisions.jsonl");
 
-        let before = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
-        let after = make_test_state("seven_day_sonnet", 3.0, 65.0, 37.5, false);
+        let before = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
+        let after = make_test_state("weekly_scoped", 3.0, 65.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &before,
@@ -782,7 +782,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test-decisions.jsonl");
 
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         // Create and append multiple entries
         for i in 0..5 {
@@ -815,7 +815,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test-decisions.jsonl");
 
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         // Create 10 entries
         for i in 0..10 {
@@ -843,8 +843,8 @@ mod tests {
 
     #[test]
     fn test_format_decision_human() {
-        let before = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
-        let after = make_test_state("seven_day_sonnet", 3.0, 65.0, 37.5, false);
+        let before = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
+        let after = make_test_state("weekly_scoped", 3.0, 65.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &before,
@@ -861,7 +861,7 @@ mod tests {
 
         assert!(formatted.contains("SCALE UP"));
         assert!(formatted.contains("Workers: 2 -> 3"));
-        assert!(formatted.contains("Binding: seven_day_sonnet"));
+        assert!(formatted.contains("Binding: weekly_scoped"));
         assert!(formatted.contains("Trigger: test trigger"));
     }
 
@@ -870,7 +870,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test-decisions.jsonl");
 
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         for i in 0..3 {
             let ctx = DecisionContext {
@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_prediction_accuracy_score() {
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &state,
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_promotion_transition() {
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &state,
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_emergency_brake_release() {
-        let state = make_test_state("seven_day_sonnet", 5.0, 95.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 95.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &state,
@@ -1007,8 +1007,8 @@ mod tests {
 
     #[test]
     fn test_pre_scale() {
-        let before = make_test_state("seven_day_sonnet", 1.0, 80.0, 30.0, false);
-        let after = make_test_state("seven_day_sonnet", 2.0, 80.0, 30.0, false);
+        let before = make_test_state("weekly_scoped", 1.0, 80.0, 30.0, false);
+        let after = make_test_state("weekly_scoped", 2.0, 80.0, 30.0, false);
 
         let ctx = DecisionContext {
             before: &before,
@@ -1033,7 +1033,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test-format.jsonl");
 
-        let state = make_test_state("seven_day_sonnet", 5.0, 60.0, 37.5, false);
+        let state = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
 
         let ctx = DecisionContext {
             before: &state,

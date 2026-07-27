@@ -693,7 +693,7 @@ pub struct WindowPctSnapshot {
     /// 7-day all-models window utilization percentage
     pub seven_day: f64,
     /// 7-day Sonnet window utilization percentage
-    pub seven_day_sonnet: f64,
+    pub weekly_scoped: f64,
 }
 
 /// Annotate instance and fleet records with window percentage deltas.
@@ -743,7 +743,7 @@ pub fn annotate_window_pct_deltas(
     // Compute per-window percentage deltas
     let delta_5h = new_pct.five_hour - old_pct.five_hour;
     let delta_7d = new_pct.seven_day - old_pct.seven_day;
-    let delta_7ds = new_pct.seven_day_sonnet - old_pct.seven_day_sonnet;
+    let delta_7ds = new_pct.weekly_scoped - old_pct.weekly_scoped;
 
     // Guard: skip if any window shows negative delta (window reset detected)
     if delta_5h < 0.0 || delta_7d < 0.0 || delta_7ds < 0.0 {
@@ -1239,12 +1239,12 @@ mod tests {
         let old_pct = WindowPctSnapshot {
             five_hour: 50.0,
             seven_day: 70.0,
-            seven_day_sonnet: 70.0,
+            weekly_scoped: 70.0,
         };
         let new_pct = WindowPctSnapshot {
             five_hour: 50.8,
             seven_day: 70.8,
-            seven_day_sonnet: 70.8,
+            weekly_scoped: 70.8,
         };
 
         let result = annotate_window_pct_deltas(
@@ -1348,12 +1348,12 @@ mod tests {
         let old_pct = WindowPctSnapshot {
             five_hour: 40.0,
             seven_day: 65.0,
-            seven_day_sonnet: 60.0,
+            weekly_scoped: 60.0,
         };
         let new_pct = WindowPctSnapshot {
             five_hour: 42.0,   // delta_5h = 2.0
             seven_day: 68.0,  // delta_7d = 3.0
-            seven_day_sonnet: 64.0,  // delta_7ds = 4.0
+            weekly_scoped: 64.0,  // delta_7ds = 4.0
         };
 
         let result = annotate_window_pct_deltas(
@@ -1436,12 +1436,12 @@ mod tests {
         let old_pct = WindowPctSnapshot {
             five_hour: 50.0,
             seven_day: 70.0,
-            seven_day_sonnet: 70.0,
+            weekly_scoped: 70.0,
         };
         let new_pct = WindowPctSnapshot {
             five_hour: 50.8,
             seven_day: 70.8,
-            seven_day_sonnet: 70.8,
+            weekly_scoped: 70.8,
         };
 
         annotate_window_pct_deltas(
@@ -1522,12 +1522,12 @@ mod tests {
         let old_pct = WindowPctSnapshot {
             five_hour: 50.0,
             seven_day: 70.0,
-            seven_day_sonnet: 70.0,
+            weekly_scoped: 70.0,
         };
         let new_pct = WindowPctSnapshot {
             five_hour: 50.8,
             seven_day: 70.8,
-            seven_day_sonnet: 70.8,
+            weekly_scoped: 70.8,
         };
 
         annotate_window_pct_deltas(

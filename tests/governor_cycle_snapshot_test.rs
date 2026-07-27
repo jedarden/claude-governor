@@ -12,14 +12,14 @@ use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
 use claude_governor::db;
 use claude_governor::governor::{
     compute_target_workers, apply_scaling, ScalingDecision,
-    WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_SEVEN_DAY_SONNET,
+    WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED,
     UsageSnapshot,
 };
 use claude_governor::state;
 
 /// Simple helper to create a usage snapshot from window values
-fn make_usage_snapshot(five_hour: f64, seven_day: f64, seven_day_sonnet: f64) -> UsageSnapshot {
-    UsageSnapshot::from_windows(five_hour, seven_day, seven_day_sonnet)
+fn make_usage_snapshot(five_hour: f64, seven_day: f64, weekly_scoped: f64) -> UsageSnapshot {
+    UsageSnapshot::from_windows(five_hour, seven_day, weekly_scoped)
 }
 
 #[test]
@@ -55,13 +55,13 @@ fn test_governor_cycle_with_snapshot() {
             safe_worker_count_p75: Some(5),
             ..Default::default()
         },
-        seven_day_sonnet: state::WindowForecast {
-            current_utilization: usage.get(WINDOW_SEVEN_DAY_SONNET).unwrap_or(0.0),
+        weekly_scoped: state::WindowForecast {
+            current_utilization: usage.get(WINDOW_WEEKLY_SCOPED).unwrap_or(0.0),
             safe_worker_count: Some(7),
             safe_worker_count_p75: Some(6),
             ..Default::default()
         },
-        binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+        binding_window: WINDOW_WEEKLY_SCOPED.to_string(),
         ..Default::default()
     };
 
@@ -168,8 +168,8 @@ fn test_snapshot_high_utilization_emergency_brake() {
             safe_worker_count_p75: Some(4),
             ..Default::default()
         },
-        seven_day_sonnet: state::WindowForecast {
-            current_utilization: usage.get(WINDOW_SEVEN_DAY_SONNET).unwrap_or(0.0),
+        weekly_scoped: state::WindowForecast {
+            current_utilization: usage.get(WINDOW_WEEKLY_SCOPED).unwrap_or(0.0),
             safe_worker_count: Some(5),
             safe_worker_count_p75: Some(4),
             ..Default::default()
@@ -226,13 +226,13 @@ fn test_snapshot_low_utilization_scale_down() {
             safe_worker_count_p75: Some(1),
             ..Default::default()
         },
-        seven_day_sonnet: state::WindowForecast {
-            current_utilization: usage.get(WINDOW_SEVEN_DAY_SONNET).unwrap_or(0.0),
+        weekly_scoped: state::WindowForecast {
+            current_utilization: usage.get(WINDOW_WEEKLY_SCOPED).unwrap_or(0.0),
             safe_worker_count: Some(2),
             safe_worker_count_p75: Some(1),
             ..Default::default()
         },
-        binding_window: WINDOW_SEVEN_DAY_SONNET.to_string(),
+        binding_window: WINDOW_WEEKLY_SCOPED.to_string(),
         ..Default::default()
     };
 
@@ -278,7 +278,7 @@ fn test_second_poll_with_delta_computation() {
         taken_at: now1,
         five_hour_pct: 10.0,
         seven_day_pct: 20.0,
-        seven_day_sonnet_pct: 15.0,
+        weekly_scoped_pct: 15.0,
     });
 
     // Verify initial state after first poll
@@ -298,7 +298,7 @@ fn test_second_poll_with_delta_computation() {
         taken_at: now2,
         five_hour_pct: 12.5,  // +2.5 from previous
         seven_day_pct: 22.0,  // +2.0 from previous
-        seven_day_sonnet_pct: 18.0,  // +3.0 from previous
+        weekly_scoped_pct: 18.0,  // +3.0 from previous
     });
 
     // Now both snapshots are Some - compute deltas
@@ -311,12 +311,12 @@ fn test_second_poll_with_delta_computation() {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) =
                 claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -365,7 +365,7 @@ fn test_poll_failure_current_snapshot_remains_none() {
         taken_at: now1,
         five_hour_pct: 10.0,
         seven_day_pct: 20.0,
-        seven_day_sonnet_pct: 15.0,
+        weekly_scoped_pct: 15.0,
     });
 
     // current_api_snapshot starts as None (no new poll data yet)
@@ -390,12 +390,12 @@ fn test_poll_failure_current_snapshot_remains_none() {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) =
                 claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -450,7 +450,7 @@ fn test_first_poll_no_previous_snapshot() {
         taken_at: now,
         five_hour_pct: 25.0,
         seven_day_pct: 40.0,
-        seven_day_sonnet_pct: 35.0,
+        weekly_scoped_pct: 35.0,
     });
 
     // Verify initial state: first poll
@@ -474,12 +474,12 @@ fn test_first_poll_no_previous_snapshot() {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) =
                 claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -532,7 +532,7 @@ fn test_first_poll_with_realistic_values() {
         now,
         12.5,   // five_hour_pct: low usage
         45.2,   // seven_day_pct: moderate usage
-        38.7,   // seven_day_sonnet_pct: moderate usage
+        38.7,   // weekly_scoped_pct: moderate usage
     ));
 
     // Verify first poll condition
@@ -596,7 +596,7 @@ fn test_identical_snapshots_produce_zero_deltas() {
         taken_at: now1,
         five_hour_pct: 25.5,
         seven_day_pct: 45.2,
-        seven_day_sonnet_pct: 38.7,
+        weekly_scoped_pct: 38.7,
     });
 
     // Set up current snapshot with IDENTICAL utilization values but later timestamp
@@ -605,7 +605,7 @@ fn test_identical_snapshots_produce_zero_deltas() {
         taken_at: now2,
         five_hour_pct: 25.5,          // Identical to previous
         seven_day_pct: 45.2,          // Identical to previous
-        seven_day_sonnet_pct: 38.7,  // Identical to previous
+        weekly_scoped_pct: 38.7,  // Identical to previous
     });
 
     // Verify both snapshots exist and have identical values
@@ -617,7 +617,7 @@ fn test_identical_snapshots_produce_zero_deltas() {
 
     assert_eq!(prev.five_hour_pct, curr.five_hour_pct);
     assert_eq!(prev.seven_day_pct, curr.seven_day_pct);
-    assert_eq!(prev.seven_day_sonnet_pct, curr.seven_day_sonnet_pct);
+    assert_eq!(prev.weekly_scoped_pct, curr.weekly_scoped_pct);
 
     // Verify timestamps are different (simulating consecutive polls)
     assert_ne!(prev.taken_at, curr.taken_at);
@@ -633,12 +633,12 @@ fn test_identical_snapshots_produce_zero_deltas() {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) =
                 claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
@@ -711,7 +711,7 @@ fn test_identical_snapshots_with_realistic_fixture_values() {
         now2,
         12.5,   // five_hour_pct: identical to baseline
         45.2,   // seven_day_pct: identical to baseline
-        38.7,   // seven_day_sonnet_pct: identical to baseline
+        38.7,   // weekly_scoped_pct: identical to baseline
     ));
 
     // Verify values are identical
@@ -721,9 +721,9 @@ fn test_identical_snapshots_with_realistic_fixture_values() {
     assert_eq!(prev.five_hour_pct, curr.five_hour_pct, "five_hour_pct should be identical");
     assert_eq!(prev.seven_day_pct, curr.seven_day_pct, "seven_day_pct should be identical");
     assert_eq!(
-        prev.seven_day_sonnet_pct,
-        curr.seven_day_sonnet_pct,
-        "seven_day_sonnet_pct should be identical"
+        prev.weekly_scoped_pct,
+        curr.weekly_scoped_pct,
+        "weekly_scoped_pct should be identical"
     );
 
     // Compute deltas
@@ -736,12 +736,12 @@ fn test_identical_snapshots_with_realistic_fixture_values() {
             let prev_pct = crate::db::WindowPctSnapshot {
                 five_hour: prev.five_hour_pct,
                 seven_day: prev.seven_day_pct,
-                seven_day_sonnet: prev.seven_day_sonnet_pct,
+                weekly_scoped: prev.weekly_scoped_pct,
             };
             let curr_pct = crate::db::WindowPctSnapshot {
                 five_hour: curr.five_hour_pct,
                 seven_day: curr.seven_day_pct,
-                seven_day_sonnet: curr.seven_day_sonnet_pct,
+                weekly_scoped: curr.weekly_scoped_pct,
             };
             let (delta_5h, delta_7d, delta_7ds) =
                 claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);

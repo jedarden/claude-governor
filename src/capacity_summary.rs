@@ -67,7 +67,7 @@ impl StatusExitCode {
         let forecast = &state.capacity_forecast;
         if forecast.five_hour.cutoff_risk
             || forecast.seven_day.cutoff_risk
-            || forecast.seven_day_sonnet.cutoff_risk
+            || forecast.weekly_scoped.cutoff_risk
         {
             return StatusExitCode::CutoffRisk;
         }
@@ -89,7 +89,7 @@ pub fn compute_pressure_level(forecast: &CapacityForecast) -> PressureLevel {
     // If any window has cutoff_risk, pressure is HIGH
     if forecast.five_hour.cutoff_risk
         || forecast.seven_day.cutoff_risk
-        || forecast.seven_day_sonnet.cutoff_risk
+        || forecast.weekly_scoped.cutoff_risk
     {
         return PressureLevel::High;
     }
@@ -99,7 +99,7 @@ pub fn compute_pressure_level(forecast: &CapacityForecast) -> PressureLevel {
         match forecast.binding_window.as_str() {
             "five_hour" => &forecast.five_hour,
             "seven_day" => &forecast.seven_day,
-            "seven_day_sonnet" => &forecast.seven_day_sonnet,
+            "weekly_scoped" => &forecast.weekly_scoped,
             _ => find_most_constrained_window(forecast),
         }
     } else {
@@ -133,7 +133,7 @@ fn find_most_constrained_window(forecast: &CapacityForecast) -> &WindowForecast 
     let windows = [
         &forecast.five_hour,
         &forecast.seven_day,
-        &forecast.seven_day_sonnet,
+        &forecast.weekly_scoped,
     ];
 
     windows
@@ -143,7 +143,7 @@ fn find_most_constrained_window(forecast: &CapacityForecast) -> &WindowForecast 
                 .partial_cmp(&b.margin_hrs)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map_or(&forecast.seven_day_sonnet, |v| v)
+        .map_or(&forecast.weekly_scoped, |v| v)
 }
 
 /// Get behavioral recommendation based on pressure level
@@ -170,7 +170,7 @@ fn get_recommendation(level: PressureLevel) -> &'static str {
 /// ```markdown
 /// ## Fleet Capacity (auto-injected by governor)
 ///
-/// - Binding window: seven_day_sonnet — 26% headroom, resets in 37h
+/// - Binding window: weekly_scoped — 26% headroom, resets in 37h
 /// - Capacity pressure: HIGH (cutoff risk active)
 /// - Recommendation: actively conserve — prefer Haiku subagents...
 /// ```
@@ -184,16 +184,16 @@ pub fn generate_capacity_summary(state: &GovernorState) -> String {
         match forecast.binding_window.as_str() {
             "five_hour" => &forecast.five_hour,
             "seven_day" => &forecast.seven_day,
-            _ => &forecast.seven_day_sonnet,
+            _ => &forecast.weekly_scoped,
         }
     } else {
-        &forecast.seven_day_sonnet
+        &forecast.weekly_scoped
     };
 
     let headroom_pct = binding.remaining_pct;
     let hours_remaining = binding.hours_remaining;
     let binding_name = if forecast.binding_window.is_empty() {
-        "seven_day_sonnet"
+        "weekly_scoped"
     } else {
         &forecast.binding_window
     };
@@ -286,8 +286,8 @@ mod tests {
     fn pressure_low_with_ample_headroom() {
         // margin_hrs = 10, hrs_left = 10 → margin > 50% of hrs_left
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(10.0, 10.0, false, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(10.0, 10.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
 
@@ -298,8 +298,8 @@ mod tests {
     fn pressure_medium_with_moderate_headroom() {
         // margin_hrs = 3, hrs_left = 10 → margin > 0 but < 50% of hrs_left
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(3.0, 10.0, false, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(3.0, 10.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
 
@@ -310,8 +310,8 @@ mod tests {
     fn pressure_high_with_cutoff_risk() {
         // cutoff_risk = true forces HIGH regardless of margin
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(10.0, 10.0, true, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(10.0, 10.0, true, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
 
@@ -322,8 +322,8 @@ mod tests {
     fn pressure_high_with_zero_margin() {
         // margin_hrs = 0 or negative → HIGH
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(0.0, 10.0, false, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(0.0, 10.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
 
@@ -334,8 +334,8 @@ mod tests {
     fn pressure_high_with_negative_margin() {
         // Negative margin = over budget
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(-5.0, 10.0, false, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(-5.0, 10.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
 
@@ -344,15 +344,15 @@ mod tests {
 
     #[test]
     fn pressure_uses_binding_window() {
-        // five_hour is binding with LOW pressure, seven_day_sonnet has HIGH
+        // five_hour is binding with LOW pressure, weekly_scoped has HIGH
         let forecast = CapacityForecast {
             five_hour: make_forecast(10.0, 2.0, false, true),
-            seven_day_sonnet: make_forecast(0.0, 40.0, true, false),
+            weekly_scoped: make_forecast(0.0, 40.0, true, false),
             binding_window: "five_hour".to_string(),
             ..CapacityForecast::default()
         };
 
-        // Should use five_hour (binding) even though seven_day_sonnet has cutoff_risk
+        // Should use five_hour (binding) even though weekly_scoped has cutoff_risk
         // Actually, cutoff_risk on ANY window should force HIGH
         assert_eq!(compute_pressure_level(&forecast), PressureLevel::High);
     }
@@ -364,7 +364,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_forecast(10.0, 2.0, false, false),
             seven_day: make_forecast(20.0, 40.0, false, false),
-            seven_day_sonnet: make_forecast(15.0, 40.0, false, false),
+            weekly_scoped: make_forecast(15.0, 40.0, false, false),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -378,7 +378,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_forecast(10.0, 2.0, false, false),
             seven_day: make_forecast(-5.0, 40.0, true, false),
-            seven_day_sonnet: make_forecast(15.0, 40.0, false, false),
+            weekly_scoped: make_forecast(15.0, 40.0, false, false),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -395,7 +395,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_forecast(10.0, 2.0, false, false),
             seven_day: make_forecast(20.0, 40.0, false, false),
-            seven_day_sonnet: make_forecast(15.0, 40.0, false, false),
+            weekly_scoped: make_forecast(15.0, 40.0, false, false),
             ..CapacityForecast::default()
         };
         let mut state = make_state(forecast);
@@ -414,7 +414,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_forecast(-5.0, 2.0, true, false),
             seven_day: make_forecast(-5.0, 40.0, true, false),
-            seven_day_sonnet: make_forecast(-5.0, 40.0, true, false),
+            weekly_scoped: make_forecast(-5.0, 40.0, true, false),
             ..CapacityForecast::default()
         };
         let mut state = make_state(forecast);
@@ -431,8 +431,8 @@ mod tests {
     #[test]
     fn summary_is_valid_markdown() {
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(10.0, 37.0, false, true),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_forecast(10.0, 37.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn summary_low_pressure_output() {
         let forecast = CapacityForecast {
-            seven_day_sonnet: WindowForecast {
+            weekly_scoped: WindowForecast {
                 margin_hrs: 20.0,
                 hours_remaining: 30.0,
                 remaining_pct: 40.0,
@@ -457,7 +457,7 @@ mod tests {
                 binding: true,
                 ..WindowForecast::default()
             },
-            binding_window: "seven_day_sonnet".to_string(),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn summary_medium_pressure_output() {
         let forecast = CapacityForecast {
-            seven_day_sonnet: WindowForecast {
+            weekly_scoped: WindowForecast {
                 margin_hrs: 5.0,
                 hours_remaining: 30.0,
                 remaining_pct: 15.0,
@@ -480,7 +480,7 @@ mod tests {
                 binding: true,
                 ..WindowForecast::default()
             },
-            binding_window: "seven_day_sonnet".to_string(),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn summary_high_pressure_output() {
         let forecast = CapacityForecast {
-            seven_day_sonnet: WindowForecast {
+            weekly_scoped: WindowForecast {
                 margin_hrs: -5.0,
                 hours_remaining: 30.0,
                 remaining_pct: 5.0,
@@ -503,7 +503,7 @@ mod tests {
                 binding: true,
                 ..WindowForecast::default()
             },
-            binding_window: "seven_day_sonnet".to_string(),
+            binding_window: "weekly_scoped".to_string(),
             ..CapacityForecast::default()
         };
         let state = make_state(forecast);
@@ -540,9 +540,9 @@ mod tests {
 
     #[test]
     fn summary_handles_no_binding_window() {
-        // When binding_window is empty, should default to seven_day_sonnet
+        // When binding_window is empty, should default to weekly_scoped
         let forecast = CapacityForecast {
-            seven_day_sonnet: make_forecast(10.0, 37.0, false, false),
+            weekly_scoped: make_forecast(10.0, 37.0, false, false),
             binding_window: String::new(),
             ..CapacityForecast::default()
         };
@@ -550,7 +550,7 @@ mod tests {
 
         let summary = generate_capacity_summary(&state);
 
-        assert!(summary.contains("seven_day_sonnet"));
+        assert!(summary.contains("weekly_scoped"));
     }
 
     // --- Edge Cases ---
@@ -572,7 +572,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_forecast(5.0, 2.0, false, false),
             seven_day: make_forecast(1.0, 40.0, false, false), // most constrained
-            seven_day_sonnet: make_forecast(10.0, 40.0, false, false),
+            weekly_scoped: make_forecast(10.0, 40.0, false, false),
             binding_window: String::new(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,

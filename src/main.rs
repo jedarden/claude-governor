@@ -449,7 +449,7 @@ fn format_human(data: &UsageData) -> String {
          - Resets At: {}\n\
          - Hours Remaining: {:.2}\n\
          \n\
-         Seven Day Sonnet Window:\n\
+         Weekly Scoped Window:\n\
          - Utilization: {:.1}%\n\
          - Resets At: {}\n\
          - Hours Remaining: {:.2}\n\
@@ -462,9 +462,9 @@ fn format_human(data: &UsageData) -> String {
         data.seven_day_utilization,
         data.seven_day_resets_at,
         data.seven_day_hours_remaining,
-        data.seven_day_sonnet_utilization,
-        data.seven_day_sonnet_resets_at,
-        data.seven_day_sonnet_hours_remaining,
+        data.weekly_scoped_utilization,
+        data.weekly_scoped_resets_at,
+        data.weekly_scoped_hours_remaining,
         if data.stale {
             "STALE (auth errors)"
         } else {
@@ -487,10 +487,10 @@ fn format_json(data: &UsageData) -> String {
             "resets_at": data.seven_day_resets_at,
             "hours_remaining": data.seven_day_hours_remaining,
         },
-        "seven_day_sonnet": {
-            "utilization": data.seven_day_sonnet_utilization,
-            "resets_at": data.seven_day_sonnet_resets_at,
-            "hours_remaining": data.seven_day_sonnet_hours_remaining,
+        "weekly_scoped": {
+            "utilization": data.weekly_scoped_utilization,
+            "resets_at": data.weekly_scoped_resets_at,
+            "hours_remaining": data.weekly_scoped_hours_remaining,
         },
         "stale": data.stale,
     })
@@ -541,7 +541,7 @@ fn format_forecast_human(state: &GovernorState) -> String {
     let windows = [
         ("Five Hour", &forecast.five_hour),
         ("Seven Day", &forecast.seven_day),
-        ("Seven Day Sonnet", &forecast.seven_day_sonnet),
+        ("Weekly Scoped", &forecast.weekly_scoped),
     ];
 
     for (name, win) in windows {
@@ -1842,9 +1842,10 @@ mod tests {
             seven_day_utilization: 68.0,
             seven_day_resets_at: "2026-03-20T03:00:00Z".to_string(),
             seven_day_hours_remaining: 32.5,
-            seven_day_sonnet_utilization: 72.0,
-            seven_day_sonnet_resets_at: "2026-03-20T04:00:00Z".to_string(),
-            seven_day_sonnet_hours_remaining: 33.5,
+            weekly_scoped_utilization: 72.0,
+            weekly_scoped_resets_at: "2026-03-20T04:00:00Z".to_string(),
+            weekly_scoped_hours_remaining: 33.5,
+            weekly_scoped_model: None,
             limits: vec![],
             timestamp: Utc::now(),
             stale: false,

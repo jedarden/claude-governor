@@ -22,7 +22,7 @@ use crate::state::GovernorState;
 const DEFAULT_RESOLUTION_MINUTES: i64 = 15;
 
 /// Window names we track
-const WINDOWS: [&str; 3] = ["five_hour", "seven_day", "seven_day_sonnet"];
+const WINDOWS: [&str; 3] = ["five_hour", "seven_day", "weekly_scoped"];
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -336,12 +336,12 @@ impl SimContext {
 
         // Seven day sonnet window
         window_utilization.insert(
-            "seven_day_sonnet".to_string(),
-            forecast.seven_day_sonnet.current_utilization,
+            "weekly_scoped".to_string(),
+            forecast.weekly_scoped.current_utilization,
         );
         window_ceiling.insert(
-            "seven_day_sonnet".to_string(),
-            forecast.seven_day_sonnet.target_ceiling,
+            "weekly_scoped".to_string(),
+            forecast.weekly_scoped.target_ceiling,
         );
 
         // Extract reset times from usage state
@@ -352,11 +352,11 @@ impl SimContext {
         }
         if !state.usage.sonnet_resets_at.is_empty() {
             if let Ok(ts) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
-                window_resets_at.insert("seven_day_sonnet".to_string(), ts);
+                window_resets_at.insert("weekly_scoped".to_string(), ts);
             }
         }
-        // Seven day window resets at the same time as seven_day_sonnet
-        if let Some(ts) = window_resets_at.get("seven_day_sonnet") {
+        // Seven day window resets at the same time as weekly_scoped
+        if let Some(ts) = window_resets_at.get("weekly_scoped") {
             window_resets_at.insert("seven_day".to_string(), *ts);
         }
 
@@ -381,8 +381,8 @@ impl SimContext {
         if ema.seven_day > 0.0 {
             fleet_pct_hr_ema.insert("seven_day".to_string(), ema.seven_day);
         }
-        if ema.seven_day_sonnet > 0.0 {
-            fleet_pct_hr_ema.insert("seven_day_sonnet".to_string(), ema.seven_day_sonnet);
+        if ema.weekly_scoped > 0.0 {
+            fleet_pct_hr_ema.insert("weekly_scoped".to_string(), ema.weekly_scoped);
         }
 
         // Baseline worker count: use last fleet aggregate's worker count so we can
@@ -551,7 +551,7 @@ pub fn simulate(
     for (key, win) in [
         ("five_hour", &forecast.five_hour),
         ("seven_day", &forecast.seven_day),
-        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+        ("weekly_scoped", &forecast.weekly_scoped),
     ] {
         cone.insert(
             key.to_string(),
@@ -615,7 +615,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
         for (key, label) in [
             ("five_hour", "5h"),
             ("seven_day", "7d"),
-            ("seven_day_sonnet", "7d-sonnet"),
+            ("weekly_scoped", "7d-sonnet"),
         ] {
             if let Some(c) = trajectory.cone.get(key) {
                 let ratio = if c.cone_ratio > 0.0 {
@@ -651,7 +651,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
         let seven_d = point.windows.get("seven_day").copied().unwrap_or(0.0);
         let seven_ds = point
             .windows
-            .get("seven_day_sonnet")
+            .get("weekly_scoped")
             .copied()
             .unwrap_or(0.0);
 
@@ -707,6 +707,7 @@ mod tests {
             sonnet_resets_at: "2026-03-21T03:00:00Z".to_string(),
             five_hour_resets_at: "2026-03-20T10:00:00Z".to_string(),
             stale: false,
+            weekly_scoped_model: None,
         };
 
         // Set up capacity forecast with ceilings
@@ -721,7 +722,7 @@ mod tests {
                 current_utilization: 50.0,
                 ..Default::default()
             },
-            seven_day_sonnet: crate::state::WindowForecast {
+            weekly_scoped: crate::state::WindowForecast {
                 target_ceiling: 90.0,
                 current_utilization: 50.0,
                 ..Default::default()
@@ -760,7 +761,7 @@ mod tests {
             peak_start_hour_et: 8,
             peak_end_hour_et: 14,
             offpeak_multiplier: 2.0,
-            applies_to: vec!["seven_day".to_string(), "seven_day_sonnet".to_string()],
+            applies_to: vec!["seven_day".to_string(), "weekly_scoped".to_string()],
         }
     }
 
@@ -847,10 +848,10 @@ mod tests {
         assert!((last.hours_offset - 24.0).abs() < 0.01);
 
         // With 1 worker at 2% per hour, no promo (1x multiplier):
-        // seven_day_sonnet resets at 19h (2026-03-21T03:00:00Z)
+        // weekly_scoped resets at 19h (2026-03-21T03:00:00Z)
         // After 19h: 50% + 38% = 88%, then reset to 0%
         // After 5 more hours: 0% + 10% = ~10%
-        let final_util = last.windows.get("seven_day_sonnet").copied().unwrap_or(0.0);
+        let final_util = last.windows.get("weekly_scoped").copied().unwrap_or(0.0);
         assert!(
             (final_util - 10.0).abs() < 1.0,
             "Expected ~10%, got {}",
@@ -963,8 +964,8 @@ mod tests {
         let mut state = make_test_state();
 
         // Set up to breach quickly: start at 84% with ceiling at 85%
-        state.capacity_forecast.seven_day_sonnet.current_utilization = 84.0;
-        state.capacity_forecast.seven_day_sonnet.target_ceiling = 85.0;
+        state.capacity_forecast.weekly_scoped.current_utilization = 84.0;
+        state.capacity_forecast.weekly_scoped.target_ceiling = 85.0;
 
         // Use 4 workers to burn faster
         let config = SimConfig::fixed(4, 1.0);
@@ -979,10 +980,10 @@ mod tests {
         let breach = trajectory
             .breaches
             .iter()
-            .find(|b| b.window == "seven_day_sonnet")
-            .expect("Should have seven_day_sonnet breach");
+            .find(|b| b.window == "weekly_scoped")
+            .expect("Should have weekly_scoped breach");
 
-        assert_eq!(breach.window, "seven_day_sonnet");
+        assert_eq!(breach.window, "weekly_scoped");
         assert!(breach.utilization >= 85.0);
         assert!(breach.hours_offset > 0.0);
     }
@@ -1079,7 +1080,7 @@ mod tests {
         let mut state = make_test_state();
 
         // Start high and burn hard
-        state.capacity_forecast.seven_day_sonnet.current_utilization = 95.0;
+        state.capacity_forecast.weekly_scoped.current_utilization = 95.0;
 
         // 10 workers for 10 hours would exceed 100% without clamping
         let config = SimConfig::fixed(10, 10.0);

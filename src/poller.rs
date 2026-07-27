@@ -124,7 +124,7 @@ impl UsageWindow {
 /// The usage API returns a list of active limits, each tagged with a `kind`
 /// (`"session"`, `"weekly_all"`, `"weekly_scoped"`). This is the generalized
 /// shape that will eventually replace the legacy top-level `seven_day` /
-/// `five_hour` / `seven_day_sonnet` fields; for now it is parsed additively
+/// `five_hour` / `weekly_scoped` fields; for now it is parsed additively
 /// alongside them (see child bead bf-3a3x7 for the window-generalization step).
 ///
 /// Every field is optional with a `#[serde(default)]` so a single odd or
@@ -173,8 +173,8 @@ pub struct LimitModel {
 /// no capacity data. They are `Option` so a null window is tolerated.
 #[derive(Debug, Deserialize)]
 pub struct UsageResponse {
-    #[serde(rename = "seven_day_sonnet", default)]
-    pub seven_day_sonnet: Option<UsageWindow>,
+    #[serde(rename = "weekly_scoped", default)]
+    pub weekly_scoped: Option<UsageWindow>,
     #[serde(rename = "seven_day", default)]
     pub seven_day: Option<UsageWindow>,
     #[serde(rename = "five_hour", default)]
@@ -205,9 +205,17 @@ fn window_or_default(window: &Option<UsageWindow>) -> (f64, String, f64) {
 /// Formatted usage data for human or machine consumption
 #[derive(Debug, Clone)]
 pub struct UsageData {
-    pub seven_day_sonnet_utilization: f64,
-    pub seven_day_sonnet_resets_at: String,
-    pub seven_day_sonnet_hours_remaining: f64,
+    pub weekly_scoped_utilization: f64,
+    pub weekly_scoped_resets_at: String,
+    pub weekly_scoped_hours_remaining: f64,
+    /// Resolved display name of the model the `weekly_scoped` window is scoped
+    /// to (e.g. `"Fable"`), derived from [`UsageData::scoped_weekly`]. `None`
+    /// when no active model-scoped weekly cap is present this period —
+    /// consistent with the null-tolerance the windows already apply
+    /// ([`window_or_default`] treats a null window as non-binding). Metadata
+    /// only: the binding key stays the generic `"weekly_scoped"`; this field
+    /// just lets downstream modules label which model that window tracks.
+    pub weekly_scoped_model: Option<String>,
     pub seven_day_utilization: f64,
     pub seven_day_resets_at: String,
     pub seven_day_hours_remaining: f64,
@@ -534,17 +542,18 @@ impl Poller {
 
         // Extract per-window fields, tolerating windows the API returns as null
         // (a null window is treated as non-binding rather than failing the poll).
-        let (seven_day_sonnet_utilization, seven_day_sonnet_resets_at, seven_day_sonnet_hours) =
-            window_or_default(&usage.seven_day_sonnet);
+        let (weekly_scoped_utilization, weekly_scoped_resets_at, weekly_scoped_hours) =
+            window_or_default(&usage.weekly_scoped);
         let (seven_day_utilization, seven_day_resets_at, seven_day_hours) =
             window_or_default(&usage.seven_day);
         let (five_hour_utilization, five_hour_resets_at, five_hour_hours) =
             window_or_default(&usage.five_hour);
 
-        let data = UsageData {
-            seven_day_sonnet_utilization,
-            seven_day_sonnet_resets_at,
-            seven_day_sonnet_hours_remaining: seven_day_sonnet_hours,
+        let mut data = UsageData {
+            weekly_scoped_utilization,
+            weekly_scoped_resets_at,
+            weekly_scoped_hours_remaining: weekly_scoped_hours,
+            weekly_scoped_model: None,
             seven_day_utilization,
             seven_day_resets_at,
             seven_day_hours_remaining: seven_day_hours,
@@ -555,6 +564,12 @@ impl Poller {
             timestamp: Utc::now(),
             stale: false,
         };
+
+        // Carry the resolved weekly_scoped model display name (e.g. "Fable") as
+        // metadata so downstream modules can label the window without changing
+        // the generic binding key. None when no model-scoped cap is active this
+        // period (scoped_weekly() returns None).
+        data.weekly_scoped_model = data.scoped_weekly().map(|(model, _)| model);
 
         // Update last usage
         self.last_usage = Some(data.clone());
@@ -652,7 +667,7 @@ mod tests {
     #[test]
     fn test_usage_data_from_response() {
         let response = UsageResponse {
-            seven_day_sonnet: Some(UsageWindow {
+            weekly_scoped: Some(UsageWindow {
                 utilization: 75.5,
                 resets_at: "2026-03-20T03:59:59Z".to_string(),
             }),
@@ -667,7 +682,7 @@ mod tests {
             limits: None,
         };
 
-        assert_eq!(response.seven_day_sonnet.as_ref().unwrap().utilization, 75.5);
+        assert_eq!(response.weekly_scoped.as_ref().unwrap().utilization, 75.5);
         assert_eq!(response.five_hour.as_ref().unwrap().utilization, 30.0);
     }
 
@@ -675,12 +690,12 @@ mod tests {
     fn test_null_window_is_tolerated() {
         // A window the API returns as null must not fail deserialization, and
         // must be treated as a non-binding limit (0% utilization).
-        let json = r#"{"seven_day_sonnet": null,
+        let json = r#"{"weekly_scoped": null,
                        "seven_day": {"utilization": 42.0, "resets_at": "2026-03-20T03:00:00Z"},
                        "five_hour": {"utilization": 10.0, "resets_at": "2026-03-18T15:59:59Z"}}"#;
         let resp: UsageResponse = serde_json::from_str(json).expect("null window must parse");
-        assert!(resp.seven_day_sonnet.is_none());
-        let (util, resets_at, _hours) = window_or_default(&resp.seven_day_sonnet);
+        assert!(resp.weekly_scoped.is_none());
+        let (util, resets_at, _hours) = window_or_default(&resp.weekly_scoped);
         assert_eq!(util, 0.0);
         assert!(resets_at.is_empty());
         assert_eq!(resp.seven_day.as_ref().unwrap().utilization, 42.0);
@@ -689,10 +704,11 @@ mod tests {
     /// Build a `UsageData` carrying only the parsed `limits[]`, so the
     /// `scoped_weekly()` accessor can be exercised in isolation.
     fn usage_data_with_limits(limits: Vec<UsageLimit>) -> UsageData {
-        UsageData {
-            seven_day_sonnet_utilization: 0.0,
-            seven_day_sonnet_resets_at: String::new(),
-            seven_day_sonnet_hours_remaining: 0.0,
+        let mut data = UsageData {
+            weekly_scoped_utilization: 0.0,
+            weekly_scoped_resets_at: String::new(),
+            weekly_scoped_hours_remaining: 0.0,
+            weekly_scoped_model: None,
             seven_day_utilization: 0.0,
             seven_day_resets_at: String::new(),
             seven_day_hours_remaining: 0.0,
@@ -702,7 +718,11 @@ mod tests {
             limits,
             timestamp: Utc::now(),
             stale: false,
-        }
+        };
+        // Mirror poll(): resolve the carrier field from the parsed limits so the
+        // returned UsageData is realistic.
+        data.weekly_scoped_model = data.scoped_weekly().map(|(model, _)| model);
+        data
     }
 
     #[test]
@@ -710,7 +730,7 @@ mod tests {
         // The real captured shape: legacy top-level windows coexist with the
         // generic limits[] array. Both must parse from a single response.
         let json = r#"{
-            "seven_day_sonnet": null,
+            "weekly_scoped": null,
             "seven_day": {"utilization": 42.0, "resets_at": "2026-08-01T03:00:00Z"},
             "five_hour": {"utilization": 10.0, "resets_at": "2026-07-26T20:00:00Z"},
             "limits": [
@@ -726,7 +746,7 @@ mod tests {
         let resp: UsageResponse = serde_json::from_str(json).expect("limits response must parse");
 
         // Legacy parsing is untouched.
-        assert!(resp.seven_day_sonnet.is_none());
+        assert!(resp.weekly_scoped.is_none());
         assert_eq!(resp.seven_day.as_ref().unwrap().utilization, 42.0);
         assert_eq!(resp.five_hour.as_ref().unwrap().utilization, 10.0);
 
@@ -808,5 +828,45 @@ mod tests {
             .expect("weekly_scoped entry should be found even without a label");
         assert_eq!(model, "Scoped");
         assert_eq!(window.utilization, 50.0);
+    }
+
+    #[test]
+    fn test_weekly_scoped_model_carries_resolved_display_name() {
+        // A fixture reporting weekly_scoped=Fable: the carrier field resolves to
+        // Some("Fable"), matching scoped_weekly()'s resolved display name. This
+        // proves the resolved model name leaves the poller as data (the field
+        // is populated the same way poll() populates it).
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "percent": 79, "resets_at": "2026-08-01T03:59:59Z",
+                 "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}}}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+
+        assert_eq!(data.weekly_scoped_model.as_deref(), Some("Fable"));
+        // The carrier field agrees with the accessor it is derived from.
+        assert_eq!(data.scoped_weekly().unwrap().0, "Fable");
+    }
+
+    #[test]
+    fn test_weekly_scoped_model_none_when_no_scoped_cap() {
+        // No weekly_scoped entry -> the carrier field is None, consistent with
+        // scoped_weekly() returning None and window_or_default treating a null
+        // window as non-binding.
+        let json = r#"{
+            "limits": [
+                {"kind": "session", "percent": 10, "resets_at": "2026-07-26T20:00:00Z",
+                 "scope": null},
+                {"kind": "weekly_all", "percent": 45, "resets_at": "2026-08-01T03:00:00Z",
+                 "scope": null}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+
+        assert!(data.weekly_scoped_model.is_none());
+        assert!(data.scoped_weekly().is_none());
     }
 }

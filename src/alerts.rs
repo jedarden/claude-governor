@@ -184,7 +184,7 @@ pub fn check_underutilization_sprint_for_worker(
     let windows = [
         ("five_hour", &forecast.five_hour),
         ("seven_day", &forecast.seven_day),
-        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+        ("weekly_scoped", &forecast.weekly_scoped),
     ];
 
     // Check for cutoff_risk in any window - safety check
@@ -638,7 +638,7 @@ pub fn check_alert_conditions(
     // Check CutoffImminent: any window with cutoff_risk=1 and margin_hrs < -2
     check_cutoff_imminent(forecast, now, &mut alerts);
 
-    // Check SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1
+    // Check SonnetCutoffRisk: weekly_scoped cutoff_risk=1
     check_sonnet_cutoff_risk(forecast, now, &mut alerts);
 
     // Check SessionCutoffRisk: five_hour cutoff_risk=1
@@ -813,7 +813,7 @@ fn check_cutoff_imminent(
     let windows = [
         ("five_hour", &forecast.five_hour),
         ("seven_day", &forecast.seven_day),
-        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+        ("weekly_scoped", &forecast.weekly_scoped),
     ];
 
     for (name, win) in windows {
@@ -845,7 +845,7 @@ fn check_cutoff_imminent(
     }
 }
 
-/// Check for SonnetCutoffRisk: seven_day_sonnet cutoff_risk=1 AND hard_limit_margin_hrs < 0 AND utilization >= 85%
+/// Check for SonnetCutoffRisk: weekly_scoped cutoff_risk=1 AND hard_limit_margin_hrs < 0 AND utilization >= 85%
 ///
 /// Uses hard_limit_margin_hrs (against 100% platform limit) instead of margin_hrs (against target
 /// ceiling). The higher utilization threshold (85% vs old 50%) ensures this alert only fires when
@@ -861,7 +861,7 @@ fn check_sonnet_cutoff_risk(
     alerts: &mut Vec<AlertCondition>,
 ) {
     const UTILIZATION_THRESHOLD: f64 = 85.0;
-    let win = &forecast.seven_day_sonnet;
+    let win = &forecast.weekly_scoped;
 
     // Consistency guard: suppress when burn-rate extrapolation is unreliable
     if !is_cutoff_alert_consistent(win) {
@@ -962,7 +962,7 @@ fn check_underutilization(
     let windows = [
         ("five_hour", &forecast.five_hour),
         ("seven_day", &forecast.seven_day),
-        ("seven_day_sonnet", &forecast.seven_day_sonnet),
+        ("weekly_scoped", &forecast.weekly_scoped),
     ];
 
     let all_abundant = windows
@@ -1192,7 +1192,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(97.0, true, -4.4, 5.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1218,7 +1218,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(96.0, true, -1.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1244,7 +1244,7 @@ mod tests {
         let forecast = CapacityForecast {
             seven_day: make_window_with_util_and_margin(52.0, true, -3.0, 60.5),
             five_hour: make_window(false, 10.0, 2.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1271,7 +1271,7 @@ mod tests {
         let forecast = CapacityForecast {
             seven_day: make_window_with_util_and_margin(96.0, true, -26.2, 27.0),
             five_hour: make_window(false, 10.0, 2.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1301,7 +1301,7 @@ mod tests {
         let forecast = CapacityForecast {
             seven_day: make_window_with_util_and_margin(40.0, true, -48.0, 50.5),
             five_hour: make_window(false, 10.0, 2.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1326,8 +1326,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window_with_util_and_margin(96.0, true, -4.2, 5.0),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window_with_util_and_margin(96.0, true, -4.2, 5.0),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1349,7 +1349,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(96.0, true, -1.2, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1379,7 +1379,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window_with_util_and_margin(100.0, true, -9.2, 9.2),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "seven_day".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1412,8 +1412,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window_with_util_and_margin(86.0, true, -16.2, 26.2),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window_with_util_and_margin(86.0, true, -16.2, 26.2),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1439,8 +1439,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window_with_util_and_margin(96.0, true, -26.2, 27.0),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window_with_util_and_margin(96.0, true, -26.2, 27.0),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1464,8 +1464,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(true, 84.0, 87.7), // cutoff_risk=1 BUT margin=84h (safe!)
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window(true, 84.0, 87.7), // cutoff_risk=1 BUT margin=84h (safe!)
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1493,8 +1493,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window_with_util_and_margin(40.0, true, -108.0, 112.0), // cutoff_risk=1, util=40% < 50%
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window_with_util_and_margin(40.0, true, -108.0, 112.0), // cutoff_risk=1, util=40% < 50%
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1517,7 +1517,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(true, 5.0, 2.0), // cutoff_risk=1 BUT margin=5h (safe!)
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1543,7 +1543,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(26.0, true, -1.0, 3.1), // cutoff_risk=1, util=26% < 50%
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1566,8 +1566,8 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 5.0, 2.0), // margin > hrs_left * 0.5
             seven_day: make_window(false, 20.0, 30.0), // margin > hrs_left * 0.5
-            seven_day_sonnet: make_window(false, 20.0, 30.0),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window(false, 20.0, 30.0),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1587,7 +1587,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window(false, 0.5, 2.0), // margin < hrs_left * 0.5 (1.0)
             seven_day: make_window(false, 20.0, 30.0),
-            seven_day_sonnet: make_window(false, 20.0, 30.0),
+            weekly_scoped: make_window(false, 20.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -1870,12 +1870,12 @@ mod tests {
         // Use high utilization (97%) so consistency guard passes and all thresholds are met.
         // hard_limit_remaining_pct = 3.0 <= 5.0 (consistency guard OK)
         // hard_limit_margin_hrs = 3.0/5.0 - 2.0 = -1.4 for five_hour
-        // hard_limit_margin_hrs = 3.0/5.0 - 30.0 = -29.4 for seven_day_sonnet
+        // hard_limit_margin_hrs = 3.0/5.0 - 30.0 = -29.4 for weekly_scoped
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(97.0, true, -1.4, 2.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window_with_util_and_margin(97.0, true, -29.4, 30.0),
-            binding_window: "seven_day_sonnet".to_string(),
+            weekly_scoped: make_window_with_util_and_margin(97.0, true, -29.4, 30.0),
+            binding_window: "weekly_scoped".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
         };
@@ -1924,7 +1924,7 @@ mod tests {
                 ..Default::default()
             },
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2126,7 +2126,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2164,7 +2164,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(55.0, 1.5, false),
             seven_day: make_window_with_util(55.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(55.0, 100.0, false),
+            weekly_scoped: make_window_with_util(55.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2197,7 +2197,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 3.0, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2230,7 +2230,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(80.0, 10.0, true), // cutoff_risk!
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "seven_day".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2262,7 +2262,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2294,7 +2294,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2326,7 +2326,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2359,7 +2359,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2402,7 +2402,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util(45.0, 1.5, false),
             seven_day: make_window_with_util(45.0, 100.0, false),
-            seven_day_sonnet: make_window_with_util(45.0, 100.0, false),
+            weekly_scoped: make_window_with_util(45.0, 100.0, false),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2562,7 +2562,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -2592,7 +2592,7 @@ mod tests {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
             seven_day: make_window(false, 10.0, 30.0),
-            seven_day_sonnet: make_window(false, 5.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
             binding_window: "five_hour".to_string(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,

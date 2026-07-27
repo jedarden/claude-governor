@@ -46,6 +46,15 @@ pub struct UsageState {
     pub five_hour_resets_at: String,
     /// True when data was sourced from stale cache (token refresh failed)
     pub stale: bool,
+    /// Resolved display name of the model the weekly_scoped window is scoped to
+    /// (e.g. "Fable"), plumbed from the poller's `scoped_weekly()` accessor.
+    /// `None` when no active model-scoped cap is present this period — metadata
+    /// only, the binding key stays the generic "weekly_scoped". Null-tolerant:
+    /// `Option<String>` already round-trips null ↔ None, so a missing/null field
+    /// in an older state file deserializes as None (no panic), mirroring the
+    /// null-tolerance applied to hard_limit_margin_hrs/cone_ratio/risk_score.
+    #[serde(default)]
+    pub weekly_scoped_model: Option<String>,
 }
 
 impl Default for UsageState {
@@ -57,6 +66,7 @@ impl Default for UsageState {
             sonnet_resets_at: String::new(),
             five_hour_resets_at: String::new(),
             stale: false,
+            weekly_scoped_model: None,
         }
     }
 }
@@ -112,7 +122,7 @@ impl Default for FleetAggregate {
 pub struct WindowPctDeltas {
     pub five_hour: f64,
     pub seven_day: f64,
-    pub seven_day_sonnet: f64,
+    pub weekly_scoped: f64,
 }
 
 impl Default for WindowPctDeltas {
@@ -120,7 +130,7 @@ impl Default for WindowPctDeltas {
         Self {
             five_hour: 0.0,
             seven_day: 0.0,
-            seven_day_sonnet: 0.0,
+            weekly_scoped: 0.0,
         }
     }
 }
@@ -136,7 +146,7 @@ pub struct PrevUsageSnapshot {
     pub taken_at: DateTime<Utc>,
     pub five_hour_pct: f64,
     pub seven_day_pct: f64,
-    pub seven_day_sonnet_pct: f64,
+    pub weekly_scoped_pct: f64,
 }
 
 impl Default for PrevUsageSnapshot {
@@ -145,7 +155,7 @@ impl Default for PrevUsageSnapshot {
             taken_at: DateTime::<Utc>::default(),
             five_hour_pct: 0.0,
             seven_day_pct: 0.0,
-            seven_day_sonnet_pct: 0.0,
+            weekly_scoped_pct: 0.0,
         }
     }
 }
@@ -276,7 +286,7 @@ impl Default for WindowForecast {
 pub struct CapacityForecast {
     pub five_hour: WindowForecast,
     pub seven_day: WindowForecast,
-    pub seven_day_sonnet: WindowForecast,
+    pub weekly_scoped: WindowForecast,
     pub binding_window: String,
     pub dollars_per_pct_7d_s: f64,
     pub estimated_remaining_dollars: f64,
@@ -287,7 +297,7 @@ impl Default for CapacityForecast {
         Self {
             five_hour: WindowForecast::default(),
             seven_day: WindowForecast::default(),
-            seven_day_sonnet: WindowForecast::default(),
+            weekly_scoped: WindowForecast::default(),
             binding_window: String::new(),
             dollars_per_pct_7d_s: 0.0,
             estimated_remaining_dollars: 0.0,
@@ -313,14 +323,14 @@ pub struct ScheduleState {
     #[serde(default = "serde_default_one")]
     pub promo_multiplier_seven_day: f64,
     #[serde(default = "serde_default_one")]
-    pub promo_multiplier_seven_day_sonnet: f64,
+    pub promo_multiplier_weekly_scoped: f64,
     /// Display multiplier: max across all windows (for backward-compatible display).
     #[serde(default = "serde_default_one")]
     pub promo_multiplier: f64,
     /// Per-window effective hours remaining (wall-clock hours × multiplier).
     pub effective_hours_remaining_five_hour: f64,
     pub effective_hours_remaining_seven_day: f64,
-    pub effective_hours_remaining_seven_day_sonnet: f64,
+    pub effective_hours_remaining_weekly_scoped: f64,
     /// Effective hours for the binding window (for display).
     pub effective_hours_remaining: f64,
     pub raw_hours_remaining: f64,
@@ -333,11 +343,11 @@ impl Default for ScheduleState {
             is_promo_active: false,
             promo_multiplier_five_hour: 1.0,
             promo_multiplier_seven_day: 1.0,
-            promo_multiplier_seven_day_sonnet: 1.0,
+            promo_multiplier_weekly_scoped: 1.0,
             promo_multiplier: 1.0,
             effective_hours_remaining_five_hour: 0.0,
             effective_hours_remaining_seven_day: 0.0,
-            effective_hours_remaining_seven_day_sonnet: 0.0,
+            effective_hours_remaining_weekly_scoped: 0.0,
             effective_hours_remaining: 0.0,
             raw_hours_remaining: 0.0,
         }
@@ -440,7 +450,7 @@ pub struct BurnRateState {
     #[serde(default)]
     pub usd_per_pct_ema_seven_day: f64,
     #[serde(default)]
-    pub usd_per_pct_ema_seven_day_sonnet: f64,
+    pub usd_per_pct_ema_weekly_scoped: f64,
 
     /// Number of positive-delta samples accumulated in fleet_pct_hr_ema.
     #[serde(default)]
@@ -467,7 +477,7 @@ impl Default for BurnRateState {
             fleet_pct_hr_ema: WindowPctDeltas::default(),
             usd_per_pct_ema_five_hour: 0.0,
             usd_per_pct_ema_seven_day: 0.0,
-            usd_per_pct_ema_seven_day_sonnet: 0.0,
+            usd_per_pct_ema_weekly_scoped: 0.0,
             fleet_pct_ema_samples: 0,
             prev_usage_snapshot: None,
         }
@@ -667,7 +677,7 @@ pub struct GovernorState {
     #[serde(default)]
     pub alert_fp_telemetry: AlertFpTelemetry,
     /// Pending predictions for each window, used to score predictions when windows reset.
-    /// Key is window name ("five_hour", "seven_day", "seven_day_sonnet").
+    /// Key is window name ("five_hour", "seven_day", "weekly_scoped").
     #[serde(default)]
     pub pending_predictions: HashMap<String, PendingPrediction>,
     /// Previous API snapshot taken at the last poll() cycle.
@@ -792,7 +802,7 @@ impl GovernorState {
     /// - `now`: The current timestamp when the snapshot was taken
     /// - `five_hour_pct`: The 5-hour window utilization percentage
     /// - `seven_day_pct`: The 7-day window utilization percentage
-    /// - `seven_day_sonnet_pct`: The 7-day Sonnet window utilization percentage
+    /// - `weekly_scoped_pct`: The 7-day Sonnet window utilization percentage
     ///
     /// # Example
     /// ```no_run
@@ -815,7 +825,7 @@ impl GovernorState {
         now: DateTime<Utc>,
         five_hour_pct: f64,
         seven_day_pct: f64,
-        seven_day_sonnet_pct: f64,
+        weekly_scoped_pct: f64,
     ) {
         // Shift: current becomes previous
         self.previous_api_snapshot = self.current_api_snapshot.take();
@@ -825,7 +835,7 @@ impl GovernorState {
             taken_at: now,
             five_hour_pct,
             seven_day_pct,
-            seven_day_sonnet_pct,
+            weekly_scoped_pct,
         });
     }
 }
@@ -1023,6 +1033,7 @@ mod tests {
                 sonnet_resets_at: "2026-03-20T03:59:59Z".to_string(),
                 five_hour_resets_at: "2026-03-18T15:59:59Z".to_string(),
                 stale: false,
+                weekly_scoped_model: Some("Fable".to_string()),
             },
             last_fleet_aggregate: FleetAggregate {
                 t0: "2026-03-18T14:25:00Z".parse().unwrap(),
@@ -1034,7 +1045,7 @@ mod tests {
                 window_pct_deltas: WindowPctDeltas {
                     five_hour: 0.66,
                     seven_day: 0.54,
-                    seven_day_sonnet: 0.75,
+                    weekly_scoped: 0.75,
                 },
                 fleet_cache_eff: 0.0,
                 cache_eff_p25: 0.0,
@@ -1070,7 +1081,7 @@ mod tests {
                     safe_worker_count: None,
                     ..Default::default()
                 },
-                seven_day_sonnet: WindowForecast {
+                weekly_scoped: WindowForecast {
                     target_ceiling: 90.0,
                     current_utilization: 63.5,
                     remaining_pct: 26.5,
@@ -1083,7 +1094,7 @@ mod tests {
                     safe_worker_count: Some(2),
                     ..Default::default()
                 },
-                binding_window: "seven_day_sonnet".to_string(),
+                binding_window: "weekly_scoped".to_string(),
                 dollars_per_pct_7d_s: 1.648,
                 estimated_remaining_dollars: 46.1,
             },
@@ -1092,11 +1103,11 @@ mod tests {
                 is_promo_active: true,
                 promo_multiplier_five_hour: 2.0,
                 promo_multiplier_seven_day: 1.0,
-                promo_multiplier_seven_day_sonnet: 1.0,
+                promo_multiplier_weekly_scoped: 1.0,
                 promo_multiplier: 2.0,
                 effective_hours_remaining_five_hour: 84.5,
                 effective_hours_remaining_seven_day: 37.5,
-                effective_hours_remaining_seven_day_sonnet: 37.5,
+                effective_hours_remaining_weekly_scoped: 37.5,
                 effective_hours_remaining: 84.5,
                 raw_hours_remaining: 37.5,
             },
@@ -1122,7 +1133,7 @@ mod tests {
             },
             alerts: vec![serde_json::json!({
                 "type": "cutoff_risk",
-                "window": "seven_day_sonnet",
+                "window": "weekly_scoped",
                 "message": "Binding window at risk of exceeding target"
             })],
             safe_mode: SafeModeState {
@@ -1167,7 +1178,12 @@ mod tests {
 
         assert_eq!(loaded.usage.sonnet_pct, 72.0);
         assert_eq!(loaded.usage.all_models_pct, 81.0);
-        assert_eq!(loaded.capacity_forecast.binding_window, "seven_day_sonnet");
+        assert_eq!(
+            loaded.usage.weekly_scoped_model.as_deref(),
+            Some("Fable"),
+            "weekly_scoped_model must round-trip as a populated Some"
+        );
+        assert_eq!(loaded.capacity_forecast.binding_window, "weekly_scoped");
         assert_eq!(loaded.burn_rate.tokens_per_pct_peak, 69780);
         assert_eq!(loaded.burn_rate.by_model["claude-sonnet-4-6"].samples, 12);
         assert_eq!(loaded.workers["claude-anthropic-sonnet"].current, 2);
@@ -1176,7 +1192,7 @@ mod tests {
         assert_eq!(loaded.safe_mode.trigger.as_deref(), Some("median_error"));
         assert_eq!(loaded.burn_rate.calibration.predictions_scored, 24);
         assert_eq!(
-            loaded.capacity_forecast.seven_day_sonnet.safe_worker_count,
+            loaded.capacity_forecast.weekly_scoped.safe_worker_count,
             Some(2)
         );
     }
@@ -1319,7 +1335,7 @@ mod tests {
         // Load it back
         let loaded = load_previous_state(&path).unwrap().unwrap();
         assert_eq!(loaded.usage.sonnet_pct, 72.0);
-        assert_eq!(loaded.capacity_forecast.binding_window, "seven_day_sonnet");
+        assert_eq!(loaded.capacity_forecast.binding_window, "weekly_scoped");
     }
 
     #[test]
@@ -1731,7 +1747,7 @@ mod tests {
         let curr = state.current_api_snapshot.as_ref().unwrap();
         assert_eq!(curr.five_hour_pct, 10.0);
         assert_eq!(curr.seven_day_pct, 20.0);
-        assert_eq!(curr.seven_day_sonnet_pct, 15.0);
+        assert_eq!(curr.weekly_scoped_pct, 15.0);
         assert_eq!(curr.taken_at, now);
     }
 
@@ -1753,10 +1769,10 @@ mod tests {
         let now = Utc::now();
         let five_hour_pct = 45.2;
         let seven_day_pct = 67.8;
-        let seven_day_sonnet_pct = 72.3;
+        let weekly_scoped_pct = 72.3;
 
         // This should not panic even though previous_api_snapshot is None
-        state.update_api_snapshot(now, five_hour_pct, seven_day_pct, seven_day_sonnet_pct);
+        state.update_api_snapshot(now, five_hour_pct, seven_day_pct, weekly_scoped_pct);
 
         // Verify the transition: None -> Some for current_api_snapshot
         assert!(state.previous_api_snapshot.is_none(),
@@ -1770,7 +1786,7 @@ mod tests {
                    "Five-hour utilization should match input");
         assert_eq!(snapshot.seven_day_pct, seven_day_pct,
                    "Seven-day utilization should match input");
-        assert_eq!(snapshot.seven_day_sonnet_pct, seven_day_sonnet_pct,
+        assert_eq!(snapshot.weekly_scoped_pct, weekly_scoped_pct,
                    "Seven-day sonnet utilization should match input");
         assert_eq!(snapshot.taken_at, now,
                    "Timestamp should match poll time");
@@ -1791,7 +1807,7 @@ mod tests {
         let snapshot = state.current_api_snapshot.as_ref().unwrap();
         assert_eq!(snapshot.five_hour_pct, 0.0);
         assert_eq!(snapshot.seven_day_pct, 0.0);
-        assert_eq!(snapshot.seven_day_sonnet_pct, 0.0);
+        assert_eq!(snapshot.weekly_scoped_pct, 0.0);
     }
 
     #[test]
@@ -1809,7 +1825,7 @@ mod tests {
         let snapshot = state.current_api_snapshot.as_ref().unwrap();
         assert_eq!(snapshot.five_hour_pct, 95.7);
         assert_eq!(snapshot.seven_day_pct, 98.2);
-        assert_eq!(snapshot.seven_day_sonnet_pct, 99.1);
+        assert_eq!(snapshot.weekly_scoped_pct, 99.1);
     }
 
     #[test]
@@ -1833,14 +1849,14 @@ mod tests {
         let prev = state.previous_api_snapshot.as_ref().unwrap();
         assert_eq!(prev.five_hour_pct, 10.0, "previous should hold first poll data");
         assert_eq!(prev.seven_day_pct, 20.0);
-        assert_eq!(prev.seven_day_sonnet_pct, 15.0);
+        assert_eq!(prev.weekly_scoped_pct, 15.0);
         assert_eq!(prev.taken_at, now1);
 
         // Verify current holds the second poll's data
         let curr = state.current_api_snapshot.as_ref().unwrap();
         assert_eq!(curr.five_hour_pct, 12.5, "current should hold second poll data");
         assert_eq!(curr.seven_day_pct, 22.0);
-        assert_eq!(curr.seven_day_sonnet_pct, 18.0);
+        assert_eq!(curr.weekly_scoped_pct, 18.0);
         assert_eq!(curr.taken_at, now2);
     }
 
@@ -1854,10 +1870,10 @@ mod tests {
             let now = Utc::now() + chrono::Duration::seconds(i as i64 * 60);
             let five_hr = 10.0 + i as f64 * 2.5;  // 10.0, 12.5, 15.0, 17.5, 20.0
             let seven_day = 20.0 + i as f64 * 2.0;  // 20.0, 22.0, 24.0, 26.0, 28.0
-            let seven_day_sonnet = 15.0 + i as f64 * 3.0;  // 15.0, 18.0, 21.0, 24.0, 27.0
+            let weekly_scoped = 15.0 + i as f64 * 3.0;  // 15.0, 18.0, 21.0, 24.0, 27.0
 
-            state.update_api_snapshot(now, five_hr, seven_day, seven_day_sonnet);
-            prev_values.push((five_hr, seven_day, seven_day_sonnet));
+            state.update_api_snapshot(now, five_hr, seven_day, weekly_scoped);
+            prev_values.push((five_hr, seven_day, weekly_scoped));
 
             // After the first poll, verify the chain
             if i > 0 {
@@ -1871,13 +1887,13 @@ mod tests {
                 let (p5h, p7d, p7ds) = prev_values[i - 1];
                 assert_eq!(prev.five_hour_pct, p5h);
                 assert_eq!(prev.seven_day_pct, p7d);
-                assert_eq!(prev.seven_day_sonnet_pct, p7ds);
+                assert_eq!(prev.weekly_scoped_pct, p7ds);
 
                 // Current should hold the current iteration's values
                 let (c5h, c7d, c7ds) = prev_values[i];
                 assert_eq!(curr.five_hour_pct, c5h);
                 assert_eq!(curr.seven_day_pct, c7d);
-                assert_eq!(curr.seven_day_sonnet_pct, c7ds);
+                assert_eq!(curr.weekly_scoped_pct, c7ds);
             }
         }
     }
@@ -1907,8 +1923,8 @@ mod tests {
         assert_eq!(prev.seven_day_pct, 90.0);
         assert_eq!(curr.seven_day_pct, 15.0);  // Window reset: 90.0 -> 15.0
 
-        assert_eq!(prev.seven_day_sonnet_pct, 85.0);
-        assert_eq!(curr.seven_day_sonnet_pct, 8.0);  // Window reset: 85.0 -> 8.0
+        assert_eq!(prev.weekly_scoped_pct, 85.0);
+        assert_eq!(curr.weekly_scoped_pct, 8.0);  // Window reset: 85.0 -> 8.0
     }
 }
 
@@ -1940,5 +1956,33 @@ mod null_roundtrip_test {
         // Deserialize back (null → infinity)
         let wf2: WindowForecast = serde_json::from_str(&json).unwrap();
         assert!(wf2.predicted_exhaustion_hours.is_infinite());
+    }
+
+    #[test]
+    fn test_usage_state_weekly_scoped_model_null_roundtrip() {
+        // Option<String> is inherently null-tolerant: null deserializes as None
+        // without panicking, mirroring the custom null-as-infinity pattern used
+        // for hard_limit_margin_hrs/cone_ratio/risk_score (which need a custom
+        // deserializer only because they are f64, not Option).
+        let null_json = r#"{"sonnet_pct": 72.0, "weekly_scoped_model": null}"#;
+        let u: UsageState =
+            serde_json::from_str(null_json).expect("null must deserialize as None");
+        assert!(u.weekly_scoped_model.is_none());
+
+        // Absent field (older state file) -> None via struct-level #[serde(default)].
+        let absent_json = r#"{"sonnet_pct": 72.0}"#;
+        let u2: UsageState =
+            serde_json::from_str(absent_json).expect("absent field must default to None");
+        assert!(u2.weekly_scoped_model.is_none());
+
+        // Some round-trips through serialize/deserialize.
+        let populated = UsageState {
+            weekly_scoped_model: Some("Fable".to_string()),
+            ..UsageState::default()
+        };
+        let s = serde_json::to_string(&populated).unwrap();
+        assert!(s.contains("\"weekly_scoped_model\":\"Fable\""));
+        let reloaded: UsageState = serde_json::from_str(&s).unwrap();
+        assert_eq!(reloaded.weekly_scoped_model.as_deref(), Some("Fable"));
     }
 }

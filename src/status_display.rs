@@ -171,7 +171,7 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     let windows: [(&str, &WindowForecast); 3] = [
         ("5h", &state.capacity_forecast.five_hour),
         ("7d", &state.capacity_forecast.seven_day),
-        ("7d-sonnet", &state.capacity_forecast.seven_day_sonnet),
+        ("7d-sonnet", &state.capacity_forecast.weekly_scoped),
     ];
 
     // Table header
@@ -510,8 +510,8 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
         ("five_hour", &state.capacity_forecast.five_hour),
         ("seven_day", &state.capacity_forecast.seven_day),
         (
-            "seven_day_sonnet",
-            &state.capacity_forecast.seven_day_sonnet,
+            "weekly_scoped",
+            &state.capacity_forecast.weekly_scoped,
         ),
     ]
     .into_iter()
@@ -638,6 +638,7 @@ mod tests {
                 sonnet_resets_at: "2026-03-20T04:00:00Z".to_string(),
                 five_hour_resets_at: "2026-03-18T16:00:00Z".to_string(),
                 stale: false,
+                weekly_scoped_model: None,
             },
             last_fleet_aggregate: FleetAggregate {
                 t0: Utc::now() - chrono::Duration::minutes(10),
@@ -681,7 +682,7 @@ mod tests {
                     safe_worker_count: None,
                     ..Default::default()
                 },
-                seven_day_sonnet: WindowForecast {
+                weekly_scoped: WindowForecast {
                     target_ceiling: 90.0,
                     current_utilization: 63.5,
                     remaining_pct: 26.5,
@@ -694,7 +695,7 @@ mod tests {
                     safe_worker_count: Some(2),
                     ..Default::default()
                 },
-                binding_window: "seven_day_sonnet".to_string(),
+                binding_window: "weekly_scoped".to_string(),
                 dollars_per_pct_7d_s: 1.648,
                 estimated_remaining_dollars: 46.1,
             },

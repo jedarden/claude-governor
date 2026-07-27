@@ -422,7 +422,7 @@ pub struct WindowRecord {
     #[serde(rename = "ts")]
     pub ts: DateTime<Utc>,
 
-    /// Window name: "five_hour", "seven_day", "seven_day_sonnet"
+    /// Window name: "five_hour", "seven_day", "weekly_scoped"
     #[serde(rename = "win")]
     pub win: String,
 
@@ -575,7 +575,7 @@ pub fn compute_safe_workers(remaining_pct: f64, hrs_left: f64, p75_rate_per_work
 
 /// Generate WindowRecords for all three usage windows and find the binding one.
 ///
-/// Produces exactly 3 records: five_hour, seven_day, seven_day_sonnet.
+/// Produces exactly 3 records: five_hour, seven_day, weekly_scoped.
 pub fn compute_window_forecasts(
     windows: &[(&str, f64, DateTime<Utc>)], // (name, snap, reset)
     ceil: f64,
@@ -2221,10 +2221,10 @@ mod tests {
             let now = base_now();
             let reset = reset_5h_from(now);
             let rec =
-                compute_window_forecast("seven_day_sonnet", 80.0, 90.0, reset, now, 1.0, false);
+                compute_window_forecast("weekly_scoped", 80.0, 90.0, reset, now, 1.0, false);
 
             assert_eq!(rec.r, "w");
-            assert_eq!(rec.win, "seven_day_sonnet");
+            assert_eq!(rec.win, "weekly_scoped");
             assert_eq!(rec.pk, false);
         }
 
@@ -2269,7 +2269,7 @@ mod tests {
         }
 
         #[test]
-        fn seven_day_sonnet_binding() {
+        fn weekly_scoped_binding() {
             let now = base_now();
             let mut forecasts = vec![
                 compute_window_forecast(
@@ -2291,7 +2291,7 @@ mod tests {
                     false,
                 ),
                 compute_window_forecast(
-                    "seven_day_sonnet",
+                    "weekly_scoped",
                     85.0,
                     90.0,
                     now + Duration::hours(50),
@@ -2303,7 +2303,7 @@ mod tests {
 
             find_binding_window(&mut forecasts, 1.0);
 
-            // seven_day_sonnet has remain=5, fleet_pct_hr=0.2, exh_hrs=25, hrs_left=50, margin=25
+            // weekly_scoped has remain=5, fleet_pct_hr=0.2, exh_hrs=25, hrs_left=50, margin=25
             // five_hour: remain=60, exh_hrs=60, hrs_left=4, margin=-56
             // Actually five_hour is more constrained. Let me adjust.
             // five_hour: remain=60, fleet_pct_hr=1.0, exh_hrs=60, hrs_left=4, margin=-56
@@ -2339,7 +2339,7 @@ mod tests {
             let windows = vec![
                 ("five_hour", 36.0, now + Duration::hours(3)),
                 ("seven_day", 68.0, now + Duration::hours(100)),
-                ("seven_day_sonnet", 72.0, now + Duration::hours(80)),
+                ("weekly_scoped", 72.0, now + Duration::hours(80)),
             ];
 
             let forecasts = compute_window_forecasts(&windows, 90.0, now, 2.0, false, 1.0);
@@ -2347,7 +2347,7 @@ mod tests {
             assert_eq!(forecasts.len(), 3);
             assert_eq!(forecasts[0].win, "five_hour");
             assert_eq!(forecasts[1].win, "seven_day");
-            assert_eq!(forecasts[2].win, "seven_day_sonnet");
+            assert_eq!(forecasts[2].win, "weekly_scoped");
 
             // Exactly one binding window
             let binding_count = forecasts.iter().filter(|f| f.bind == 1).count();
