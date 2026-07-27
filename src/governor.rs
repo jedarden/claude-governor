@@ -1453,6 +1453,13 @@ mod window_delta_tests {
     /// - `seven_day`: 7-day window utilization percentage (all models)
     /// - `weekly_scoped`: 7-day window utilization percentage (Sonnet only)
     ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// The weekly_scoped field is MODEL-AGNOSTIC and can be scoped to ANY model
+    /// (Fable, Opus, Sonnet, etc.) depending on which model carries the scoped cap
+    /// this period. See state.rs UsageState.weekly_scoped_model and weekly_scoped_pct
+    /// for the model-agnostic implementation. This affects all locations where
+    /// weekly_scoped is documented as "Sonnet only" in this file.
+    ///
     /// # Returns
     /// A WindowPctSnapshot struct with the specified values.
     ///
@@ -1486,6 +1493,13 @@ mod window_delta_tests {
     /// - `five_hour_pct`: 5-hour window utilization percentage
     /// - `seven_day_pct`: 7-day window utilization percentage (all models)
     /// - `weekly_scoped_pct`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// The weekly_scoped_pct field is MODEL-AGNOSTIC and applies to whatever model
+    /// carries the scoped cap this period (Fable, Opus, Sonnet, etc.).
+    /// The correct implementation uses state::UsageState.weekly_scoped_model to
+    /// determine which model is active, and weekly_scoped_pct for the utilization.
+    /// See state.rs lines 70-77 for the model-agnostic design.
     ///
     /// # Returns
     /// A PrevUsageSnapshot struct with the specified values and current timestamp.
@@ -1523,6 +1537,11 @@ mod window_delta_tests {
     /// - `five_hour_pct`: 5-hour window utilization percentage
     /// - `seven_day_pct`: 7-day window utilization percentage (all models)
     /// - `weekly_scoped_pct`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// weekly_scoped_pct is MODEL-AGNOSTIC. Use state::UsageState.weekly_scoped_model
+    /// to determine which model (Fable, Opus, etc.) carries the scoped cap this period.
+    /// The legacy sonnet_pct field is deprecated; see state.rs lines 53-56.
     ///
     /// # Returns
     /// A PrevUsageSnapshot struct with the specified values and custom timestamp.
@@ -5499,6 +5518,11 @@ mod tests {
     /// - `seven_day`: 7-day window utilization percentage (all models)
     /// - `weekly_scoped`: 7-day window utilization percentage (Sonnet only)
     ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// weekly_scoped is MODEL-AGNOSTIC and can be Fable, Opus, Sonnet, etc.
+    /// This field represents the scoped weekly cap utilization for whatever model
+    /// is active this period (see state::UsageState.weekly_scoped_model).
+    ///
     /// # Returns
     /// A UsageSnapshot struct with the specified window values.
     ///
@@ -7606,6 +7630,11 @@ impl MockPoller {
     /// - `five_hour_util`: 5-hour window utilization percentage
     /// - `seven_day_util`: 7-day window utilization percentage (all models)
     /// - `weekly_scoped_util`: 7-day window utilization percentage (Sonnet only)
+    ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// weekly_scoped_util is MODEL-AGNOSTIC. It represents utilization for whatever
+    /// model carries the scoped cap (Fable, Opus, Sonnet, etc.) this period.
+    /// Use UsageData.weekly_scoped_model to identify the active model.
     pub fn with_utilization(
         five_hour_util: f64,
         seven_day_util: f64,
@@ -7678,6 +7707,11 @@ impl MockPoller {
     /// - 5-hour window: 50% utilization
     /// - 7-day window: 60% utilization (all models)
     /// - 7-day window: 55% utilization (Sonnet only)
+    ///
+    /// ⚠️ BUG: The documentation above incorrectly states "Sonnet only".
+    /// The weekly_scoped utilization is MODEL-AGNOSTIC. This default creates
+    /// data without setting weekly_scoped_model (None), making it apply to the
+    /// generic scoped cap regardless of which model is active.
     /// - Reset times 4-5 hours in the future
     fn default_usage_data() -> crate::poller::UsageData {
         use chrono::Duration;
