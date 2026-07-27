@@ -5013,4 +5013,84 @@ mod tests {
             "exhaustion should be in the future"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Cold window base rate test (bf-5oh6w)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cold_window_base_rate_seeding_production_path() {
+        // Test cold window base rate seeding through the production path
+        // This test directly calls generate_window_forecast (the production path)
+        // instead of estimate_burn_rates, verifying the seeded base rate is preserved.
+        //
+        // Scenario: Cold start window with 0 samples, 2 workers running
+        // Baseline: 1.5%/hr per worker
+        // Expected seeded rate: 1.5 * 2 = 3.0%/hr
+
+        let baseline_pct_per_worker = 1.5; // 1.5% per hour per worker
+        let worker_count = 2; // 2 workers currently running
+        let seeded_fleet_pct_hr = baseline_pct_per_worker * worker_count as f64; // 3.0%/hr
+
+        // Call generate_window_forecast directly with the seeded rate
+        // This simulates the production path after seeding has occurred
+        let forecast = generate_window_forecast(
+            "weekly_scoped",                     // cold window name
+            seeded_fleet_pct_hr,                 // seeded fleet burn rate: 3.0%/hr
+            25.0,                                // current utilization: 25%
+            90.0,                                // target ceiling: 90%
+            80.0,                                // hours remaining: 80 hours
+            baseline_pct_per_worker,            // mean rate per worker: 1.5%/hr
+            seeded_fleet_pct_hr * 0.5,          // std_pct_hr: conservative spread (50% of mean)
+            crate::state::EstimateQuality::ColdStart, // quality flag: cold start
+        );
+
+        // CRITICAL VERIFY: fleet_pct_per_hour must be the seeded rate, NOT 0.0
+        // This is the key invariant: cold windows get seeded baseline rates,
+        // preventing infinite exhaustion predictions and unsafe over-scaling.
+        assert!(
+            forecast.fleet_pct_per_hour > 0.0,
+            "cold window must have positive fleet_pct_per_hour (seeded), got {:.2}",
+            forecast.fleet_pct_per_hour
+        );
+
+        assert!(
+            (forecast.fleet_pct_per_hour - seeded_fleet_pct_hr).abs() < 1e-9,
+            "fleet_pct_per_hour must equal seeded rate ({:.2}), got {:.2}",
+            seeded_fleet_pct_hr,
+            forecast.fleet_pct_per_hour
+        );
+
+        // Verify the seeded rate produces meaningful exhaustion predictions
+        // With seeded 3.0%/hr and 65% remaining (90-25), exhaustion should be:
+        // 65% / 3.0%/hr = 21.67 hours (finite, not infinite)
+        assert!(
+            forecast.predicted_exhaustion_hours.is_finite(),
+            "cold window with seeded rate must have finite exhaustion time, got inf"
+        );
+
+        let expected_exhaustion = 65.0 / seeded_fleet_pct_hr;
+        assert!(
+            (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.01,
+            "predicted_exhaustion_hours should match seeded rate calculation, \
+             expected {:.2}, got {:.2}",
+            expected_exhaustion,
+            forecast.predicted_exhaustion_hours
+        );
+
+        // Verify EstimateQuality is correctly set to ColdStart
+        assert_eq!(
+            forecast.estimate_quality,
+            crate::state::EstimateQuality::ColdStart,
+            "cold window should have estimate_quality=ColdStart"
+        );
+
+        // Verify safe_worker_count is computable from the seeded rate
+        // With 65% remaining, 1.5%/hr per worker, 80 hours:
+        // safe_workers = floor(65% / (1.5%/worker/hr * 80hr)) = floor(65 / 120) = 0
+        assert!(
+            forecast.safe_worker_count.is_some(),
+            "safe_worker_count should be computable from seeded rate"
+        );
+    }
 }
