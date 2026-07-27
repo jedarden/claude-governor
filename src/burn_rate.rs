@@ -1175,6 +1175,7 @@ pub fn generate_window_forecast(
     hours_remaining: f64,
     mean_rate_per_worker: f64,
     std_pct_hr: f64,
+    estimate_quality: crate::state::EstimateQuality,
 ) -> crate::state::WindowForecast {
     let remaining_pct = (target_ceiling - current_utilization).max(0.0);
 
@@ -1263,7 +1264,7 @@ pub fn generate_window_forecast(
         } else {
             f64::INFINITY
         },
-        estimate_quality: crate::state::EstimateQuality::Calibrated,
+        estimate_quality,
     }
 }
 
@@ -1461,6 +1462,15 @@ pub fn estimate_burn_rates(
             );
         }
 
+        // Determine estimate quality based on sample count and fresh rate
+        let estimate_quality = if has_fresh_rate || window_samples >= MIN_SAMPLES_FOR_EMA {
+            crate::state::EstimateQuality::Calibrated
+        } else if window_samples == 0 {
+            crate::state::EstimateQuality::ColdStart
+        } else {
+            crate::state::EstimateQuality::InsufficientSamples
+        };
+
         forecasts.insert(
             window.to_string(),
             generate_window_forecast(
@@ -1471,6 +1481,7 @@ pub fn estimate_burn_rates(
                 hrs_left,
                 p75_per_worker,
                 std_pct_hr,
+                estimate_quality,
             ),
         );
     }
@@ -3151,6 +3162,7 @@ mod tests {
             37.5, // hours remaining
             1.0,  // p75 per worker
             0.0,  // std_pct_hr (no spread)
+            crate::state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
         assert!((f.remaining_pct - 18.0).abs() < 1e-9);
@@ -3177,6 +3189,7 @@ mod tests {
             3.0,
             0.0,
             0.0, // std_pct_hr
+            crate::state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
         assert!(f.predicted_exhaustion_hours.is_infinite());

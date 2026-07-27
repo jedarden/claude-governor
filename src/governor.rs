@@ -4588,6 +4588,21 @@ pub fn run_governor_cycle(
         };
         let std_pct_hr = state.last_fleet_aggregate.sonnet_std_usd_hr / effective_usd_per_pct;
 
+        // Compute estimate_quality based on EMA sample count
+        let ema_val = match *window {
+            "five_hour" => state.burn_rate.fleet_pct_hr_ema.five_hour,
+            "seven_day" => state.burn_rate.fleet_pct_hr_ema.seven_day,
+            "weekly_scoped" => state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+            _ => 0.0,
+        };
+        let estimate_quality = if state.burn_rate.fleet_pct_ema_samples >= 3 && ema_val > 0.0 {
+            state::EstimateQuality::Calibrated
+        } else if state.burn_rate.fleet_pct_ema_samples == 0 {
+            state::EstimateQuality::ColdStart
+        } else {
+            state::EstimateQuality::InsufficientSamples
+        };
+
         let forecast = generate_window_forecast(
             window,
             fleet_pct_hr,
@@ -4596,24 +4611,10 @@ pub fn run_governor_cycle(
             hrs_left,
             pct_per_worker,
             std_pct_hr,
+            estimate_quality,
         );
 
-        // Set estimate_quality based on EMA sample count (bead bf-n21u3 child 1).
-        // This child only marks the calibrated path explicitly; cold-start/insufficient
-        // marking is deferred to child 2 and 3. Since the default is Calibrated and we're
-        // only plumbing the field for now, we set it when we have >= 3 samples and a
-        // positive EMA value for the window. This is additive — no behavior change.
         let mut forecast = forecast;
-        let ema_val = match *window {
-            "five_hour" => state.burn_rate.fleet_pct_hr_ema.five_hour,
-            "seven_day" => state.burn_rate.fleet_pct_hr_ema.seven_day,
-            "weekly_scoped" => state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
-            _ => 0.0,
-        };
-        if state.burn_rate.fleet_pct_ema_samples >= 3 && ema_val > 0.0 {
-            forecast.estimate_quality = state::EstimateQuality::Calibrated;
-        }
-        // Otherwise leave at default (Calibrated) — child 2/3 will mark cold/insufficient
 
         match *window {
             "five_hour" => five_hour_forecast = forecast,
@@ -6196,6 +6197,7 @@ mod tests {
             24.0,                   // hours remaining
             estimated_pct_hr / 2.0, // mean per-worker (half fleet for 2 workers)
             0.0,                    // std_pct_hr (no spread data in this test)
+            state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
         assert!(
