@@ -4800,6 +4800,7 @@ pub fn run_governor_cycle(
         // (the full fleet rate itself) to widen the confidence cone, so the
         // pessimistic p75 safe-worker path engages until real samples take over.
         // Calibrated windows (>= MIN_SAMPLES_FOR_EMA) are unaffected.
+        //
         let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
             if matches!(estimate_quality, state::EstimateQuality::ColdStart | state::EstimateQuality::InsufficientSamples)
                 && util > 0.0
