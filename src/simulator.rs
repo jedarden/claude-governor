@@ -615,7 +615,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
         for (key, label) in [
             ("five_hour", "5h"),
             ("seven_day", "7d"),
-            ("weekly_scoped", "7d-sonnet"),
+            ("weekly_scoped", "weekly_scoped"),
         ] {
             if let Some(c) = trajectory.cone.get(key) {
                 let ratio = if c.cone_ratio > 0.0 {

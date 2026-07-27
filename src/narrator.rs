@@ -183,6 +183,22 @@ fn get_window_forecast<'a>(state: &'a GovernorState, window: &str) -> Option<&'a
     }
 }
 
+/// Human-readable label for the binding window, for decision reason text.
+///
+/// `binding_window` stays the generic key used for window *matching* (so it still
+/// resolves the right forecast); this returns the label shown to humans. When the
+/// binding window is the model-scoped weekly window, it surfaces the resolved
+/// model display name (e.g. "Fable") read from state, falling back to the generic
+/// "weekly_scoped" key when no model is known for this period.
+fn binding_display_label(state: &GovernorState, binding_window: &str) -> String {
+    if binding_window == "weekly_scoped" {
+        crate::state::weekly_scoped_display_label(state.usage.weekly_scoped_model.as_deref())
+            .to_string()
+    } else {
+        binding_window.to_string()
+    }
+}
+
 /// Generate the human-readable reason text
 fn generate_reason(
     ctx: &DecisionContext,
@@ -190,6 +206,10 @@ fn generate_reason(
     margin_before: f64,
     margin_after: f64,
 ) -> String {
+    // Display label for humans: surfaces the resolved model name when the binding
+    // window is the model-scoped weekly window. `binding_window` (the generic key)
+    // is still used for window matching below.
+    let binding_display = binding_display_label(ctx.after, binding_window);
     match ctx.action {
         ScaleAction::ScaleUp => {
             let win = get_window_forecast(ctx.after, binding_window);
@@ -201,7 +221,7 @@ fn generate_reason(
             });
             format!(
                 "Scaled up from {} to {} workers. Binding window '{}'{} had margin {:.1}h, now predicted {:.1}h.",
-                ctx.workers_before, ctx.workers_after, binding_window, util_info, margin_before, margin_after
+                ctx.workers_before, ctx.workers_after, binding_display, util_info, margin_before, margin_after
             )
         }
         ScaleAction::ScaleDown => {
@@ -211,7 +231,7 @@ fn generate_reason(
             });
             format!(
                 "Scaled down from {} to {} workers. Binding window '{}'{} had margin {:.1}h, now predicted {:.1}h.",
-                ctx.workers_before, ctx.workers_after, binding_window, util_info, margin_before, margin_after
+                ctx.workers_before, ctx.workers_after, binding_display, util_info, margin_before, margin_after
             )
         }
         ScaleAction::Hold => {
@@ -224,7 +244,7 @@ fn generate_reason(
             });
             format!(
                 "Holding at {} workers. Binding window: '{}'. {}",
-                ctx.workers_after, binding_window, margin_info
+                ctx.workers_after, binding_display, margin_info
             )
         }
         ScaleAction::SprintActivate => {
@@ -233,7 +253,7 @@ fn generate_reason(
             let trigger_info = win.map_or(ctx.trigger.clone(), |w| {
                 format!(
                     "{} at {:.1}% utilization, {:.1}h to reset",
-                    binding_window, w.current_utilization, w.hours_remaining
+                    binding_display, w.current_utilization, w.hours_remaining
                 )
             });
             format!(
@@ -258,7 +278,7 @@ fn generate_reason(
             });
             format!(
                 "Pre-emptive scale from {} to {} workers. Binding window '{}'{} to prevent cutoff. Margin: {:.1}h -> {:.1}h.",
-                ctx.workers_before, ctx.workers_after, binding_window, exhaustion_info, margin_before, margin_after
+                ctx.workers_before, ctx.workers_after, binding_display, exhaustion_info, margin_before, margin_after
             )
         }
         ScaleAction::EmergencyBrakeEngage => {
@@ -268,7 +288,7 @@ fn generate_reason(
             });
             format!(
                 "EMERGENCY BRAKE ENGAGED: Scaled all workers from {} to 0. Binding window '{}'{} exceeded 98% threshold. Immediate halt to prevent cutoff.",
-                ctx.workers_before, binding_window, util_info
+                ctx.workers_before, binding_display, util_info
             )
         }
         ScaleAction::EmergencyBrakeRelease => {
@@ -278,7 +298,7 @@ fn generate_reason(
             });
             format!(
                 "Emergency brake released. Binding window '{}'{}. Resuming with {} workers.",
-                binding_window, util_info, ctx.workers_after
+                binding_display, util_info, ctx.workers_after
             )
         }
         ScaleAction::PromotionTransition => {
@@ -304,7 +324,7 @@ fn generate_reason(
             });
             format!(
                 "CUTOFF RISK ALERT: Window '{}' transitioned from safe to at-risk{}. Workers: {} -> {}. Predicted exhaustion in {:.1}h.",
-                binding_window,
+                binding_display,
                 details,
                 ctx.workers_before,
                 ctx.workers_after,
@@ -321,7 +341,7 @@ fn generate_reason(
             });
             format!(
                 "Cutoff risk cleared: Window '{}' is now safe{}. Workers restored to {}.",
-                binding_window, details, ctx.workers_after
+                binding_display, details, ctx.workers_after
             )
         }
         ScaleAction::PredictionAccuracyScore => {
@@ -621,6 +641,42 @@ mod tests {
         assert!(entry.binding_window == "weekly_scoped");
         assert!((entry.margin_before - 5.0).abs() < 0.01);
         assert!((entry.margin_after - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_narrate_surfaces_resolved_model_name() {
+        // When the binding window is weekly_scoped and a resolved model is known,
+        // the human-readable reason surfaces that model name (e.g. "Fable") while
+        // the binding_window field stays the generic key used for matching.
+        let mut before = make_test_state("weekly_scoped", 5.0, 60.0, 37.5, false);
+        before.usage.weekly_scoped_model = Some("Fable".to_string());
+        let mut after = make_test_state("weekly_scoped", 3.0, 65.0, 37.5, false);
+        after.usage.weekly_scoped_model = Some("Fable".to_string());
+
+        let ctx = DecisionContext {
+            before: &before,
+            after: &after,
+            action: ScaleAction::ScaleUp,
+            trigger: "margin_hrs dropped below 5h threshold".to_string(),
+            agent_id: None,
+            workers_before: 2,
+            workers_after: 3,
+        };
+
+        let entry = narrate_decision(&ctx);
+
+        assert!(
+            entry.reason.contains("Binding window 'Fable'"),
+            "reason should surface the resolved model name, got: {}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("7d-sonnet") && !entry.reason.contains("sonnet"),
+            "reason must not carry a stale third-window label, got: {}",
+            entry.reason
+        );
+        // Matching key is unchanged.
+        assert_eq!(entry.binding_window, "weekly_scoped");
     }
 
     #[test]

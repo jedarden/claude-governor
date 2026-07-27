@@ -170,10 +170,14 @@ fn get_recommendation(level: PressureLevel) -> &'static str {
 /// ```markdown
 /// ## Fleet Capacity (auto-injected by governor)
 ///
-/// - Binding window: weekly_scoped — 26% headroom, resets in 37h
+/// - Binding window: Fable — 26% headroom, resets in 37h
 /// - Capacity pressure: HIGH (cutoff risk active)
 /// - Recommendation: actively conserve — prefer Haiku subagents...
 /// ```
+///
+/// When the binding window is the model-scoped weekly window, the line shows
+/// the resolved model name (e.g. "Fable") it is scoped to, falling back to
+/// the generic "weekly_scoped" key when no model is known for this period.
 pub fn generate_capacity_summary(state: &GovernorState) -> String {
     let forecast = &state.capacity_forecast;
     let pressure_level = compute_pressure_level(forecast);
@@ -192,10 +196,15 @@ pub fn generate_capacity_summary(state: &GovernorState) -> String {
 
     let headroom_pct = binding.remaining_pct;
     let hours_remaining = binding.hours_remaining;
-    let binding_name = if forecast.binding_window.is_empty() {
-        "weekly_scoped"
-    } else {
-        &forecast.binding_window
+    // Surface the resolved model name (e.g. "Fable") when the binding window is
+    // the model-scoped weekly window; otherwise show the window key as before.
+    // The binding key itself ("weekly_scoped") is unchanged — this is display only.
+    let binding_name = match forecast.binding_window.as_str() {
+        "" | "weekly_scoped" => crate::state::weekly_scoped_display_label(
+            state.usage.weekly_scoped_model.as_deref(),
+        )
+        .to_string(),
+        other => other.to_string(),
     };
 
     // Format reset time
@@ -551,6 +560,50 @@ mod tests {
         let summary = generate_capacity_summary(&state);
 
         assert!(summary.contains("weekly_scoped"));
+    }
+
+    #[test]
+    fn summary_surfaces_resolved_model_name() {
+        // When weekly_scoped_model is known, the binding line surfaces that model
+        // name (e.g. "Fable") instead of the stale "7d-sonnet"/"sonnet" label or
+        // the generic "weekly_scoped" key.
+        let forecast = CapacityForecast {
+            weekly_scoped: make_forecast(10.0, 37.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
+            ..CapacityForecast::default()
+        };
+        let mut state = make_state(forecast);
+        state.usage.weekly_scoped_model = Some("Fable".to_string());
+
+        let summary = generate_capacity_summary(&state);
+
+        assert!(
+            summary.contains("Binding window: Fable"),
+            "summary should surface the resolved model name, got: {summary}"
+        );
+        assert!(
+            !summary.contains("7d-sonnet") && !summary.contains("sonnet"),
+            "summary must not carry a stale third-window label, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_falls_back_when_model_absent() {
+        // No model-scoped cap this period -> generic "weekly_scoped" key, no panic,
+        // and never a stale model name.
+        let forecast = CapacityForecast {
+            weekly_scoped: make_forecast(10.0, 37.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
+            ..CapacityForecast::default()
+        };
+        let state = make_state(forecast); // UsageState::default() -> weekly_scoped_model None
+
+        let summary = generate_capacity_summary(&state);
+
+        assert!(
+            summary.contains("Binding window: weekly_scoped"),
+            "absent model must fall back to the generic key, got: {summary}"
+        );
     }
 
     // --- Edge Cases ---

@@ -1096,7 +1096,7 @@ fn effective_burn_rate(ema: &ModelWindowEma, baseline: &BaselineBurnRates) -> (f
 fn duration_weight(window: &str) -> f64 {
     match window {
         "five_hour" => 3.0,        // 5h window: highest urgency (resets every 5 hours)
-        "weekly_scoped" => 1.5, // 7d sonnet: medium urgency
+        "weekly_scoped" => 1.5, // weekly_scoped (model-scoped): medium urgency
         "seven_day" => 1.0,        // 7d: lowest urgency (resets every 7 days)
         _ => 1.0,
     }
@@ -1106,7 +1106,7 @@ fn duration_weight(window: &str) -> f64 {
 ///
 /// The risk score combines three factors:
 /// 1. **Margin urgency**: How close are we to exhaustion? (1.0 - margin_pct)
-/// 2. **Duration weight**: Shorter windows are higher risk (5h > 7d-sonnet > 7d)
+/// 2. **Duration weight**: Shorter windows are higher risk (5h > weekly_scoped > 7d)
 /// 3. **Volatility factor**: Wider confidence cone = higher uncertainty = higher risk
 ///
 /// Formula:
@@ -1116,7 +1116,7 @@ fn duration_weight(window: &str) -> f64 {
 ///
 /// Where:
 /// - `margin_pct` = margin_hrs / hours_remaining (fraction of time remaining)
-/// - `duration_weight` = 3.0 for 5h, 1.5 for 7d-sonnet, 1.0 for 7d
+/// - `duration_weight` = 3.0 for 5h, 1.5 for weekly_scoped (model-scoped), 1.0 for 7d
 /// - `volatility_factor` = cone_ratio (wider cone = higher risk)
 ///
 /// A higher risk_score means the window is more urgent and should be prioritized
@@ -1606,11 +1606,20 @@ pub fn staleness_checked_fleet_dollar_rate(
 }
 
 /// Log per-window capacity forecast (for governor loop integration)
-pub fn log_capacity_forecast(forecast: &crate::state::CapacityForecast) {
+///
+/// `weekly_scoped_model` carries the resolved model display name (e.g. "Fable")
+/// the model-scoped window tracks, so the third window logs as that model
+/// instead of the stale hardcoded "7d-sonnet"/"sonnet". `None` falls back to the
+/// generic "weekly_scoped" key. Metadata only — the binding key is unchanged.
+pub fn log_capacity_forecast(
+    forecast: &crate::state::CapacityForecast,
+    weekly_scoped_model: Option<&str>,
+) {
+    let scoped_label = crate::state::weekly_scoped_display_label(weekly_scoped_model);
     let windows = [
         ("5h", &forecast.five_hour),
         ("7d", &forecast.seven_day),
-        ("7d-sonnet", &forecast.weekly_scoped),
+        (scoped_label, &forecast.weekly_scoped),
     ];
 
     for (label, f) in &windows {
@@ -2994,8 +3003,8 @@ mod tests {
             estimated_remaining_dollars: 46.1,
         };
 
-        // Should not panic
-        log_capacity_forecast(&forecast);
+        // Should not panic; None -> generic "weekly_scoped" label (fallback path)
+        log_capacity_forecast(&forecast, None);
     }
 
     // -----------------------------------------------------------------------
@@ -3105,7 +3114,7 @@ mod tests {
         //   safe_worker_count = floor(60 / (1.0 * 150)) = 0 (too conservative)
         //   margin = 150 - (60/3) = 130
         //
-        // 7d_sonnet (idx 2): similar to 7d
+        // weekly_scoped (idx 2): similar to 7d
         //   remaining=55%, hours_remaining=150, fleet_pct_hr=3.0
         //   margin = 150 - (55/3) = 131.67
         //
@@ -3114,7 +3123,7 @@ mod tests {
         let forecasts = vec![
             wf(5.0, 0.5, 3.0, -1.167, Some(10)),   // 5h binding
             wf(60.0, 150.0, 3.0, 130.0, Some(0)),  // 7d
-            wf(55.0, 150.0, 3.0, 131.67, Some(0)), // 7d_sonnet
+            wf(55.0, 150.0, 3.0, 131.67, Some(0)), // weekly_scoped
         ];
 
         let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
@@ -3129,7 +3138,7 @@ mod tests {
             composite_safe
         );
         // 7d: floor(60 / (1.0 * 0.5)) = 120
-        // 7d_sonnet: floor(55 / (1.0 * 0.5)) = 110
+        // weekly_scoped: floor(55 / (1.0 * 0.5)) = 110
         // max = 120
         assert_eq!(composite_safe, 120);
     }
@@ -3361,7 +3370,7 @@ mod tests {
 
     #[test]
     fn compute_risk_score_duration_weights_correct() {
-        // Verify duration weights: 5h > 7d-sonnet > 7d
+        // Verify duration weights: 5h > weekly_scoped > 7d
         let margin_hrs = 1.0;
         let hours_remaining = 10.0;
         let cone_ratio = 1.0;
@@ -3376,8 +3385,8 @@ mod tests {
 
         // All have same margin_pct and volatility, so ratios should equal duration weight ratios
         assert!((risk_5h / risk_7d - 3.0).abs() < 0.1); // 5h weight is 3x 7d
-        assert!((risk_5h / risk_7ds - 2.0).abs() < 0.1); // 5h weight is 2x 7d-sonnet
-        assert!((risk_7ds / risk_7d - 1.5).abs() < 0.1); // 7d-sonnet weight is 1.5x 7d
+        assert!((risk_5h / risk_7ds - 2.0).abs() < 0.1); // 5h weight is 2x weekly_scoped
+        assert!((risk_7ds / risk_7d - 1.5).abs() < 0.1); // weekly_scoped weight is 1.5x 7d
     }
 
     #[test]

@@ -168,10 +168,15 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     output.push_str("Window Capacity\n");
     output.push_str("---------------\n");
 
+    // Surface the resolved model name (e.g. "Fable") the model-scoped window is
+    // scoped to, falling back to the generic "weekly_scoped" key when no model is
+    // known for this period — never the stale "7d-sonnet"/"sonnet" label.
+    let scoped_label =
+        crate::state::weekly_scoped_display_label(state.usage.weekly_scoped_model.as_deref());
     let windows: [(&str, &WindowForecast); 3] = [
         ("5h", &state.capacity_forecast.five_hour),
         ("7d", &state.capacity_forecast.seven_day),
-        ("7d-sonnet", &state.capacity_forecast.weekly_scoped),
+        (scoped_label, &state.capacity_forecast.weekly_scoped),
     ];
 
     // Table header
@@ -757,10 +762,13 @@ mod tests {
         let state = make_test_state();
         let output = format_status_dashboard(&state, Utc::now());
 
-        // Window names
+        // Window names. The third window is the model-scoped weekly window:
+        // with no model known (test state has weekly_scoped_model: None) it shows
+        // the generic "weekly_scoped" key, never the stale "7d-sonnet"/"sonnet".
         assert!(output.contains("5h"));
         assert!(output.contains("7d"));
-        assert!(output.contains("7d-sonnet"));
+        assert!(output.contains("weekly_scoped"));
+        assert!(!output.contains("7d-sonnet"));
 
         // Column headers
         assert!(output.contains("Used%"));
@@ -779,8 +787,28 @@ mod tests {
         let output = format_status_dashboard(&state, Utc::now());
 
         assert!(output.contains("* = binding window"));
-        // 7d-sonnet should have the binding marker
-        assert!(output.contains("7d-sonnet"));
+        // The model-scoped weekly window (binding in test state) should carry the
+        // binding marker. Falls back to the generic "weekly_scoped" key here.
+        assert!(output.contains("weekly_scoped"));
+    }
+
+    #[test]
+    fn format_dashboard_surfaces_resolved_model_name() {
+        // When weekly_scoped_model is known, the capacity table (and confidence
+        // cone) label the third window with that model name (e.g. "Fable")
+        // instead of the stale "7d-sonnet"/"sonnet" label or the generic key.
+        let mut state = make_test_state();
+        state.usage.weekly_scoped_model = Some("Fable".to_string());
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(
+            output.contains("Fable"),
+            "dashboard should surface the resolved model name, got: {output}"
+        );
+        assert!(
+            !output.contains("7d-sonnet"),
+            "dashboard must not carry a stale third-window label, got: {output}"
+        );
     }
 
     #[test]

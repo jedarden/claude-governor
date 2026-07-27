@@ -71,6 +71,17 @@ impl Default for UsageState {
     }
 }
 
+/// Human-readable label for the model-scoped weekly window.
+///
+/// Returns the resolved model display name (e.g. `"Fable"`) when one is known
+/// for this period, otherwise the generic `"weekly_scoped"` key. Metadata only:
+/// the binding key stays `"weekly_scoped"` and selection logic is untouched —
+/// this is purely so logs/display label the third window with *which* model it
+/// tracks instead of the stale hardcoded `"7d-sonnet"`/`"sonnet"`.
+pub fn weekly_scoped_display_label(model: Option<&str>) -> &str {
+    model.filter(|m| !m.is_empty()).unwrap_or("weekly_scoped")
+}
+
 /// Last fleet aggregate from the token collector
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1984,5 +1995,20 @@ mod null_roundtrip_test {
         assert!(s.contains("\"weekly_scoped_model\":\"Fable\""));
         let reloaded: UsageState = serde_json::from_str(&s).unwrap();
         assert_eq!(reloaded.weekly_scoped_model.as_deref(), Some("Fable"));
+    }
+
+    #[test]
+    fn test_weekly_scoped_display_label() {
+        // Resolved model name surfaces verbatim — this is the label every
+        // human-facing surface (logs, summary, dashboard, decision reasons) uses
+        // for the third window instead of the stale "7d-sonnet"/"sonnet".
+        assert_eq!(weekly_scoped_display_label(Some("Fable")), "Fable");
+        assert_eq!(weekly_scoped_display_label(Some("Opus")), "Opus");
+
+        // None (no active model-scoped cap this period) -> generic fallback key.
+        assert_eq!(weekly_scoped_display_label(None), "weekly_scoped");
+
+        // Empty string (poller populated nothing meaningful) -> fallback, not "".
+        assert_eq!(weekly_scoped_display_label(Some("")), "weekly_scoped");
     }
 }

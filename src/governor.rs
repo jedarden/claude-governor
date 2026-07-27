@@ -4804,7 +4804,10 @@ pub fn run_governor_cycle(
     }
 
     // 6. Log capacity forecast
-    log_capacity_forecast(&state.capacity_forecast);
+    log_capacity_forecast(
+        &state.capacity_forecast,
+        state.usage.weekly_scoped_model.as_deref(),
+    );
 
     // Get the effective target ceiling for the binding window (used for logging)
     let binding_effective_ceiling = effective_target_ceilings

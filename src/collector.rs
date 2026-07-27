@@ -411,7 +411,7 @@ pub fn read_new_lines(path: &Path, cursor: &mut CursorStore) -> Result<Vec<Strin
 /// Forecast record for a single usage window
 ///
 /// Captures the current snapshot, ceiling, and projected exhaustion metrics
-/// for one of the three Claude Code usage windows (5h, 7d, 7d-sonnet).
+/// for one of the three Claude Code usage windows (5h, 7d, weekly_scoped).
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowRecord {
     /// Record type discriminator (always "w" for window)
