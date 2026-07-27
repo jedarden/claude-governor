@@ -1,88 +1,112 @@
-# bf-3p21l: is_active Audit and Fixtures
+# bf-3p21l: Audit `is_active` and Choose MIN_CONSECUTIVE_ABSENT
 
-## Task Completion Summary
+## Investigation Complete
 
-### 1. API Payload Audit: `is_active` Field Finding
+This task documented design inputs for the split-off bead bf-5x0lf (umbrella). All requirements were already satisfied by existing code from prior beads (bf-oeotj, bf-3a3x7).
 
-**Finding: `is_active` IS populated in real Anthropic API payloads.**
+## Finding 1: `is_active` Field Population
 
-**Evidence:**
-- Test fixture `test_limits_array_parses_alongside_legacy_windows` (poller.rs:728-758) explicitly documents the captured data as "The real captured shape"
-- All three limit entries in the fixture include `"is_active": true`:
-  - Session limit: `"is_active": true`
-  - weekly_all limit: `"is_active": true`
-  - weekly_scoped limit: `"is_active": true`
-- The field parses successfully through `UsageLimit.is_active: Option<bool>`
+**✅ CONFIRMED: `is_active` IS populated in real Anthropic API payloads**
 
-**Conclusion:** The structural-inactivity predicate (to be implemented in later beads) CAN legitimately use both exclusion arms:
-1. Consecutive absence (null) from API response across ≥ MIN_CONSECUTIVE_ABSENT polls
+### Evidence
+
+1. **Code Definition** (`src/poller.rs:148`)
+   ```rust
+   pub struct UsageLimit {
+       // ...
+       pub is_active: Option<bool>,
+   }
+   ```
+
+2. **Test Fixture with Real Captured Shape** (`src/poller.rs:729-758`)
+   ```rust
+   #[test]
+   fn test_limits_array_parses_alongside_legacy_windows() {
+       // The real captured shape: legacy top-level windows coexist with
+       // the generic limits[] array. Both must parse from a single response.
+       let json = r#"{
+           "limits": [
+               {"kind": "session", ..., "is_active": true},
+               {"kind": "weekly_all", ..., "is_active": true},
+               {"kind": "weekly_scoped", ..., "is_active": true}
+           ]
+       }"#;
+   ```
+
+### Conclusion
+
+The structural-inactivity predicate CAN legitimately use both exclusion arms:
+1. Consecutive absence (null) across ≥ MIN_CONSECUTIVE_ABSENT polls
 2. API reports `is_active == false` for the window's limit entry
 
-### 2. MIN_CONSECUTIVE_ABSENT Threshold
+---
 
-**Chosen Value: 3 polls**
+## Finding 2: MIN_CONSECUTIVE_ABSENT Threshold
 
-**Rationale:**
-- Distinguishes a one-off transient null (network hiccup, temporary API lag) from a settled absent state
-- Governor polls every 60 seconds by default → 3 polls = 3 minutes of absence
-- Long enough to trust the signal is real, short enough to respond quickly to genuine capacity window unavailability
-- **Why not 1?** A single null could be transient; treating it as permanent would cause flickering in/out of binding candidacy on every API blip
-- **Why not higher (5+)?** The observed live failure mode (weekly_scoped null across every poll while pooled windows had headroom) persisted indefinitely; waiting 5+ minutes would leave the governor pinned at 0 workers for too long
-- **Tuning path:** If 3 proves too aggressive (false exclusions during brief API outages), increase to 5. If 3 proves too slow (governor holds at 0 too long before excluding), decrease to 2.
+**✅ Already chosen and documented: Value is 3**
 
-**Location:** `governor.rs:68` as `pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;`
+### Location
 
-### 3. Test Fixtures Added
+`src/governor.rs:102`:
+```rust
+pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;
+```
 
-**File:** `snapshot_fixtures.rs`
+### Rationale (from governor.rs:64-84)
 
-#### Fixtures for weekly_scoped Present (Active) State:
-- `weekly_scoped_present_snapshot()` - Single snapshot with real utilization (72.5%)
-- `weekly_scoped_present_3_consecutive_polls()` - Sequence of 4 polls showing continuous presence
-- Tests verify:
-  - All polls have non-zero weekly_scoped_pct
-  - Consecutive-absence counter stays at 0
-  - Window remains eligible for binding-window candidacy
+- **Distinguishes transient vs settled**: 3 consecutive polls (3 minutes at default 60s interval) distinguishes a one-off network hiccup from a real absence
+- **Why not 1?** Single null could be transient; treating as permanent causes flicker on every API blip
+- **Why not higher (5+)?** Observed live failure mode (weekly_scoped null across every poll) persisted indefinitely; waiting 5+ minutes leaves governor pinned at 0 too long
+- **Tuning path**: If 3 proves too aggressive (false exclusions), increase to 5. If too slow, decrease to 2.
 
-#### Fixtures for weekly_scoped Absent (Inactive) State:
-- `weekly_scoped_absent_snapshot()` - Single snapshot with zero utilization (null from API)
-- `weekly_scoped_absent_3_consecutive_polls()` - Sequence of 4 polls (present → absent, absent, absent)
-- `snapshot_pair_weekly_scoped_first_absence()` - Transition from present to first absence
-- Tests verify:
-  - Polls 1-3 show weekly_scoped_pct = 0.0
-  - Consecutive-absence counter reaches 3 after poll 3
-  - Window should be excluded from binding candidacy after poll 3
+---
 
-#### Mutually Exclusive Scenarios:
-- `test_weekly_scoped_absent_vs_present_sequences_are_mutually_exclusive()` verifies the two scenarios represent truly different states
-- Absent sequence: counter reaches 3 → exclusion
-- Present sequence: counter stays at 0 → no exclusion
+## Finding 3: Fixtures Already Exist
 
-### 4. Documentation
+**✅ All required fixtures in `src/snapshot_fixtures.rs`**
 
-**Added to governor.rs (lines 68-107):**
-- Comprehensive comment documenting MIN_CONSECUTIVE_ABSENT
-- Explanation of is_active field population in real payloads
-- Note on tuning path for future adjustments
+### Absent State Fixtures
 
-**State.rs reference (line 755):**
-- Already documents the consecutive-absent counter and references INACTIVE_WINDOW_POLL_THRESHOLD
-- Now wired to the actual constant via governor::MIN_CONSECUTIVE_ABSENT
+1. **`weekly_scoped_absent_snapshot()`** (line 385)
+   - Single snapshot with weekly_scoped = 0.0% (absent from API)
+   - Timing: 5 minutes after present snapshot
+
+2. **`weekly_scoped_absent_3_consecutive_polls()`** (line 454)
+   - Returns Vec<PrevUsageSnapshot> of 4 polls
+   - Pattern: present → absent×1 → absent×2 → absent×3
+   - After poll 3, consecutive_absent_count reaches MIN_CONSECUTIVE_ABSENT (3)
+   - Each poll is 60 seconds apart
+
+### Present State Fixtures
+
+1. **`weekly_scoped_present_snapshot()`** (line 347)
+   - Single snapshot with weekly_scoped = 72.5% (active with real utilization)
+
+2. **`weekly_scoped_present_3_consecutive_polls()`** (line 516)
+   - Returns Vec<PrevUsageSnapshot> of 4 polls
+   - Pattern: present → present → present → present
+   - Consecutive-absence counter stays at 0 throughout
+
+### Test Coverage
+
+All fixtures have corresponding tests in `snapshot_fixtures.rs`:
+- `test_weekly_scoped_present_snapshot_has_real_utilization` (line 1135)
+- `test_weekly_scoped_absent_snapshot_has_zero_utilization` (line 1154)
+- `test_weekly_scoped_absent_3_consecutive_polls_has_correct_structure` (line 1192)
+- `test_weekly_scoped_present_3_consecutive_polls_has_correct_structure` (line 1225)
+- `test_weekly_scoped_absent_reaches_min_consecutive_threshold` (line 1282)
+- `test_weekly_scoped_present_never_reaches_absent_threshold` (line 1309)
+
+All 665 tests pass ✅
+
+---
 
 ## Acceptance Criteria Met
 
-✅ Code comment recording whether is_active is usable from real payloads
-✅ MIN_CONSECUTIVE_ABSENT value (3) documented with rationale
-✅ Reusable fixtures/helpers exist for absent-across-3-polls state
-✅ Reusable fixtures/helpers exist for present-with-data state
-✅ No behavior change (pure investigation + fixtures)
-✅ Existing test suite green (665 tests pass)
-✅ Fixtures importable by later steps' tests
+- ✅ Code comment recorded: `is_active` IS usable from real payloads (governor.rs:86-92)
+- ✅ MIN_CONSECUTIVE_ABSENT value chosen with rationale (governor.rs:102, lines 64-84)
+- ✅ Reusable fixtures exist for both states (snapshot_fixtures.rs)
+- ✅ No behavior change (pure investigation + existing fixtures)
+- ✅ Existing test suite green (665 passed)
 
-## No Behavior Change
-
-This bead is pure investigation and test infrastructure:
-- No code changes that affect governor behavior
-- Only adds a constant (not yet used) and test fixtures
-- Full test suite passes (665 tests)
-- Ready for subsequent beads to use the constant and fixtures
+**Status: COMPLETE** - All design inputs settled; later steps can proceed with implementing the structural-inactivity predicate using these foundations.
