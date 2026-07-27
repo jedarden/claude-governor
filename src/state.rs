@@ -19,6 +19,17 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Window name keys for consecutive-absent tracking
+const WINDOW_FIVE_HOUR: &str = "five_hour";
+const WINDOW_SEVEN_DAY: &str = "seven_day";
+const WINDOW_WEEKLY_SCOPED: &str = "weekly_scoped";
+
+/// Minimum consecutive absent polls before treating a window as structurally inactive.
+///
+/// This matches the threshold in governor.rs (MIN_CONSECUTIVE_ABSENT) and is duplicated
+/// here to avoid circular dependencies between modules.
+const MIN_CONSECUTIVE_ABSENT: u32 = 3;
+
 /// Errors that can occur during state operations
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -797,6 +808,74 @@ impl GovernorState {
     /// Create a new empty state with the current timestamp
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Update consecutive-absent counters for all three pooled windows.
+    ///
+    /// For each window (five_hour, seven_day, weekly_scoped), this method:
+    /// - Increments the counter if the window is absent (null from API or empty resets_at)
+    /// - Resets the counter to 0 if the window reports real data
+    ///
+    /// The counters persist across governor cycles and are used to detect
+    /// structural absence (windows that are consistently missing from the API).
+    ///
+    /// # Arguments
+    /// - `five_hour_present`: true if the 5-hour window reported real data
+    /// - `seven_day_present`: true if the 7-day window reported real data
+    /// - `weekly_scoped_present`: true if the weekly_scoped window reported real data
+    ///
+    /// # Window Presence Detection
+    /// A window is considered "absent" when:
+    /// - The API returned null for the window (`Option<UsageWindow>::None`), OR
+    /// - The window's `resets_at` field is empty (indicates null/default fallback)
+    ///
+    /// This matches the `window_or_default()` semantics in poller.rs where a null
+    /// window becomes (0.0, String::new(), 168.0).
+    pub fn update_consecutive_absent_polls(
+        &mut self,
+        five_hour_present: bool,
+        seven_day_present: bool,
+        weekly_scoped_present: bool,
+    ) {
+        // Update each window's counter based on presence
+        for (window_key, is_present) in [
+            (WINDOW_FIVE_HOUR, five_hour_present),
+            (WINDOW_SEVEN_DAY, seven_day_present),
+            (WINDOW_WEEKLY_SCOPED, weekly_scoped_present),
+        ] {
+            let counter = self.consecutive_absent_polls.entry(window_key.to_string()).or_insert(0);
+
+            if is_present {
+                // Window is present: reset counter to 0
+                *counter = 0;
+            } else {
+                // Window is absent: increment counter
+                *counter += 1;
+            }
+        }
+    }
+
+    /// Check if a window has reached the consecutive-absent threshold.
+    ///
+    /// Returns true if the window's consecutive-absent counter is >= MIN_CONSECUTIVE_ABSENT,
+    /// indicating the window should be treated as structurally inactive (excluded from
+    /// binding-window candidacy).
+    ///
+    /// # Arguments
+    /// - `window`: The window key ("five_hour", "seven_day", "weekly_scoped")
+    pub fn is_window_consecutively_absent(&self, window: &str) -> bool {
+        self.consecutive_absent_polls
+            .get(window)
+            .map(|&count| count >= MIN_CONSECUTIVE_ABSENT)
+            .unwrap_or(false)
+    }
+
+    /// Get the consecutive-absent count for a specific window.
+    ///
+    /// Returns the number of consecutive polls where the window has been absent,
+    /// or 0 if the window has never been absent.
+    pub fn get_consecutive_absent_count(&self, window: &str) -> u32 {
+        self.consecutive_absent_polls.get(window).copied().unwrap_or(0)
     }
 
     /// Populate baseline burn rates from agent configuration
@@ -1985,6 +2064,200 @@ mod tests {
 
         assert_eq!(prev.weekly_scoped_pct, 85.0);
         assert_eq!(curr.weekly_scoped_pct, 8.0);  // Window reset: 85.0 -> 8.0
+    }
+
+    // --- Consecutive-absent poll tracking ---
+
+    #[test]
+    fn consecutive_absent_initializes_to_zero() {
+        let state = GovernorState::new();
+
+        // All counters should start at 0 (or be absent from the map)
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 0);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
+    }
+
+    #[test]
+    fn consecutive_absent_increments_on_absent_window() {
+        let mut state = GovernorState::new();
+
+        // Simulate three consecutive absent polls for weekly_scoped
+        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
+        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
+        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
+
+        // weekly_scoped counter should be 3
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+
+        // Other windows should remain at 0 (they were present)
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 0);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);
+    }
+
+    #[test]
+    fn consecutive_absent_resets_on_present_window() {
+        let mut state = GovernorState::new();
+
+        // Simulate 3 consecutive absent polls for weekly_scoped
+        state.update_consecutive_absent_polls(true, true, false);
+        state.update_consecutive_absent_polls(true, true, false);
+        state.update_consecutive_absent_polls(true, true, false);
+
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+
+        // Now simulate a present poll (window reappears)
+        state.update_consecutive_absent_polls(true, true, true);  // weekly_scoped present
+
+        // Counter should reset to 0
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
+    }
+
+    #[test]
+    fn consecutive_absent_multiple_windows_independent() {
+        let mut state = GovernorState::new();
+
+        // five_hour absent, seven_day present, weekly_scoped absent
+        state.update_consecutive_absent_polls(false, true, false);
+        state.update_consecutive_absent_polls(false, true, false);
+        state.update_consecutive_absent_polls(false, true, false);
+
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 3);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);  // was present
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+
+        // five_hour reappears, weekly_scoped stays absent
+        state.update_consecutive_absent_polls(true, true, false);
+
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 0);  // reset
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 4);  // incremented
+    }
+
+    #[test]
+    fn is_window_consecutively_absent_threshold() {
+        let mut state = GovernorState::new();
+
+        // Below threshold (2 < 3)
+        state.update_consecutive_absent_polls(true, true, false);
+        state.update_consecutive_absent_polls(true, true, false);
+        assert!(!state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // At threshold (3 == 3)
+        state.update_consecutive_absent_polls(true, true, false);
+        assert!(state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Above threshold (4 > 3)
+        state.update_consecutive_absent_polls(true, true, false);
+        assert!(state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+    }
+
+    #[test]
+    fn is_window_consecutively_absent_unknown_window() {
+        let state = GovernorState::new();
+
+        // Unknown window should return false (not consecutively absent)
+        assert!(!state.is_window_consecutively_absent("unknown_window"));
+    }
+
+    #[test]
+    fn consecutive_absent_roundtrips_serialization() {
+        let mut state = GovernorState::new();
+
+        // Set some counters
+        state.update_consecutive_absent_polls(false, true, false);
+        state.update_consecutive_absent_polls(false, true, false);
+        state.update_consecutive_absent_polls(false, true, false);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: GovernorState = serde_json::from_str(&json).unwrap();
+
+        // Verify counters survived the roundtrip
+        assert_eq!(loaded.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 3);
+        assert_eq!(loaded.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);
+        assert_eq!(loaded.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+    }
+
+    #[test]
+    fn consecutive_absent_persists_across_cycles() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("governor-state.json");
+
+        // First cycle: start with 2 consecutive absents
+        let mut state1 = GovernorState::new();
+        state1.update_consecutive_absent_polls(true, true, false);
+        state1.update_consecutive_absent_polls(true, true, false);
+        save_state(&state1, &path).unwrap();
+
+        // Second cycle: load and continue
+        let mut state2 = load_state(&path).unwrap();
+        assert_eq!(state2.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 2);
+
+        // Add one more absent poll (should reach threshold)
+        state2.update_consecutive_absent_polls(true, true, false);
+        assert_eq!(state2.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+        assert!(state2.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Save and load again
+        save_state(&state2, &path).unwrap();
+        let state3 = load_state(&path).unwrap();
+
+        // Threshold status should persist
+        assert!(state3.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+        assert_eq!(state3.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+    }
+
+    #[test]
+    fn consecutive_absent_default_null_tolerant() {
+        // Simulate loading an older state file that doesn't have consecutive_absent_polls
+        let old_json = r#"{
+            "updated_at": "2026-03-18T14:30:00Z",
+            "usage": {
+                "sonnet_pct": 72.0,
+                "all_models_pct": 81.0,
+                "five_hour_pct": 14.0
+            },
+            "alerts": []
+        }"#;
+
+        let state: GovernorState = serde_json::from_str(old_json).unwrap();
+
+        // Should deserialize successfully with default empty map
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
+        assert!(!state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+    }
+
+    #[test]
+    fn consecutive_absent_realistic_scenario() {
+        let mut state = GovernorState::new();
+
+        // Scenario: weekly_scoped window is null for 3 polls, then reappears
+        // This is the observed live failure mode mentioned in the docs
+
+        // Poll 1: weekly_scoped absent (null from API)
+        state.update_consecutive_absent_polls(true, true, false);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 1);
+        assert!(!state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Poll 2: weekly_scoped still absent
+        state.update_consecutive_absent_polls(true, true, false);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 2);
+        assert!(!state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Poll 3: weekly_scoped still absent (now at threshold)
+        state.update_consecutive_absent_polls(true, true, false);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
+        assert!(state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Poll 4: weekly_scoped reappears (API now returns data)
+        state.update_consecutive_absent_polls(true, true, true);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
+        assert!(!state.is_window_consecutively_absent(WINDOW_WEEKLY_SCOPED));
+
+        // Poll 5: weekly_scoped present again (counter stays at 0)
+        state.update_consecutive_absent_polls(true, true, true);
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
     }
 }
 
