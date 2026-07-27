@@ -101,9 +101,20 @@ struct RefreshResponse {
 /// Usage window data from the API
 #[derive(Debug, Deserialize, Clone)]
 pub struct UsageWindow {
+    /// Name of the window (e.g., "five_hour", "seven_day", "weekly_scoped")
+    /// This is not deserialized from the API; it must be set explicitly.
+    #[serde(skip)]
+    pub name: String,
     pub utilization: f64,
     #[serde(rename = "resets_at")]
     pub resets_at: String,
+    /// Whether this window's limit is currently active.
+    ///
+    /// Absent/null indicates the field was not populated in the API response;
+    /// treat as active (not inactive) in this case. Only `false` definitively
+    /// marks the window as structurally inactive.
+    #[serde(default)]
+    pub is_active: Option<bool>,
 }
 
 impl UsageWindow {
@@ -116,6 +127,12 @@ impl UsageWindow {
         let now = Utc::now();
         let duration = reset_time.signed_duration_since(now);
         Ok(duration.num_seconds() as f64 / 3600.0)
+    }
+
+    /// Set the window name (for when it's not deserialized with one)
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 }
 
@@ -272,9 +289,11 @@ impl UsageData {
                 .and_then(|m| m.display_name.clone())
                 .unwrap_or_else(|| "Scoped".to_string());
             let window = UsageWindow {
+                name: "weekly_scoped".to_string(),
                 /// **Model-agnostic weekly_scoped pct source: reads from limits[].percent**
                 utilization: limit.percent.unwrap_or(0.0),
                 resets_at: limit.resets_at.clone().unwrap_or_default(),
+                is_active: None,
             };
             Some((model_name, window))
         })

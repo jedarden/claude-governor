@@ -19,6 +19,7 @@ use crate::alerts::{
     check_alert_conditions, check_low_cache_efficiency, fire_alert, should_fire, update_cooldown,
     AlertType, SprintTrigger,
 };
+use crate::poller::UsageWindow;
 use crate::burn_rate::{
     compute_composite_safe_workers, effective_multiplier, generate_window_forecast,
     log_capacity_forecast, validate_promotion_from_db, PromotionValidationResult,
@@ -100,6 +101,47 @@ pub const WINDOW_WEEKLY_SCOPED: &str = "weekly_scoped";
 /// false reading excludes the window immediately, matching the platform's explicit
 /// signal that the limit is not active).
 pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;
+
+/// Check if a window is structurally inactive.
+///
+/// A window is considered structurally inactive when EITHER:
+/// 1. The window's consecutive absence count (from state.consecutive_absent_polls)
+///    is >= MIN_CONSECUTIVE_ABSENT, indicating the window has been absent (null)
+///    from the API response across multiple consecutive polls.
+/// 2. The API reports `is_active == false` for the window (only if the field is
+///    populated in the API response).
+///
+/// # Arguments
+/// - `window_name`: The window identifier ("five_hour", "seven_day", "weekly_scoped")
+/// - `window`: The usage window to check
+/// - `state`: The governor state containing consecutive absence tracking
+///
+/// # Returns
+/// `true` if the window is structurally inactive (should be excluded from
+/// binding-window candidacy), `false` otherwise.
+///
+/// # Note on is_active field population
+/// The is_active field is optional in UsageWindow. When absent/null in the API
+/// response, the window is treated as active (not inactive). Only an explicit
+/// `false` value marks the window as structurally inactive.
+fn is_structurally_inactive(
+    window: &UsageWindow,
+    state: &state::GovernorState,
+) -> bool {
+    // Condition 1: Consecutive absence threshold reached
+    // Check if the window has been absent (null) from API responses across
+    // >= MIN_CONSECUTIVE_ABSENT consecutive polls.
+    // This accesses state::GovernorState.is_window_consecutively_absent()
+    let is_inactive_by_consecutive_absence = state.is_window_consecutively_absent(&window.name);
+
+    // Condition 2: API reports is_active == false
+    // Only treat as inactive if is_active is explicitly false. If None or true,
+    // the window is considered active.
+    let is_inactive_by_api = window.is_active == Some(false);
+
+    // The window is structurally inactive if EITHER condition is true.
+    is_inactive_by_consecutive_absence || is_inactive_by_api
+}
 
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
