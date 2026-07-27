@@ -3794,7 +3794,13 @@ pub fn run_governor_cycle(
 
             state.usage = state::UsageState {
                 weekly_scoped_pct: usage_data.weekly_scoped_utilization,
-                sonnet_pct: usage_data.weekly_scoped_utilization, // Legacy field, kept for backward compatibility
+                // Only set sonnet_pct when weekly_scoped is actually tracking Sonnet;
+                // otherwise set to 0.0 since the legacy field should not reflect other models
+                sonnet_pct: if usage_data.is_weekly_scoped_sonnet() {
+                    usage_data.weekly_scoped_utilization
+                } else {
+                    0.0
+                },
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
                 sonnet_resets_at: usage_data.weekly_scoped_resets_at,
