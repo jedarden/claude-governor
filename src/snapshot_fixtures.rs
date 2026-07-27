@@ -312,6 +312,239 @@ pub fn snapshot_pair_reset() -> (PrevUsageSnapshot, PrevUsageSnapshot) {
 }
 
 // ---------------------------------------------------------------------------
+// Window presence/absence fixtures for structural inactivity testing
+// ---------------------------------------------------------------------------
+
+/// Snapshot representing weekly_scoped window present with real data.
+///
+/// Models a normal poll where the weekly_scoped window is actively reporting
+/// utilization (the window exists and is enabled for the account). This is the
+/// baseline "healthy" state where the window can legitimately participate in
+/// binding-window candidacy.
+///
+/// # Timing
+/// - Wednesday, March 18, 2026 at 12:00:00 UTC
+///
+/// # Values
+/// - 5-hour window: 15.3% (normal operation)
+/// - 7-day window: 48.7% (normal operation)
+/// - weekly_scoped: 72.5% (active model-scoped cap, reporting real utilization)
+///
+/// # Use Case
+/// This fixture verifies that when weekly_scoped IS present with data, it:
+/// - Is NOT excluded from binding-window candidacy
+/// - CAN be selected as the binding window (if it has the highest risk_score)
+/// - Contributes normally to capacity forecasts
+///
+/// # Example
+/// ```rust
+/// use claude_governor::snapshot_fixtures::weekly_scoped_present_snapshot;
+///
+/// let snapshot = weekly_scoped_present_snapshot();
+/// assert!(snapshot.weekly_scoped_pct > 0.0, "weekly_scoped should report utilization");
+/// assert_eq!(snapshot.weekly_scoped_pct, 72.5);
+/// ```
+pub fn weekly_scoped_present_snapshot() -> PrevUsageSnapshot {
+    let taken_at = "2026-03-18T12:00:00Z".parse().unwrap();
+
+    PrevUsageSnapshot {
+        taken_at,
+        five_hour_pct: 15.3,
+        seven_day_pct: 48.7,
+        weekly_scoped_pct: 72.5, // Active model-scoped cap with real utilization
+    }
+}
+
+/// Snapshot representing weekly_scoped window absent from API response.
+///
+/// Models a poll where the weekly_scoped window is completely missing (null) from
+/// the API response. This occurs when the account has no active model-scoped
+/// weekly cap, or when the platform temporarily stops reporting it.
+///
+/// # Timing
+/// - Wednesday, March 18, 2026 at 12:05:00 UTC (5 minutes after present snapshot)
+///
+/// # Values
+/// - 5-hour window: 15.8% (slight increase from previous)
+/// - 7-day window: 49.1% (slight increase from previous)
+/// - weekly_scoped: 0.0% (window absent from API, treated as non-binding)
+///
+/// # Use Case
+/// This fixture, when used consecutively 3+ times, simulates the scenario where
+/// weekly_scoped is structurally inactive and should be excluded from binding-window
+/// candidacy. The governor should stop waiting for burn-rate data that cannot arrive
+/// and select the tightest REMAINING window as binding.
+///
+/// # Example
+/// ```rust
+/// use claude_governor::snapshot_fixtures::weekly_scoped_absent_snapshot;
+///
+/// let snapshot = weekly_scoped_absent_snapshot();
+/// assert_eq!(snapshot.weekly_scoped_pct, 0.0, "weekly_scoped should be 0 when absent");
+/// ```
+pub fn weekly_scoped_absent_snapshot() -> PrevUsageSnapshot {
+    // 5 minutes after the present snapshot (consecutive poll scenario)
+    let taken_at = "2026-03-18T12:05:00Z".parse().unwrap();
+
+    PrevUsageSnapshot {
+        taken_at,
+        five_hour_pct: 15.8,     // Slight increase from previous
+        seven_day_pct: 49.1,     // Slight increase from previous
+        weekly_scoped_pct: 0.0, // Window absent from API (null response)
+    }
+}
+
+/// Fixture pair: weekly_scoped present → absent (first consecutive absence).
+///
+/// Returns a tuple of (previous, current) snapshots representing the transition
+/// from an active weekly_scoped window to its first absence from the API.
+///
+/// # Use Case
+/// This simulates the FIRST poll where weekly_scoped goes missing. After this
+/// transition, the consecutive-absence counter would be 1 (not yet >=
+/// MIN_CONSECUTIVE_ABSENT, so the window is NOT yet excluded).
+///
+/// # Example
+/// ```rust
+/// use claude_governor::snapshot_fixtures::snapshot_pair_weekly_scoped_first_absence;
+///
+/// let (prev, curr) = snapshot_pair_weekly_scoped_first_absence();
+/// assert!(prev.weekly_scoped_pct > 0.0, "previous should have utilization");
+/// assert_eq!(curr.weekly_scoped_pct, 0.0, "current should show absence");
+pub fn snapshot_pair_weekly_scoped_first_absence() -> (PrevUsageSnapshot, PrevUsageSnapshot) {
+    (weekly_scoped_present_snapshot(), weekly_scoped_absent_snapshot())
+}
+
+/// Fixture sequence: 3 consecutive polls with weekly_scoped absent.
+///
+/// Returns a vector of 4 snapshots representing:
+/// - Poll 0: weekly_scoped present with data (baseline)
+/// - Poll 1: weekly_scoped absent (first absence)
+/// - Poll 2: weekly_scoped absent (second consecutive absence)
+/// - Poll 3: weekly_scoped absent (third consecutive absence)
+///
+/// # Timing
+/// Each poll is 60 seconds after the previous, matching the governor's default
+/// polling interval. Total elapsed: 3 minutes.
+///
+/// # Use Case
+/// This sequence tests the structural-inactivity predicate. After poll 3, the
+/// consecutive-absence counter for weekly_scoped reaches MIN_CONSECUTIVE_ABSENT (3),
+/// so the window should be excluded from binding-window candidacy starting with
+/// the next reconciliation cycle.
+///
+/// # Values
+/// - Poll 0 (baseline): weekly_scoped = 72.5%, five_hour = 15.3%, seven_day = 48.7%
+/// - Poll 1 (absent #1): weekly_scoped = 0.0%, five_hour = 16.2%, seven_day = 49.3%
+/// - Poll 2 (absent #2): weekly_scoped = 0.0%, five_hour = 17.1%, seven_day = 49.9%
+/// - Poll 3 (absent #3): weekly_scoped = 0.0%, five_hour = 18.0%, seven_day = 50.5%
+///
+/// # Example
+/// ```rust
+/// use claude_governor::snapshot_fixtures::weekly_scoped_absent_3_consecutive_polls;
+///
+/// let polls = weekly_scoped_absent_3_consecutive_polls();
+/// assert_eq!(polls.len(), 4, "should have 4 polls (baseline + 3 absences)");
+///
+/// // Verify the pattern: present → absent, absent, absent
+/// assert!(polls[0].weekly_scoped_pct > 0.0, "poll 0 should have data");
+/// assert_eq!(polls[1].weekly_scoped_pct, 0.0, "poll 1 should show absence");
+/// assert_eq!(polls[2].weekly_scoped_pct, 0.0, "poll 2 should show absence");
+/// assert_eq!(polls[3].weekly_scoped_pct, 0.0, "poll 3 should show absence");
+pub fn weekly_scoped_absent_3_consecutive_polls() -> Vec<PrevUsageSnapshot> {
+    let baseline = weekly_scoped_present_snapshot();
+    let taken_at = baseline.taken_at;
+
+    // Poll 1: first absence (60 seconds after baseline)
+    let poll1 = PrevUsageSnapshot {
+        taken_at: taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 16.2,
+        seven_day_pct: 49.3,
+        weekly_scoped_pct: 0.0, // Absent
+    };
+
+    // Poll 2: second consecutive absence (60 seconds after poll 1)
+    let poll2 = PrevUsageSnapshot {
+        taken_at: poll1.taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 17.1,
+        seven_day_pct: 49.9,
+        weekly_scoped_pct: 0.0, // Absent
+    };
+
+    // Poll 3: third consecutive absence (60 seconds after poll 2)
+    let poll3 = PrevUsageSnapshot {
+        taken_at: poll2.taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 18.0,
+        seven_day_pct: 50.5,
+        weekly_scoped_pct: 0.0, // Absent
+    };
+
+    vec![baseline, poll1, poll2, poll3]
+}
+
+/// Fixture sequence: 3 consecutive polls with weekly_scoped present with data.
+///
+/// Returns a vector of 4 snapshots representing normal operation where weekly_scoped
+/// is present and reporting utilization across 3 consecutive polls.
+///
+/// # Timing
+/// Each poll is 60 seconds after the previous, matching the governor's default
+/// polling interval. Total elapsed: 3 minutes.
+///
+/// # Use Case
+/// This sequence verifies that when weekly_scoped IS consistently present with
+/// real data, it remains eligible for binding-window candidacy throughout. The
+/// consecutive-absence counter stays at 0, so the window is never excluded.
+///
+/// # Values
+/// - Poll 0 (baseline): weekly_scoped = 72.5%, five_hour = 15.3%, seven_day = 48.7%
+/// - Poll 1: weekly_scoped = 73.1%, five_hour = 16.2%, seven_day = 49.3%
+/// - Poll 2: weekly_scoped = 73.8%, five_hour = 17.1%, seven_day = 49.9%
+/// - Poll 3: weekly_scoped = 74.5%, five_hour = 18.0%, seven_day = 50.5%
+///
+/// # Example
+/// ```rust
+/// use claude_governor::snapshot_fixtures::weekly_scoped_present_3_consecutive_polls;
+///
+/// let polls = weekly_scoped_present_3_consecutive_polls();
+/// assert_eq!(polls.len(), 4, "should have 4 polls");
+///
+/// // Verify all polls have weekly_scoped data
+/// for (i, poll) in polls.iter().enumerate() {
+///     assert!(poll.weekly_scoped_pct > 0.0, "poll {} should have data", i);
+/// }
+pub fn weekly_scoped_present_3_consecutive_polls() -> Vec<PrevUsageSnapshot> {
+    let baseline = weekly_scoped_present_snapshot();
+    let taken_at = baseline.taken_at;
+
+    // Poll 1: present with increased utilization (60 seconds after baseline)
+    let poll1 = PrevUsageSnapshot {
+        taken_at: taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 16.2,
+        seven_day_pct: 49.3,
+        weekly_scoped_pct: 73.1, // Present with data
+    };
+
+    // Poll 2: present with increased utilization (60 seconds after poll 1)
+    let poll2 = PrevUsageSnapshot {
+        taken_at: poll1.taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 17.1,
+        seven_day_pct: 49.9,
+        weekly_scoped_pct: 73.8, // Present with data
+    };
+
+    // Poll 3: present with increased utilization (60 seconds after poll 2)
+    let poll3 = PrevUsageSnapshot {
+        taken_at: poll2.taken_at + chrono::Duration::seconds(60),
+        five_hour_pct: 18.0,
+        seven_day_pct: 50.5,
+        weekly_scoped_pct: 74.5, // Present with data
+    };
+
+    vec![baseline, poll1, poll2, poll3]
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -892,5 +1125,208 @@ mod tests {
         // 7ds: 1.15 * 1.30 = 1.495 (total +49.5%)
         assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.495).abs() < DELTA_TOLERANCE,
             "Compounded 7ds increase should be +49.5%");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests for window presence/absence fixtures
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_weekly_scoped_present_snapshot_has_real_utilization() {
+        let snapshot = weekly_scoped_present_snapshot();
+
+        // Verify weekly_scoped has real utilization data (not zero)
+        assert!(snapshot.weekly_scoped_pct > 0.0,
+            "weekly_scoped_present_snapshot should have non-zero utilization");
+        assert_eq!(snapshot.weekly_scoped_pct, 72.5,
+            "weekly_scoped should match the expected utilization");
+
+        // Verify other windows have realistic values
+        assert_eq!(snapshot.five_hour_pct, 15.3);
+        assert_eq!(snapshot.seven_day_pct, 48.7);
+
+        // Verify timestamp
+        let expected_time: DateTime<Utc> = "2026-03-18T12:00:00Z".parse().unwrap();
+        assert_eq!(snapshot.taken_at, expected_time);
+    }
+
+    #[test]
+    fn test_weekly_scoped_absent_snapshot_has_zero_utilization() {
+        let snapshot = weekly_scoped_absent_snapshot();
+
+        // Verify weekly_scoped is zero (absent from API)
+        assert_eq!(snapshot.weekly_scoped_pct, 0.0,
+            "weekly_scoped_absent_snapshot should have 0% utilization (absent from API)");
+
+        // Verify other windows still have values (they're present)
+        assert_eq!(snapshot.five_hour_pct, 15.8);
+        assert_eq!(snapshot.seven_day_pct, 49.1);
+
+        // Verify timestamp is 5 minutes after the present snapshot
+        let present_time = weekly_scoped_present_snapshot().taken_at;
+        let elapsed = snapshot.taken_at.signed_duration_since(present_time);
+        assert_eq!(elapsed.num_minutes(), 5,
+            "absent snapshot should be 5 minutes after present snapshot");
+    }
+
+    #[test]
+    fn test_snapshot_pair_weekly_scoped_first_absence_documents_transition() {
+        let (prev, curr) = snapshot_pair_weekly_scoped_first_absence();
+
+        // Verify previous has data
+        assert!(prev.weekly_scoped_pct > 0.0,
+            "previous snapshot should have utilization data");
+        assert_eq!(prev.weekly_scoped_pct, 72.5);
+
+        // Verify current shows absence
+        assert_eq!(curr.weekly_scoped_pct, 0.0,
+            "current snapshot should show absence (0%)");
+
+        // Verify this represents the first absence (consecutive count would be 1)
+        let elapsed = curr.taken_at.signed_duration_since(prev.taken_at);
+        assert_eq!(elapsed.num_minutes(), 5,
+            "transition should occur over 5 minutes (one poll interval)");
+    }
+
+    #[test]
+    fn test_weekly_scoped_absent_3_consecutive_polls_has_correct_structure() {
+        let polls = weekly_scoped_absent_3_consecutive_polls();
+
+        // Verify we have exactly 4 polls
+        assert_eq!(polls.len(), 4,
+            "should have 4 polls (baseline + 3 consecutive absences)");
+
+        // Verify poll 0: present with data
+        assert!(polls[0].weekly_scoped_pct > 0.0,
+            "poll 0 (baseline) should have utilization data");
+        assert_eq!(polls[0].weekly_scoped_pct, 72.5);
+
+        // Verify polls 1-3: all absent
+        for (i, poll) in polls.iter().enumerate().skip(1) {
+            assert_eq!(poll.weekly_scoped_pct, 0.0,
+                "poll {} should show absence (0%)", i);
+        }
+
+        // Verify timestamps are 60 seconds apart (consecutive polls)
+        for i in 1..polls.len() {
+            let elapsed = polls[i].taken_at.signed_duration_since(polls[i-1].taken_at);
+            assert_eq!(elapsed.num_seconds(), 60,
+                "poll {} should be 60 seconds after poll {}", i, i-1);
+        }
+
+        // Verify other windows show gradual increase (realistic usage)
+        assert!(polls[3].five_hour_pct > polls[0].five_hour_pct,
+            "5-hour window should show increase over 3 minutes");
+        assert!(polls[3].seven_day_pct > polls[0].seven_day_pct,
+            "7-day window should show increase over 3 minutes");
+    }
+
+    #[test]
+    fn test_weekly_scoped_present_3_consecutive_polls_has_correct_structure() {
+        let polls = weekly_scoped_present_3_consecutive_polls();
+
+        // Verify we have exactly 4 polls
+        assert_eq!(polls.len(), 4,
+            "should have 4 polls (baseline + 3 consecutive present polls)");
+
+        // Verify ALL polls have weekly_scoped data
+        for (i, poll) in polls.iter().enumerate() {
+            assert!(poll.weekly_scoped_pct > 0.0,
+                "poll {} should have utilization data (present)", i);
+        }
+
+        // Verify timestamps are 60 seconds apart (consecutive polls)
+        for i in 1..polls.len() {
+            let elapsed = polls[i].taken_at.signed_duration_since(polls[i-1].taken_at);
+            assert_eq!(elapsed.num_seconds(), 60,
+                "poll {} should be 60 seconds after poll {}", i, i-1);
+        }
+
+        // Verify weekly_scoped shows gradual increase (realistic usage)
+        assert!(polls[3].weekly_scoped_pct > polls[0].weekly_scoped_pct,
+            "weekly_scoped should show increase over 3 minutes");
+
+        // Verify the progression: 72.5 → 73.1 → 73.8 → 74.5
+        assert_eq!(polls[0].weekly_scoped_pct, 72.5);
+        assert_eq!(polls[1].weekly_scoped_pct, 73.1);
+        assert_eq!(polls[2].weekly_scoped_pct, 73.8);
+        assert_eq!(polls[3].weekly_scoped_pct, 74.5);
+    }
+
+    #[test]
+    fn test_weekly_scoped_absent_vs_present_sequences_are_mutually_exclusive() {
+        // The absent sequence: poll 0 has data, polls 1-3 are absent
+        let absent_polls = weekly_scoped_absent_3_consecutive_polls();
+        assert!(absent_polls[0].weekly_scoped_pct > 0.0,
+            "absent sequence: poll 0 should have data");
+        assert_eq!(absent_polls[1].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 1 should be absent");
+        assert_eq!(absent_polls[2].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 2 should be absent");
+        assert_eq!(absent_polls[3].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 3 should be absent");
+
+        // The present sequence: ALL polls have data
+        let present_polls = weekly_scoped_present_3_consecutive_polls();
+        for (i, poll) in present_polls.iter().enumerate() {
+            assert!(poll.weekly_scoped_pct > 0.0,
+                "present sequence: poll {} should have data", i);
+        }
+
+        // Verify the scenarios are truly different
+        assert_ne!(absent_polls[3].weekly_scoped_pct, present_polls[3].weekly_scoped_pct,
+            "final poll state should differ between scenarios");
+    }
+
+    #[test]
+    fn test_weekly_scoped_absent_reaches_min_consecutive_threshold() {
+        let polls = weekly_scoped_absent_3_consecutive_polls();
+
+        // Simulate the consecutive-absence counter
+        let mut consecutive_absent_count = 0;
+        let min_threshold = 3; // MIN_CONSECUTIVE_ABSENT from governor.rs
+
+        for (i, poll) in polls.iter().enumerate() {
+            if poll.weekly_scoped_pct == 0.0 {
+                consecutive_absent_count += 1;
+            } else {
+                consecutive_absent_count = 0; // Reset on presence
+            }
+
+            // Verify the counter reaches exactly 3 after the final poll
+            if i == 3 {
+                assert_eq!(consecutive_absent_count, min_threshold,
+                    "after 3 consecutive absences, counter should reach MIN_CONSECUTIVE_ABSENT (3)");
+            }
+        }
+
+        // Final verification: counter is 3, meaning window should be excluded
+        assert_eq!(consecutive_absent_count, 3,
+            "consecutive absent count should be exactly 3 at end of sequence");
+    }
+
+    #[test]
+    fn test_weekly_scoped_present_never_reaches_absent_threshold() {
+        let polls = weekly_scoped_present_3_consecutive_polls();
+
+        // Simulate the consecutive-absence counter
+        let mut consecutive_absent_count = 0;
+        let min_threshold = 3; // MIN_CONSECUTIVE_ABSENT from governor.rs
+
+        for poll in polls.iter() {
+            if poll.weekly_scoped_pct == 0.0 {
+                consecutive_absent_count += 1;
+            } else {
+                consecutive_absent_count = 0; // Reset on presence
+            }
+
+            // Verify the counter NEVER reaches 3
+            assert!(consecutive_absent_count < min_threshold,
+                "consecutive absent count should stay below threshold when window is present");
+        }
+
+        // Final verification: counter is 0, meaning window should NOT be excluded
+        assert_eq!(consecutive_absent_count, 0,
+            "consecutive absent count should be 0 when window is always present");
     }
 }

@@ -60,6 +60,47 @@ pub const WINDOW_FIVE_HOUR: &str = "five_hour";
 pub const WINDOW_SEVEN_DAY: &str = "seven_day";
 pub const WINDOW_WEEKLY_SCOPED: &str = "weekly_scoped";
 
+/// Minimum number of consecutive polls where a window is absent from the API
+/// response (null) or reports `is_active == false` before treating it as
+/// structurally inactive and excluding it from binding-window candidacy.
+///
+/// # Rationale
+/// - **Value: 3 polls** - Distinguishes a one-off transient null (network hiccup,
+///   temporary API lag) from a settled absent state (window not enabled for the
+///   account). The governor polls every 60 seconds by default, so 3 polls = 3 minutes
+///   of absence — long enough to trust the signal is real, short enough to respond
+///   quickly to a genuine capacity window becoming unavailable.
+///
+/// - **Why not 1?** A single null could be transient; treating it as permanent would
+///   cause a window to flicker in/out of binding candidacy on every API blip.
+///
+/// - **Why not higher (5+)?** The observed live failure mode (weekly_scoped null
+///   across every poll while pooled windows had headroom) persisted indefinitely;
+///   waiting 5+ minutes would leave the governor pinned at 0 workers for too long.
+///
+/// - **Tuning path:** If 3 proves too aggressive (false exclusions during brief API
+///   outages), increase to 5. If 3 proves too slow (governor holds at 0 for too long
+///   before excluding), decrease to 2.
+///
+/// # Note on `is_active` field population
+/// **Finding: `is_active` IS populated in real Anthropic API payloads.**
+///
+/// Evidence from test_limits_array_parses_alongside_legacy_windows (poller.rs:728-758):
+/// - The test fixture is explicitly documented as "The real captured shape"
+/// - All three limit entries (session, weekly_all, weekly_scoped) include
+///   `"is_active": true` in the captured payload
+/// - The field parses successfully through `UsageLimit.is_active: Option<bool>`
+///
+/// Therefore, the structural-inactivity predicate (to be implemented in child beads)
+/// CAN legitimately use both exclusion arms:
+/// 1. Consecutive absence (null) from API response across >= MIN_CONSECUTIVE_ABSENT polls
+/// 2. API reports `is_active == false` for the window's limit entry
+///
+/// This constant governs threshold (1); threshold (2) is instantaneous (a single
+/// false reading excludes the window immediately, matching the platform's explicit
+/// signal that the limit is not active).
+pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;
+
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSnapshot {
