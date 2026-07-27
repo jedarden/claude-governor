@@ -2552,6 +2552,201 @@ mod tests {
     }
 
     #[test]
+    fn weekly_scoped_becomes_binding_when_most_constrained() {
+        // Parent acceptance criterion (bf-oeotj): when the model-scoped weekly
+        // window is the REAL constraint — high utilization with a near reset —
+        // the governor must SELECT it as the binding window instead of ignoring
+        // it in favour of five_hour/seven_day.
+        //
+        // Parameterized over the scoped model because the whole point of the
+        // generic weekly_scoped window is that it is NOT hardcoded to Sonnet:
+        // binding selection is window-name based, so whichever model the cap is
+        // scoped to (Sonnet here, Fable in the production limits[] capture) the
+        // window is still selected when it is the tightest constraint.
+        for model in [
+            "claude-sonnet-4-20250514",
+            "claude-fable-5", // the production Fable-scoped cap (display_name "Fable")
+        ] {
+            weekly_scoped_becomes_binding_for_model(model);
+        }
+    }
+
+    /// Shared body for [`weekly_scoped_becomes_binding_when_most_constrained`].
+    ///
+    /// Fixture: weekly_scoped at 79% utilization (the real captured Fable cap
+    /// value) with only ~2h to reset and a burn rate that leaves a razor-thin
+    /// margin, while five_hour and seven_day have comfortable headroom. The
+    /// weekly window must win on `risk_score` and be marked binding.
+    fn weekly_scoped_becomes_binding_for_model(model: &str) {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Single worker, 1h elapsed -> fleet_pct_hr == pct_delta.
+        let instances = vec![multi_window_record(
+            "w1",
+            model,
+            2.0,
+            500_000,
+            Some(2.0),  // five_hour burn: slow, lots of headroom
+            Some(0.2),  // seven_day burn: slow, far reset
+            Some(5.0),  // weekly_scoped burn: tight against a near reset
+            30.0, 28.0, // five_hour current/prev (delta 2.0)
+            40.0, 39.8, // seven_day current/prev (delta 0.2)
+            79.0, 74.0, // weekly_scoped current/prev (delta 5.0)
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 30.0);
+        utilization.insert("seven_day".to_string(), 40.0);
+        utilization.insert("weekly_scoped".to_string(), 79.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 4.5); // plenty of time
+        hrs_left.insert("seven_day".to_string(), 160.0); // far reset
+        hrs_left.insert("weekly_scoped".to_string(), 2.0); // near reset -> tight
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // Hand-computed risk_scores (target_ceiling=90, single instance so
+        // std_pct_hr=0 -> cone_ratio=1.0, volatility multiplier = 1.0):
+        //   weekly_scoped: remain=11, exh=11/5=2.2,  margin=2.2-2=+0.2,
+        //                  margin_pct=0.1,   urgency=0.9,
+        //                  risk=0.9*1.5 = 1.35        (HIGHEST -> binding)
+        //   seven_day:     remain=50, exh=50/0.2=250, margin=250-160=+90,
+        //                  margin_pct=0.5625, urgency=0.4375,
+        //                  risk=0.4375*1.0 = 0.4375
+        //   five_hour:     remain=60, exh=60/2=30,    margin=30-4.5=+25.5,
+        //                  margin_pct=5.667, urgency=-4.667,
+        //                  risk=-4.667*3.0 = -14.0    (comfortably safe)
+        assert!(
+            forecast.weekly_scoped.risk_score > forecast.seven_day.risk_score
+                && forecast.weekly_scoped.risk_score > forecast.five_hour.risk_score,
+            "model={}: weekly_scoped risk ({}) must rank above seven_day ({}) and five_hour ({})",
+            model,
+            forecast.weekly_scoped.risk_score,
+            forecast.seven_day.risk_score,
+            forecast.five_hour.risk_score,
+        );
+        assert_eq!(
+            forecast.binding_window, "weekly_scoped",
+            "model={}: expected weekly_scoped to be the binding window", model,
+        );
+        assert!(
+            forecast.weekly_scoped.binding,
+            "model={}: expected weekly_scoped.binding == true", model,
+        );
+        assert!(
+            !forecast.five_hour.binding,
+            "model={}: five_hour must not be binding", model,
+        );
+        assert!(
+            !forecast.seven_day.binding,
+            "model={}: seven_day must not be binding", model,
+        );
+        // Being selected proves it was not dismissed as "just the weekly/
+        // model-scoped window"; and it carries a real safe_worker_count (here 1)
+        // so it does not trip the insufficient-data hold (the None branch of
+        // `binding_forecast.safe_worker_count` further down in this file).
+        assert_eq!(
+            forecast.weekly_scoped.safe_worker_count,
+            Some(1),
+            "model={}: binding weekly_scoped must carry a safe_worker_count (no hold)", model,
+        );
+    }
+
+    #[test]
+    fn absent_weekly_scoped_is_immediately_non_binding() {
+        // Parent acceptance criterion (bf-oeotj): when weekly_scoped is absent
+        // (scoped_weekly() returns None / the window is null), the governor must
+        // treat it as immediately NON-BINDING — 0% utilization, far-off reset —
+        // and never hold the fleet pending on a perpetual "waiting for sonnet/
+        // Fable data" / "insufficient data" state.
+        //
+        // poller::window_or_default maps a null weekly_scoped window to
+        // (0.0% util, 168.0h to reset) — that is the value this burn-rate layer
+        // actually sees, so this fixture feeds exactly that.
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // A real constraint lives in five_hour; weekly_scoped is the absent/null
+        // window (pct_delta None -> no burn record -> fleet_pct_hr 0). Single
+        // worker, 1h elapsed -> fleet_pct_hr == pct_delta where present.
+        let instances = vec![multi_window_record(
+            "w1",
+            "claude-sonnet-4-20250514",
+            2.0,
+            500_000,
+            Some(20.0), // five_hour: the real, binding constraint
+            Some(0.2),  // seven_day: comfortable
+            None,       // weekly_scoped: NO burn data this interval (absent)
+            85.0, 65.0, // five_hour current/prev (delta 20.0)
+            40.0, 39.8, // seven_day current/prev (delta 0.2)
+            0.0, 0.0,   // weekly_scoped unused (pct_delta None -> skipped)
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 85.0);
+        utilization.insert("seven_day".to_string(), 40.0);
+        utilization.insert("weekly_scoped".to_string(), 0.0); // null -> 0% util
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 1.0); // tight -> real constraint
+        hrs_left.insert("seven_day".to_string(), 160.0);
+        hrs_left.insert("weekly_scoped".to_string(), 168.0); // null -> far reset
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // (1) The absent window is NOT selected as binding and ranks below the
+        // real constraint. With no burn data fleet_pct_hr=0 -> predicted
+        // exhaustion is +inf -> margin +inf -> urgency -inf -> risk_score -inf
+        // (i.e. "infinitely safe", the correct benign representation of a window
+        // that does not exist this period).
+        assert_ne!(
+            forecast.binding_window, "weekly_scoped",
+            "absent weekly_scoped must never be selected as the binding window",
+        );
+        assert!(
+            !forecast.weekly_scoped.binding,
+            "absent weekly_scoped must not carry the binding flag",
+        );
+        assert!(
+            forecast.weekly_scoped.risk_score < forecast.five_hour.risk_score,
+            "absent weekly_scoped (risk={}) must rank below the real constraint (risk={})",
+            forecast.weekly_scoped.risk_score,
+            forecast.five_hour.risk_score,
+        );
+
+        // (2) The binding window that IS selected (five_hour) has real burn data
+        // and a safe_worker_count, so the governor does NOT raise the
+        // "insufficient burn rate data, will hold" branch (the None arm of
+        // `binding_forecast.safe_worker_count` further down in this file). No
+        // perpetual hold — the fleet gets a concrete target.
+        assert_eq!(forecast.binding_window, "five_hour");
+        assert!(
+            forecast.five_hour.safe_worker_count.is_some(),
+            "selected binding window must carry a safe_worker_count (no insufficient-data hold)",
+        );
+    }
+
+    #[test]
     fn ema_updates_over_multiple_cycles() {
         let baseline = BaselineBurnRates::default();
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
