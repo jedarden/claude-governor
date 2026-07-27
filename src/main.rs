@@ -1845,6 +1845,7 @@ mod tests {
             seven_day_sonnet_utilization: 72.0,
             seven_day_sonnet_resets_at: "2026-03-20T04:00:00Z".to_string(),
             seven_day_sonnet_hours_remaining: 33.5,
+            limits: vec![],
             timestamp: Utc::now(),
             stale: false,
         }

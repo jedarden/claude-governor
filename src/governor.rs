@@ -7360,6 +7360,7 @@ impl MockPoller {
             seven_day_sonnet_utilization: 55.0,
             seven_day_sonnet_resets_at: seven_day_reset.to_rfc3339(),
             seven_day_sonnet_hours_remaining: 120.0,
+            limits: vec![],
             timestamp: now,
             stale: false,
         }
@@ -7580,6 +7581,7 @@ mod mock_poller_tests {
             seven_day_sonnet_utilization: 72.0,
             seven_day_sonnet_resets_at: (now + Duration::hours(96)).to_rfc3339(),
             seven_day_sonnet_hours_remaining: 96.0,
+            limits: vec![],
             timestamp: now,
             stale: false,
         };

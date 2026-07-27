@@ -119,6 +119,51 @@ impl UsageWindow {
     }
 }
 
+/// A single entry in the usage API's generic `limits[]` array.
+///
+/// The usage API returns a list of active limits, each tagged with a `kind`
+/// (`"session"`, `"weekly_all"`, `"weekly_scoped"`). This is the generalized
+/// shape that will eventually replace the legacy top-level `seven_day` /
+/// `five_hour` / `seven_day_sonnet` fields; for now it is parsed additively
+/// alongside them (see child bead bf-3a3x7 for the window-generalization step).
+///
+/// Every field is optional with a `#[serde(default)]` so a single odd or
+/// forward-incompatible entry in the array never fails the whole poll — the
+/// same tolerance already applied to the legacy windows.
+#[derive(Debug, Deserialize, Clone)]
+pub struct UsageLimit {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub scope: Option<LimitScope>,
+    #[serde(default)]
+    pub is_active: Option<bool>,
+}
+
+/// `scope` block on a model-scoped limit (e.g. a `weekly_scoped` cap).
+#[derive(Debug, Deserialize, Clone)]
+pub struct LimitScope {
+    #[serde(default)]
+    pub model: Option<LimitModel>,
+}
+
+/// The model a scoped limit applies to.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LimitModel {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
 /// Full usage response from the API
 ///
 /// Each window is optional: the usage API legitimately returns `null` for a
@@ -134,6 +179,11 @@ pub struct UsageResponse {
     pub seven_day: Option<UsageWindow>,
     #[serde(rename = "five_hour", default)]
     pub five_hour: Option<UsageWindow>,
+    /// Generic per-limit array returned alongside the legacy windows. Absent
+    /// when the API response omits it (older/region variants); never fails the
+    /// poll. Parsed additively — the legacy fields above are unchanged.
+    #[serde(default)]
+    pub limits: Option<Vec<UsageLimit>>,
 }
 
 /// Extract `(utilization, resets_at, hours_remaining)` from an optional window.
@@ -164,8 +214,43 @@ pub struct UsageData {
     pub five_hour_utilization: f64,
     pub five_hour_resets_at: String,
     pub five_hour_hours_remaining: f64,
+    /// Parsed entries from the generic `limits[]` array (empty when the API
+    /// omits the array). Enables model-scoped lookups such as
+    /// [`UsageData::scoped_weekly`].
+    pub limits: Vec<UsageLimit>,
     pub timestamp: DateTime<Utc>,
     pub stale: bool,
+}
+
+impl UsageData {
+    /// The active model-scoped weekly cap, if any.
+    ///
+    /// Finds the `limits[]` entry with `kind == "weekly_scoped"` and returns
+    /// its model display name (falling back to `"Scoped"`, matching the
+    /// `usage-statusline.sh` reference) plus its `percent` / `resets_at` as a
+    /// [`UsageWindow`].
+    ///
+    /// Returns `None` when this account/period has no active model-scoped
+    /// weekly cap — callers must not treat the scoped cap as a binding limit
+    /// in that case. This never errors: a missing entry is normal.
+    pub fn scoped_weekly(&self) -> Option<(String, UsageWindow)> {
+        self.limits.iter().find_map(|limit| {
+            if limit.kind.as_deref() != Some("weekly_scoped") {
+                return None;
+            }
+            let model_name = limit
+                .scope
+                .as_ref()
+                .and_then(|s| s.model.as_ref())
+                .and_then(|m| m.display_name.clone())
+                .unwrap_or_else(|| "Scoped".to_string());
+            let window = UsageWindow {
+                utilization: limit.percent.unwrap_or(0.0),
+                resets_at: limit.resets_at.clone().unwrap_or_default(),
+            };
+            Some((model_name, window))
+        })
+    }
 }
 
 /// Consecutive refresh failure counter
@@ -466,6 +551,7 @@ impl Poller {
             five_hour_utilization,
             five_hour_resets_at,
             five_hour_hours_remaining: five_hour_hours,
+            limits: usage.limits.unwrap_or_default(),
             timestamp: Utc::now(),
             stale: false,
         };
@@ -578,6 +664,7 @@ mod tests {
                 utilization: 30.0,
                 resets_at: "2026-03-18T15:59:59Z".to_string(),
             }),
+            limits: None,
         };
 
         assert_eq!(response.seven_day_sonnet.as_ref().unwrap().utilization, 75.5);
@@ -597,5 +684,129 @@ mod tests {
         assert_eq!(util, 0.0);
         assert!(resets_at.is_empty());
         assert_eq!(resp.seven_day.as_ref().unwrap().utilization, 42.0);
+    }
+
+    /// Build a `UsageData` carrying only the parsed `limits[]`, so the
+    /// `scoped_weekly()` accessor can be exercised in isolation.
+    fn usage_data_with_limits(limits: Vec<UsageLimit>) -> UsageData {
+        UsageData {
+            seven_day_sonnet_utilization: 0.0,
+            seven_day_sonnet_resets_at: String::new(),
+            seven_day_sonnet_hours_remaining: 0.0,
+            seven_day_utilization: 0.0,
+            seven_day_resets_at: String::new(),
+            seven_day_hours_remaining: 0.0,
+            five_hour_utilization: 0.0,
+            five_hour_resets_at: String::new(),
+            five_hour_hours_remaining: 0.0,
+            limits,
+            timestamp: Utc::now(),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn test_limits_array_parses_alongside_legacy_windows() {
+        // The real captured shape: legacy top-level windows coexist with the
+        // generic limits[] array. Both must parse from a single response.
+        let json = r#"{
+            "seven_day_sonnet": null,
+            "seven_day": {"utilization": 42.0, "resets_at": "2026-08-01T03:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-07-26T20:00:00Z"},
+            "limits": [
+                {"kind": "session", "group": "default", "percent": 10, "severity": "low",
+                 "resets_at": "2026-07-26T20:00:00Z", "scope": null, "is_active": true},
+                {"kind": "weekly_all", "percent": 45, "resets_at": "2026-08-01T03:00:00Z",
+                 "scope": null, "is_active": true},
+                {"kind": "weekly_scoped", "percent": 79, "resets_at": "2026-08-01T03:59:59Z",
+                 "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}},
+                 "is_active": true}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("limits response must parse");
+
+        // Legacy parsing is untouched.
+        assert!(resp.seven_day_sonnet.is_none());
+        assert_eq!(resp.seven_day.as_ref().unwrap().utilization, 42.0);
+        assert_eq!(resp.five_hour.as_ref().unwrap().utilization, 10.0);
+
+        // The generic array parsed all three entries.
+        let limits = resp.limits.expect("limits array should be present");
+        assert_eq!(limits.len(), 3);
+        assert_eq!(limits[0].kind.as_deref(), Some("session"));
+        assert_eq!(limits[2].kind.as_deref(), Some("weekly_scoped"));
+    }
+
+    #[test]
+    fn test_scoped_weekly_returns_real_captured_shape() {
+        // Real captured weekly_scoped entry: display_name "Fable", percent 79.
+        let json = r#"{
+            "seven_day": {"utilization": 42.0, "resets_at": "2026-08-01T03:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-07-26T20:00:00Z"},
+            "limits": [
+                {"kind": "session", "percent": 10, "resets_at": "2026-07-26T20:00:00Z",
+                 "scope": null},
+                {"kind": "weekly_scoped", "percent": 79, "resets_at": "2026-08-01T03:59:59Z",
+                 "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}}}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+
+        let (model, window) = data
+            .scoped_weekly()
+            .expect("weekly_scoped entry should be found");
+        assert_eq!(model, "Fable");
+        assert_eq!(window.utilization, 79.0);
+        assert_eq!(window.resets_at, "2026-08-01T03:59:59Z");
+    }
+
+    #[test]
+    fn test_scoped_weekly_none_when_entry_omitted() {
+        // limits[] present but has no weekly_scoped entry -> None, no panic.
+        let json = r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-07-26T20:00:00Z"},
+            "limits": [
+                {"kind": "session", "percent": 10, "resets_at": "2026-07-26T20:00:00Z",
+                 "scope": null},
+                {"kind": "weekly_all", "percent": 45, "resets_at": "2026-08-01T03:00:00Z",
+                 "scope": null}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+        assert!(data.scoped_weekly().is_none());
+    }
+
+    #[test]
+    fn test_scoped_weekly_none_when_limits_absent() {
+        // limits[] key entirely absent -> None, no panic, no error.
+        let json = r#"{
+            "seven_day": {"utilization": 42.0, "resets_at": "2026-08-01T03:00:00Z"},
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-07-26T20:00:00Z"}
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        assert!(resp.limits.is_none());
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+        assert!(data.scoped_weekly().is_none());
+    }
+
+    #[test]
+    fn test_scoped_weekly_falls_back_to_scoped_label() {
+        // A weekly_scoped entry whose scope lacks display_name falls back to
+        // the "Scoped" label, matching usage-statusline.sh.
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "percent": 50, "resets_at": "2026-08-01T03:59:59Z",
+                 "scope": {"model": {}}}
+            ]
+        }"#;
+        let resp: UsageResponse = serde_json::from_str(json).expect("response must parse");
+        let data = usage_data_with_limits(resp.limits.unwrap_or_default());
+        let (model, window) = data
+            .scoped_weekly()
+            .expect("weekly_scoped entry should be found even without a label");
+        assert_eq!(model, "Scoped");
+        assert_eq!(window.utilization, 50.0);
     }
 }

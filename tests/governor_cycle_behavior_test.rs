@@ -96,6 +96,7 @@ impl SimpleMockPoller {
             seven_day_sonnet_utilization: 55.0,
             seven_day_sonnet_resets_at: seven_day_reset.to_rfc3339(),
             seven_day_sonnet_hours_remaining: 120.0,
+            limits: vec![],
             timestamp: now,
             stale: false,
         }
