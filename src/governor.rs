@@ -3440,9 +3440,23 @@ pub fn run_governor_cycle(
         let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
         let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
 
-        // Per-worker pct/hr rate for safe_worker_count calculation
-        let pct_per_worker = if current_total > 0 && fleet_pct_hr > 0.0 {
-            fleet_pct_hr / current_total as f64
+        // Per-worker pct/hr rate for safe_worker_count calculation.
+        //
+        // Use current_total.max(1) rather than requiring current_total > 0: when the
+        // fleet has genuinely scaled to 0 (e.g. correctly holding at 0 to protect a
+        // tight window) but we DO have real aggregate rate data (fleet_pct_hr > 0),
+        // dividing by a hypothetical 1 worker yields a conservative (pessimistic)
+        // per-worker estimate, letting safe_worker_count compute a real, stable 0
+        // instead of collapsing to None ("insufficient data"). Previously, hitting
+        // current_total == 0 made this 0.0 regardless of fleet_pct_hr, which flowed
+        // into safe_worker_count_or_max's None branch and reset the ceiling to
+        // max_workers — causing a 0 -> None -> max_workers -> real-0-again flap every
+        // cycle the fleet drained to 0, launching (and billing) workers each time.
+        // True cold start (fleet_pct_hr == 0, no samples ever) is unaffected: it still
+        // yields 0.0 here and correctly falls through to the max_workers-ceiling
+        // bootstrap path downstream.
+        let pct_per_worker = if fleet_pct_hr > 0.0 {
+            fleet_pct_hr / current_total.max(1) as f64
         } else {
             0.0
         };
