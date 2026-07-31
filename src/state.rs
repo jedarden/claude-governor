@@ -43,6 +43,11 @@ pub struct UsageState {
     pub all_models_pct: f64,
     pub five_hour_pct: f64,
     pub sonnet_resets_at: String,
+    /// Reset time for the `seven_day` (all-models) window. Populated independently
+    /// of `sonnet_resets_at` — an account with no distinct Sonnet-scoped limit
+    /// (sonnet_resets_at == "") still has a real all-models weekly reset, and the
+    /// two must not be conflated (see poller.rs UsageResponse doc comment).
+    pub seven_day_resets_at: String,
     pub five_hour_resets_at: String,
     /// True when data was sourced from stale cache (token refresh failed)
     pub stale: bool,
@@ -55,6 +60,7 @@ impl Default for UsageState {
             all_models_pct: 0.0,
             five_hour_pct: 0.0,
             sonnet_resets_at: String::new(),
+            seven_day_resets_at: String::new(),
             five_hour_resets_at: String::new(),
             stale: false,
         }
@@ -938,6 +944,7 @@ mod tests {
                 all_models_pct: 81.0,
                 five_hour_pct: 14.0,
                 sonnet_resets_at: "2026-03-20T03:59:59Z".to_string(),
+                seven_day_resets_at: "2026-03-20T03:59:59Z".to_string(),
                 five_hour_resets_at: "2026-03-18T15:59:59Z".to_string(),
                 stale: false,
             },

@@ -2644,6 +2644,7 @@ pub fn run_governor_cycle(
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
                 sonnet_resets_at: usage_data.seven_day_sonnet_resets_at,
+                seven_day_resets_at: usage_data.seven_day_resets_at,
                 five_hour_resets_at: usage_data.five_hour_resets_at,
                 stale: usage_data.stale,
             };
@@ -3230,6 +3231,19 @@ pub fn run_governor_cycle(
             schedule::effective_hours_remaining_from(now, reset_time, promotions, "five_hour"),
         );
     }
+    // seven_day (all-models) has its own reset time, independent of whether this
+    // account has a distinct Sonnet-scoped window at all. Previously this was
+    // (incorrectly) derived from sonnet_resets_at, so an account with no separate
+    // Sonnet limit (sonnet_resets_at == "") silently lost seven_day's hours_remaining
+    // too — it defaulted to 0.0 downstream via unwrap_or(0.0), which made a healthy,
+    // real window look maximally urgent and could out-compete five_hour for binding
+    // status on a phantom score. See [[project_cgov_polish_loop]] root-cause writeup.
+    if let Ok(reset_time) = state.usage.seven_day_resets_at.parse::<DateTime<Utc>>() {
+        hours_remaining.insert(
+            "seven_day".to_string(),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
+        );
+    }
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
         hours_remaining.insert(
             "seven_day_sonnet".to_string(),
@@ -3239,11 +3253,6 @@ pub fn run_governor_cycle(
                 promotions,
                 "seven_day_sonnet",
             ),
-        );
-        // Approximate seven_day reset time as same as seven_day_sonnet
-        hours_remaining.insert(
-            "seven_day".to_string(),
-            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
         );
     }
 
@@ -3481,8 +3490,16 @@ pub fn run_governor_cycle(
         ("seven_day_sonnet", &seven_day_sonnet_forecast),
     ];
 
+    // Only consider windows we actually have reset-time data for this cycle. A
+    // window absent from `hours_remaining` (e.g. seven_day_sonnet on an account
+    // with no distinct Sonnet-scoped limit) falls back to hrs_left=0.0 upstream,
+    // which zeroes its margin_pct and defaults risk_score to 0.0 — a phantom
+    // score that can beat a real, healthy window's legitimately negative
+    // (low-risk) score. Excluding data-absent windows keeps binding selection
+    // limited to windows the API actually reports as real constraints.
     let binding_window = windows
         .iter()
+        .filter(|(name, _)| hours_remaining.contains_key(*name))
         .max_by(|(_, a), (_, b)| {
             a.risk_score
                 .partial_cmp(&b.risk_score)
