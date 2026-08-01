@@ -3877,6 +3877,7 @@ pub fn run_governor_cycle(
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
                 sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+                seven_day_resets_at: usage_data.seven_day_resets_at,
                 five_hour_resets_at: usage_data.five_hour_resets_at,
                 stale: usage_data.stale,
                 weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
@@ -4522,6 +4523,19 @@ pub fn run_governor_cycle(
             schedule::effective_hours_remaining_from(now, reset_time, promotions, "five_hour"),
         );
     }
+    // seven_day (all-models) has its own reset time, independent of whether this
+    // account has a distinct Sonnet-scoped window at all. Previously this was
+    // (incorrectly) derived from sonnet_resets_at, so an account with no separate
+    // Sonnet limit (sonnet_resets_at == "") silently lost seven_day's hours_remaining
+    // too — it defaulted to 0.0 downstream via unwrap_or(0.0), which made a healthy,
+    // real window look maximally urgent and could out-compete five_hour for binding
+    // status on a phantom score. See [[project_cgov_polish_loop]] root-cause writeup.
+    if let Ok(reset_time) = state.usage.seven_day_resets_at.parse::<DateTime<Utc>>() {
+        hours_remaining.insert(
+            "seven_day".to_string(),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
+        );
+    }
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
         hours_remaining.insert(
             "weekly_scoped".to_string(),
@@ -4531,11 +4545,6 @@ pub fn run_governor_cycle(
                 promotions,
                 "weekly_scoped",
             ),
-        );
-        // Approximate seven_day reset time as same as weekly_scoped
-        hours_remaining.insert(
-            "seven_day".to_string(),
-            schedule::effective_hours_remaining_from(now, reset_time, promotions, "seven_day"),
         );
     }
 
@@ -4739,8 +4748,23 @@ pub fn run_governor_cycle(
         effective_target_ceilings.insert(window.to_string(), effective_target_ceiling);
 
         // Per-worker pct/hr rate for safe_worker_count calculation
-        let pct_per_worker = if current_total > 0 && fleet_pct_hr > 0.0 {
-            fleet_pct_hr / current_total as f64
+        // Per-worker pct/hr rate for safe_worker_count calculation.
+        //
+        // Use current_total.max(1) rather than requiring current_total > 0: when the
+        // fleet has genuinely scaled to 0 (e.g. correctly holding at 0 to protect a
+        // tight window) but we DO have real aggregate rate data (fleet_pct_hr > 0),
+        // dividing by a hypothetical 1 worker yields a conservative (pessimistic)
+        // per-worker estimate, letting safe_worker_count compute a real, stable 0
+        // instead of collapsing to None ("insufficient data"). Previously, hitting
+        // current_total == 0 made this 0.0 regardless of fleet_pct_hr, which flowed
+        // into safe_worker_count_or_max's None branch and reset the ceiling to
+        // max_workers — causing a 0 -> None -> max_workers -> real-0-again flap every
+        // cycle the fleet drained to 0, launching (and billing) workers each time.
+        // True cold start (fleet_pct_hr == 0, no samples ever) is unaffected: it still
+        // yields 0.0 here and correctly falls through to the max_workers-ceiling
+        // bootstrap path downstream.
+        let pct_per_worker = if fleet_pct_hr > 0.0 {
+            fleet_pct_hr / current_total.max(1) as f64
         } else {
             0.0
         };
@@ -4859,9 +4883,19 @@ pub fn run_governor_cycle(
         ("weekly_scoped", &weekly_scoped_forecast),
     ];
 
+    // Only consider windows we actually have reset-time data for this cycle. A
+    // window absent from `hours_remaining` (e.g. seven_day_sonnet on an account
+    // with no distinct Sonnet-scoped limit) falls back to hrs_left=0.0 upstream,
+    // which zeroes its margin_pct and defaults risk_score to 0.0 — a phantom
+    // score that can beat a real, healthy window's legitimately negative
+    // (low-risk) score. Excluding data-absent windows keeps binding selection
+    // limited to windows the API actually reports as real constraints.
     let binding_window = windows
         .iter()
-        .filter(|(name, _)| !state.is_window_consecutively_absent(name))
+        .filter(|(name, _)| {
+            hours_remaining.contains_key(*name)
+                && !state.is_window_consecutively_absent(name)
+        })
         .max_by(|(_, a), (_, b)| {
             a.risk_score
                 .partial_cmp(&b.risk_score)

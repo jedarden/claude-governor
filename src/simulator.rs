@@ -706,6 +706,7 @@ mod tests {
             all_models_pct: 60.0,
             five_hour_pct: 30.0,
             sonnet_resets_at: "2026-03-21T03:00:00Z".to_string(),
+            seven_day_resets_at: "2026-03-21T03:00:00Z".to_string(),
             five_hour_resets_at: "2026-03-20T10:00:00Z".to_string(),
             stale: false,
             weekly_scoped_model: None,
