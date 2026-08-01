@@ -4,8 +4,8 @@
 //! and state files for governor cycle tests.
 
 use claude_governor::config::{
-    AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig,
-    GovernorConfig, ModelPricing, PricingConfig, SprintConfig,
+    AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig, GovernorConfig,
+    ModelPricing, PricingConfig, SprintConfig,
 };
 use claude_governor::state;
 use std::collections::HashMap;
@@ -57,7 +57,11 @@ pub fn test_agent_config(name: &str) -> AgentConfig {
 /// assert_eq!(config.min_workers, 2);
 /// assert_eq!(config.max_workers, 10);
 /// ```
-pub fn test_agent_config_with_bounds(name: &str, min_workers: u32, max_workers: u32) -> AgentConfig {
+pub fn test_agent_config_with_bounds(
+    name: &str,
+    min_workers: u32,
+    max_workers: u32,
+) -> AgentConfig {
     AgentConfig {
         launch_cmd: format!("echo {}", name),
         session_pattern: format!("{}-*", name),
@@ -486,7 +490,10 @@ mod tests {
         assert!(config.alerts.enabled);
         assert!(!config.composite_risk.enabled);
         assert_eq!(config.cone_scaling.narrow_threshold, 1.5);
-        assert!(config.pricing.models.contains_key("claude-sonnet-4-20250514"));
+        assert!(config
+            .pricing
+            .models
+            .contains_key("claude-sonnet-4-20250514"));
     }
 
     #[test]
@@ -554,13 +561,7 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert("test-agent".to_string(), (5, 1, 10));
 
-        let state_path = create_full_state_file(
-            temp_dir.path(),
-            &workers,
-            50.0,
-            40.0,
-            35.0,
-        );
+        let state_path = create_full_state_file(temp_dir.path(), &workers, 50.0, 40.0, 35.0);
 
         assert!(state_path.exists());
         let loaded = state::load_state(&state_path).unwrap();
@@ -574,14 +575,8 @@ mod tests {
         assert_eq!(loaded.usage.weekly_scoped_pct, 35.0);
 
         // Capacity forecast
-        assert_eq!(
-            loaded.capacity_forecast.five_hour.current_utilization,
-            50.0
-        );
-        assert_eq!(
-            loaded.capacity_forecast.seven_day.current_utilization,
-            40.0
-        );
+        assert_eq!(loaded.capacity_forecast.five_hour.current_utilization, 50.0);
+        assert_eq!(loaded.capacity_forecast.seven_day.current_utilization, 40.0);
         assert_eq!(
             loaded.capacity_forecast.weekly_scoped.current_utilization,
             35.0

@@ -923,7 +923,10 @@ impl GovernorState {
             (WINDOW_SEVEN_DAY, seven_day_present),
             (WINDOW_WEEKLY_SCOPED, weekly_scoped_present),
         ] {
-            let counter = self.consecutive_absent_polls.entry(window_key.to_string()).or_insert(0);
+            let counter = self
+                .consecutive_absent_polls
+                .entry(window_key.to_string())
+                .or_insert(0);
 
             if is_present {
                 // Window is present: reset counter to 0
@@ -955,7 +958,10 @@ impl GovernorState {
     /// Returns the number of consecutive polls where the window has been absent,
     /// or 0 if the window has never been absent.
     pub fn get_consecutive_absent_count(&self, window: &str) -> u32 {
-        self.consecutive_absent_polls.get(window).copied().unwrap_or(0)
+        self.consecutive_absent_polls
+            .get(window)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Populate baseline burn rates from agent configuration
@@ -989,7 +995,8 @@ impl GovernorState {
                     baseline.pct_per_worker_per_hour,
                     baseline.dollars_per_worker_per_hour
                 );
-                self.baseline_burn_rates.insert(agent_name.clone(), baseline);
+                self.baseline_burn_rates
+                    .insert(agent_name.clone(), baseline);
             }
             // If baseline_burn_rate is None, we don't insert anything
             // The caller can use BaselineBurnRates::default() as a fallback
@@ -1960,10 +1967,14 @@ mod tests {
         // First poll: only current should be set, previous should remain None
         state.update_api_snapshot(now, 10.0, 20.0, 15.0);
 
-        assert!(state.previous_api_snapshot.is_none(),
-                "On first poll, previous_api_snapshot should be None");
-        assert!(state.current_api_snapshot.is_some(),
-                "On first poll, current_api_snapshot should be Some");
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "On first poll, previous_api_snapshot should be None"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "On first poll, current_api_snapshot should be Some"
+        );
 
         let curr = state.current_api_snapshot.as_ref().unwrap();
         assert_eq!(curr.five_hour_pct, 10.0);
@@ -1981,10 +1992,14 @@ mod tests {
         let mut state = GovernorState::new();
 
         // Verify initial state: both snapshots should be None
-        assert!(state.previous_api_snapshot.is_none(),
-                "Initial state: previous_api_snapshot should be None");
-        assert!(state.current_api_snapshot.is_none(),
-                "Initial state: current_api_snapshot should be None");
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "Initial state: previous_api_snapshot should be None"
+        );
+        assert!(
+            state.current_api_snapshot.is_none(),
+            "Initial state: current_api_snapshot should be None"
+        );
 
         // Simulate first successful poll with realistic utilization values
         let now = Utc::now();
@@ -1996,21 +2011,30 @@ mod tests {
         state.update_api_snapshot(now, five_hour_pct, seven_day_pct, weekly_scoped_pct);
 
         // Verify the transition: None -> Some for current_api_snapshot
-        assert!(state.previous_api_snapshot.is_none(),
-                "After first poll: previous_api_snapshot should still be None");
-        assert!(state.current_api_snapshot.is_some(),
-                "After first poll: current_api_snapshot should be Some");
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "After first poll: previous_api_snapshot should still be None"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "After first poll: current_api_snapshot should be Some"
+        );
 
         // Verify all snapshot fields are stored correctly
         let snapshot = state.current_api_snapshot.as_ref().unwrap();
-        assert_eq!(snapshot.five_hour_pct, five_hour_pct,
-                   "Five-hour utilization should match input");
-        assert_eq!(snapshot.seven_day_pct, seven_day_pct,
-                   "Seven-day utilization should match input");
-        assert_eq!(snapshot.weekly_scoped_pct, weekly_scoped_pct,
-                   "Seven-day sonnet utilization should match input");
-        assert_eq!(snapshot.taken_at, now,
-                   "Timestamp should match poll time");
+        assert_eq!(
+            snapshot.five_hour_pct, five_hour_pct,
+            "Five-hour utilization should match input"
+        );
+        assert_eq!(
+            snapshot.seven_day_pct, seven_day_pct,
+            "Seven-day utilization should match input"
+        );
+        assert_eq!(
+            snapshot.weekly_scoped_pct, weekly_scoped_pct,
+            "Seven-day sonnet utilization should match input"
+        );
+        assert_eq!(snapshot.taken_at, now, "Timestamp should match poll time");
     }
 
     #[test]
@@ -2061,21 +2085,31 @@ mod tests {
         // Second poll: should shift current to previous, then set new current
         state.update_api_snapshot(now2, 12.5, 22.0, 18.0);
 
-        assert!(state.previous_api_snapshot.is_some(),
-                "On second poll, previous_api_snapshot should be Some");
-        assert!(state.current_api_snapshot.is_some(),
-                "On second poll, current_api_snapshot should be Some");
+        assert!(
+            state.previous_api_snapshot.is_some(),
+            "On second poll, previous_api_snapshot should be Some"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "On second poll, current_api_snapshot should be Some"
+        );
 
         // Verify previous holds the first poll's data
         let prev = state.previous_api_snapshot.as_ref().unwrap();
-        assert_eq!(prev.five_hour_pct, 10.0, "previous should hold first poll data");
+        assert_eq!(
+            prev.five_hour_pct, 10.0,
+            "previous should hold first poll data"
+        );
         assert_eq!(prev.seven_day_pct, 20.0);
         assert_eq!(prev.weekly_scoped_pct, 15.0);
         assert_eq!(prev.taken_at, now1);
 
         // Verify current holds the second poll's data
         let curr = state.current_api_snapshot.as_ref().unwrap();
-        assert_eq!(curr.five_hour_pct, 12.5, "current should hold second poll data");
+        assert_eq!(
+            curr.five_hour_pct, 12.5,
+            "current should hold second poll data"
+        );
         assert_eq!(curr.seven_day_pct, 22.0);
         assert_eq!(curr.weekly_scoped_pct, 18.0);
         assert_eq!(curr.taken_at, now2);
@@ -2089,9 +2123,9 @@ mod tests {
         let mut prev_values = Vec::new();
         for i in 0..5 {
             let now = Utc::now() + chrono::Duration::seconds(i as i64 * 60);
-            let five_hr = 10.0 + i as f64 * 2.5;  // 10.0, 12.5, 15.0, 17.5, 20.0
-            let seven_day = 20.0 + i as f64 * 2.0;  // 20.0, 22.0, 24.0, 26.0, 28.0
-            let weekly_scoped = 15.0 + i as f64 * 3.0;  // 15.0, 18.0, 21.0, 24.0, 27.0
+            let five_hr = 10.0 + i as f64 * 2.5; // 10.0, 12.5, 15.0, 17.5, 20.0
+            let seven_day = 20.0 + i as f64 * 2.0; // 20.0, 22.0, 24.0, 26.0, 28.0
+            let weekly_scoped = 15.0 + i as f64 * 3.0; // 15.0, 18.0, 21.0, 24.0, 27.0
 
             state.update_api_snapshot(now, five_hr, seven_day, weekly_scoped);
             prev_values.push((five_hr, seven_day, weekly_scoped));
@@ -2139,13 +2173,13 @@ mod tests {
         let curr = state.current_api_snapshot.as_ref().unwrap();
 
         assert_eq!(prev.five_hour_pct, 80.0);
-        assert_eq!(curr.five_hour_pct, 5.0);  // Window reset: 80.0 -> 5.0
+        assert_eq!(curr.five_hour_pct, 5.0); // Window reset: 80.0 -> 5.0
 
         assert_eq!(prev.seven_day_pct, 90.0);
-        assert_eq!(curr.seven_day_pct, 15.0);  // Window reset: 90.0 -> 15.0
+        assert_eq!(curr.seven_day_pct, 15.0); // Window reset: 90.0 -> 15.0
 
         assert_eq!(prev.weekly_scoped_pct, 85.0);
-        assert_eq!(curr.weekly_scoped_pct, 8.0);  // Window reset: 85.0 -> 8.0
+        assert_eq!(curr.weekly_scoped_pct, 8.0); // Window reset: 85.0 -> 8.0
     }
 
     // --- Consecutive-absent poll tracking ---
@@ -2165,9 +2199,9 @@ mod tests {
         let mut state = GovernorState::new();
 
         // Simulate three consecutive absent polls for weekly_scoped
-        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
-        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
-        state.update_consecutive_absent_polls(true, true, false);  // weekly_scoped absent
+        state.update_consecutive_absent_polls(true, true, false); // weekly_scoped absent
+        state.update_consecutive_absent_polls(true, true, false); // weekly_scoped absent
+        state.update_consecutive_absent_polls(true, true, false); // weekly_scoped absent
 
         // weekly_scoped counter should be 3
         assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
@@ -2189,7 +2223,7 @@ mod tests {
         assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
 
         // Now simulate a present poll (window reappears)
-        state.update_consecutive_absent_polls(true, true, true);  // weekly_scoped present
+        state.update_consecutive_absent_polls(true, true, true); // weekly_scoped present
 
         // Counter should reset to 0
         assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 0);
@@ -2205,15 +2239,16 @@ mod tests {
         state.update_consecutive_absent_polls(false, true, false);
 
         assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 3);
-        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);  // was present
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0); // was present
         assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 3);
 
         // five_hour reappears, weekly_scoped stays absent
         state.update_consecutive_absent_polls(true, true, false);
 
-        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 0);  // reset
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_FIVE_HOUR), 0); // reset
         assert_eq!(state.get_consecutive_absent_count(WINDOW_SEVEN_DAY), 0);
-        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 4);  // incremented
+        assert_eq!(state.get_consecutive_absent_count(WINDOW_WEEKLY_SCOPED), 4);
+        // incremented
     }
 
     #[test]
@@ -2359,11 +2394,7 @@ mod tests {
         let prev_model = Some("Fable".to_string());
         let new_model = Some("Opus".to_string());
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(reset, "Should detect model change from Fable to Opus");
         assert_eq!(
@@ -2403,11 +2434,7 @@ mod tests {
         let prev_model = Some("Fable".to_string());
         let new_model = Some("Fable".to_string());
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(!reset, "Should NOT reset when model is unchanged");
         assert_eq!(
@@ -2427,11 +2454,7 @@ mod tests {
         let prev_model = None;
         let new_model = Some("Fable".to_string());
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(reset, "Should detect initialization from None to Some");
         // When transitioning from None to Some, we start with cold EMA (already zero)
@@ -2453,11 +2476,7 @@ mod tests {
         let prev_model = Some("Fable".to_string());
         let new_model = None;
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(reset, "Should detect model cleared (Some to None)");
         assert_eq!(
@@ -2485,11 +2504,7 @@ mod tests {
         let prev_model = None;
         let new_model = None;
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(!reset, "Should NOT reset when both are None");
         assert_eq!(
@@ -2517,11 +2532,7 @@ mod tests {
         let prev_model = Some("Fable".to_string());
         let new_model = Some("Opus".to_string());
 
-        let reset = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset = reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
         assert!(reset, "Should detect realistic rotation scenario");
         assert_eq!(burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0);
@@ -2542,7 +2553,7 @@ mod tests {
 
         // Simulate a state where Fable was tracking weekly_scoped at 72% utilization
         let mut usage_state = UsageState {
-            weekly_scoped_pct: 72.0,  // Fable's utilization
+            weekly_scoped_pct: 72.0, // Fable's utilization
             weekly_scoped_model: Some("Fable".to_string()),
             ..UsageState::default()
         };
@@ -2551,36 +2562,43 @@ mod tests {
             fleet_pct_hr_ema: WindowPctDeltas {
                 five_hour: 4.5,
                 seven_day: 1.8,
-                weekly_scoped: 3.6,  // EMA computed from Fable's pct
+                weekly_scoped: 3.6, // EMA computed from Fable's pct
             },
             ..BurnRateState::default()
         };
 
         // Now the API rotates to Opus, which reports 45% utilization
         let new_model = Some("Opus".to_string());
-        let new_weekly_scoped_pct = 45.0;  // Opus's actual utilization
+        let new_weekly_scoped_pct = 45.0; // Opus's actual utilization
 
         // Verify the model change detection works
         let prev_model = usage_state.weekly_scoped_model.clone();
-        let reset_detected = reset_weekly_scoped_on_model_change(
-            &prev_model,
-            &new_model,
-            &mut burn_rate,
-        );
+        let reset_detected =
+            reset_weekly_scoped_on_model_change(&prev_model, &new_model, &mut burn_rate);
 
-        assert!(reset_detected, "Model change from Fable to Opus should be detected");
-        assert_eq!(burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
-                   "EMA should reset to zero on model change");
+        assert!(
+            reset_detected,
+            "Model change from Fable to Opus should be detected"
+        );
+        assert_eq!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped, 0.0,
+            "EMA should reset to zero on model change"
+        );
 
         // Simulate updating the usage state with the new model's pct
         usage_state.weekly_scoped_pct = new_weekly_scoped_pct;
         usage_state.weekly_scoped_model = new_model.clone();
 
         // Verify the new state reflects the rotated model's pct
-        assert_eq!(usage_state.weekly_scoped_pct, 45.0,
-                   "weekly_scoped_pct should now reflect Opus's utilization");
-        assert_eq!(usage_state.weekly_scoped_model, Some("Opus".to_string()),
-                   "weekly_scoped_model should now be Opus");
+        assert_eq!(
+            usage_state.weekly_scoped_pct, 45.0,
+            "weekly_scoped_pct should now reflect Opus's utilization"
+        );
+        assert_eq!(
+            usage_state.weekly_scoped_model,
+            Some("Opus".to_string()),
+            "weekly_scoped_model should now be Opus"
+        );
 
         // Simulate an EMA update using the new pct
         // In real code, this happens in governor.rs where:
@@ -2588,25 +2606,30 @@ mod tests {
         //   state.burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate + ...
         const EMA_ALPHA: f64 = 0.2;
         let elapsed_hours = 1.0;
-        let old_pct = 72.0;  // Previous snapshot (Fable)
-        let new_pct = usage_state.weekly_scoped_pct;  // Current (Opus) = 45.0
-        let delta = new_pct - old_pct;  // -27.0 (negative delta, would be skipped in real code)
-        let rate = delta.abs() / elapsed_hours;  // 27.0 %/hr
+        let old_pct = 72.0; // Previous snapshot (Fable)
+        let new_pct = usage_state.weekly_scoped_pct; // Current (Opus) = 45.0
+        let delta = new_pct - old_pct; // -27.0 (negative delta, would be skipped in real code)
+        let rate = delta.abs() / elapsed_hours; // 27.0 %/hr
 
         // Update EMA with the new rate (this would use Opus's pct)
-        burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate
-            + (1.0 - EMA_ALPHA) * burn_rate.fleet_pct_hr_ema.weekly_scoped;
+        burn_rate.fleet_pct_hr_ema.weekly_scoped =
+            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * burn_rate.fleet_pct_hr_ema.weekly_scoped;
 
         // Verify the EMA was updated using the new model's pct
-        assert!(burn_rate.fleet_pct_hr_ema.weekly_scoped > 0.0,
-                "EMA should be updated with the new model's pct");
+        assert!(
+            burn_rate.fleet_pct_hr_ema.weekly_scoped > 0.0,
+            "EMA should be updated with the new model's pct"
+        );
 
         // KEY ASSERTION: The pct value used (45.0) came from the rotated model (Opus),
         // not the stale Fable value (72.0). This is verified by:
         // 1. The model change reset the EMA to 0
         // 2. The new pct (45.0) was read from usage_state.weekly_scoped_pct
         // 3. The EMA update used new_pct = usage_state.weekly_scoped_pct = 45.0
-        assert_eq!(new_pct, 45.0, "New pct should be Opus's 45%, not Fable's 72%");
+        assert_eq!(
+            new_pct, 45.0,
+            "New pct should be Opus's 45%, not Fable's 72%"
+        );
     }
 }
 
@@ -2647,8 +2670,7 @@ mod null_roundtrip_test {
         // for hard_limit_margin_hrs/cone_ratio/risk_score (which need a custom
         // deserializer only because they are f64, not Option).
         let null_json = r#"{"sonnet_pct": 72.0, "weekly_scoped_model": null}"#;
-        let u: UsageState =
-            serde_json::from_str(null_json).expect("null must deserialize as None");
+        let u: UsageState = serde_json::from_str(null_json).expect("null must deserialize as None");
         assert!(u.weekly_scoped_model.is_none());
 
         // Absent field (older state file) -> None via struct-level #[serde(default)].

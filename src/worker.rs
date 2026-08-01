@@ -434,8 +434,7 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
 
     // Get the current tmux sessions for this prefix
     let (_, tmux_sessions) = count_tmux_sessions(session_prefix);
-    let tmux_sessions_set: std::collections::HashSet<String> =
-        tmux_sessions.into_iter().collect();
+    let tmux_sessions_set: std::collections::HashSet<String> = tmux_sessions.into_iter().collect();
 
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -591,7 +590,9 @@ mod tests {
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
         // Create fresh heartbeat files whose sessions match the prefix "test-worker"
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         fs::write(
             config.heartbeat_dir.join("test-worker-1.json"),
             format!(r#"{{"session":"test-worker-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
@@ -619,7 +620,9 @@ mod tests {
 
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         fs::write(
             config.heartbeat_dir.join("test-worker-1.json"),
             format!(r#"{{"session":"test-worker-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
@@ -640,7 +643,9 @@ mod tests {
 
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
 
         // Create busy worker (prefixed)
         fs::write(
@@ -667,7 +672,9 @@ mod tests {
 
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
 
         for i in 0..5 {
             fs::write(
@@ -712,7 +719,9 @@ mod tests {
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
 
         // Create a fresh heartbeat file
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         fs::write(
             config.heartbeat_dir.join("test-worker-1.json"),
             format!(r#"{{"session":"test-worker-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),

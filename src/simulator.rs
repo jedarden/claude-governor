@@ -649,11 +649,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
         let time_str = point.timestamp.format("%Y-%m-%d %H:%M").to_string();
         let five_h = point.windows.get("five_hour").copied().unwrap_or(0.0);
         let seven_d = point.windows.get("seven_day").copied().unwrap_or(0.0);
-        let seven_ds = point
-            .windows
-            .get("weekly_scoped")
-            .copied()
-            .unwrap_or(0.0);
+        let seven_ds = point.windows.get("weekly_scoped").copied().unwrap_or(0.0);
 
         let events_str = if point.events.is_empty() {
             String::new()
@@ -1143,8 +1139,14 @@ mod tests {
         let five_hour_ema_before = state.burn_rate.fleet_pct_hr_ema.five_hour;
         let seven_day_ema_before = state.burn_rate.fleet_pct_hr_ema.seven_day;
 
-        assert_eq!(weekly_scoped_ema_before, 2.5, "Should start with Fable's EMA");
-        assert_eq!(weekly_scoped_samples_before, 10, "Should start with 10 samples");
+        assert_eq!(
+            weekly_scoped_ema_before, 2.5,
+            "Should start with Fable's EMA"
+        );
+        assert_eq!(
+            weekly_scoped_samples_before, 10,
+            "Should start with 10 samples"
+        );
         assert_eq!(usd_ema_before, 3.2, "Should start with Fable's USD EMA");
 
         // 3. Simulate model rotation: Fable -> Opus
@@ -1159,7 +1161,10 @@ mod tests {
         );
 
         // 4. Verify reset was performed
-        assert!(reset_performed, "Reset should be performed when model changes from Fable to Opus");
+        assert!(
+            reset_performed,
+            "Reset should be performed when model changes from Fable to Opus"
+        );
 
         // 5. Verify weekly_scoped samples are reset to 0 (no stale Fable carry-over)
         assert_eq!(
@@ -1191,7 +1196,10 @@ mod tests {
         let has_fresh_rate = false; // No fresh per-instance rate yet
 
         let is_cold_start = !has_fresh_rate && window_samples < 3;
-        assert!(is_cold_start, "Opus window should be cold-start after reset");
+        assert!(
+            is_cold_start,
+            "Opus window should be cold-start after reset"
+        );
 
         // Verify conservative baseline seeding (not 0)
         if is_cold_start && util > 0.0 && current_workers > 0 {
@@ -1211,7 +1219,8 @@ mod tests {
             };
 
             assert_eq!(
-                estimate_quality, crate::state::EstimateQuality::ColdStart,
+                estimate_quality,
+                crate::state::EstimateQuality::ColdStart,
                 "Opus window should be flagged as ColdStart"
             );
         }
@@ -1237,7 +1246,10 @@ mod tests {
         let trajectory = simulate(&state, &config, vec![]).unwrap();
 
         // Verify trajectory has valid points
-        assert!(!trajectory.points.is_empty(), "Should have trajectory points");
+        assert!(
+            !trajectory.points.is_empty(),
+            "Should have trajectory points"
+        );
 
         // Verify weekly_scoped utilization doesn't claim 0% or infinite headroom
         let first_point = &trajectory.points[0];

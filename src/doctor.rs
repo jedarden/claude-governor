@@ -1370,7 +1370,9 @@ fn check_claude_binary_installed() -> CheckResult {
                 match Command::new("claude").arg("--version").output() {
                     Ok(ver_output) => {
                         if ver_output.status.success() {
-                            let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                            let version = String::from_utf8_lossy(&ver_output.stdout)
+                                .trim()
+                                .to_string();
                             CheckResult::pass("claude_binary", version)
                         } else {
                             // Binary exists but --version failed
@@ -1422,7 +1424,9 @@ fn check_claude_print_installed() -> CheckResult {
         match Command::new(&local_bin_path).arg("--version").output() {
             Ok(ver_output) => {
                 if ver_output.status.success() {
-                    let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                    let version = String::from_utf8_lossy(&ver_output.stdout)
+                        .trim()
+                        .to_string();
                     CheckResult::pass("claude_print", version)
                 } else {
                     CheckResult::warn(
@@ -1510,10 +1514,7 @@ fn check_subscription_session_presence() -> CheckResult {
     };
 
     // Check if any agents are marked as subscription agents
-    let has_subscription_agents = config
-        .agents
-        .values()
-        .any(|agent| agent.subscription);
+    let has_subscription_agents = config.agents.values().any(|agent| agent.subscription);
 
     // If no subscription agents are configured, skip the check
     if !has_subscription_agents {
@@ -1603,7 +1604,10 @@ fn check_subscription_session_presence() -> CheckResult {
     if recent_cli_entrypoint_files > 0 {
         CheckResult::pass(
             "subscription_session_presence",
-            format!("{} cli-entrypoint sessions in last 24h", recent_cli_entrypoint_files),
+            format!(
+                "{} cli-entrypoint sessions in last 24h",
+                recent_cli_entrypoint_files
+            ),
         )
     } else {
         // No cli-entrypoint sessions found - warn about potential sdk-cli fallback

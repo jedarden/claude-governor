@@ -341,8 +341,8 @@ impl Poller {
         let credentials_path = if let Some(path_str) = path {
             // Expand ~ to home directory if present
             if path_str.starts_with('~') {
-                let home_dir =
-                    dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+                let home_dir = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
                 home_dir.join(
                     path_str
                         .strip_prefix('~')
@@ -354,8 +354,8 @@ impl Poller {
             }
         } else {
             // Use default path
-            let home_dir =
-                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+            let home_dir = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
             home_dir.join(CREDENTIALS_PATH)
         };
 

@@ -552,7 +552,8 @@ fn check_subscription_billing_drift(
                 // Read heartbeat JSON to get session ID
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(heartbeat) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(session_id) = heartbeat.get("session").and_then(|v| v.as_str()) {
+                        if let Some(session_id) = heartbeat.get("session").and_then(|v| v.as_str())
+                        {
                             // Check if this session has sdk-cli entrypoint
                             if let Some(entrypoint) = get_session_entrypoint(session_id) {
                                 if entrypoint == "sdk-cli" {
@@ -603,11 +604,15 @@ fn get_session_entrypoint(session_id: &str) -> Option<String> {
                         // Parse lines to find entrypoint field
                         for line in content.lines() {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                                if let Some(entrypoint) = json.get("entrypoint").and_then(|v| v.as_str()) {
+                                if let Some(entrypoint) =
+                                    json.get("entrypoint").and_then(|v| v.as_str())
+                                {
                                     return Some(entrypoint.to_string());
                                 }
                                 // Also check for promptSource field (another indicator of sdk-cli)
-                                if let Some(prompt_source) = json.get("promptSource").and_then(|v| v.as_str()) {
+                                if let Some(prompt_source) =
+                                    json.get("promptSource").and_then(|v| v.as_str())
+                                {
                                     if prompt_source == "sdk" {
                                         return Some("sdk-cli".to_string());
                                     }
@@ -1205,7 +1210,10 @@ mod tests {
         let imminent = alerts
             .iter()
             .find(|a| a.alert_type == AlertType::CutoffImminent);
-        assert!(imminent.is_some(), "Should have CutoffImminent alert at 97% util with negative hard limit margin");
+        assert!(
+            imminent.is_some(),
+            "Should have CutoffImminent alert at 97% util with negative hard limit margin"
+        );
         let alert = imminent.unwrap();
         assert_eq!(alert.severity, AlertSeverity::Critical);
         assert!(alert.message.contains("five_hour"));
@@ -1962,7 +1970,10 @@ mod tests {
         let brake = alerts
             .iter()
             .find(|a| a.alert_type == AlertType::EmergencyBrakeActivated);
-        assert!(brake.is_none(), "EmergencyBrakeActivated should NOT create alert beads (100% FP rate)");
+        assert!(
+            brake.is_none(),
+            "EmergencyBrakeActivated should NOT create alert beads (100% FP rate)"
+        );
     }
 
     #[test]
@@ -2578,7 +2589,12 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let fired = process_alerts(&mut state, &config, base_now(), &std::collections::HashMap::new());
+        let fired = process_alerts(
+            &mut state,
+            &config,
+            base_now(),
+            &std::collections::HashMap::new(),
+        );
         assert!(fired >= 1, "Should have fired at least one alert");
 
         // Cooldown should now be set
@@ -2615,7 +2631,12 @@ mod tests {
             ..AlertConfig::default()
         };
 
-        let fired = process_alerts(&mut state, &config, base_now(), &std::collections::HashMap::new());
+        let fired = process_alerts(
+            &mut state,
+            &config,
+            base_now(),
+            &std::collections::HashMap::new(),
+        );
         // Both CutoffImminent and SessionCutoffRisk should be skipped due to cooldown
         assert_eq!(fired, 0, "Should have fired zero alerts due to cooldown");
     }

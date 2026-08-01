@@ -20,8 +20,8 @@
 //! - `2` = cutoff_risk active
 //! - `3` = emergency brake engaged
 
-use std::collections::HashMap;
 use crate::state::{CapacityForecast, GovernorState, WindowForecast};
+use std::collections::HashMap;
 
 /// Capacity pressure level for worker guidance
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,10 +200,10 @@ pub fn generate_capacity_summary(state: &GovernorState) -> String {
     // the model-scoped weekly window; otherwise show the window key as before.
     // The binding key itself ("weekly_scoped") is unchanged — this is display only.
     let binding_name = match forecast.binding_window.as_str() {
-        "" | "weekly_scoped" => crate::state::weekly_scoped_display_label(
-            state.usage.weekly_scoped_model.as_deref(),
-        )
-        .to_string(),
+        "" | "weekly_scoped" => {
+            crate::state::weekly_scoped_display_label(state.usage.weekly_scoped_model.as_deref())
+                .to_string()
+        }
         other => other.to_string(),
     };
 

@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 /// Helper function to create a test state file with safe mode active
 fn create_state_with_safe_mode(temp_dir: &TempDir) -> PathBuf {
-    use claude_governor::state::{GovernorState, WorkerState, save_state};
     use chrono::Utc;
+    use claude_governor::state::{save_state, GovernorState, WorkerState};
 
     let state_path = temp_dir.path().join("governor-state.json");
 
@@ -44,7 +44,7 @@ fn create_state_with_safe_mode(temp_dir: &TempDir) -> PathBuf {
 
 /// Helper function to create a test state file WITHOUT safe mode active
 fn create_state_without_safe_mode(temp_dir: &TempDir) -> PathBuf {
-    use claude_governor::state::{GovernorState, WorkerState, save_state};
+    use claude_governor::state::{save_state, GovernorState, WorkerState};
 
     let state_path = temp_dir.path().join("governor-state.json");
 
@@ -73,8 +73,8 @@ fn create_state_without_safe_mode(temp_dir: &TempDir) -> PathBuf {
 
 /// Helper function to simulate the scale command logic with stdout capture
 fn simulate_scale_command_with_stdout(state_path: &PathBuf, target_count: u32) -> String {
-    use claude_governor::state::{load_state, save_state};
     use chrono::Utc;
+    use claude_governor::state::{load_state, save_state};
 
     // Capture stdout by redirecting to a string
     let mut buffer = Vec::new();
@@ -99,10 +99,7 @@ fn simulate_scale_command_with_stdout(state_path: &PathBuf, target_count: u32) -
             if target_count < worker.min || target_count > worker.max {
                 panic!(
                     "Worker count {} is outside allowed range for agent {} ({} - {})",
-                    target_count,
-                    agent_id,
-                    worker.min,
-                    worker.max
+                    target_count, agent_id, worker.min, worker.max
                 );
             }
         }
@@ -115,11 +112,20 @@ fn simulate_scale_command_with_stdout(state_path: &PathBuf, target_count: u32) -
         state.updated_at = Utc::now();
         save_state(&state, state_path).expect("Failed to save state");
 
-        writeln!(captured_stdout, "Target worker count set to {} for all agents", target_count).unwrap();
+        writeln!(
+            captured_stdout,
+            "Target worker count set to {} for all agents",
+            target_count
+        )
+        .unwrap();
 
         // Warn user that safe mode will reassert on next cycle
         if safe_mode_was_active {
-            writeln!(captured_stdout, "NOTE: Safe mode remains active and will reassert its target on the next cycle").unwrap();
+            writeln!(
+                captured_stdout,
+                "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+            )
+            .unwrap();
         }
     }
 
@@ -156,7 +162,9 @@ fn test_scale_safe_mode_stdout_notification() {
 
     // 3. Verify the safe mode reassertion notification appears
     assert!(
-        stdout_output.contains("NOTE: Safe mode remains active and will reassert its target on the next cycle"),
+        stdout_output.contains(
+            "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+        ),
         "Stdout should contain notification that safe mode will reassert. Got: {}",
         stdout_output
     );
@@ -164,7 +172,10 @@ fn test_scale_safe_mode_stdout_notification() {
     // 4. Verify the state was actually updated
     use claude_governor::state::load_state;
     let updated_state = load_state(&state_path).expect("Failed to load updated state");
-    assert_eq!(updated_state.workers["test-agent"].target, 8, "Worker target should be updated to 8");
+    assert_eq!(
+        updated_state.workers["test-agent"].target, 8,
+        "Worker target should be updated to 8"
+    );
 }
 
 #[test]
@@ -205,7 +216,10 @@ fn test_scale_without_safe_mode_no_stdout_notification() {
     // 4. Verify the state was actually updated
     use claude_governor::state::load_state;
     let updated_state = load_state(&state_path).expect("Failed to load updated state");
-    assert_eq!(updated_state.workers["test-agent"].target, 7, "Worker target should be updated to 7");
+    assert_eq!(
+        updated_state.workers["test-agent"].target, 7,
+        "Worker target should be updated to 7"
+    );
 }
 
 #[test]
@@ -226,14 +240,26 @@ fn test_scale_safe_mode_notification_order_and_completeness() {
     let lines: Vec<&str> = stdout_output.lines().collect();
 
     // Find the indices of each expected message
-    let warning_idx = lines.iter().position(|l| l.contains("WARN: manual scale override"));
-    let confirmation_idx = lines.iter().position(|l| l.contains("Target worker count set to"));
-    let notification_idx = lines.iter().position(|l| l.contains("NOTE: Safe mode remains active"));
+    let warning_idx = lines
+        .iter()
+        .position(|l| l.contains("WARN: manual scale override"));
+    let confirmation_idx = lines
+        .iter()
+        .position(|l| l.contains("Target worker count set to"));
+    let notification_idx = lines
+        .iter()
+        .position(|l| l.contains("NOTE: Safe mode remains active"));
 
     // Verify all messages appear
     assert!(warning_idx.is_some(), "Warning message should appear");
-    assert!(confirmation_idx.is_some(), "Confirmation message should appear");
-    assert!(notification_idx.is_some(), "Safe mode notification should appear");
+    assert!(
+        confirmation_idx.is_some(),
+        "Confirmation message should appear"
+    );
+    assert!(
+        notification_idx.is_some(),
+        "Safe mode notification should appear"
+    );
 
     // Verify order: warning comes before confirmation, notification comes after confirmation
     let w = warning_idx.unwrap();
@@ -258,7 +284,9 @@ fn test_scale_safe_mode_notification_order_and_completeness() {
         lines[c]
     );
     assert!(
-        lines[n].contains("NOTE: Safe mode remains active and will reassert its target on the next cycle"),
+        lines[n].contains(
+            "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+        ),
         "Notification should have the exact expected format at line {}",
         lines[n]
     );
@@ -278,7 +306,9 @@ fn test_scale_safe_mode_notification_multiple_scales() {
 
         // Verify notification appears for each scale operation
         assert!(
-            stdout_output.contains("NOTE: Safe mode remains active and will reassert its target on the next cycle"),
+            stdout_output.contains(
+                "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+            ),
             "Safe mode notification should appear for scale to {}. Output: {}",
             count,
             stdout_output
@@ -288,8 +318,7 @@ fn test_scale_safe_mode_notification_multiple_scales() {
         use claude_governor::state::load_state;
         let state = load_state(&state_path).expect("Failed to load state");
         assert_eq!(
-            state.workers["test-agent"].target,
-            count,
+            state.workers["test-agent"].target, count,
             "Worker target should be updated to {}",
             count
         );
@@ -313,7 +342,8 @@ fn test_scale_safe_mode_notification_content_accuracy() {
         .expect("Notification line should exist");
 
     // Verify exact text match (case-sensitive, no typos)
-    let expected_text = "NOTE: Safe mode remains active and will reassert its target on the next cycle";
+    let expected_text =
+        "NOTE: Safe mode remains active and will reassert its target on the next cycle";
     assert_eq!(
         notification_line.trim(),
         expected_text,

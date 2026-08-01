@@ -10,8 +10,8 @@
 //! - Consecutive snapshot (7 days later) with increased usage
 //! - Consecutive snapshot (7 days later, same weekday) with increased usage
 
-use chrono::{DateTime, Datelike, Utc};
 use crate::state::PrevUsageSnapshot;
+use chrono::{DateTime, Datelike, Utc};
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -123,8 +123,8 @@ pub fn snapshot_after_5h() -> PrevUsageSnapshot {
 
     PrevUsageSnapshot {
         taken_at,
-        five_hour_pct: 18.2,      // +5.7% from baseline
-        seven_day_pct: 46.8,       // +1.6% from baseline
+        five_hour_pct: 18.2,     // +5.7% from baseline
+        seven_day_pct: 46.8,     // +1.6% from baseline
         weekly_scoped_pct: 40.3, // +1.6% from baseline
     }
 }
@@ -161,8 +161,8 @@ pub fn snapshot_after_7d() -> PrevUsageSnapshot {
 
     PrevUsageSnapshot {
         taken_at,
-        five_hour_pct: 15.8,       // New 5-hour window (reset occurred)
-        seven_day_pct: 52.4,       // +7.2% from baseline
+        five_hour_pct: 15.8,     // New 5-hour window (reset occurred)
+        seven_day_pct: 52.4,     // +7.2% from baseline
         weekly_scoped_pct: 46.1, // +7.4% from baseline
     }
 }
@@ -272,8 +272,8 @@ pub fn post_reset_snapshot() -> PrevUsageSnapshot {
 
     PrevUsageSnapshot {
         taken_at,
-        five_hour_pct: 2.1,        // Just reset
-        seven_day_pct: 48.3,       // Still accumulating
+        five_hour_pct: 2.1,      // Just reset
+        seven_day_pct: 48.3,     // Still accumulating
         weekly_scoped_pct: 42.8, // Still accumulating
     }
 }
@@ -388,8 +388,8 @@ pub fn weekly_scoped_absent_snapshot() -> PrevUsageSnapshot {
 
     PrevUsageSnapshot {
         taken_at,
-        five_hour_pct: 15.8,     // Slight increase from previous
-        seven_day_pct: 49.1,     // Slight increase from previous
+        five_hour_pct: 15.8,    // Slight increase from previous
+        seven_day_pct: 49.1,    // Slight increase from previous
         weekly_scoped_pct: 0.0, // Window absent from API (null response)
     }
 }
@@ -412,7 +412,10 @@ pub fn weekly_scoped_absent_snapshot() -> PrevUsageSnapshot {
 /// assert!(prev.weekly_scoped_pct > 0.0, "previous should have utilization");
 /// assert_eq!(curr.weekly_scoped_pct, 0.0, "current should show absence");
 pub fn snapshot_pair_weekly_scoped_first_absence() -> (PrevUsageSnapshot, PrevUsageSnapshot) {
-    (weekly_scoped_present_snapshot(), weekly_scoped_absent_snapshot())
+    (
+        weekly_scoped_present_snapshot(),
+        weekly_scoped_absent_snapshot(),
+    )
 }
 
 /// Fixture sequence: 3 consecutive polls with weekly_scoped absent.
@@ -673,7 +676,10 @@ mod tests {
 
         // Should show negative delta in 5-hour window
         let delta_5h = curr.five_hour_pct - prev.five_hour_pct;
-        assert!(delta_5h < 0.0, "5-hour delta should be negative after reset");
+        assert!(
+            delta_5h < 0.0,
+            "5-hour delta should be negative after reset"
+        );
     }
 
     #[test]
@@ -701,12 +707,21 @@ mod tests {
 
         for snapshot in fixtures {
             // All percentages should be in valid range [0, 100]
-            assert!(snapshot.five_hour_pct >= 0.0 && snapshot.five_hour_pct <= 100.0,
-                "five_hour_pct out of range: {}", snapshot.five_hour_pct);
-            assert!(snapshot.seven_day_pct >= 0.0 && snapshot.seven_day_pct <= 100.0,
-                "seven_day_pct out of range: {}", snapshot.seven_day_pct);
-            assert!(snapshot.weekly_scoped_pct >= 0.0 && snapshot.weekly_scoped_pct <= 100.0,
-                "weekly_scoped_pct out of range: {}", snapshot.weekly_scoped_pct);
+            assert!(
+                snapshot.five_hour_pct >= 0.0 && snapshot.five_hour_pct <= 100.0,
+                "five_hour_pct out of range: {}",
+                snapshot.five_hour_pct
+            );
+            assert!(
+                snapshot.seven_day_pct >= 0.0 && snapshot.seven_day_pct <= 100.0,
+                "seven_day_pct out of range: {}",
+                snapshot.seven_day_pct
+            );
+            assert!(
+                snapshot.weekly_scoped_pct >= 0.0 && snapshot.weekly_scoped_pct <= 100.0,
+                "weekly_scoped_pct out of range: {}",
+                snapshot.weekly_scoped_pct
+            );
         }
     }
 
@@ -741,8 +756,8 @@ mod tests {
         // Create current snapshot with +10% increase across all windows
         let curr = make_snapshot(
             prev.taken_at + chrono::Duration::hours(5),
-            prev.five_hour_pct * 1.10,        // 12.5% → 13.75%
-            prev.seven_day_pct * 1.10,        // 45.2% → 49.72%
+            prev.five_hour_pct * 1.10,     // 12.5% → 13.75%
+            prev.seven_day_pct * 1.10,     // 45.2% → 49.72%
             prev.weekly_scoped_pct * 1.10, // 38.7% → 42.57%
         );
 
@@ -752,29 +767,50 @@ mod tests {
         let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
-        assert!(delta_5h > 0.0, "5h delta should be positive with +10% increase");
-        assert!(delta_7d > 0.0, "7d delta should be positive with +10% increase");
-        assert!(delta_7ds > 0.0, "7ds delta should be positive with +10% increase");
+        assert!(
+            delta_5h > 0.0,
+            "5h delta should be positive with +10% increase"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7d delta should be positive with +10% increase"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7ds delta should be positive with +10% increase"
+        );
 
         // Verify exact delta values (within floating-point tolerance)
-        let expected_5h = 1.25;   // 12.5 * 0.10
-        let expected_7d = 4.52;   // 45.2 * 0.10
-        let expected_7ds = 3.87;  // 38.7 * 0.10
+        let expected_5h = 1.25; // 12.5 * 0.10
+        let expected_7d = 4.52; // 45.2 * 0.10
+        let expected_7ds = 3.87; // 38.7 * 0.10
 
-        assert!((delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
-            "5h delta should be +{expected_5h}% (10% of baseline), got {delta_5h}");
-        assert!((delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
-            "7d delta should be +{expected_7d}% (10% of baseline), got {delta_7d}");
-        assert!((delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +{expected_7ds}% (10% of baseline), got {delta_7ds}");
+        assert!(
+            (delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
+            "5h delta should be +{expected_5h}% (10% of baseline), got {delta_5h}"
+        );
+        assert!(
+            (delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
+            "7d delta should be +{expected_7d}% (10% of baseline), got {delta_7d}"
+        );
+        assert!(
+            (delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +{expected_7ds}% (10% of baseline), got {delta_7ds}"
+        );
 
         // Verify current snapshot values are exactly 10% higher
-        assert!((curr.five_hour_pct - prev.five_hour_pct * 1.10).abs() < DELTA_TOLERANCE,
-            "Current 5h should be 10% higher than previous");
-        assert!((curr.seven_day_pct - prev.seven_day_pct * 1.10).abs() < DELTA_TOLERANCE,
-            "Current 7d should be 10% higher than previous");
-        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.10).abs() < DELTA_TOLERANCE,
-            "Current 7ds should be 10% higher than previous");
+        assert!(
+            (curr.five_hour_pct - prev.five_hour_pct * 1.10).abs() < DELTA_TOLERANCE,
+            "Current 5h should be 10% higher than previous"
+        );
+        assert!(
+            (curr.seven_day_pct - prev.seven_day_pct * 1.10).abs() < DELTA_TOLERANCE,
+            "Current 7d should be 10% higher than previous"
+        );
+        assert!(
+            (curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.10).abs() < DELTA_TOLERANCE,
+            "Current 7ds should be 10% higher than previous"
+        );
     }
 
     /// Test consecutive snapshots with +25% increase for all three window types.
@@ -798,8 +834,8 @@ mod tests {
         // Create current snapshot with +25% increase across all windows
         let curr = make_snapshot(
             prev.taken_at + chrono::Duration::hours(5),
-            prev.five_hour_pct * 1.25,        // 12.5% → 15.625%
-            prev.seven_day_pct * 1.25,        // 45.2% → 56.5%
+            prev.five_hour_pct * 1.25,     // 12.5% → 15.625%
+            prev.seven_day_pct * 1.25,     // 45.2% → 56.5%
             prev.weekly_scoped_pct * 1.25, // 38.7% → 48.375%
         );
 
@@ -809,29 +845,50 @@ mod tests {
         let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
-        assert!(delta_5h > 0.0, "5h delta should be positive with +25% increase");
-        assert!(delta_7d > 0.0, "7d delta should be positive with +25% increase");
-        assert!(delta_7ds > 0.0, "7ds delta should be positive with +25% increase");
+        assert!(
+            delta_5h > 0.0,
+            "5h delta should be positive with +25% increase"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7d delta should be positive with +25% increase"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7ds delta should be positive with +25% increase"
+        );
 
         // Verify exact delta values (within floating-point tolerance)
-        let expected_5h = 3.125;  // 12.5 * 0.25
-        let expected_7d = 11.3;    // 45.2 * 0.25
+        let expected_5h = 3.125; // 12.5 * 0.25
+        let expected_7d = 11.3; // 45.2 * 0.25
         let expected_7ds = 9.675; // 38.7 * 0.25
 
-        assert!((delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
-            "5h delta should be +{expected_5h}% (25% of baseline), got {delta_5h}");
-        assert!((delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
-            "7d delta should be +{expected_7d}% (25% of baseline), got {delta_7d}");
-        assert!((delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +{expected_7ds}% (25% of baseline), got {delta_7ds}");
+        assert!(
+            (delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
+            "5h delta should be +{expected_5h}% (25% of baseline), got {delta_5h}"
+        );
+        assert!(
+            (delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
+            "7d delta should be +{expected_7d}% (25% of baseline), got {delta_7d}"
+        );
+        assert!(
+            (delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +{expected_7ds}% (25% of baseline), got {delta_7ds}"
+        );
 
         // Verify current snapshot values are exactly 25% higher
-        assert!((curr.five_hour_pct - prev.five_hour_pct * 1.25).abs() < DELTA_TOLERANCE,
-            "Current 5h should be 25% higher than previous");
-        assert!((curr.seven_day_pct - prev.seven_day_pct * 1.25).abs() < DELTA_TOLERANCE,
-            "Current 7d should be 25% higher than previous");
-        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.25).abs() < DELTA_TOLERANCE,
-            "Current 7ds should be 25% higher than previous");
+        assert!(
+            (curr.five_hour_pct - prev.five_hour_pct * 1.25).abs() < DELTA_TOLERANCE,
+            "Current 5h should be 25% higher than previous"
+        );
+        assert!(
+            (curr.seven_day_pct - prev.seven_day_pct * 1.25).abs() < DELTA_TOLERANCE,
+            "Current 7d should be 25% higher than previous"
+        );
+        assert!(
+            (curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.25).abs() < DELTA_TOLERANCE,
+            "Current 7ds should be 25% higher than previous"
+        );
     }
 
     /// Test consecutive snapshots with +50% increase for all three window types.
@@ -855,8 +912,8 @@ mod tests {
         // Create current snapshot with +50% increase across all windows
         let curr = make_snapshot(
             prev.taken_at + chrono::Duration::hours(5),
-            prev.five_hour_pct * 1.50,        // 12.5% → 18.75%
-            prev.seven_day_pct * 1.50,        // 45.2% → 67.8%
+            prev.five_hour_pct * 1.50,     // 12.5% → 18.75%
+            prev.seven_day_pct * 1.50,     // 45.2% → 67.8%
             prev.weekly_scoped_pct * 1.50, // 38.7% → 58.05%
         );
 
@@ -866,34 +923,64 @@ mod tests {
         let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased significantly)
-        assert!(delta_5h > 0.0, "5h delta should be positive with +50% increase");
-        assert!(delta_7d > 0.0, "7d delta should be positive with +50% increase");
-        assert!(delta_7ds > 0.0, "7ds delta should be positive with +50% increase");
+        assert!(
+            delta_5h > 0.0,
+            "5h delta should be positive with +50% increase"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7d delta should be positive with +50% increase"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7ds delta should be positive with +50% increase"
+        );
 
         // Verify exact delta values (within floating-point tolerance)
-        let expected_5h = 6.25;   // 12.5 * 0.50
-        let expected_7d = 22.6;   // 45.2 * 0.50
+        let expected_5h = 6.25; // 12.5 * 0.50
+        let expected_7d = 22.6; // 45.2 * 0.50
         let expected_7ds = 19.35; // 38.7 * 0.50
 
-        assert!((delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
-            "5h delta should be +{expected_5h}% (50% of baseline), got {delta_5h}");
-        assert!((delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
-            "7d delta should be +{expected_7d}% (50% of baseline), got {delta_7d}");
-        assert!((delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +{expected_7ds}% (50% of baseline), got {delta_7ds}");
+        assert!(
+            (delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
+            "5h delta should be +{expected_5h}% (50% of baseline), got {delta_5h}"
+        );
+        assert!(
+            (delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
+            "7d delta should be +{expected_7d}% (50% of baseline), got {delta_7d}"
+        );
+        assert!(
+            (delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +{expected_7ds}% (50% of baseline), got {delta_7ds}"
+        );
 
         // Verify current snapshot values are exactly 50% higher
-        assert!((curr.five_hour_pct - prev.five_hour_pct * 1.50).abs() < DELTA_TOLERANCE,
-            "Current 5h should be 50% higher than previous");
-        assert!((curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
-            "Current 7d should be 50% higher than previous");
-        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.50).abs() < DELTA_TOLERANCE,
-            "Current 7ds should be 50% higher than previous");
+        assert!(
+            (curr.five_hour_pct - prev.five_hour_pct * 1.50).abs() < DELTA_TOLERANCE,
+            "Current 5h should be 50% higher than previous"
+        );
+        assert!(
+            (curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
+            "Current 7d should be 50% higher than previous"
+        );
+        assert!(
+            (curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.50).abs() < DELTA_TOLERANCE,
+            "Current 7ds should be 50% higher than previous"
+        );
 
         // Verify the +50% increase is significant (larger than +10% and +25%)
-        assert!(delta_5h > 3.125, "50% increase 5h delta should exceed 25% increase delta");
-        assert!(delta_7d > 11.3, "50% increase 7d delta should exceed 25% increase delta");
-        assert!(delta_7ds > 9.675, "50% increase 7ds delta should exceed 25% increase delta");
+        assert!(
+            delta_5h > 3.125,
+            "50% increase 5h delta should exceed 25% increase delta"
+        );
+        assert!(
+            delta_7d > 11.3,
+            "50% increase 7d delta should exceed 25% increase delta"
+        );
+        assert!(
+            delta_7ds > 9.675,
+            "50% increase 7ds delta should exceed 25% increase delta"
+        );
     }
 
     /// Test consecutive snapshots with mixed realistic increases across window types.
@@ -917,8 +1004,8 @@ mod tests {
         // Create current snapshot with different increases per window
         let curr = make_snapshot(
             prev.taken_at + chrono::Duration::hours(5),
-            prev.five_hour_pct * 1.15,        // 12.5% → 14.375% (+15%)
-            prev.seven_day_pct * 1.20,        // 45.2% → 54.24% (+20%)
+            prev.five_hour_pct * 1.15,     // 12.5% → 14.375% (+15%)
+            prev.seven_day_pct * 1.20,     // 45.2% → 54.24% (+20%)
             prev.weekly_scoped_pct * 1.30, // 38.7% → 50.31% (+30%)
         );
 
@@ -928,33 +1015,60 @@ mod tests {
         let delta_7ds = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify all deltas are positive (usage increased)
-        assert!(delta_5h > 0.0, "5h delta should be positive with +15% increase");
-        assert!(delta_7d > 0.0, "7d delta should be positive with +20% increase");
-        assert!(delta_7ds > 0.0, "7ds delta should be positive with +30% increase");
+        assert!(
+            delta_5h > 0.0,
+            "5h delta should be positive with +15% increase"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7d delta should be positive with +20% increase"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7ds delta should be positive with +30% increase"
+        );
 
         // Verify exact delta values (within floating-point tolerance)
-        let expected_5h = 1.875;  // 12.5 * 0.15
-        let expected_7d = 9.04;   // 45.2 * 0.20
-        let expected_7ds = 11.61;  // 38.7 * 0.30
+        let expected_5h = 1.875; // 12.5 * 0.15
+        let expected_7d = 9.04; // 45.2 * 0.20
+        let expected_7ds = 11.61; // 38.7 * 0.30
 
-        assert!((delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
-            "5h delta should be +{expected_5h}% (15% of baseline), got {delta_5h}");
-        assert!((delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
-            "7d delta should be +{expected_7d}% (20% of baseline), got {delta_7d}");
-        assert!((delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +{expected_7ds}% (30% of baseline), got {delta_7ds}");
+        assert!(
+            (delta_5h - expected_5h).abs() < DELTA_TOLERANCE,
+            "5h delta should be +{expected_5h}% (15% of baseline), got {delta_5h}"
+        );
+        assert!(
+            (delta_7d - expected_7d).abs() < DELTA_TOLERANCE,
+            "7d delta should be +{expected_7d}% (20% of baseline), got {delta_7d}"
+        );
+        assert!(
+            (delta_7ds - expected_7ds).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +{expected_7ds}% (30% of baseline), got {delta_7ds}"
+        );
 
         // Verify each window increased by its expected percentage
-        assert!((curr.five_hour_pct - prev.five_hour_pct * 1.15).abs() < DELTA_TOLERANCE,
-            "Current 5h should be 15% higher than previous");
-        assert!((curr.seven_day_pct - prev.seven_day_pct * 1.20).abs() < DELTA_TOLERANCE,
-            "Current 7d should be 20% higher than previous");
-        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.30).abs() < DELTA_TOLERANCE,
-            "Current 7ds should be 30% higher than previous");
+        assert!(
+            (curr.five_hour_pct - prev.five_hour_pct * 1.15).abs() < DELTA_TOLERANCE,
+            "Current 5h should be 15% higher than previous"
+        );
+        assert!(
+            (curr.seven_day_pct - prev.seven_day_pct * 1.20).abs() < DELTA_TOLERANCE,
+            "Current 7d should be 20% higher than previous"
+        );
+        assert!(
+            (curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.30).abs() < DELTA_TOLERANCE,
+            "Current 7ds should be 30% higher than previous"
+        );
 
         // Verify deltas increase with the percentage increase
-        assert!(delta_7ds > delta_7d, "30% increase delta should exceed 20% increase delta");
-        assert!(delta_7d > delta_5h, "20% increase delta should exceed 15% increase delta");
+        assert!(
+            delta_7ds > delta_7d,
+            "30% increase delta should exceed 20% increase delta"
+        );
+        assert!(
+            delta_7d > delta_5h,
+            "20% increase delta should exceed 15% increase delta"
+        );
     }
 
     /// Test that existing fixture snapshots produce correct positive deltas.
@@ -971,17 +1085,32 @@ mod tests {
         let delta_7d = curr_5h.seven_day_pct - prev_5h.seven_day_pct;
         let delta_7ds = curr_5h.weekly_scoped_pct - prev_5h.weekly_scoped_pct;
 
-        assert!(delta_5h > 0.0, "5h window should show positive increase after 5 hours");
-        assert!((delta_5h - 5.7).abs() < DELTA_TOLERANCE,
-            "5h delta should be +5.7% (18.2 - 12.5), got {delta_5h}");
+        assert!(
+            delta_5h > 0.0,
+            "5h window should show positive increase after 5 hours"
+        );
+        assert!(
+            (delta_5h - 5.7).abs() < DELTA_TOLERANCE,
+            "5h delta should be +5.7% (18.2 - 12.5), got {delta_5h}"
+        );
 
-        assert!(delta_7d > 0.0, "7d window should show positive increase after 5 hours");
-        assert!((delta_7d - 1.6).abs() < DELTA_TOLERANCE,
-            "7d delta should be +1.6% (46.8 - 45.2), got {delta_7d}");
+        assert!(
+            delta_7d > 0.0,
+            "7d window should show positive increase after 5 hours"
+        );
+        assert!(
+            (delta_7d - 1.6).abs() < DELTA_TOLERANCE,
+            "7d delta should be +1.6% (46.8 - 45.2), got {delta_7d}"
+        );
 
-        assert!(delta_7ds > 0.0, "7ds window should show positive increase after 5 hours");
-        assert!((delta_7ds - 1.6).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +1.6% (40.3 - 38.7), got {delta_7ds}");
+        assert!(
+            delta_7ds > 0.0,
+            "7ds window should show positive increase after 5 hours"
+        );
+        assert!(
+            (delta_7ds - 1.6).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +1.6% (40.3 - 38.7), got {delta_7ds}"
+        );
 
         // Test baseline → after_7d (7-day window increase)
         let (prev_7d, curr_7d) = snapshot_pair_7d();
@@ -990,26 +1119,42 @@ mod tests {
         let delta_7ds_7d = curr_7d.weekly_scoped_pct - prev_7d.weekly_scoped_pct;
 
         // 5-hour window reset, so we verify it changed (not necessarily positive)
-        assert!((delta_5h_7d - 3.3).abs() < DELTA_TOLERANCE,
-            "5h delta after 7d should be +3.3% (15.8 - 12.5), got {delta_5h_7d}");
+        assert!(
+            (delta_5h_7d - 3.3).abs() < DELTA_TOLERANCE,
+            "5h delta after 7d should be +3.3% (15.8 - 12.5), got {delta_5h_7d}"
+        );
 
-        assert!(delta_7d_7d > 0.0, "7d window should show positive increase after 7 days");
-        assert!((delta_7d_7d - 7.2).abs() < DELTA_TOLERANCE,
-            "7d delta should be +7.2% (52.4 - 45.2), got {delta_7d_7d}");
+        assert!(
+            delta_7d_7d > 0.0,
+            "7d window should show positive increase after 7 days"
+        );
+        assert!(
+            (delta_7d_7d - 7.2).abs() < DELTA_TOLERANCE,
+            "7d delta should be +7.2% (52.4 - 45.2), got {delta_7d_7d}"
+        );
 
-        assert!(delta_7ds_7d > 0.0, "7ds window should show positive increase after 7 days");
-        assert!((delta_7ds_7d - 7.4).abs() < DELTA_TOLERANCE,
-            "7ds delta should be +7.4% (46.1 - 38.7), got {delta_7ds_7d}");
+        assert!(
+            delta_7ds_7d > 0.0,
+            "7ds window should show positive increase after 7 days"
+        );
+        assert!(
+            (delta_7ds_7d - 7.4).abs() < DELTA_TOLERANCE,
+            "7ds delta should be +7.4% (46.1 - 38.7), got {delta_7ds_7d}"
+        );
 
         // Test baseline → after_7ds (same as after_7d)
         let (prev_7ds, curr_7ds) = snapshot_pair_7ds();
         let delta_7d_7ds = curr_7ds.seven_day_pct - prev_7ds.seven_day_pct;
         let delta_7ds_7ds = curr_7ds.weekly_scoped_pct - prev_7ds.weekly_scoped_pct;
 
-        assert!((delta_7d_7ds - delta_7d_7d).abs() < DELTA_TOLERANCE,
-            "7ds snapshot should produce same 7d delta as 7d snapshot");
-        assert!((delta_7ds_7ds - delta_7ds_7d).abs() < DELTA_TOLERANCE,
-            "7ds snapshot should produce same 7ds delta as 7d snapshot");
+        assert!(
+            (delta_7d_7ds - delta_7d_7d).abs() < DELTA_TOLERANCE,
+            "7ds snapshot should produce same 7d delta as 7d snapshot"
+        );
+        assert!(
+            (delta_7ds_7ds - delta_7ds_7d).abs() < DELTA_TOLERANCE,
+            "7ds snapshot should produce same 7ds delta as 7d snapshot"
+        );
     }
 
     /// Test delta computation accuracy with extreme percentage increases.
@@ -1033,12 +1178,18 @@ mod tests {
         let delta_7d_75 = curr_75.seven_day_pct - prev.seven_day_pct;
         let delta_7ds_75 = curr_75.weekly_scoped_pct - prev.weekly_scoped_pct;
 
-        assert!((delta_5h_75 - 9.375).abs() < DELTA_TOLERANCE,
-            "75% increase 5h delta should be +9.375%, got {delta_5h_75}");
-        assert!((delta_7d_75 - 33.9).abs() < DELTA_TOLERANCE,
-            "75% increase 7d delta should be +33.9%, got {delta_7d_75}");
-        assert!((delta_7ds_75 - 29.025).abs() < DELTA_TOLERANCE,
-            "75% increase 7ds delta should be +29.025%, got {delta_7ds_75}");
+        assert!(
+            (delta_5h_75 - 9.375).abs() < DELTA_TOLERANCE,
+            "75% increase 5h delta should be +9.375%, got {delta_5h_75}"
+        );
+        assert!(
+            (delta_7d_75 - 33.9).abs() < DELTA_TOLERANCE,
+            "75% increase 7d delta should be +33.9%, got {delta_7d_75}"
+        );
+        assert!(
+            (delta_7ds_75 - 29.025).abs() < DELTA_TOLERANCE,
+            "75% increase 7ds delta should be +29.025%, got {delta_7ds_75}"
+        );
 
         // Test +100% increase (doubling)
         let curr_100 = make_snapshot(
@@ -1052,20 +1203,32 @@ mod tests {
         let delta_7d_100 = curr_100.seven_day_pct - prev.seven_day_pct;
         let delta_7ds_100 = curr_100.weekly_scoped_pct - prev.weekly_scoped_pct;
 
-        assert!((delta_5h_100 - 12.5).abs() < DELTA_TOLERANCE,
-            "100% increase 5h delta should be +12.5%, got {delta_5h_100}");
-        assert!((delta_7d_100 - 45.2).abs() < DELTA_TOLERANCE,
-            "100% increase 7d delta should be +45.2%, got {delta_7d_100}");
-        assert!((delta_7ds_100 - 38.7).abs() < DELTA_TOLERANCE,
-            "100% increase 7ds delta should be +38.7%, got {delta_7ds_100}");
+        assert!(
+            (delta_5h_100 - 12.5).abs() < DELTA_TOLERANCE,
+            "100% increase 5h delta should be +12.5%, got {delta_5h_100}"
+        );
+        assert!(
+            (delta_7d_100 - 45.2).abs() < DELTA_TOLERANCE,
+            "100% increase 7d delta should be +45.2%, got {delta_7d_100}"
+        );
+        assert!(
+            (delta_7ds_100 - 38.7).abs() < DELTA_TOLERANCE,
+            "100% increase 7ds delta should be +38.7%, got {delta_7ds_100}"
+        );
 
         // Verify 100% increase is exactly double the 50% increase
-        assert!((delta_5h_100 - 2.0 * 6.25).abs() < DELTA_TOLERANCE,
-            "100% increase delta should be exactly 2x 50% increase delta");
-        assert!((delta_7d_100 - 2.0 * 22.6).abs() < DELTA_TOLERANCE,
-            "100% increase delta should be exactly 2x 50% increase delta");
-        assert!((delta_7ds_100 - 2.0 * 19.35).abs() < DELTA_TOLERANCE,
-            "100% increase delta should be exactly 2x 50% increase delta");
+        assert!(
+            (delta_5h_100 - 2.0 * 6.25).abs() < DELTA_TOLERANCE,
+            "100% increase delta should be exactly 2x 50% increase delta"
+        );
+        assert!(
+            (delta_7d_100 - 2.0 * 22.6).abs() < DELTA_TOLERANCE,
+            "100% increase delta should be exactly 2x 50% increase delta"
+        );
+        assert!(
+            (delta_7ds_100 - 2.0 * 19.35).abs() < DELTA_TOLERANCE,
+            "100% increase delta should be exactly 2x 50% increase delta"
+        );
     }
 
     /// Test that delta computation is consistent across multiple consecutive polls.
@@ -1081,15 +1244,15 @@ mod tests {
         // Create three consecutive snapshots
         let mid = make_snapshot(
             prev.taken_at + chrono::Duration::hours(5),
-            prev.five_hour_pct * 1.25,        // +25% at step 1
-            prev.seven_day_pct * 1.20,        // +20% at step 1
+            prev.five_hour_pct * 1.25,     // +25% at step 1
+            prev.seven_day_pct * 1.20,     // +20% at step 1
             prev.weekly_scoped_pct * 1.15, // +15% at step 1
         );
 
         let curr = make_snapshot(
             mid.taken_at + chrono::Duration::hours(5),
-            mid.five_hour_pct * 1.20,        // Additional +20% at step 2
-            mid.seven_day_pct * 1.25,        // Additional +25% at step 2
+            mid.five_hour_pct * 1.20,     // Additional +20% at step 2
+            mid.seven_day_pct * 1.25,     // Additional +25% at step 2
             mid.weekly_scoped_pct * 1.30, // Additional +30% at step 2
         );
 
@@ -1108,23 +1271,35 @@ mod tests {
         let delta_7ds_total = curr.weekly_scoped_pct - prev.weekly_scoped_pct;
 
         // Verify additivity: total = step1 + step2
-        assert!((delta_5h_total - (delta_5h_step1 + delta_5h_step2)).abs() < DELTA_TOLERANCE,
-            "Total 5h delta should equal sum of step deltas");
-        assert!((delta_7d_total - (delta_7d_step1 + delta_7d_step2)).abs() < DELTA_TOLERANCE,
-            "Total 7d delta should equal sum of step deltas");
-        assert!((delta_7ds_total - (delta_7ds_step1 + delta_7ds_step2)).abs() < DELTA_TOLERANCE,
-            "Total 7ds delta should equal sum of step deltas");
+        assert!(
+            (delta_5h_total - (delta_5h_step1 + delta_5h_step2)).abs() < DELTA_TOLERANCE,
+            "Total 5h delta should equal sum of step deltas"
+        );
+        assert!(
+            (delta_7d_total - (delta_7d_step1 + delta_7d_step2)).abs() < DELTA_TOLERANCE,
+            "Total 7d delta should equal sum of step deltas"
+        );
+        assert!(
+            (delta_7ds_total - (delta_7ds_step1 + delta_7ds_step2)).abs() < DELTA_TOLERANCE,
+            "Total 7ds delta should equal sum of step deltas"
+        );
 
         // Verify the compounded percentages
         // 5h: 1.25 * 1.20 = 1.50 (total +50%)
-        assert!((curr.five_hour_pct - prev.five_hour_pct * 1.50).abs() < DELTA_TOLERANCE,
-            "Compounded 5h increase should be +50%");
+        assert!(
+            (curr.five_hour_pct - prev.five_hour_pct * 1.50).abs() < DELTA_TOLERANCE,
+            "Compounded 5h increase should be +50%"
+        );
         // 7d: 1.20 * 1.25 = 1.50 (total +50%)
-        assert!((curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
-            "Compounded 7d increase should be +50%");
+        assert!(
+            (curr.seven_day_pct - prev.seven_day_pct * 1.50).abs() < DELTA_TOLERANCE,
+            "Compounded 7d increase should be +50%"
+        );
         // 7ds: 1.15 * 1.30 = 1.495 (total +49.5%)
-        assert!((curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.495).abs() < DELTA_TOLERANCE,
-            "Compounded 7ds increase should be +49.5%");
+        assert!(
+            (curr.weekly_scoped_pct - prev.weekly_scoped_pct * 1.495).abs() < DELTA_TOLERANCE,
+            "Compounded 7ds increase should be +49.5%"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1136,10 +1311,14 @@ mod tests {
         let snapshot = weekly_scoped_present_snapshot();
 
         // Verify weekly_scoped has real utilization data (not zero)
-        assert!(snapshot.weekly_scoped_pct > 0.0,
-            "weekly_scoped_present_snapshot should have non-zero utilization");
-        assert_eq!(snapshot.weekly_scoped_pct, 72.5,
-            "weekly_scoped should match the expected utilization");
+        assert!(
+            snapshot.weekly_scoped_pct > 0.0,
+            "weekly_scoped_present_snapshot should have non-zero utilization"
+        );
+        assert_eq!(
+            snapshot.weekly_scoped_pct, 72.5,
+            "weekly_scoped should match the expected utilization"
+        );
 
         // Verify other windows have realistic values
         assert_eq!(snapshot.five_hour_pct, 15.3);
@@ -1155,8 +1334,10 @@ mod tests {
         let snapshot = weekly_scoped_absent_snapshot();
 
         // Verify weekly_scoped is zero (absent from API)
-        assert_eq!(snapshot.weekly_scoped_pct, 0.0,
-            "weekly_scoped_absent_snapshot should have 0% utilization (absent from API)");
+        assert_eq!(
+            snapshot.weekly_scoped_pct, 0.0,
+            "weekly_scoped_absent_snapshot should have 0% utilization (absent from API)"
+        );
 
         // Verify other windows still have values (they're present)
         assert_eq!(snapshot.five_hour_pct, 15.8);
@@ -1165,8 +1346,11 @@ mod tests {
         // Verify timestamp is 5 minutes after the present snapshot
         let present_time = weekly_scoped_present_snapshot().taken_at;
         let elapsed = snapshot.taken_at.signed_duration_since(present_time);
-        assert_eq!(elapsed.num_minutes(), 5,
-            "absent snapshot should be 5 minutes after present snapshot");
+        assert_eq!(
+            elapsed.num_minutes(),
+            5,
+            "absent snapshot should be 5 minutes after present snapshot"
+        );
     }
 
     #[test]
@@ -1174,18 +1358,25 @@ mod tests {
         let (prev, curr) = snapshot_pair_weekly_scoped_first_absence();
 
         // Verify previous has data
-        assert!(prev.weekly_scoped_pct > 0.0,
-            "previous snapshot should have utilization data");
+        assert!(
+            prev.weekly_scoped_pct > 0.0,
+            "previous snapshot should have utilization data"
+        );
         assert_eq!(prev.weekly_scoped_pct, 72.5);
 
         // Verify current shows absence
-        assert_eq!(curr.weekly_scoped_pct, 0.0,
-            "current snapshot should show absence (0%)");
+        assert_eq!(
+            curr.weekly_scoped_pct, 0.0,
+            "current snapshot should show absence (0%)"
+        );
 
         // Verify this represents the first absence (consecutive count would be 1)
         let elapsed = curr.taken_at.signed_duration_since(prev.taken_at);
-        assert_eq!(elapsed.num_minutes(), 5,
-            "transition should occur over 5 minutes (one poll interval)");
+        assert_eq!(
+            elapsed.num_minutes(),
+            5,
+            "transition should occur over 5 minutes (one poll interval)"
+        );
     }
 
     #[test]
@@ -1193,32 +1384,51 @@ mod tests {
         let polls = weekly_scoped_absent_3_consecutive_polls();
 
         // Verify we have exactly 4 polls
-        assert_eq!(polls.len(), 4,
-            "should have 4 polls (baseline + 3 consecutive absences)");
+        assert_eq!(
+            polls.len(),
+            4,
+            "should have 4 polls (baseline + 3 consecutive absences)"
+        );
 
         // Verify poll 0: present with data
-        assert!(polls[0].weekly_scoped_pct > 0.0,
-            "poll 0 (baseline) should have utilization data");
+        assert!(
+            polls[0].weekly_scoped_pct > 0.0,
+            "poll 0 (baseline) should have utilization data"
+        );
         assert_eq!(polls[0].weekly_scoped_pct, 72.5);
 
         // Verify polls 1-3: all absent
         for (i, poll) in polls.iter().enumerate().skip(1) {
-            assert_eq!(poll.weekly_scoped_pct, 0.0,
-                "poll {} should show absence (0%)", i);
+            assert_eq!(
+                poll.weekly_scoped_pct, 0.0,
+                "poll {} should show absence (0%)",
+                i
+            );
         }
 
         // Verify timestamps are 60 seconds apart (consecutive polls)
         for i in 1..polls.len() {
-            let elapsed = polls[i].taken_at.signed_duration_since(polls[i-1].taken_at);
-            assert_eq!(elapsed.num_seconds(), 60,
-                "poll {} should be 60 seconds after poll {}", i, i-1);
+            let elapsed = polls[i]
+                .taken_at
+                .signed_duration_since(polls[i - 1].taken_at);
+            assert_eq!(
+                elapsed.num_seconds(),
+                60,
+                "poll {} should be 60 seconds after poll {}",
+                i,
+                i - 1
+            );
         }
 
         // Verify other windows show gradual increase (realistic usage)
-        assert!(polls[3].five_hour_pct > polls[0].five_hour_pct,
-            "5-hour window should show increase over 3 minutes");
-        assert!(polls[3].seven_day_pct > polls[0].seven_day_pct,
-            "7-day window should show increase over 3 minutes");
+        assert!(
+            polls[3].five_hour_pct > polls[0].five_hour_pct,
+            "5-hour window should show increase over 3 minutes"
+        );
+        assert!(
+            polls[3].seven_day_pct > polls[0].seven_day_pct,
+            "7-day window should show increase over 3 minutes"
+        );
     }
 
     #[test]
@@ -1226,25 +1436,40 @@ mod tests {
         let polls = weekly_scoped_present_3_consecutive_polls();
 
         // Verify we have exactly 4 polls
-        assert_eq!(polls.len(), 4,
-            "should have 4 polls (baseline + 3 consecutive present polls)");
+        assert_eq!(
+            polls.len(),
+            4,
+            "should have 4 polls (baseline + 3 consecutive present polls)"
+        );
 
         // Verify ALL polls have weekly_scoped data
         for (i, poll) in polls.iter().enumerate() {
-            assert!(poll.weekly_scoped_pct > 0.0,
-                "poll {} should have utilization data (present)", i);
+            assert!(
+                poll.weekly_scoped_pct > 0.0,
+                "poll {} should have utilization data (present)",
+                i
+            );
         }
 
         // Verify timestamps are 60 seconds apart (consecutive polls)
         for i in 1..polls.len() {
-            let elapsed = polls[i].taken_at.signed_duration_since(polls[i-1].taken_at);
-            assert_eq!(elapsed.num_seconds(), 60,
-                "poll {} should be 60 seconds after poll {}", i, i-1);
+            let elapsed = polls[i]
+                .taken_at
+                .signed_duration_since(polls[i - 1].taken_at);
+            assert_eq!(
+                elapsed.num_seconds(),
+                60,
+                "poll {} should be 60 seconds after poll {}",
+                i,
+                i - 1
+            );
         }
 
         // Verify weekly_scoped shows gradual increase (realistic usage)
-        assert!(polls[3].weekly_scoped_pct > polls[0].weekly_scoped_pct,
-            "weekly_scoped should show increase over 3 minutes");
+        assert!(
+            polls[3].weekly_scoped_pct > polls[0].weekly_scoped_pct,
+            "weekly_scoped should show increase over 3 minutes"
+        );
 
         // Verify the progression: 72.5 → 73.1 → 73.8 → 74.5
         assert_eq!(polls[0].weekly_scoped_pct, 72.5);
@@ -1257,25 +1482,38 @@ mod tests {
     fn test_weekly_scoped_absent_vs_present_sequences_are_mutually_exclusive() {
         // The absent sequence: poll 0 has data, polls 1-3 are absent
         let absent_polls = weekly_scoped_absent_3_consecutive_polls();
-        assert!(absent_polls[0].weekly_scoped_pct > 0.0,
-            "absent sequence: poll 0 should have data");
-        assert_eq!(absent_polls[1].weekly_scoped_pct, 0.0,
-            "absent sequence: poll 1 should be absent");
-        assert_eq!(absent_polls[2].weekly_scoped_pct, 0.0,
-            "absent sequence: poll 2 should be absent");
-        assert_eq!(absent_polls[3].weekly_scoped_pct, 0.0,
-            "absent sequence: poll 3 should be absent");
+        assert!(
+            absent_polls[0].weekly_scoped_pct > 0.0,
+            "absent sequence: poll 0 should have data"
+        );
+        assert_eq!(
+            absent_polls[1].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 1 should be absent"
+        );
+        assert_eq!(
+            absent_polls[2].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 2 should be absent"
+        );
+        assert_eq!(
+            absent_polls[3].weekly_scoped_pct, 0.0,
+            "absent sequence: poll 3 should be absent"
+        );
 
         // The present sequence: ALL polls have data
         let present_polls = weekly_scoped_present_3_consecutive_polls();
         for (i, poll) in present_polls.iter().enumerate() {
-            assert!(poll.weekly_scoped_pct > 0.0,
-                "present sequence: poll {} should have data", i);
+            assert!(
+                poll.weekly_scoped_pct > 0.0,
+                "present sequence: poll {} should have data",
+                i
+            );
         }
 
         // Verify the scenarios are truly different
-        assert_ne!(absent_polls[3].weekly_scoped_pct, present_polls[3].weekly_scoped_pct,
-            "final poll state should differ between scenarios");
+        assert_ne!(
+            absent_polls[3].weekly_scoped_pct, present_polls[3].weekly_scoped_pct,
+            "final poll state should differ between scenarios"
+        );
     }
 
     #[test]
@@ -1295,14 +1533,18 @@ mod tests {
 
             // Verify the counter reaches exactly 3 after the final poll
             if i == 3 {
-                assert_eq!(consecutive_absent_count, min_threshold,
-                    "after 3 consecutive absences, counter should reach MIN_CONSECUTIVE_ABSENT (3)");
+                assert_eq!(
+                    consecutive_absent_count, min_threshold,
+                    "after 3 consecutive absences, counter should reach MIN_CONSECUTIVE_ABSENT (3)"
+                );
             }
         }
 
         // Final verification: counter is 3, meaning window should be excluded
-        assert_eq!(consecutive_absent_count, 3,
-            "consecutive absent count should be exactly 3 at end of sequence");
+        assert_eq!(
+            consecutive_absent_count, 3,
+            "consecutive absent count should be exactly 3 at end of sequence"
+        );
     }
 
     #[test]
@@ -1321,12 +1563,16 @@ mod tests {
             }
 
             // Verify the counter NEVER reaches 3
-            assert!(consecutive_absent_count < min_threshold,
-                "consecutive absent count should stay below threshold when window is present");
+            assert!(
+                consecutive_absent_count < min_threshold,
+                "consecutive absent count should stay below threshold when window is present"
+            );
         }
 
         // Final verification: counter is 0, meaning window should NOT be excluded
-        assert_eq!(consecutive_absent_count, 0,
-            "consecutive absent count should be 0 when window is always present");
+        assert_eq!(
+            consecutive_absent_count, 0,
+            "consecutive absent count should be 0 when window is always present"
+        );
     }
 }

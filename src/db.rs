@@ -760,9 +760,8 @@ pub fn annotate_window_pct_deltas(
     let t0_str = t0.to_rfc3339();
     let t1_str = t1.to_rfc3339();
 
-    let mut instance_stmt = conn.prepare(
-        "SELECT rowid, sess, total_usd FROM i WHERE t0 = ? AND t1 = ?"
-    )?;
+    let mut instance_stmt =
+        conn.prepare("SELECT rowid, sess, total_usd FROM i WHERE t0 = ? AND t1 = ?")?;
 
     let instances: Vec<(i64, String, f64)> = instance_stmt
         .query_map(params![&t0_str, &t1_str], |row| {
@@ -830,11 +829,13 @@ pub fn annotate_window_pct_deltas(
         // Compute usd_per_pct_7ds for the fleet record
         let usd_per_pct_7ds = if delta_7ds > 0.0 {
             // Query total_usd from the fleet record we just updated
-            let fleet_total_usd: f64 = tx.query_row(
-                "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
-                params![&t0_str, &t1_str],
-                |row| row.get(0)
-            ).unwrap_or(0.0);
+            let fleet_total_usd: f64 = tx
+                .query_row(
+                    "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
+                    params![&t0_str, &t1_str],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0.0);
             fleet_total_usd / delta_7ds
         } else {
             0.0
@@ -1248,16 +1249,15 @@ mod tests {
         };
 
         let result = annotate_window_pct_deltas(
-            &conn,
-            t0_parsed,
-            t1_parsed,
-            &old_pct,
-            &new_pct,
-            2, // workers_at_start
+            &conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 2, // workers_at_start
             2, // workers_at_end
         );
 
-        assert!(result.is_ok(), "annotate_window_pct_deltas should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "annotate_window_pct_deltas should succeed: {:?}",
+            result
+        );
 
         // Verify instance apportioning:
         // - session-a (0.10 usd): 0.8 * (0.10 / 0.40) = 0.2
@@ -1277,8 +1277,16 @@ mod tests {
             )
             .unwrap();
 
-        assert!((p7ds_a - 0.2).abs() < 1e-6, "session-a should get p7ds=0.2, got {}", p7ds_a);
-        assert!((p7ds_b - 0.6).abs() < 1e-6, "session-b should get p7ds=0.6, got {}", p7ds_b);
+        assert!(
+            (p7ds_a - 0.2).abs() < 1e-6,
+            "session-a should get p7ds=0.2, got {}",
+            p7ds_a
+        );
+        assert!(
+            (p7ds_b - 0.6).abs() < 1e-6,
+            "session-b should get p7ds=0.6, got {}",
+            p7ds_b
+        );
 
         // Verify fleet record gets full delta (0.8)
         let fleet_p7ds: f64 = conn
@@ -1289,7 +1297,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!((fleet_p7ds - 0.8).abs() < 1e-6, "fleet should get p7ds=0.8, got {}", fleet_p7ds);
+        assert!(
+            (fleet_p7ds - 0.8).abs() < 1e-6,
+            "fleet should get p7ds=0.8, got {}",
+            fleet_p7ds
+        );
 
         // Verify usd_per_pct_7ds is computed correctly: 0.40 / 0.8 = 0.5
         let usd_per_pct: f64 = conn
@@ -1300,7 +1312,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!((usd_per_pct - 0.5).abs() < 1e-6, "usd_per_pct_7ds should be 0.5, got {}", usd_per_pct);
+        assert!(
+            (usd_per_pct - 0.5).abs() < 1e-6,
+            "usd_per_pct_7ds should be 0.5, got {}",
+            usd_per_pct
+        );
     }
 
     #[test]
@@ -1351,18 +1367,13 @@ mod tests {
             weekly_scoped: 60.0,
         };
         let new_pct = WindowPctSnapshot {
-            five_hour: 42.0,   // delta_5h = 2.0
-            seven_day: 68.0,  // delta_7d = 3.0
-            weekly_scoped: 64.0,  // delta_7ds = 4.0
+            five_hour: 42.0,     // delta_5h = 2.0
+            seven_day: 68.0,     // delta_7d = 3.0
+            weekly_scoped: 64.0, // delta_7ds = 4.0
         };
 
         let result = annotate_window_pct_deltas(
-            &conn,
-            t0_parsed,
-            t1_parsed,
-            &old_pct,
-            &new_pct,
-            3, // workers_at_start
+            &conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 3, // workers_at_start
             3, // workers_at_end
         );
 
@@ -1379,9 +1390,19 @@ mod tests {
                 )
                 .unwrap();
 
-            assert!((p5h - 2.0 / 3.0).abs() < 1e-6, "session-{} p5h should be {}", i, 2.0 / 3.0);
+            assert!(
+                (p5h - 2.0 / 3.0).abs() < 1e-6,
+                "session-{} p5h should be {}",
+                i,
+                2.0 / 3.0
+            );
             assert!((p7d - 1.0).abs() < 1e-6, "session-{} p7d should be 1.0", i);
-            assert!((p7ds - 4.0 / 3.0).abs() < 1e-6, "session-{} p7ds should be {}", i, 4.0 / 3.0);
+            assert!(
+                (p7ds - 4.0 / 3.0).abs() < 1e-6,
+                "session-{} p7ds should be {}",
+                i,
+                4.0 / 3.0
+            );
         }
 
         // Fleet gets full deltas
@@ -1430,7 +1451,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(usd_per_pct_before.is_none(), "Before annotation, usd_per_pct_7ds should be NULL");
+        assert!(
+            usd_per_pct_before.is_none(),
+            "Before annotation, usd_per_pct_7ds should be NULL"
+        );
 
         // Annotate with p7ds = 0.8
         let old_pct = WindowPctSnapshot {
@@ -1444,16 +1468,7 @@ mod tests {
             weekly_scoped: 70.8,
         };
 
-        annotate_window_pct_deltas(
-            &conn,
-            t0_parsed,
-            t1_parsed,
-            &old_pct,
-            &new_pct,
-            1,
-            1,
-        )
-        .unwrap();
+        annotate_window_pct_deltas(&conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 1, 1).unwrap();
 
         // After annotation, usd_per_pct_7ds should be non-NULL
         let usd_per_pct_after: Option<f64> = conn
@@ -1464,10 +1479,17 @@ mod tests {
             )
             .unwrap();
 
-        assert!(usd_per_pct_after.is_some(), "After annotation, usd_per_pct_7ds should be non-NULL");
+        assert!(
+            usd_per_pct_after.is_some(),
+            "After annotation, usd_per_pct_7ds should be non-NULL"
+        );
         let value = usd_per_pct_after.unwrap();
         // total_usd = 0.40, p7ds = 0.8, so usd_per_pct_7ds = 0.40 / 0.8 = 0.5
-        assert!((value - 0.5).abs() < 1e-6, "usd_per_pct_7ds should be 0.5, got {}", value);
+        assert!(
+            (value - 0.5).abs() < 1e-6,
+            "usd_per_pct_7ds should be 0.5, got {}",
+            value
+        );
     }
 
     #[test]
@@ -1516,7 +1538,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(usd_per_pct_before.is_none(), "Before annotation, usd_per_pct_7ds should be NULL");
+        assert!(
+            usd_per_pct_before.is_none(),
+            "Before annotation, usd_per_pct_7ds should be NULL"
+        );
 
         // Annotate with p7ds = 0.8 (full fleet delta, split between instances)
         let old_pct = WindowPctSnapshot {
@@ -1530,16 +1555,7 @@ mod tests {
             weekly_scoped: 70.8,
         };
 
-        annotate_window_pct_deltas(
-            &conn,
-            t0_parsed,
-            t1_parsed,
-            &old_pct,
-            &new_pct,
-            2,
-            2,
-        )
-        .unwrap();
+        annotate_window_pct_deltas(&conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 2, 2).unwrap();
 
         // After annotation, usd_per_pct_7ds should be non-NULL
         // promo_check groups by (pk, hr_et, model) and computes SUM(total_usd) / p7ds
@@ -1568,12 +1584,19 @@ mod tests {
             )
             .unwrap();
 
-        assert!(usd_per_pct_after.is_some(), "After annotation, usd_per_pct_7ds should be non-NULL");
+        assert!(
+            usd_per_pct_after.is_some(),
+            "After annotation, usd_per_pct_7ds should be non-NULL"
+        );
 
         // The value should be non-zero and reasonable
         // Due to GROUP BY using an arbitrary p7ds from the group, we just check it's some value
         let value = usd_per_pct_after.unwrap();
-        assert!(value > 0.0, "usd_per_pct_7ds should be positive, got {}", value);
+        assert!(
+            value > 0.0,
+            "usd_per_pct_7ds should be positive, got {}",
+            value
+        );
     }
 
     #[test]
@@ -1607,6 +1630,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(usd_per_pct.is_none(), "usd_per_pct_7ds should be NULL when p7ds is NULL");
+        assert!(
+            usd_per_pct.is_none(),
+            "usd_per_pct_7ds should be NULL when p7ds is NULL"
+        );
     }
 }

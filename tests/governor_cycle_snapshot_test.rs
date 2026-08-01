@@ -11,9 +11,8 @@ use chrono::Utc;
 use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
 use claude_governor::db;
 use claude_governor::governor::{
-    compute_target_workers, apply_scaling, ScalingDecision,
-    WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED,
-    UsageSnapshot,
+    apply_scaling, compute_target_workers, ScalingDecision, UsageSnapshot, WINDOW_FIVE_HOUR,
+    WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED,
 };
 use claude_governor::state;
 
@@ -95,8 +94,7 @@ fn test_governor_cycle_with_snapshot() {
             let target_f = target as f64;
             let current_f = current_total as f64;
             assert!(
-                target_f >= current_f - hysteresis_band
-                    && target_f <= current_f + hysteresis_band,
+                target_f >= current_f - hysteresis_band && target_f <= current_f + hysteresis_band,
                 "NoChange: target {} should be within hysteresis band of current {}",
                 target,
                 current_total
@@ -130,10 +128,12 @@ fn test_governor_cycle_with_snapshot() {
     }
 
     // 7. Verify state is consistent after the cycle
-    assert!(!state.workers.is_empty(), "State should retain workers after cycle");
+    assert!(
+        !state.workers.is_empty(),
+        "State should retain workers after cycle"
+    );
     assert_eq!(
-        state.workers["test-agent"].current,
-        5,
+        state.workers["test-agent"].current, 5,
         "Current workers unchanged in state"
     );
     assert!(!state.safe_mode.active, "Safe mode should not be active");
@@ -282,23 +282,35 @@ fn test_second_poll_with_delta_computation() {
     });
 
     // Verify initial state after first poll
-    assert!(state.previous_api_snapshot.is_none(), "After first poll, previous should be None");
-    assert!(state.current_api_snapshot.is_some(), "After first poll, current should be Some");
+    assert!(
+        state.previous_api_snapshot.is_none(),
+        "After first poll, previous should be None"
+    );
+    assert!(
+        state.current_api_snapshot.is_some(),
+        "After first poll, current should be Some"
+    );
 
     // Simulate the shift at the start of second poll (as in run_governor_cycle line 2959)
     state.previous_api_snapshot = state.current_api_snapshot.take();
 
     // Verify shift occurred
-    assert!(state.previous_api_snapshot.is_some(), "After shift, previous should be Some");
-    assert!(state.current_api_snapshot.is_none(), "After shift, current should be None");
+    assert!(
+        state.previous_api_snapshot.is_some(),
+        "After shift, previous should be Some"
+    );
+    assert!(
+        state.current_api_snapshot.is_none(),
+        "After shift, current should be None"
+    );
 
     // Simulate second poll: set new current_api_snapshot
     let now2 = now1 + chrono::Duration::seconds(60);
     state.current_api_snapshot = Some(state::PrevUsageSnapshot {
         taken_at: now2,
-        five_hour_pct: 12.5,  // +2.5 from previous
-        seven_day_pct: 22.0,  // +2.0 from previous
-        weekly_scoped_pct: 18.0,  // +3.0 from previous
+        five_hour_pct: 12.5,     // +2.5 from previous
+        seven_day_pct: 22.0,     // +2.0 from previous
+        weekly_scoped_pct: 18.0, // +3.0 from previous
     });
 
     // Now both snapshots are Some - compute deltas
@@ -369,7 +381,10 @@ fn test_poll_failure_current_snapshot_remains_none() {
     });
 
     // current_api_snapshot starts as None (no new poll data yet)
-    assert!(state.current_api_snapshot.is_none(), "Before poll, current should be None");
+    assert!(
+        state.current_api_snapshot.is_none(),
+        "Before poll, current should be None"
+    );
 
     // Simulate poll failure: the Err branch in run_governor_cycle (line 3027-3044)
     // When poll fails, current_api_snapshot is NOT updated, so it remains None
@@ -502,15 +517,18 @@ fn test_first_poll_no_previous_snapshot() {
 
     // Verify: on first poll, all deltas should be Some(0.0), not None
     assert_eq!(
-        p5h_delta, Some(0.0),
+        p5h_delta,
+        Some(0.0),
         "5h delta should be Some(0.0) on first poll (no previous snapshot)"
     );
     assert_eq!(
-        p7d_delta, Some(0.0),
+        p7d_delta,
+        Some(0.0),
         "7d delta should be Some(0.0) on first poll (no previous snapshot)"
     );
     assert_eq!(
-        p7ds_delta, Some(0.0),
+        p7ds_delta,
+        Some(0.0),
         "7ds delta should be Some(0.0) on first poll (no previous snapshot)"
     );
 }
@@ -529,10 +547,9 @@ fn test_first_poll_with_realistic_values() {
     // Simulate first poll with realistic utilization values
     let now = Utc::now();
     state.current_api_snapshot = Some(make_snapshot(
-        now,
-        12.5,   // five_hour_pct: low usage
-        45.2,   // seven_day_pct: moderate usage
-        38.7,   // weekly_scoped_pct: moderate usage
+        now, 12.5, // five_hour_pct: low usage
+        45.2, // seven_day_pct: moderate usage
+        38.7, // weekly_scoped_pct: moderate usage
     ));
 
     // Verify first poll condition
@@ -558,15 +575,18 @@ fn test_first_poll_with_realistic_values() {
 
     // Verify: with realistic values, first poll still produces Some(0.0) for all deltas
     assert_eq!(
-        p5h_delta, Some(0.0),
+        p5h_delta,
+        Some(0.0),
         "5h delta should be Some(0.0) on first poll with realistic values"
     );
     assert_eq!(
-        p7d_delta, Some(0.0),
+        p7d_delta,
+        Some(0.0),
         "7d delta should be Some(0.0) on first poll with realistic values"
     );
     assert_eq!(
-        p7ds_delta, Some(0.0),
+        p7ds_delta,
+        Some(0.0),
         "7ds delta should be Some(0.0) on first poll with realistic values"
     );
 }
@@ -603,9 +623,9 @@ fn test_identical_snapshots_produce_zero_deltas() {
     let now2 = now1 + chrono::Duration::seconds(60);
     state.current_api_snapshot = Some(state::PrevUsageSnapshot {
         taken_at: now2,
-        five_hour_pct: 25.5,          // Identical to previous
-        seven_day_pct: 45.2,          // Identical to previous
-        weekly_scoped_pct: 38.7,  // Identical to previous
+        five_hour_pct: 25.5,     // Identical to previous
+        seven_day_pct: 45.2,     // Identical to previous
+        weekly_scoped_pct: 38.7, // Identical to previous
     });
 
     // Verify both snapshots exist and have identical values
@@ -708,21 +728,25 @@ fn test_identical_snapshots_with_realistic_fixture_values() {
     // Create current snapshot with identical values but later timestamp
     let now2 = now1 + chrono::Duration::hours(5);
     state.current_api_snapshot = Some(make_snapshot(
-        now2,
-        12.5,   // five_hour_pct: identical to baseline
-        45.2,   // seven_day_pct: identical to baseline
-        38.7,   // weekly_scoped_pct: identical to baseline
+        now2, 12.5, // five_hour_pct: identical to baseline
+        45.2, // seven_day_pct: identical to baseline
+        38.7, // weekly_scoped_pct: identical to baseline
     ));
 
     // Verify values are identical
     let prev = state.previous_api_snapshot.as_ref().unwrap();
     let curr = state.current_api_snapshot.as_ref().unwrap();
 
-    assert_eq!(prev.five_hour_pct, curr.five_hour_pct, "five_hour_pct should be identical");
-    assert_eq!(prev.seven_day_pct, curr.seven_day_pct, "seven_day_pct should be identical");
     assert_eq!(
-        prev.weekly_scoped_pct,
-        curr.weekly_scoped_pct,
+        prev.five_hour_pct, curr.five_hour_pct,
+        "five_hour_pct should be identical"
+    );
+    assert_eq!(
+        prev.seven_day_pct, curr.seven_day_pct,
+        "seven_day_pct should be identical"
+    );
+    assert_eq!(
+        prev.weekly_scoped_pct, curr.weekly_scoped_pct,
         "weekly_scoped_pct should be identical"
     );
 

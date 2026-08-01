@@ -150,9 +150,8 @@ fn append_to_governor_log(message: &str, config: &GovernorConfig) -> Result<()> 
     // Ensure log directory exists
     if let Some(parent) = log_path.parent() {
         if !parent.exists() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create log directory: {}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log directory: {}", parent.display()))?;
         }
     }
 
@@ -1080,7 +1079,11 @@ fn main() -> Result<()> {
         } => {
             run_simulate_command(&workers, hours, resolution, json)?;
         }
-        Commands::Status { json, summary, watch } => {
+        Commands::Status {
+            json,
+            summary,
+            watch,
+        } => {
             let state_path = default_state_path();
 
             // --watch is incompatible with --json and --summary
@@ -1897,8 +1900,8 @@ mod tests {
     /// 4. The exact warning message text matches the expected format
     #[test]
     fn test_scale_safe_mode_warning_log_message() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         // Create a temporary directory for test files
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -1955,7 +1958,8 @@ mod tests {
                     "{} [governor] WARN: manual scale override during safe mode\n",
                     Utc::now().to_rfc3339()
                 );
-                file.write_all(log_line.as_bytes()).expect("Failed to write to log file");
+                file.write_all(log_line.as_bytes())
+                    .expect("Failed to write to log file");
             }
         }
 
@@ -1997,8 +2001,8 @@ mod tests {
     /// 3. The log file remains empty/clean for normal operations
     #[test]
     fn test_scale_without_safe_mode_no_warning() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         // Create a temporary directory for test files
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -2032,7 +2036,10 @@ mod tests {
         let loaded_state = state::load_state(&state_path).expect("Failed to load state");
 
         // Verify safe mode is NOT active
-        assert!(!loaded_state.safe_mode.active, "Safe mode should not be active");
+        assert!(
+            !loaded_state.safe_mode.active,
+            "Safe mode should not be active"
+        );
 
         // Execute the scale command logic (should NOT emit warning because safe mode is inactive)
         if loaded_state.safe_mode.active {
@@ -2123,13 +2130,17 @@ mod tests {
         );
 
         // Verify the expected notification message content
-        let expected_notification = "NOTE: Safe mode remains active and will reassert its target on the next cycle";
+        let expected_notification =
+            "NOTE: Safe mode remains active and will reassert its target on the next cycle";
 
         // When safe mode is active, the notification should contain the expected message
         if safe_mode_was_active {
             // In production code, this would be: println!("{}", expected_notification);
             // We verify the message text is correct and would be printed
-            assert!(!expected_notification.is_empty(), "Notification message should not be empty");
+            assert!(
+                !expected_notification.is_empty(),
+                "Notification message should not be empty"
+            );
             assert!(
                 expected_notification.contains("Safe mode remains active"),
                 "Notification should mention safe mode remains active"
@@ -2200,12 +2211,19 @@ mod tests {
         let backup_1 = log_path.with_extension("log.1");
         assert!(backup_1.exists(), "Backup .1 should exist");
         let backup_1_contents = fs::read_to_string(&backup_1).expect("Failed to read backup");
-        assert_eq!(backup_1_contents, large_content, "Backup should contain original content");
+        assert_eq!(
+            backup_1_contents, large_content,
+            "Backup should contain original content"
+        );
 
         // Verify new log file exists and is empty
         assert!(log_path.exists(), "New log file should exist");
         let new_contents = fs::read_to_string(&log_path).expect("Failed to read new log");
-        assert_eq!(new_contents.len(), 0, "New log file should be empty after rotation");
+        assert_eq!(
+            new_contents.len(),
+            0,
+            "New log file should be empty after rotation"
+        );
 
         // Test multiple rotations: create another large file
         fs::write(&log_path, &large_content).expect("Failed to write second log file");
@@ -2214,13 +2232,22 @@ mod tests {
 
         // Verify .2 backup was created (previous .1 shifted to .2)
         let backup_2 = log_path.with_extension("log.2");
-        assert!(backup_2.exists(), "Backup .2 should exist after second rotation");
+        assert!(
+            backup_2.exists(),
+            "Backup .2 should exist after second rotation"
+        );
         let backup_2_contents = fs::read_to_string(&backup_2).expect("Failed to read backup .2");
-        assert_eq!(backup_2_contents, large_content, "Backup .2 should contain first content");
+        assert_eq!(
+            backup_2_contents, large_content,
+            "Backup .2 should contain first content"
+        );
 
         // Verify .1 contains the second content
         let backup_1_contents = fs::read_to_string(&backup_1).expect("Failed to read backup .1");
-        assert_eq!(backup_1_contents, large_content, "Backup .1 should contain second content");
+        assert_eq!(
+            backup_1_contents, large_content,
+            "Backup .1 should contain second content"
+        );
     }
 
     /// Test that verifies log rotation is NOT triggered when file size is below threshold.
@@ -2244,11 +2271,17 @@ mod tests {
 
         // Try to trigger rotation (should not happen)
         let result = rotate_log_file_if_needed(&log_path, 100, 3);
-        assert!(result.is_ok(), "Rotation check should succeed even if no rotation needed");
+        assert!(
+            result.is_ok(),
+            "Rotation check should succeed even if no rotation needed"
+        );
 
         // Verify no backups were created
         let backup_1 = log_path.with_extension("log.1");
-        assert!(!backup_1.exists(), "No backup should be created when file is below threshold");
+        assert!(
+            !backup_1.exists(),
+            "No backup should be created when file is below threshold"
+        );
 
         // Verify original file is unchanged
         let contents = fs::read_to_string(&log_path).expect("Failed to read log file");
@@ -2286,7 +2319,10 @@ mod tests {
 
         // Verify .3 does NOT exist (should have been cleaned up)
         let backup_3 = log_path.with_extension("log.3");
-        assert!(!backup_3.exists(), "Backup .3 should NOT exist (exceeds backup_count)");
+        assert!(
+            !backup_3.exists(),
+            "Backup .3 should NOT exist (exceeds backup_count)"
+        );
 
         // Verify .4 does NOT exist (should never be created)
         let backup_4 = log_path.with_extension("log.4");

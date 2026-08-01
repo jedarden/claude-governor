@@ -520,7 +520,9 @@ pub struct WindowOverrideConfig {
 
 impl Default for WindowOverrideConfig {
     fn default() -> Self {
-        Self { target_utilization: None }
+        Self {
+            target_utilization: None,
+        }
     }
 }
 
@@ -1086,11 +1088,25 @@ pricing:
 "#;
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
         // No window overrides configured, should fall back to global default
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 90.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 90.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 90.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            90.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            90.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            90.0
+        );
         // Unknown window should also use global default
-        assert_eq!(config.daemon.get_target_ceiling_for_window("unknown_window"), 90.0);
+        assert_eq!(
+            config
+                .daemon
+                .get_target_ceiling_for_window("unknown_window"),
+            90.0
+        );
     }
 
     #[test]
@@ -1111,16 +1127,30 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // five_hour has override: 0.85 * 100 = 85.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            85.0
+        );
 
         // seven_day has override: 0.92 * 100 = 92.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 92.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            92.0
+        );
 
         // weekly_scoped has override: 0.88 * 100 = 88.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 88.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            88.0
+        );
 
         // Unknown window falls back to global default (90.0)
-        assert_eq!(config.daemon.get_target_ceiling_for_window("unknown_window"), 90.0);
+        assert_eq!(
+            config
+                .daemon
+                .get_target_ceiling_for_window("unknown_window"),
+            90.0
+        );
     }
 
     #[test]
@@ -1138,13 +1168,22 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // five_hour has override: 0.80 * 100 = 80.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 80.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            80.0
+        );
 
         // seven_day uses global default: 95.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 95.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            95.0
+        );
 
         // weekly_scoped uses global default: 95.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 95.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            95.0
+        );
     }
 
     #[test]
@@ -1162,7 +1201,10 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // five_hour has no target_utilization set, should use global default: 90.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 90.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            90.0
+        );
     }
 
     #[test]
@@ -1177,9 +1219,18 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // Empty windows map, all windows should use global default: 85.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 85.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 85.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            85.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            85.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            85.0
+        );
     }
 
     #[test]
@@ -1198,13 +1249,22 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // five_hour has tighter override: 0.85 * 100 = 85.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 85.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            85.0
+        );
 
         // seven_day uses global default: 90.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 90.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            90.0
+        );
 
         // weekly_scoped uses global default: 90.0
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 90.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            90.0
+        );
     }
 
     #[test]
@@ -1226,9 +1286,18 @@ daemon:
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
 
         // Each window has its own override
-        assert_eq!(config.daemon.get_target_ceiling_for_window("five_hour"), 80.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("seven_day"), 92.0);
-        assert_eq!(config.daemon.get_target_ceiling_for_window("weekly_scoped"), 88.0);
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("five_hour"),
+            80.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("seven_day"),
+            92.0
+        );
+        assert_eq!(
+            config.daemon.get_target_ceiling_for_window("weekly_scoped"),
+            88.0
+        );
 
         // Unknown window still uses global default
         assert_eq!(config.daemon.get_target_ceiling_for_window("unknown"), 95.0);

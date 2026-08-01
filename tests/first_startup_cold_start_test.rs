@@ -58,7 +58,7 @@ fn create_brand_new_state() -> BurnRateState {
         last_sample_at: None, // Never sampled
         calibration: claude_governor::state::CalibrationState::default(),
         fleet_pct_hr_ema: claude_governor::state::WindowPctDeltas {
-            five_hour: 0.0,   // No burn rate history
+            five_hour: 0.0, // No burn rate history
             seven_day: 0.0,
             weekly_scoped: 0.0, // Key: no model-scoped history either
         },

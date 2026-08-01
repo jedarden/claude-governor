@@ -43,7 +43,7 @@ fn create_continuously_calibrated_state() -> BurnRateState {
 
     // Fleet-level EMAs are fully calibrated (many samples)
     let fleet_pct_hr_ema = claude_governor::state::WindowPctDeltas {
-        five_hour: 9.0,    // 5 workers * 1.8%/hr = 9.0%/hr fleet
+        five_hour: 9.0, // 5 workers * 1.8%/hr = 9.0%/hr fleet
         seven_day: 9.0,
         weekly_scoped: 9.0,
     };
@@ -182,14 +182,22 @@ fn test_continuously_calibrated_forecast_is_stable() {
     // remaining_pct = 90 - 45 = 45%
     // predicted_exhaustion = 45 / 9.0 = 5.0 hours
     // margin_hrs = 5.0 - 4.0 = 1.0 hours (positive = safe)
-    assert!((forecast_five_hour.remaining_pct - 45.0).abs() < 0.001,
-        "five_hour remaining_pct should be 45.0 (90 - 45)");
-    assert!((forecast_five_hour.predicted_exhaustion_hours - 5.0).abs() < 0.01,
-        "five_hour predicted exhaustion should be 5.0 hours (45% / 9.0%/hr)");
-    assert!((forecast_five_hour.margin_hrs - 1.0).abs() < 0.01,
-        "five_hour margin should be 1.0 hours (5.0 - 4.0)");
-    assert_eq!(forecast_five_hour.fleet_pct_per_hour, 9.0,
-        "five_hour fleet burn rate should be 9.0%/hr (5 workers * 1.8%/hr)");
+    assert!(
+        (forecast_five_hour.remaining_pct - 45.0).abs() < 0.001,
+        "five_hour remaining_pct should be 45.0 (90 - 45)"
+    );
+    assert!(
+        (forecast_five_hour.predicted_exhaustion_hours - 5.0).abs() < 0.01,
+        "five_hour predicted exhaustion should be 5.0 hours (45% / 9.0%/hr)"
+    );
+    assert!(
+        (forecast_five_hour.margin_hrs - 1.0).abs() < 0.01,
+        "five_hour margin should be 1.0 hours (5.0 - 4.0)"
+    );
+    assert_eq!(
+        forecast_five_hour.fleet_pct_per_hour, 9.0,
+        "five_hour fleet burn rate should be 9.0%/hr (5 workers * 1.8%/hr)"
+    );
 
     // Safe worker count: floor(remaining_pct / (rate_per_worker * hours_remaining))
     // safe_workers = floor(45 / (1.8 * 4.0)) = floor(6.25) = 6
@@ -215,27 +223,43 @@ fn test_continuously_calibrated_forecast_is_stable() {
     // exh_hrs_p25 (pessimistic) = 45 / 9.6075 = 4.68 hours
     // exh_hrs_p75 (optimistic) = 45 / 8.3925 = 5.36 hours
     // cone_ratio = 5.36 / 4.68 = 1.145
-    assert!((forecast_five_hour.exh_hrs_p25 - 4.68).abs() < 0.01,
-        "five_hour P25 exhaustion (pessimistic) should be ~4.68 hours");
-    assert!((forecast_five_hour.exh_hrs_p50 - 5.0).abs() < 0.01,
-        "five_hour P50 exhaustion (central) should be 5.0 hours");
-    assert!((forecast_five_hour.exh_hrs_p75 - 5.36).abs() < 0.01,
-        "five_hour P75 exhaustion (optimistic) should be ~5.36 hours");
-    assert!((forecast_five_hour.cone_ratio - 1.145).abs() < 0.01,
-        "five_hour cone ratio should be ~1.145 (narrow uncertainty for calibrated window)");
+    assert!(
+        (forecast_five_hour.exh_hrs_p25 - 4.68).abs() < 0.01,
+        "five_hour P25 exhaustion (pessimistic) should be ~4.68 hours"
+    );
+    assert!(
+        (forecast_five_hour.exh_hrs_p50 - 5.0).abs() < 0.01,
+        "five_hour P50 exhaustion (central) should be 5.0 hours"
+    );
+    assert!(
+        (forecast_five_hour.exh_hrs_p75 - 5.36).abs() < 0.01,
+        "five_hour P75 exhaustion (optimistic) should be ~5.36 hours"
+    );
+    assert!(
+        (forecast_five_hour.cone_ratio - 1.145).abs() < 0.01,
+        "five_hour cone ratio should be ~1.145 (narrow uncertainty for calibrated window)"
+    );
 
     // seven_day forecast values
     // remaining_pct = 90 - 54 = 36%
     // predicted_exhaustion = 36 / 9.0 = 4.0 hours
     // margin_hrs = 4.0 - 120.0 = -116.0 hours (negative = very safe)
-    assert!((forecast_seven_day.remaining_pct - 36.0).abs() < 0.001,
-        "seven_day remaining_pct should be 36.0 (90 - 54)");
-    assert!((forecast_seven_day.predicted_exhaustion_hours - 4.0).abs() < 0.01,
-        "seven_day predicted exhaustion should be 4.0 hours (36% / 9.0%/hr)");
-    assert!((forecast_seven_day.margin_hrs - (-116.0)).abs() < 0.1,
-        "seven_day margin should be -116.0 hours (4.0 - 120.0, very safe)");
-    assert_eq!(forecast_seven_day.fleet_pct_per_hour, 9.0,
-        "seven_day fleet burn rate should be 9.0%/hr");
+    assert!(
+        (forecast_seven_day.remaining_pct - 36.0).abs() < 0.001,
+        "seven_day remaining_pct should be 36.0 (90 - 54)"
+    );
+    assert!(
+        (forecast_seven_day.predicted_exhaustion_hours - 4.0).abs() < 0.01,
+        "seven_day predicted exhaustion should be 4.0 hours (36% / 9.0%/hr)"
+    );
+    assert!(
+        (forecast_seven_day.margin_hrs - (-116.0)).abs() < 0.1,
+        "seven_day margin should be -116.0 hours (4.0 - 120.0, very safe)"
+    );
+    assert_eq!(
+        forecast_seven_day.fleet_pct_per_hour, 9.0,
+        "seven_day fleet burn rate should be 9.0%/hr"
+    );
 
     // Safe worker count: floor(36 / (1.8 * 120)) = floor(0.167) = 0 (plenty of time)
     assert_eq!(
@@ -248,14 +272,22 @@ fn test_continuously_calibrated_forecast_is_stable() {
     // remaining_pct = 90 - 58.5 = 31.5%
     // predicted_exhaustion = 31.5 / 9.0 = 3.5 hours
     // margin_hrs = 3.5 - 100.0 = -96.5 hours (safe)
-    assert!((forecast_weekly_scoped.remaining_pct - 31.5).abs() < 0.001,
-        "weekly_scoped remaining_pct should be 31.5 (90 - 58.5)");
-    assert!((forecast_weekly_scoped.predicted_exhaustion_hours - 3.5).abs() < 0.01,
-        "weekly_scoped predicted exhaustion should be 3.5 hours (31.5% / 9.0%/hr)");
-    assert!((forecast_weekly_scoped.margin_hrs - (-96.5)).abs() < 0.1,
-        "weekly_scoped margin should be -96.5 hours (3.5 - 100.0, safe)");
-    assert_eq!(forecast_weekly_scoped.fleet_pct_per_hour, 9.0,
-        "weekly_scoped fleet burn rate should be 9.0%/hr");
+    assert!(
+        (forecast_weekly_scoped.remaining_pct - 31.5).abs() < 0.001,
+        "weekly_scoped remaining_pct should be 31.5 (90 - 58.5)"
+    );
+    assert!(
+        (forecast_weekly_scoped.predicted_exhaustion_hours - 3.5).abs() < 0.01,
+        "weekly_scoped predicted exhaustion should be 3.5 hours (31.5% / 9.0%/hr)"
+    );
+    assert!(
+        (forecast_weekly_scoped.margin_hrs - (-96.5)).abs() < 0.1,
+        "weekly_scoped margin should be -96.5 hours (3.5 - 100.0, safe)"
+    );
+    assert_eq!(
+        forecast_weekly_scoped.fleet_pct_per_hour, 9.0,
+        "weekly_scoped fleet burn rate should be 9.0%/hr"
+    );
 
     // Safe worker count: floor(31.5 / (1.8 * 100)) = floor(0.175) = 0
     assert_eq!(
@@ -275,7 +307,9 @@ fn test_continuously_calibrated_forecast_is_stable() {
         "seven_day predicted exhaustion should be finite (not infinite)"
     );
     assert!(
-        forecast_weekly_scoped.predicted_exhaustion_hours.is_finite(),
+        forecast_weekly_scoped
+            .predicted_exhaustion_hours
+            .is_finite(),
         "weekly_scoped predicted exhaustion should be finite (not infinite)"
     );
 
@@ -315,12 +349,16 @@ fn test_calibrated_window_unchanged_by_children_1_3_fixes() {
     let burn_rate_state = create_continuously_calibrated_state();
 
     // Verify calibration (samples >= 3, established EMA)
-    assert_eq!(burn_rate_state.fleet_pct_ema_samples, 25,
-        "Should have 25 samples (well-calibrated, not cold-start)");
+    assert_eq!(
+        burn_rate_state.fleet_pct_ema_samples, 25,
+        "Should have 25 samples (well-calibrated, not cold-start)"
+    );
 
     let five_hour_ema = burn_rate_state.fleet_pct_hr_ema.five_hour;
-    assert!(five_hour_ema > 0.0,
-        "Should have established EMA rate (9.0%/hr fleet), not cold-start (0.0)");
+    assert!(
+        five_hour_ema > 0.0,
+        "Should have established EMA rate (9.0%/hr fleet), not cold-start (0.0)"
+    );
 
     // === TEST: Generate forecast using calibrated path ===
 
@@ -346,80 +384,113 @@ fn test_calibrated_window_unchanged_by_children_1_3_fixes() {
 
     // The forecast should use the established EMA rate (9.0%/hr fleet),
     // NOT the conservative baseline (7.5%/hr = 1.5 * 5 workers from cold-start)
-    assert_eq!(forecast.fleet_pct_per_hour, five_hour_ema,
+    assert_eq!(
+        forecast.fleet_pct_per_hour, five_hour_ema,
         "Calibrated forecast should use established EMA (9.0%/hr), \
-         not cold-start seeded baseline (7.5%/hr)");
+         not cold-start seeded baseline (7.5%/hr)"
+    );
 
     // === VERIFY: Numerical values are deterministic ===
 
     // remaining_pct = 90 - 50 = 40%
-    assert_eq!(forecast.remaining_pct, 40.0,
-        "Remaining percentage should be 40% (90 - 50)");
+    assert_eq!(
+        forecast.remaining_pct, 40.0,
+        "Remaining percentage should be 40% (90 - 50)"
+    );
 
     // predicted_exhaustion = 40 / 9.0 = 4.444... hours
     let expected_exhaustion = 40.0 / five_hour_ema;
-    assert!((forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.001,
+    assert!(
+        (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.001,
         "Predicted exhaustion should be {:.3} hours (40% / 9.0%/hr), got {:.3}",
-        expected_exhaustion, forecast.predicted_exhaustion_hours);
+        expected_exhaustion,
+        forecast.predicted_exhaustion_hours
+    );
 
     // margin_hrs = 4.444 - 10 = -5.556 hours (safe)
     let expected_margin = expected_exhaustion - hours_remaining;
-    assert!((forecast.margin_hrs - expected_margin).abs() < 0.001,
+    assert!(
+        (forecast.margin_hrs - expected_margin).abs() < 0.001,
         "Margin should be {:.3} hours ({:.3} - 10.0), got {:.3}",
-        expected_margin, expected_exhaustion, forecast.margin_hrs);
+        expected_margin,
+        expected_exhaustion,
+        forecast.margin_hrs
+    );
 
     // === VERIFY: Safe worker count uses established rate ===
 
     // safe_workers = floor(40 / (1.8 * 10)) = floor(2.22) = 2
-    assert_eq!(forecast.safe_worker_count, Some(2),
-        "Safe worker count should be 2 (40% / (1.8%/hr * 10hr))");
+    assert_eq!(
+        forecast.safe_worker_count,
+        Some(2),
+        "Safe worker count should be 2 (40% / (1.8%/hr * 10hr))"
+    );
 
     // safe_workers_p75 uses rate + 0.675σ
     // rate_p75_fleet = 9.0 + 0.675 * 0.9 = 9.6075
     // rate_p75_per_worker = 1.8 * 9.6075 / 9.0 = 1.9215
     // safe_p75 = floor(40 / (1.9215 * 10)) = floor(2.082) = 2
-    assert_eq!(forecast.safe_worker_count_p75, Some(2),
-        "P75 safe workers should be 2 (conservative with widened rate)");
+    assert_eq!(
+        forecast.safe_worker_count_p75,
+        Some(2),
+        "P75 safe workers should be 2 (conservative with widened rate)"
+    );
 
     // === VERIFY: Confidence cone is narrow (calibrated characteristic) ===
 
     // Cold-start windows have cone_ratio >= 2.0 (from seeding std == rate)
     // Calibrated windows have cone_ratio ~1.1-1.3 (normal std)
-    assert!(forecast.cone_ratio < 1.5,
+    assert!(
+        forecast.cone_ratio < 1.5,
         "Calibrated window should have narrow cone ratio (<1.5), got {:.3}",
-        forecast.cone_ratio);
+        forecast.cone_ratio
+    );
 
     // === REGRESSION GUARD: These values must NOT change ===
 
     // If Children 1-3 fixes accidentally affected the warm path,
     // any of these assertions would fail.
     const EXPECTED_VALUES: (f64, f64, f64, f64, Option<u32>, Option<u32>) = (
-        9.0,    // fleet_pct_per_hour
-        40.0,   // remaining_pct
-        40.0 / 9.0,  // predicted_exhaustion_hours
-        40.0 / 9.0 - 10.0,  // margin_hrs
-        Some(2), // safe_worker_count
-        Some(2), // safe_worker_count_p75
+        9.0,               // fleet_pct_per_hour
+        40.0,              // remaining_pct
+        40.0 / 9.0,        // predicted_exhaustion_hours
+        40.0 / 9.0 - 10.0, // margin_hrs
+        Some(2),           // safe_worker_count
+        Some(2),           // safe_worker_count_p75
     );
 
-    assert_eq!(forecast.fleet_pct_per_hour, EXPECTED_VALUES.0,
+    assert_eq!(
+        forecast.fleet_pct_per_hour, EXPECTED_VALUES.0,
         "REGRESSION: Fleet burn rate changed (was 9.0%/hr, now {:.2}%)",
-        forecast.fleet_pct_per_hour);
-    assert_eq!(forecast.remaining_pct, EXPECTED_VALUES.1,
+        forecast.fleet_pct_per_hour
+    );
+    assert_eq!(
+        forecast.remaining_pct, EXPECTED_VALUES.1,
         "REGRESSION: Remaining pct changed (was 40.0%, now {:.2}%)",
-        forecast.remaining_pct);
-    assert!((forecast.predicted_exhaustion_hours - EXPECTED_VALUES.2).abs() < 0.001,
+        forecast.remaining_pct
+    );
+    assert!(
+        (forecast.predicted_exhaustion_hours - EXPECTED_VALUES.2).abs() < 0.001,
         "REGRESSION: Predicted exhaustion changed (was {:.3}hr, now {:.3}hr)",
-        EXPECTED_VALUES.2, forecast.predicted_exhaustion_hours);
-    assert!((forecast.margin_hrs - EXPECTED_VALUES.3).abs() < 0.001,
+        EXPECTED_VALUES.2,
+        forecast.predicted_exhaustion_hours
+    );
+    assert!(
+        (forecast.margin_hrs - EXPECTED_VALUES.3).abs() < 0.001,
         "REGRESSION: Margin changed (was {:.3}hr, now {:.3}hr)",
-        EXPECTED_VALUES.3, forecast.margin_hrs);
-    assert_eq!(forecast.safe_worker_count, EXPECTED_VALUES.4,
+        EXPECTED_VALUES.3,
+        forecast.margin_hrs
+    );
+    assert_eq!(
+        forecast.safe_worker_count, EXPECTED_VALUES.4,
         "REGRESSION: Safe worker count changed (was {:?}, now {:?})",
-        EXPECTED_VALUES.4, forecast.safe_worker_count);
-    assert_eq!(forecast.safe_worker_count_p75, EXPECTED_VALUES.5,
+        EXPECTED_VALUES.4, forecast.safe_worker_count
+    );
+    assert_eq!(
+        forecast.safe_worker_count_p75, EXPECTED_VALUES.5,
         "REGRESSION: P75 safe worker count changed (was {:?}, now {:?})",
-        EXPECTED_VALUES.5, forecast.safe_worker_count_p75);
+        EXPECTED_VALUES.5, forecast.safe_worker_count_p75
+    );
 }
 
 /// Test: Calibrated vs cold-start forecast comparison
@@ -472,55 +543,89 @@ fn test_calibrated_vs_cold_start_forecast_difference() {
     // === VERIFY: Paths produce different forecasts ===
 
     // 1. Burn rates differ (established EMA vs seeded baseline)
-    assert_ne!(forecast_calibrated.fleet_pct_per_hour,
-               forecast_cold_start.fleet_pct_per_hour,
-               "Calibrated and cold-start should use different burn rates");
-    assert_eq!(forecast_calibrated.fleet_pct_per_hour, 9.0,
-        "Calibrated should use established EMA (9.0%/hr)");
-    assert_eq!(forecast_cold_start.fleet_pct_per_hour, 7.5,
-        "Cold-start should use seeded baseline (7.5%/hr = 1.5 * 5 workers)");
+    assert_ne!(
+        forecast_calibrated.fleet_pct_per_hour, forecast_cold_start.fleet_pct_per_hour,
+        "Calibrated and cold-start should use different burn rates"
+    );
+    assert_eq!(
+        forecast_calibrated.fleet_pct_per_hour, 9.0,
+        "Calibrated should use established EMA (9.0%/hr)"
+    );
+    assert_eq!(
+        forecast_cold_start.fleet_pct_per_hour, 7.5,
+        "Cold-start should use seeded baseline (7.5%/hr = 1.5 * 5 workers)"
+    );
 
     // 2. Predicted exhaustion differs (different burn rates)
-    assert_ne!(forecast_calibrated.predicted_exhaustion_hours,
-               forecast_cold_start.predicted_exhaustion_hours,
-               "Predicted exhaustion should differ between paths");
-    assert_eq!(forecast_calibrated.predicted_exhaustion_hours, 40.0 / 9.0,
-        "Calibrated exhaustion: 40% / 9.0%/hr = 4.44hr");
-    assert_eq!(forecast_cold_start.predicted_exhaustion_hours, 40.0 / 7.5,
-        "Cold-start exhaustion: 40% / 7.5%/hr = 5.33hr");
+    assert_ne!(
+        forecast_calibrated.predicted_exhaustion_hours,
+        forecast_cold_start.predicted_exhaustion_hours,
+        "Predicted exhaustion should differ between paths"
+    );
+    assert_eq!(
+        forecast_calibrated.predicted_exhaustion_hours,
+        40.0 / 9.0,
+        "Calibrated exhaustion: 40% / 9.0%/hr = 4.44hr"
+    );
+    assert_eq!(
+        forecast_cold_start.predicted_exhaustion_hours,
+        40.0 / 7.5,
+        "Cold-start exhaustion: 40% / 7.5%/hr = 5.33hr"
+    );
 
     // 3. Safe worker counts (may coincide, but computed from different rates)
     // Note: Both paths produce 2 workers here, but from different burn rates:
     // - Calibrated: floor(40 / (1.8 * 10)) = floor(2.22) = 2
     // - Cold-start: floor(40 / (1.5 * 10)) = floor(2.67) = 2
-    assert_eq!(forecast_calibrated.safe_worker_count, Some(2),
-        "Calibrated safe workers: floor(40 / (1.8 * 10)) = 2");
-    assert_eq!(forecast_cold_start.safe_worker_count, Some(2),
-        "Cold-start safe workers: floor(40 / (1.5 * 10)) = 2 (coincidentally same)");
+    assert_eq!(
+        forecast_calibrated.safe_worker_count,
+        Some(2),
+        "Calibrated safe workers: floor(40 / (1.8 * 10)) = 2"
+    );
+    assert_eq!(
+        forecast_cold_start.safe_worker_count,
+        Some(2),
+        "Cold-start safe workers: floor(40 / (1.5 * 10)) = 2 (coincidentally same)"
+    );
     // The key difference is in the burn rates used (9.0%/hr vs 7.5%/hr)
 
     // 4. Cone ratio differs dramatically (narrow vs wide uncertainty)
-    assert_ne!(forecast_calibrated.cone_ratio,
-               forecast_cold_start.cone_ratio,
-               "Cone ratios should differ (narrow vs wide)");
-    assert!(forecast_calibrated.cone_ratio < 1.5,
+    assert_ne!(
+        forecast_calibrated.cone_ratio, forecast_cold_start.cone_ratio,
+        "Cone ratios should differ (narrow vs wide)"
+    );
+    assert!(
+        forecast_calibrated.cone_ratio < 1.5,
         "Calibrated cone should be narrow (<1.5), got {:.3}",
-        forecast_calibrated.cone_ratio);
-    assert!(forecast_cold_start.cone_ratio >= 2.0,
+        forecast_calibrated.cone_ratio
+    );
+    assert!(
+        forecast_cold_start.cone_ratio >= 2.0,
         "Cold-start cone should be wide (>=2.0), got {:.3}",
-        forecast_cold_start.cone_ratio);
+        forecast_cold_start.cone_ratio
+    );
 
     // === VERIFY: Estimate quality flags differ ===
 
-    assert_eq!(forecast_calibrated.estimate_quality, EstimateQuality::Calibrated,
-        "Calibrated path should flag Calibrated");
-    assert_eq!(forecast_cold_start.estimate_quality, EstimateQuality::ColdStart,
-        "Cold-start path should flag ColdStart");
+    assert_eq!(
+        forecast_calibrated.estimate_quality,
+        EstimateQuality::Calibrated,
+        "Calibrated path should flag Calibrated"
+    );
+    assert_eq!(
+        forecast_cold_start.estimate_quality,
+        EstimateQuality::ColdStart,
+        "Cold-start path should flag ColdStart"
+    );
 
     // === VERIFY: Both produce finite exhaustion (Child-3: no infinite headroom) ===
 
-    assert!(forecast_calibrated.predicted_exhaustion_hours.is_finite(),
-        "Calibrated should produce finite exhaustion");
-    assert!(forecast_cold_start.predicted_exhaustion_hours.is_finite(),
-        "Cold-start should produce finite exhaustion (Child-3 fix)");
+    assert!(
+        forecast_calibrated.predicted_exhaustion_hours.is_finite(),
+        "Calibrated should produce finite exhaustion"
+    );
+    assert!(
+        forecast_cold_start.predicted_exhaustion_hours.is_finite(),
+        "Cold-start should produce finite exhaustion (Child-3 fix)"
+    );
 }

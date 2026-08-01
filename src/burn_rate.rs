@@ -871,8 +871,8 @@ pub fn staleness_tier(last_update: DateTime<Utc>) -> StalenessTier {
     let age_secs = collector_data_age(last_update);
 
     // Tier thresholds (in seconds)
-    const FRESH_THRESHOLD_SECS: u64 = 10 * 60;   // 10 minutes
-    const STALE_THRESHOLD_SECS: u64 = 30 * 60;   // 30 minutes
+    const FRESH_THRESHOLD_SECS: u64 = 10 * 60; // 10 minutes
+    const STALE_THRESHOLD_SECS: u64 = 30 * 60; // 30 minutes
 
     if age_secs < FRESH_THRESHOLD_SECS {
         StalenessTier::Fresh
@@ -1095,9 +1095,9 @@ fn effective_burn_rate(ema: &ModelWindowEma, baseline: &BaselineBurnRates) -> (f
 /// meaning we have less time to recover from exhaustion.
 fn duration_weight(window: &str) -> f64 {
     match window {
-        "five_hour" => 3.0,        // 5h window: highest urgency (resets every 5 hours)
+        "five_hour" => 3.0,     // 5h window: highest urgency (resets every 5 hours)
         "weekly_scoped" => 1.5, // weekly_scoped (model-scoped): medium urgency
-        "seven_day" => 1.0,        // 7d: lowest urgency (resets every 7 days)
+        "seven_day" => 1.0,     // 7d: lowest urgency (resets every 7 days)
         _ => 1.0,
     }
 }
@@ -1508,10 +1508,7 @@ pub fn estimate_burn_rates(
     let capacity_forecast = crate::state::CapacityForecast {
         five_hour: forecasts.get("five_hour").cloned().unwrap_or_default(),
         seven_day: forecasts.get("seven_day").cloned().unwrap_or_default(),
-        weekly_scoped: forecasts
-            .get("weekly_scoped")
-            .cloned()
-            .unwrap_or_default(),
+        weekly_scoped: forecasts.get("weekly_scoped").cloned().unwrap_or_default(),
         binding_window: binding_window.clone(),
         dollars_per_pct_7d_s: 0.0, // Computed externally from fleet aggregate
         estimated_remaining_dollars: 0.0, // Computed externally
@@ -2673,12 +2670,15 @@ mod tests {
             model,
             2.0,
             500_000,
-            Some(2.0),  // five_hour burn: slow, lots of headroom
-            Some(0.2),  // seven_day burn: slow, far reset
-            Some(5.0),  // weekly_scoped burn: tight against a near reset
-            30.0, 28.0, // five_hour current/prev (delta 2.0)
-            40.0, 39.8, // seven_day current/prev (delta 0.2)
-            79.0, 74.0, // weekly_scoped current/prev (delta 5.0)
+            Some(2.0), // five_hour burn: slow, lots of headroom
+            Some(0.2), // seven_day burn: slow, far reset
+            Some(5.0), // weekly_scoped burn: tight against a near reset
+            30.0,
+            28.0, // five_hour current/prev (delta 2.0)
+            40.0,
+            39.8, // seven_day current/prev (delta 0.2)
+            79.0,
+            74.0, // weekly_scoped current/prev (delta 5.0)
         )];
 
         let mut utilization = HashMap::new();
@@ -2724,19 +2724,23 @@ mod tests {
         );
         assert_eq!(
             forecast.binding_window, "weekly_scoped",
-            "model={}: expected weekly_scoped to be the binding window", model,
+            "model={}: expected weekly_scoped to be the binding window",
+            model,
         );
         assert!(
             forecast.weekly_scoped.binding,
-            "model={}: expected weekly_scoped.binding == true", model,
+            "model={}: expected weekly_scoped.binding == true",
+            model,
         );
         assert!(
             !forecast.five_hour.binding,
-            "model={}: five_hour must not be binding", model,
+            "model={}: five_hour must not be binding",
+            model,
         );
         assert!(
             !forecast.seven_day.binding,
-            "model={}: seven_day must not be binding", model,
+            "model={}: seven_day must not be binding",
+            model,
         );
         // Being selected proves it was not dismissed as "just the weekly/
         // model-scoped window"; and it carries a real safe_worker_count (here 1)
@@ -2745,7 +2749,8 @@ mod tests {
         assert_eq!(
             forecast.weekly_scoped.safe_worker_count,
             Some(1),
-            "model={}: binding weekly_scoped must carry a safe_worker_count (no hold)", model,
+            "model={}: binding weekly_scoped must carry a safe_worker_count (no hold)",
+            model,
         );
     }
 
@@ -2774,9 +2779,12 @@ mod tests {
             Some(20.0), // five_hour: the real, binding constraint
             Some(0.2),  // seven_day: comfortable
             None,       // weekly_scoped: NO burn data this interval (absent)
-            85.0, 65.0, // five_hour current/prev (delta 20.0)
-            40.0, 39.8, // seven_day current/prev (delta 0.2)
-            0.0, 0.0,   // weekly_scoped unused (pct_delta None -> skipped)
+            85.0,
+            65.0, // five_hour current/prev (delta 20.0)
+            40.0,
+            39.8, // seven_day current/prev (delta 0.2)
+            0.0,
+            0.0, // weekly_scoped unused (pct_delta None -> skipped)
         )];
 
         let mut utilization = HashMap::new();
@@ -3156,12 +3164,12 @@ mod tests {
     fn generate_window_forecast_basic() {
         let f = generate_window_forecast(
             "weekly_scoped",
-            2.0,  // fleet_pct_hr
-            72.0, // current utilization
-            90.0, // target ceiling
-            37.5, // hours remaining
-            1.0,  // p75 per worker
-            0.0,  // std_pct_hr (no spread)
+            2.0,                                       // fleet_pct_hr
+            72.0,                                      // current utilization
+            90.0,                                      // target ceiling
+            37.5,                                      // hours remaining
+            1.0,                                       // p75 per worker
+            0.0,                                       // std_pct_hr (no spread)
             crate::state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
@@ -3188,7 +3196,7 @@ mod tests {
             90.0,
             3.0,
             0.0,
-            0.0, // std_pct_hr
+            0.0,                                       // std_pct_hr
             crate::state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
@@ -3661,8 +3669,7 @@ mod tests {
         let risk_5h =
             compute_risk_score("five_hour", margin_hrs, hours_remaining, cone_ratio).unwrap();
         let risk_7ds =
-            compute_risk_score("weekly_scoped", margin_hrs, hours_remaining, cone_ratio)
-                .unwrap();
+            compute_risk_score("weekly_scoped", margin_hrs, hours_remaining, cone_ratio).unwrap();
         let risk_7d =
             compute_risk_score("seven_day", margin_hrs, hours_remaining, cone_ratio).unwrap();
 
@@ -3706,7 +3713,7 @@ mod tests {
 
     #[test]
     fn compute_empirical_promo_ratio_with_sufficient_data() {
-        use crate::db::{open_db, create_schema, insert_instance};
+        use crate::db::{create_schema, insert_instance, open_db};
         use tempfile::TempDir;
 
         // Create a temporary database
@@ -3779,28 +3786,46 @@ mod tests {
         // Call compute_empirical_promo_ratio
         let result = compute_empirical_promo_ratio(&db_path);
 
-        assert!(result.is_some(), "compute_empirical_promo_ratio should return Some()");
+        assert!(
+            result.is_some(),
+            "compute_empirical_promo_ratio should return Some()"
+        );
         let ratio = result.unwrap();
 
         // Verify the observed ratio is approximately 2.0 (offpeak/peak)
-        assert!((ratio.observed_ratio - 2.0).abs() < 0.1,
-            "expected ratio ~2.0, got {}", ratio.observed_ratio);
+        assert!(
+            (ratio.observed_ratio - 2.0).abs() < 0.1,
+            "expected ratio ~2.0, got {}",
+            ratio.observed_ratio
+        );
 
         // Verify we have sufficient data
-        assert!(ratio.sufficient_data, "should have sufficient data (>=10 each)");
+        assert!(
+            ratio.sufficient_data,
+            "should have sufficient data (>=10 each)"
+        );
         assert!(ratio.peak_samples >= 10, "should have >=10 peak samples");
-        assert!(ratio.offpeak_samples >= 10, "should have >=10 offpeak samples");
+        assert!(
+            ratio.offpeak_samples >= 10,
+            "should have >=10 offpeak samples"
+        );
 
         // Verify median values are approximately correct
-        assert!((ratio.median_peak - 70_000.0).abs() < 5_000.0,
-            "expected median_peak ~70k, got {}", ratio.median_peak);
-        assert!((ratio.median_offpeak - 140_000.0).abs() < 10_000.0,
-            "expected median_offpeak ~140k, got {}", ratio.median_offpeak);
+        assert!(
+            (ratio.median_peak - 70_000.0).abs() < 5_000.0,
+            "expected median_peak ~70k, got {}",
+            ratio.median_peak
+        );
+        assert!(
+            (ratio.median_offpeak - 140_000.0).abs() < 10_000.0,
+            "expected median_offpeak ~140k, got {}",
+            ratio.median_offpeak
+        );
     }
 
     #[test]
     fn compute_empirical_promo_ratio_insufficient_data_returns_some() {
-        use crate::db::{open_db, create_schema, insert_instance};
+        use crate::db::{create_schema, insert_instance, open_db};
         use tempfile::TempDir;
 
         // Create a temporary database
@@ -3856,17 +3881,26 @@ mod tests {
         let result = compute_empirical_promo_ratio(&db_path);
 
         // Should still return Some(), but with insufficient_data = false
-        assert!(result.is_some(), "compute_empirical_promo_ratio should return Some()");
+        assert!(
+            result.is_some(),
+            "compute_empirical_promo_ratio should return Some()"
+        );
         let ratio = result.unwrap();
 
-        assert!(!ratio.sufficient_data, "should not have sufficient data (<10 each)");
+        assert!(
+            !ratio.sufficient_data,
+            "should not have sufficient data (<10 each)"
+        );
         assert!(ratio.peak_samples < 10, "should have <10 peak samples");
-        assert!(ratio.offpeak_samples < 10, "should have <10 offpeak samples");
+        assert!(
+            ratio.offpeak_samples < 10,
+            "should have <10 offpeak samples"
+        );
     }
 
     #[test]
     fn compute_empirical_promo_ratio_no_data_returns_none() {
-        use crate::db::{open_db, create_schema};
+        use crate::db::{create_schema, open_db};
         use tempfile::TempDir;
 
         // Create an empty temporary database
@@ -3880,16 +3914,22 @@ mod tests {
         // Call compute_empirical_promo_ratio
         let result = compute_empirical_promo_ratio(&db_path);
 
-        assert!(result.is_none(), "compute_empirical_promo_ratio should return None when no data");
+        assert!(
+            result.is_none(),
+            "compute_empirical_promo_ratio should return None when no data"
+        );
     }
 
     /// Test: Integration test that creates synthetic data, annotates it, and returns Some(ratio)
     /// This verifies the full workflow: create synthetic interval data → annotate with window deltas → compute empirical ratio
     #[test]
     fn compute_empirical_promo_ratio_integration_with_annotation() {
-        use crate::db::{open_db, create_schema, insert_instance, insert_fleet, WindowPctSnapshot, annotate_window_pct_deltas};
-        use tempfile::TempDir;
+        use crate::db::{
+            annotate_window_pct_deltas, create_schema, insert_fleet, insert_instance, open_db,
+            WindowPctSnapshot,
+        };
         use chrono::{DateTime, Utc};
+        use tempfile::TempDir;
 
         // Create a temporary database
         let temp_dir = TempDir::new().unwrap();
@@ -3976,18 +4016,13 @@ mod tests {
             weekly_scoped: 70.0,
         };
         let new_pct = WindowPctSnapshot {
-            five_hour: 41.0,   // delta_5h = 1.0
-            seven_day: 71.0,  // delta_7d = 1.0
-            weekly_scoped: 71.0,  // delta_7ds = 1.0
+            five_hour: 41.0,     // delta_5h = 1.0
+            seven_day: 71.0,     // delta_7d = 1.0
+            weekly_scoped: 71.0, // delta_7ds = 1.0
         };
 
         let result = annotate_window_pct_deltas(
-            &conn,
-            t0_parsed,
-            t1_parsed,
-            &old_pct,
-            &new_pct,
-            2, // workers_at_start
+            &conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 2, // workers_at_start
             2, // workers_at_end
         );
         assert!(result.is_ok(), "annotate_window_pct_deltas should succeed");
@@ -3995,26 +4030,40 @@ mod tests {
         // Now verify that compute_empirical_promo_ratio returns Some() with annotated data
         let ratio_result = compute_empirical_promo_ratio(&db_path);
 
-        assert!(ratio_result.is_some(), "compute_empirical_promo_ratio should return Some() after annotation");
+        assert!(
+            ratio_result.is_some(),
+            "compute_empirical_promo_ratio should return Some() after annotation"
+        );
         let ratio = ratio_result.unwrap();
 
         // Verify sufficient_data is true (>= 10 peak and >= 10 off-peak)
-        assert!(ratio.sufficient_data, "should have sufficient data (>=10 each)");
+        assert!(
+            ratio.sufficient_data,
+            "should have sufficient data (>=10 each)"
+        );
         assert!(ratio.peak_samples >= 10, "should have >=10 peak samples");
-        assert!(ratio.offpeak_samples >= 10, "should have >=10 off-peak samples");
+        assert!(
+            ratio.offpeak_samples >= 10,
+            "should have >=10 off-peak samples"
+        );
 
         // Verify the observed ratio is approximately 2.0 (offpeak/peak: 140k/70k tokens per %)
         // After annotation with equal weights, each instance gets p7ds = 1.0 / 30 = 0.0333...
         // Peak tokens_per_pct = 70000 / 0.0333 = 2,100,000
         // Off-peak tokens_per_pct = 140000 / 0.0333 = 4,200,000
         // Ratio = 4200000 / 2100000 = 2.0
-        assert!((ratio.observed_ratio - 2.0).abs() < 0.1,
-            "expected ratio ~2.0, got {}", ratio.observed_ratio);
+        assert!(
+            (ratio.observed_ratio - 2.0).abs() < 0.1,
+            "expected ratio ~2.0, got {}",
+            ratio.observed_ratio
+        );
 
         // Verify median values reflect the 2x ratio (off-peak is double peak)
-        assert!((ratio.median_offpeak / ratio.median_peak - 2.0).abs() < 0.1,
+        assert!(
+            (ratio.median_offpeak / ratio.median_peak - 2.0).abs() < 0.1,
             "expected median_offpeak to be ~2x median_peak, got ratio {}",
-            ratio.median_offpeak / ratio.median_peak);
+            ratio.median_offpeak / ratio.median_peak
+        );
     }
 
     /// Test: Verify scaling behavior unchanged when annotation data is absent
@@ -4053,7 +4102,10 @@ mod tests {
         let rates = compute_instance_burn(&record, 1.0);
 
         // Should return empty vector since all windows have null pct_delta
-        assert!(rates.is_empty(), "compute_instance_burn should return empty when all pct_delta are null");
+        assert!(
+            rates.is_empty(),
+            "compute_instance_burn should return empty when all pct_delta are null"
+        );
 
         // Verify that with a mix of null and valid, only valid windows are used
         let record_mixed = InstanceRecord {
@@ -4086,7 +4138,11 @@ mod tests {
         let rates_mixed = compute_instance_burn(&record_mixed, 1.0);
 
         // Should have exactly one rate (from the valid seven_day window)
-        assert_eq!(rates_mixed.len(), 1, "compute_instance_burn should return 1 rate for 1 valid window");
+        assert_eq!(
+            rates_mixed.len(),
+            1,
+            "compute_instance_burn should return 1 rate for 1 valid window"
+        );
         assert_eq!(rates_mixed[0].window, "seven_day");
         assert!((rates_mixed[0].pct_per_hour - 2.0).abs() < 1e-9);
         assert!((rates_mixed[0].dollar_per_hour - 5.0).abs() < 1e-9);
@@ -4097,7 +4153,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: create a FleetAggregate for testing staleness
-    fn test_fleet_aggregate(age_minutes: i64, p75_usd_hr: f64, workers: u32) -> crate::state::FleetAggregate {
+    fn test_fleet_aggregate(
+        age_minutes: i64,
+        p75_usd_hr: f64,
+        workers: u32,
+    ) -> crate::state::FleetAggregate {
         let t1 = Utc::now() - chrono::Duration::minutes(age_minutes);
         crate::state::FleetAggregate {
             t0: t1 - chrono::Duration::seconds(60),
@@ -4120,14 +4180,22 @@ mod tests {
     fn collector_data_age_fresh() {
         let five_min_ago = Utc::now() - chrono::Duration::minutes(5);
         let age = collector_data_age(five_min_ago);
-        assert!((age as f64 - 300.0).abs() < 2.0, "expected ~300s, got {}", age);
+        assert!(
+            (age as f64 - 300.0).abs() < 2.0,
+            "expected ~300s, got {}",
+            age
+        );
     }
 
     #[test]
     fn collector_data_age_stale() {
         let forty_min_ago = Utc::now() - chrono::Duration::minutes(40);
         let age = collector_data_age(forty_min_ago);
-        assert!((age as f64 - 2400.0).abs() < 2.0, "expected ~2400s, got {}", age);
+        assert!(
+            (age as f64 - 2400.0).abs() < 2.0,
+            "expected ~2400s, got {}",
+            age
+        );
     }
 
     #[test]
@@ -4143,7 +4211,11 @@ mod tests {
         let tier = staleness_tier(fifteen_min_ago);
         match tier {
             StalenessTier::Aging { age_secs } => {
-                assert!(age_secs >= 600 && age_secs < 1800, "age_secs should be 600-1800, got {}", age_secs);
+                assert!(
+                    age_secs >= 600 && age_secs < 1800,
+                    "age_secs should be 600-1800, got {}",
+                    age_secs
+                );
             }
             _ => panic!("expected Aging tier, got {:?}", tier),
         }
@@ -4155,7 +4227,11 @@ mod tests {
         let tier = staleness_tier(forty_min_ago);
         match tier {
             StalenessTier::Stale { age_secs } => {
-                assert!(age_secs >= 1800, "age_secs should be >= 1800, got {}", age_secs);
+                assert!(
+                    age_secs >= 1800,
+                    "age_secs should be >= 1800, got {}",
+                    age_secs
+                );
             }
             _ => panic!("expected Stale tier, got {:?}", tier),
         }
@@ -4214,7 +4290,11 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // Fresh data should use aggregate: $10/hr / 2 workers = $5/worker/hr
-        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from fresh aggregate, got ${:.2}", rate);
+        assert!(
+            (rate - 5.0).abs() < 0.01,
+            "expected $5/worker/hr from fresh aggregate, got ${:.2}",
+            rate
+        );
     }
 
     #[test]
@@ -4227,7 +4307,11 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // Aging data should still use aggregate EMA values
-        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from aging aggregate, got ${:.2}", rate);
+        assert!(
+            (rate - 5.0).abs() < 0.01,
+            "expected $5/worker/hr from aging aggregate, got ${:.2}",
+            rate
+        );
     }
 
     #[test]
@@ -4240,7 +4324,11 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // Stale data should use baseline
-        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from baseline, got ${:.2}", rate);
+        assert!(
+            (rate - 5.0).abs() < 0.01,
+            "expected $5/worker/hr from baseline, got ${:.2}",
+            rate
+        );
     }
 
     #[test]
@@ -4253,7 +4341,11 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // No workers should always use baseline
-        assert!((rate - 5.0).abs() < 0.01, "expected $5/worker/hr from baseline (no workers), got ${:.2}", rate);
+        assert!(
+            (rate - 5.0).abs() < 0.01,
+            "expected $5/worker/hr from baseline (no workers), got ${:.2}",
+            rate
+        );
     }
 
     #[test]
@@ -4268,8 +4360,15 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // Stale data should use baseline, not aggregate
-        assert!((rate - 7.5).abs() < 0.01, "expected $7.5/worker/hr from baseline, got ${:.2}", rate);
-        assert!((rate - 10.0).abs() > 0.01, "should NOT use aggregate value $10/worker/hr");
+        assert!(
+            (rate - 7.5).abs() < 0.01,
+            "expected $7.5/worker/hr from baseline, got ${:.2}",
+            rate
+        );
+        assert!(
+            (rate - 10.0).abs() > 0.01,
+            "should NOT use aggregate value $10/worker/hr"
+        );
     }
 
     #[test]
@@ -4284,10 +4383,17 @@ mod tests {
 
         let rate = staleness_checked_fleet_dollar_rate(&aggregate, &baseline);
         // 45 minutes is well into the stale tier (>30 min), should use baseline
-        assert!((rate - 6.0).abs() < 0.01, "expected $6/worker/hr from baseline (45min stale), got ${:.2}", rate);
+        assert!(
+            (rate - 6.0).abs() < 0.01,
+            "expected $6/worker/hr from baseline (45min stale), got ${:.2}",
+            rate
+        );
 
         // Verify we're NOT using the aggregate value ($15/hr / 3 = $5/worker/hr)
-        assert!((rate - 5.0).abs() > 0.01, "should NOT use aggregate value $5/worker/hr when stale");
+        assert!(
+            (rate - 5.0).abs() > 0.01,
+            "should NOT use aggregate value $5/worker/hr when stale"
+        );
     }
 
     #[test]
@@ -4304,12 +4410,20 @@ mod tests {
         // Phase 1: Fresh data (5 min old) - should use aggregate
         let fresh_aggregate = test_fleet_aggregate(5, 12.0, 2); // $12/hr, 2 workers = $6/worker/hr
         let fresh_rate = staleness_checked_fleet_dollar_rate(&fresh_aggregate, &baseline);
-        assert!((fresh_rate - 6.0).abs() < 0.01, "fresh data should use aggregate ($6/worker/hr), got ${:.2}", fresh_rate);
+        assert!(
+            (fresh_rate - 6.0).abs() < 0.01,
+            "fresh data should use aggregate ($6/worker/hr), got ${:.2}",
+            fresh_rate
+        );
 
         // Phase 2: Stale data (45 min old) - should use baseline
         let stale_aggregate = test_fleet_aggregate(45, 12.0, 2); // Same aggregate but stale
         let stale_rate = staleness_checked_fleet_dollar_rate(&stale_aggregate, &baseline);
-        assert!((stale_rate - 5.0).abs() < 0.01, "stale data should use baseline ($5/worker/hr), got ${:.2}", stale_rate);
+        assert!(
+            (stale_rate - 5.0).abs() < 0.01,
+            "stale data should use baseline ($5/worker/hr), got ${:.2}",
+            stale_rate
+        );
 
         // Phase 3: Recovery - fresh data again (5 min old with new aggregate value)
         // This simulates the collector running again after a stale period
@@ -4317,8 +4431,15 @@ mod tests {
         let recovered_rate = staleness_checked_fleet_dollar_rate(&recovered_aggregate, &baseline);
 
         // Recovery should use the fresh aggregate value, not remain stuck on baseline
-        assert!((recovered_rate - 9.0).abs() < 0.01, "recovered data should use new aggregate ($9/worker/hr), got ${:.2}", recovered_rate);
-        assert!((recovered_rate - 5.0).abs() > 0.01, "recovered data should NOT stick to baseline ($5/worker/hr)");
+        assert!(
+            (recovered_rate - 9.0).abs() < 0.01,
+            "recovered data should use new aggregate ($9/worker/hr), got ${:.2}",
+            recovered_rate
+        );
+        assert!(
+            (recovered_rate - 5.0).abs() > 0.01,
+            "recovered data should NOT stick to baseline ($5/worker/hr)"
+        );
     }
 
     #[test]
@@ -4331,7 +4452,11 @@ mod tests {
         match tier {
             StalenessTier::Aging { age_secs } => {
                 // 15 minutes should be in the aging tier (10-30 min range)
-                assert!((age_secs as f64 - 900.0).abs() < 2.0, "age_secs should be ~900s (15min), got {}", age_secs);
+                assert!(
+                    (age_secs as f64 - 900.0).abs() < 2.0,
+                    "age_secs should be ~900s (15min), got {}",
+                    age_secs
+                );
             }
             _ => panic!("expected Aging tier at exactly 15 minutes, got {:?}", tier),
         }
@@ -4362,18 +4487,21 @@ mod tests {
             2.0,
             500_000,
             Some(1.0), // five_hour: has fresh rate
-            None,       // seven_day: no fresh rate
-            None,       // weekly_scoped: no fresh rate (cold start!)
-            42.0, 41.0, // five_hour current/prev (delta 1.0)
-            30.0, 30.0, // seven_day unused (pct_delta None)
-            15.0, 15.0, // weekly_scoped unused (pct_delta None)
+            None,      // seven_day: no fresh rate
+            None,      // weekly_scoped: no fresh rate (cold start!)
+            42.0,
+            41.0, // five_hour current/prev (delta 1.0)
+            30.0,
+            30.0, // seven_day unused (pct_delta None)
+            15.0,
+            15.0, // weekly_scoped unused (pct_delta None)
         )];
 
         // Window has utilization > 0 (it exists this period)
         let mut utilization = HashMap::new();
         utilization.insert("weekly_scoped".to_string(), 15.0); // 15% used, exists!
-        utilization.insert("five_hour".to_string(), 42.0);     // Has data
-        utilization.insert("seven_day".to_string(), 30.0);     // Has data
+        utilization.insert("five_hour".to_string(), 42.0); // Has data
+        utilization.insert("seven_day".to_string(), 30.0); // Has data
 
         let mut hrs_left = HashMap::new();
         hrs_left.insert("weekly_scoped".to_string(), 100.0); // 100 hours to reset
@@ -4437,10 +4565,13 @@ mod tests {
             500_000,
             Some(2.0), // five_hour: has fresh rate
             Some(0.5), // seven_day: has fresh rate
-            None,       // weekly_scoped: no fresh rate (cold start!)
-            43.0, 41.0, // five_hour
-            61.0, 60.5, // seven_day
-            20.0, 20.0, // weekly_scoped unused
+            None,      // weekly_scoped: no fresh rate (cold start!)
+            43.0,
+            41.0, // five_hour
+            61.0,
+            60.5, // seven_day
+            20.0,
+            20.0, // weekly_scoped unused
         )];
 
         let mut utilization = HashMap::new();
@@ -4503,10 +4634,13 @@ mod tests {
             500_000,
             Some(1.5), // five_hour: has fresh rate
             Some(0.3), // seven_day: has fresh rate
-            None,       // weekly_scoped: no fresh rate (cold start!)
-            42.5, 41.0, // five_hour
-            61.0, 60.7, // seven_day
-            25.0, 25.0, // weekly_scoped unused
+            None,      // weekly_scoped: no fresh rate (cold start!)
+            42.5,
+            41.0, // five_hour
+            61.0,
+            60.7, // seven_day
+            25.0,
+            25.0, // weekly_scoped unused
         )];
 
         let mut utilization = HashMap::new();
@@ -4578,11 +4712,14 @@ mod tests {
             2.0,
             500_000,
             Some(1.0), // five_hour: has fresh rate
-            None,       // seven_day: no fresh rate
-            None,       // weekly_scoped: no fresh rate, BUT 0% util!
-            41.0, 40.0, // five_hour
-            30.0, 30.0, // seven_day unused
-            0.0, 0.0,   // weekly_scoped: 0% util (absent)
+            None,      // seven_day: no fresh rate
+            None,      // weekly_scoped: no fresh rate, BUT 0% util!
+            41.0,
+            40.0, // five_hour
+            30.0,
+            30.0, // seven_day unused
+            0.0,
+            0.0, // weekly_scoped: 0% util (absent)
         )];
 
         // weekly_scoped at 0% utilization (absent)
@@ -4622,7 +4759,10 @@ mod tests {
 
         // weekly_scoped should have infinite exhaustion (no constraint)
         assert!(
-            forecast.weekly_scoped.predicted_exhaustion_hours.is_infinite(),
+            forecast
+                .weekly_scoped
+                .predicted_exhaustion_hours
+                .is_infinite(),
             "absent window should have infinite exhaustion"
         );
     }
@@ -4646,9 +4786,12 @@ mod tests {
             Some(4.0), // five_hour: 4% delta this interval
             Some(0.5),
             Some(1.0), // weekly_scoped: 1% delta this interval
-            45.0, 41.0, // five_hour
-            70.0, 69.5, // seven_day
-            25.0, 24.0, // weekly_scoped
+            45.0,
+            41.0, // five_hour
+            70.0,
+            69.5, // seven_day
+            25.0,
+            24.0, // weekly_scoped
         )];
 
         let mut utilization = HashMap::new();
@@ -4718,8 +4861,8 @@ mod tests {
                 2.0,
                 500_000,
                 Some(1.0), // Consistent 1%/hr burn rate for five_hour
-                None,       // seven_day: no data
-                None,       // weekly_scoped: no data (stays at 0 samples!)
+                None,      // seven_day: no data
+                None,      // weekly_scoped: no data (stays at 0 samples!)
                 41.0 + i as f64,
                 40.0,
                 60.5,
@@ -4768,11 +4911,14 @@ mod tests {
             3.0,
             800_000,
             Some(1.2), // five_hour: fresh rate (calibrated)
-            None,       // seven_day: no fresh rate
-            None,       // weekly_scoped: no fresh rate (cold start)
-            45.0, 43.8, // five_hour
-            62.0, 62.0, // seven_day unused
-            80.0, 80.0, // weekly_scoped unused
+            None,      // seven_day: no fresh rate
+            None,      // weekly_scoped: no fresh rate (cold start)
+            45.0,
+            43.8, // five_hour
+            62.0,
+            62.0, // seven_day unused
+            80.0,
+            80.0, // weekly_scoped unused
         )];
 
         let mut utilization = HashMap::new();
@@ -4967,9 +5113,12 @@ mod tests {
             Some(2.0), // 2% per hour
             Some(1.0),
             Some(1.5),
-            50.0, 48.0, // five_hour
-            50.0, 49.0, // seven_day
-            50.0, 48.5, // weekly_scoped
+            50.0,
+            48.0, // five_hour
+            50.0,
+            49.0, // seven_day
+            50.0,
+            48.5, // weekly_scoped
         )];
 
         let mut utilization = HashMap::new();
@@ -5035,13 +5184,13 @@ mod tests {
         // Call generate_window_forecast directly with the seeded rate
         // This simulates the production path after seeding has occurred
         let forecast = generate_window_forecast(
-            "weekly_scoped",                     // cold window name
-            seeded_fleet_pct_hr,                 // seeded fleet burn rate: 3.0%/hr
-            25.0,                                // current utilization: 25%
-            90.0,                                // target ceiling: 90%
-            80.0,                                // hours remaining: 80 hours
-            baseline_pct_per_worker,            // mean rate per worker: 1.5%/hr
-            seeded_fleet_pct_hr * 0.5,          // std_pct_hr: conservative spread (50% of mean)
+            "weekly_scoped",                          // cold window name
+            seeded_fleet_pct_hr,                      // seeded fleet burn rate: 3.0%/hr
+            25.0,                                     // current utilization: 25%
+            90.0,                                     // target ceiling: 90%
+            80.0,                                     // hours remaining: 80 hours
+            baseline_pct_per_worker,                  // mean rate per worker: 1.5%/hr
+            seeded_fleet_pct_hr * 0.5, // std_pct_hr: conservative spread (50% of mean)
             crate::state::EstimateQuality::ColdStart, // quality flag: cold start
         );
 
@@ -5114,13 +5263,13 @@ mod tests {
 
         // Call generate_window_forecast directly with cold start parameters
         let forecast = generate_window_forecast(
-            "weekly_scoped",                     // cold window name
-            seeded_fleet_pct_hr,                 // seeded fleet burn rate: 6.0%/hr
-            30.0,                                // current utilization: 30%
-            90.0,                                // target ceiling: 90%
-            100.0,                               // hours remaining: 100 hours
-            baseline_pct_per_worker,            // mean rate per worker: 2.0%/hr
-            widened_std_pct_hr,                  // widened std for uncertainty: 6.0%/hr
+            "weekly_scoped",                          // cold window name
+            seeded_fleet_pct_hr,                      // seeded fleet burn rate: 6.0%/hr
+            30.0,                                     // current utilization: 30%
+            90.0,                                     // target ceiling: 90%
+            100.0,                                    // hours remaining: 100 hours
+            baseline_pct_per_worker,                  // mean rate per worker: 2.0%/hr
+            widened_std_pct_hr,                       // widened std for uncertainty: 6.0%/hr
             crate::state::EstimateQuality::ColdStart, // quality flag: cold start
         );
 
@@ -5146,12 +5295,14 @@ mod tests {
         assert!(
             forecast.exh_hrs_p25 < forecast.exh_hrs_p50,
             "p25 (pessimistic) should be < p50 (mean), got p25={:.2}, p50={:.2}",
-            forecast.exh_hrs_p25, forecast.exh_hrs_p50
+            forecast.exh_hrs_p25,
+            forecast.exh_hrs_p50
         );
         assert!(
             forecast.exh_hrs_p50 < forecast.exh_hrs_p75,
             "p50 (mean) should be < p75 (optimistic), got p50={:.2}, p75={:.2}",
-            forecast.exh_hrs_p50, forecast.exh_hrs_p75
+            forecast.exh_hrs_p50,
+            forecast.exh_hrs_p75
         );
 
         // VERIFY 4: The spread should be meaningful (not just floating point noise)
@@ -5168,7 +5319,8 @@ mod tests {
             assert!(
                 forecast.safe_worker_count_p75 <= forecast.safe_worker_count,
                 "p75 safe workers should be <= p50 (more conservative), got p75={:?}, p50={:?}",
-                forecast.safe_worker_count_p75, forecast.safe_worker_count
+                forecast.safe_worker_count_p75,
+                forecast.safe_worker_count
             );
         }
 
@@ -5179,7 +5331,8 @@ mod tests {
         assert!(
             (forecast.predicted_exhaustion_hours - expected_exhaustion).abs() < 0.1,
             "predicted_exhaustion_hours should match seeded rate, expected {:.2}, got {:.2}",
-            expected_exhaustion, forecast.predicted_exhaustion_hours
+            expected_exhaustion,
+            forecast.predicted_exhaustion_hours
         );
     }
 
@@ -5213,7 +5366,7 @@ mod tests {
             target_ceiling,
             hours_remaining,
             mean_rate_per_worker,
-            std_pct_hr, // Low variance from real samples
+            std_pct_hr,                                // Low variance from real samples
             crate::state::EstimateQuality::Calibrated, // Calibrated quality
         );
 
@@ -5229,7 +5382,8 @@ mod tests {
         // rate_fast = 5.0 + 0.675*0.5 = 5.3375
         // rate_slow = 5.0 - 0.675*0.5 = 4.6625
         // cone_ratio = rate_fast/rate_slow = 5.3375/4.6625 ≈ 1.145
-        let expected_cone_ratio = (fleet_pct_hr + 0.675 * std_pct_hr) / (fleet_pct_hr - 0.675 * std_pct_hr);
+        let expected_cone_ratio =
+            (fleet_pct_hr + 0.675 * std_pct_hr) / (fleet_pct_hr - 0.675 * std_pct_hr);
         assert!(
             (forecast.cone_ratio - expected_cone_ratio).abs() < 0.01,
             "cone_ratio should match calculation from std_pct_hr, expected {:.3}, got {:.3}",
@@ -5322,53 +5476,43 @@ mod tests {
 
         // VERIFY: All numeric fields should be identical
         assert_eq!(
-            forecast1.fleet_pct_per_hour,
-            forecast2.fleet_pct_per_hour,
+            forecast1.fleet_pct_per_hour, forecast2.fleet_pct_per_hour,
             "fleet_pct_per_hour should be identical"
         );
         assert_eq!(
-            forecast1.remaining_pct,
-            forecast2.remaining_pct,
+            forecast1.remaining_pct, forecast2.remaining_pct,
             "remaining_pct should be identical"
         );
         assert_eq!(
-            forecast1.predicted_exhaustion_hours,
-            forecast2.predicted_exhaustion_hours,
+            forecast1.predicted_exhaustion_hours, forecast2.predicted_exhaustion_hours,
             "predicted_exhaustion_hours should be identical"
         );
         assert_eq!(
-            forecast1.margin_hrs,
-            forecast2.margin_hrs,
+            forecast1.margin_hrs, forecast2.margin_hrs,
             "margin_hrs should be identical"
         );
         assert_eq!(
-            forecast1.safe_worker_count,
-            forecast2.safe_worker_count,
+            forecast1.safe_worker_count, forecast2.safe_worker_count,
             "safe_worker_count should be identical"
         );
         assert_eq!(
-            forecast1.cone_ratio,
-            forecast2.cone_ratio,
+            forecast1.cone_ratio, forecast2.cone_ratio,
             "cone_ratio should be identical"
         );
         assert_eq!(
-            forecast1.exh_hrs_p25,
-            forecast2.exh_hrs_p25,
+            forecast1.exh_hrs_p25, forecast2.exh_hrs_p25,
             "exh_hrs_p25 should be identical"
         );
         assert_eq!(
-            forecast1.exh_hrs_p50,
-            forecast2.exh_hrs_p50,
+            forecast1.exh_hrs_p50, forecast2.exh_hrs_p50,
             "exh_hrs_p50 should be identical"
         );
         assert_eq!(
-            forecast1.exh_hrs_p75,
-            forecast2.exh_hrs_p75,
+            forecast1.exh_hrs_p75, forecast2.exh_hrs_p75,
             "exh_hrs_p75 should be identical"
         );
         assert_eq!(
-            forecast1.risk_score,
-            forecast2.risk_score,
+            forecast1.risk_score, forecast2.risk_score,
             "risk_score should be identical"
         );
     }

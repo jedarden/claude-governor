@@ -7,15 +7,20 @@
 //! - State is written after cycle completes
 //! - Errors are handled gracefully
 
+use anyhow::Result;
+use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use chrono::{Utc, Duration};
-use anyhow::Result;
 
-use claude_governor::config::{GovernorConfig, AlertConfig, DaemonConfig, PricingConfig, SprintConfig, CompositeRiskConfig, ConeScalingConfig, ModelPricing};
-use claude_governor::governor::{UsageSnapshot, WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED};
+use claude_governor::config::{
+    AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig, GovernorConfig,
+    ModelPricing, PricingConfig, SprintConfig,
+};
+use claude_governor::governor::{
+    UsageSnapshot, WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED,
+};
 use claude_governor::poller::UsageData;
 use claude_governor::state::{self, GovernorState, WorkerState};
 
@@ -50,7 +55,11 @@ impl SimpleMockPoller {
     }
 
     /// Create a mock poller with custom utilization values
-    pub fn with_utilization(five_hour_util: f64, seven_day_util: f64, weekly_scoped_util: f64) -> Self {
+    pub fn with_utilization(
+        five_hour_util: f64,
+        seven_day_util: f64,
+        weekly_scoped_util: f64,
+    ) -> Self {
         let mut data = Self::default_usage_data();
         data.five_hour_utilization = five_hour_util;
         data.seven_day_utilization = seven_day_util;
@@ -145,7 +154,13 @@ fn create_minimal_config() -> GovernorConfig {
 }
 
 /// Create a test state file with worker configuration
-fn create_test_state_file(temp_dir: &TempDir, current: u32, target: u32, min: u32, max: u32) -> PathBuf {
+fn create_test_state_file(
+    temp_dir: &TempDir,
+    current: u32,
+    target: u32,
+    min: u32,
+    max: u32,
+) -> PathBuf {
     let state_path = temp_dir.path().join("governor-state.json");
 
     let mut state = GovernorState::new();
@@ -177,23 +192,19 @@ fn test_state_loaded_correctly() {
     // Verify state is loaded with correct values
     assert_eq!(loaded_state.workers.len(), 1, "State should have 1 worker");
     assert_eq!(
-        loaded_state.workers["test-agent"].current,
-        5,
+        loaded_state.workers["test-agent"].current, 5,
         "Current workers should be 5"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].target,
-        5,
+        loaded_state.workers["test-agent"].target, 5,
         "Target workers should be 5"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].min,
-        1,
+        loaded_state.workers["test-agent"].min, 1,
         "Min workers should be 1"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].max,
-        10,
+        loaded_state.workers["test-agent"].max, 10,
         "Max workers should be 10"
     );
 }
@@ -228,38 +239,31 @@ fn test_state_written_correctly() {
     let loaded_state = state::load_state(&state_path).expect("Failed to load state");
 
     assert_eq!(
-        loaded_state.workers["test-agent"].current,
-        8,
+        loaded_state.workers["test-agent"].current, 8,
         "Current workers should match saved value"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].target,
-        8,
+        loaded_state.workers["test-agent"].target, 8,
         "Target workers should match saved value"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].min,
-        2,
+        loaded_state.workers["test-agent"].min, 2,
         "Min workers should match saved value"
     );
     assert_eq!(
-        loaded_state.workers["test-agent"].max,
-        15,
+        loaded_state.workers["test-agent"].max, 15,
         "Max workers should match saved value"
     );
     assert_eq!(
-        loaded_state.usage.five_hour_pct,
-        75.0,
+        loaded_state.usage.five_hour_pct, 75.0,
         "5-hour utilization should match saved value"
     );
     assert_eq!(
-        loaded_state.usage.sonnet_pct,
-        68.0,
+        loaded_state.usage.sonnet_pct, 68.0,
         "Sonnet utilization should match saved value"
     );
     assert_eq!(
-        loaded_state.usage.all_models_pct,
-        72.0,
+        loaded_state.usage.all_models_pct, 72.0,
         "All models utilization should match saved value"
     );
 }
@@ -276,13 +280,19 @@ fn test_poller_called_during_cycle() {
     let result = mock_poller.poll();
 
     // Verify poll was called
-    assert_eq!(mock_poller.poll_count, 1, "Poll count should be 1 after poll()");
+    assert_eq!(
+        mock_poller.poll_count, 1,
+        "Poll count should be 1 after poll()"
+    );
 
     // Verify result is successful
     assert!(result.is_ok(), "Poll should return Ok");
     let data = result.unwrap();
     assert!(!data.stale, "Default data should not be stale");
-    assert_eq!(data.five_hour_utilization, 50.0, "5-hour utilization should be 50%");
+    assert_eq!(
+        data.five_hour_utilization, 50.0,
+        "5-hour utilization should be 50%"
+    );
 }
 
 /// Verify poller data is processed into usage snapshot
@@ -292,7 +302,10 @@ fn test_poller_data_processed_to_snapshot() {
 
     // Poll the mock poller
     let poll_result = mock_poller.poll().expect("Poll should succeed");
-    assert_eq!(mock_poller.poll_count, 1, "Poll should have been called once");
+    assert_eq!(
+        mock_poller.poll_count, 1,
+        "Poll should have been called once"
+    );
 
     // Create usage snapshot from poller data
     let snapshot = UsageSnapshot::from_windows(
@@ -397,7 +410,10 @@ fn test_no_emergency_brake_below_98_percent() {
     );
 
     // Verify safe mode is not active
-    assert!(!state.safe_mode.active, "Safe mode should not be active at 75% utilization");
+    assert!(
+        !state.safe_mode.active,
+        "Safe mode should not be active at 75% utilization"
+    );
 }
 
 /// Verify state is updated with poller data after cycle completes
@@ -435,23 +451,19 @@ fn test_state_updated_after_cycle() {
     let reloaded_state = state::load_state(&state_path).expect("Failed to reload state");
 
     assert_eq!(
-        reloaded_state.usage.five_hour_pct,
-        55.0,
+        reloaded_state.usage.five_hour_pct, 55.0,
         "5-hour utilization should be updated"
     );
     assert_eq!(
-        reloaded_state.usage.weekly_scoped_pct,
-        58.0,
+        reloaded_state.usage.weekly_scoped_pct, 58.0,
         "Weekly-scoped utilization should be updated"
     );
     assert_eq!(
-        reloaded_state.usage.all_models_pct,
-        60.0,
+        reloaded_state.usage.all_models_pct, 60.0,
         "All models utilization should be updated"
     );
     assert_eq!(
-        reloaded_state.workers["test-agent"].target,
-        6,
+        reloaded_state.workers["test-agent"].target, 6,
         "Worker target should be updated"
     );
     assert!(
@@ -476,7 +488,10 @@ fn test_error_handling_when_poll_fails() {
     let poll_result = mock_poller.poll();
 
     // Verify error is returned
-    assert!(poll_result.is_err(), "Poll should return Err when configured with error");
+    assert!(
+        poll_result.is_err(),
+        "Poll should return Err when configured with error"
+    );
     let error_msg = poll_result.unwrap_err().to_string();
     assert!(
         error_msg.contains("Simulated API failure"),
@@ -485,18 +500,19 @@ fn test_error_handling_when_poll_fails() {
 
     // Verify state was NOT modified (error handling preserves existing state)
     assert_eq!(
-        state.workers["test-agent"].current,
-        5,
+        state.workers["test-agent"].current, 5,
         "Worker current should remain unchanged after poll error"
     );
     assert_eq!(
-        state.workers["test-agent"].target,
-        5,
+        state.workers["test-agent"].target, 5,
         "Worker target should remain unchanged after poll error"
     );
 
     // Verify poll count was incremented even on error
-    assert_eq!(mock_poller.poll_count, 1, "Poll count should be incremented even on error");
+    assert_eq!(
+        mock_poller.poll_count, 1,
+        "Poll count should be incremented even on error"
+    );
 }
 
 /// Verify error handling preserves existing state
@@ -525,28 +541,23 @@ fn test_error_handling_preserves_state() {
     // State should not be modified after failed poll
     // (In a real cycle, the error would be caught and state would remain unchanged)
     assert_eq!(
-        state.workers["test-agent"].current,
-        original_current,
+        state.workers["test-agent"].current, original_current,
         "Worker current should be preserved after poll error"
     );
     assert_eq!(
-        state.workers["test-agent"].target,
-        original_target,
+        state.workers["test-agent"].target, original_target,
         "Worker target should be preserved after poll error"
     );
     assert_eq!(
-        state.workers["test-agent"].min,
-        original_min,
+        state.workers["test-agent"].min, original_min,
         "Worker min should be preserved after poll error"
     );
     assert_eq!(
-        state.workers["test-agent"].max,
-        original_max,
+        state.workers["test-agent"].max, original_max,
         "Worker max should be preserved after poll error"
     );
     assert_eq!(
-        state.usage.five_hour_pct,
-        original_five_hour,
+        state.usage.five_hour_pct, original_five_hour,
         "Utilization data should be preserved after poll error"
     );
 }
@@ -592,8 +603,7 @@ fn test_stale_data_handling() {
     // Reload and verify state persisted
     let reloaded_state = state::load_state(&state_path).expect("Failed to reload state");
     assert_eq!(
-        reloaded_state.usage.five_hour_pct,
-        state.usage.five_hour_pct,
+        reloaded_state.usage.five_hour_pct, state.usage.five_hour_pct,
         "Stale data should persist in state"
     );
 }
@@ -606,12 +616,18 @@ fn test_complete_governor_cycle() {
 
     // 1. Load initial state
     let mut state = state::load_state(&state_path).expect("Failed to load state");
-    assert_eq!(state.workers["test-agent"].current, 5, "Initial current should be 5");
+    assert_eq!(
+        state.workers["test-agent"].current, 5,
+        "Initial current should be 5"
+    );
 
     // 2. Poll for new data
     let mut mock_poller = SimpleMockPoller::with_utilization(70.0, 72.0, 71.0);
     let poll_result = mock_poller.poll().expect("Poll should succeed");
-    assert_eq!(mock_poller.poll_count, 1, "Poll should have been called once");
+    assert_eq!(
+        mock_poller.poll_count, 1,
+        "Poll should have been called once"
+    );
 
     // 3. Update state with poller data
     state.usage.five_hour_pct = poll_result.five_hour_utilization;
@@ -639,28 +655,23 @@ fn test_complete_governor_cycle() {
 
     // Verify all updates persisted correctly
     assert_eq!(
-        reloaded_state.usage.five_hour_pct,
-        70.0,
+        reloaded_state.usage.five_hour_pct, 70.0,
         "5-hour utilization should persist"
     );
     assert_eq!(
-        reloaded_state.usage.sonnet_pct,
-        71.0,
+        reloaded_state.usage.sonnet_pct, 71.0,
         "Sonnet utilization should persist"
     );
     assert_eq!(
-        reloaded_state.usage.all_models_pct,
-        72.0,
+        reloaded_state.usage.all_models_pct, 72.0,
         "All models utilization should persist"
     );
     assert_eq!(
-        reloaded_state.workers["test-agent"].current,
-        5,
+        reloaded_state.workers["test-agent"].current, 5,
         "Current workers should remain unchanged (simulated state, not actual workers)"
     );
     assert_eq!(
-        reloaded_state.workers["test-agent"].target,
-        new_target,
+        reloaded_state.workers["test-agent"].target, new_target,
         "Target workers should be updated to new value"
     );
 }
@@ -672,15 +683,24 @@ fn test_poller_called_across_multiple_cycles() {
 
     // First cycle
     let _result1 = mock_poller.poll().expect("First poll should succeed");
-    assert_eq!(mock_poller.poll_count, 1, "Poll count should be 1 after first cycle");
+    assert_eq!(
+        mock_poller.poll_count, 1,
+        "Poll count should be 1 after first cycle"
+    );
 
     // Second cycle
     let _result2 = mock_poller.poll().expect("Second poll should succeed");
-    assert_eq!(mock_poller.poll_count, 2, "Poll count should be 2 after second cycle");
+    assert_eq!(
+        mock_poller.poll_count, 2,
+        "Poll count should be 2 after second cycle"
+    );
 
     // Third cycle
     let _result3 = mock_poller.poll().expect("Third poll should succeed");
-    assert_eq!(mock_poller.poll_count, 3, "Poll count should be 3 after third cycle");
+    assert_eq!(
+        mock_poller.poll_count, 3,
+        "Poll count should be 3 after third cycle"
+    );
 
     // Verify poller continues to work correctly
     assert_eq!(mock_poller.poll_count, 3, "Final poll count should be 3");
@@ -713,8 +733,7 @@ fn test_emergency_brake_exact_threshold() {
 
     // Verify utilization is exactly at threshold
     assert_eq!(
-        state.usage.five_hour_pct,
-        98.0,
+        state.usage.five_hour_pct, 98.0,
         "5-hour utilization should be exactly 98%"
     );
 
@@ -736,11 +755,21 @@ fn test_state_load_creates_new_state_when_missing() {
     let load_result = state::load_state(&nonexistent_path);
 
     // Verify load succeeds with a new default state (not an error)
-    assert!(load_result.is_ok(), "Load from non-existent path should return Ok with new state");
+    assert!(
+        load_result.is_ok(),
+        "Load from non-existent path should return Ok with new state"
+    );
 
     let loaded_state = load_result.unwrap();
-    assert_eq!(loaded_state.workers.len(), 0, "New state should have no workers");
-    assert_eq!(loaded_state.usage.five_hour_pct, 0.0, "New state should have zero utilization");
+    assert_eq!(
+        loaded_state.workers.len(),
+        0,
+        "New state should have no workers"
+    );
+    assert_eq!(
+        loaded_state.usage.five_hour_pct, 0.0,
+        "New state should have zero utilization"
+    );
 }
 
 /// Verify state write succeeds even when parent directory doesn't exist
@@ -761,18 +790,31 @@ fn test_state_write_creates_parent_directories() {
     );
 
     // Attempt to save to a path with nonexistent parent directories
-    let nested_path = temp_dir.path().join("level1").join("level2").join("state.json");
+    let nested_path = temp_dir
+        .path()
+        .join("level1")
+        .join("level2")
+        .join("state.json");
 
     let save_result = state::save_state(&state, &nested_path);
 
     // Verify save succeeds (creates parent directories automatically)
-    assert!(save_result.is_ok(), "Save should succeed by creating parent directories");
+    assert!(
+        save_result.is_ok(),
+        "Save should succeed by creating parent directories"
+    );
 
     // Verify the file was actually created
-    assert!(nested_path.exists(), "State file should exist at nested path");
+    assert!(
+        nested_path.exists(),
+        "State file should exist at nested path"
+    );
 
     // Load and verify the state
     let loaded_state = state::load_state(&nested_path).expect("Failed to load state");
     assert_eq!(loaded_state.workers.len(), 1, "State should have 1 worker");
-    assert_eq!(loaded_state.workers["test-agent"].current, 3, "Worker data should persist");
+    assert_eq!(
+        loaded_state.workers["test-agent"].current, 3,
+        "Worker data should persist"
+    );
 }

@@ -19,7 +19,6 @@ use crate::alerts::{
     check_alert_conditions, check_low_cache_efficiency, fire_alert, should_fire, update_cooldown,
     AlertType, SprintTrigger,
 };
-use crate::poller::UsageWindow;
 use crate::burn_rate::{
     compute_composite_safe_workers, effective_multiplier, generate_window_forecast,
     log_capacity_forecast, validate_promotion_from_db, PromotionValidationResult,
@@ -31,6 +30,7 @@ use crate::config::{
 };
 use crate::db;
 use crate::poller::Poller;
+use crate::poller::UsageWindow;
 use crate::schedule::{self, Promotion};
 use crate::state;
 use crate::worker::{self, WorkerConfig};
@@ -124,10 +124,7 @@ pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;
 /// The is_active field is optional in UsageWindow. When absent/null in the API
 /// response, the window is treated as active (not inactive). Only an explicit
 /// `false` value marks the window as structurally inactive.
-fn is_structurally_inactive(
-    window: &UsageWindow,
-    state: &state::GovernorState,
-) -> bool {
+fn is_structurally_inactive(window: &UsageWindow, state: &state::GovernorState) -> bool {
     // Condition 1: Consecutive absence threshold reached
     // Check if the window has been absent (null) from API responses across
     // >= MIN_CONSECUTIVE_ABSENT consecutive polls.
@@ -956,12 +953,13 @@ fn get_sonnet_baseline_config(
     log::debug!("[governor] state has no baseline_burn_rates, falling back to agent config");
 
     // Helper to convert from burn_rate::BaselineBurnRates to state::BaselineBurnRates
-    let convert_baseline = |br: crate::burn_rate::BaselineBurnRates| -> crate::state::BaselineBurnRates {
-        crate::state::BaselineBurnRates {
-            pct_per_worker_per_hour: br.pct_per_worker_per_hour,
-            dollars_per_worker_per_hour: br.dollars_per_worker_per_hour,
-        }
-    };
+    let convert_baseline =
+        |br: crate::burn_rate::BaselineBurnRates| -> crate::state::BaselineBurnRates {
+            crate::state::BaselineBurnRates {
+                pct_per_worker_per_hour: br.pct_per_worker_per_hour,
+                dollars_per_worker_per_hour: br.dollars_per_worker_per_hour,
+            }
+        };
 
     // First try to find a subscription agent with "sonnet" in its name
     for (name, cfg) in agents {
@@ -1136,8 +1134,8 @@ mod window_delta_tests {
     #[test]
     fn test_apportion_delta_equal_weights() {
         // Two sessions with equal spend
-        let result1 = apportion_delta(3.0, 60.0, 30.0);  // Half of total
-        let result2 = apportion_delta(3.0, 60.0, 30.0);  // Half of total
+        let result1 = apportion_delta(3.0, 60.0, 30.0); // Half of total
+        let result2 = apportion_delta(3.0, 60.0, 30.0); // Half of total
         assert!((result1 - 1.5).abs() < f64::EPSILON);
         assert!((result2 - 1.5).abs() < f64::EPSILON);
         assert!((result1 + result2 - 3.0).abs() < f64::EPSILON);
@@ -1204,9 +1202,18 @@ mod window_delta_tests {
         assert!(delta_7ds > 0.0, "7ds delta should be positive");
 
         // Verify exact delta values
-        assert!((delta_5h - 2.5).abs() < f64::EPSILON, "5h delta = 12.5 - 10.0 = 2.5");
-        assert!((delta_7d - 2.0).abs() < f64::EPSILON, "7d delta = 22.0 - 20.0 = 2.0");
-        assert!((delta_7ds - 3.0).abs() < f64::EPSILON, "7ds delta = 18.0 - 15.0 = 3.0");
+        assert!(
+            (delta_5h - 2.5).abs() < f64::EPSILON,
+            "5h delta = 12.5 - 10.0 = 2.5"
+        );
+        assert!(
+            (delta_7d - 2.0).abs() < f64::EPSILON,
+            "7d delta = 22.0 - 20.0 = 2.0"
+        );
+        assert!(
+            (delta_7ds - 3.0).abs() < f64::EPSILON,
+            "7ds delta = 18.0 - 15.0 = 3.0"
+        );
     }
 
     /// Test that identical snapshots produce zero deltas.
@@ -1241,9 +1248,18 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // All deltas should be exactly zero
-        assert_eq!(delta_5h, 0.0, "5h delta should be zero for identical snapshots");
-        assert_eq!(delta_7d, 0.0, "7d delta should be zero for identical snapshots");
-        assert_eq!(delta_7ds, 0.0, "7ds delta should be zero for identical snapshots");
+        assert_eq!(
+            delta_5h, 0.0,
+            "5h delta should be zero for identical snapshots"
+        );
+        assert_eq!(
+            delta_7d, 0.0,
+            "7d delta should be zero for identical snapshots"
+        );
+        assert_eq!(
+            delta_7ds, 0.0,
+            "7ds delta should be zero for identical snapshots"
+        );
     }
 
     /// Test first poll handling when no previous snapshot exists.
@@ -1270,8 +1286,14 @@ mod window_delta_tests {
         let mut delta_computation_attempted = false;
 
         // ASSERTION 1: Verify snapshot state BEFORE the match
-        assert!(previous.is_none(), "Previous snapshot should be None on first poll");
-        assert!(current.is_some(), "Current snapshot should be Some on first poll");
+        assert!(
+            previous.is_none(),
+            "Previous snapshot should be None on first poll"
+        );
+        assert!(
+            current.is_some(),
+            "Current snapshot should be Some on first poll"
+        );
 
         // The code should handle this gracefully - no delta computation
         // This simulates the check in run_governor_cycle:
@@ -1308,12 +1330,16 @@ mod window_delta_tests {
         };
 
         // ASSERTION 2: Verify delta computation was skipped (returns early)
-        assert!(!delta_computation_attempted,
-                "Delta computation should be skipped on first poll when prev_snapshot is None");
+        assert!(
+            !delta_computation_attempted,
+            "Delta computation should be skipped on first poll when prev_snapshot is None"
+        );
 
         // ASSERTION 3: Verify the match fell into the correct branch
-        assert_eq!(match_result, "first_poll_skip",
-                   "Should match the (None, Some) branch on first poll");
+        assert_eq!(
+            match_result, "first_poll_skip",
+            "Should match the (None, Some) branch on first poll"
+        );
 
         // ASSERTION 4: Verify no panic occurred - test reaches this point
         // (If we reach here, graceful handling succeeded)
@@ -1340,8 +1366,8 @@ mod window_delta_tests {
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
             // Each window changes differently
-            five_hour_pct: 15.0,      // +5.0
-            seven_day_pct: 25.0,      // +5.0
+            five_hour_pct: 15.0,     // +5.0
+            seven_day_pct: 25.0,     // +5.0
             weekly_scoped_pct: 20.0, // +5.0
         };
 
@@ -1360,9 +1386,18 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // Verify each delta uses the correct field pair
-        assert!((delta_5h - 5.0).abs() < f64::EPSILON, "5h: curr(15.0) - prev(10.0) = 5.0");
-        assert!((delta_7d - 5.0).abs() < f64::EPSILON, "7d: curr(25.0) - prev(20.0) = 5.0");
-        assert!((delta_7ds - 5.0).abs() < f64::EPSILON, "7ds: curr(20.0) - prev(15.0) = 5.0");
+        assert!(
+            (delta_5h - 5.0).abs() < f64::EPSILON,
+            "5h: curr(15.0) - prev(10.0) = 5.0"
+        );
+        assert!(
+            (delta_7d - 5.0).abs() < f64::EPSILON,
+            "7d: curr(25.0) - prev(20.0) = 5.0"
+        );
+        assert!(
+            (delta_7ds - 5.0).abs() < f64::EPSILON,
+            "7ds: curr(20.0) - prev(15.0) = 5.0"
+        );
     }
 
     /// Test that negative deltas (window resets) are computed correctly.
@@ -1383,8 +1418,8 @@ mod window_delta_tests {
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
             // Window reset - utilization drops
-            five_hour_pct: 5.0,   // -75.0 (reset)
-            seven_day_pct: 15.0,  // -75.0 (reset)
+            five_hour_pct: 5.0,     // -75.0 (reset)
+            seven_day_pct: 15.0,    // -75.0 (reset)
             weekly_scoped_pct: 8.0, // -77.0 (reset)
         };
 
@@ -1408,9 +1443,18 @@ mod window_delta_tests {
         assert!(delta_7ds < 0.0, "7ds delta should be negative on reset");
 
         // Verify exact values
-        assert!((delta_5h - (-75.0)).abs() < f64::EPSILON, "5h: 5.0 - 80.0 = -75.0");
-        assert!((delta_7d - (-75.0)).abs() < f64::EPSILON, "7d: 15.0 - 90.0 = -75.0");
-        assert!((delta_7ds - (-77.0)).abs() < f64::EPSILON, "7ds: 8.0 - 85.0 = -77.0");
+        assert!(
+            (delta_5h - (-75.0)).abs() < f64::EPSILON,
+            "5h: 5.0 - 80.0 = -75.0"
+        );
+        assert!(
+            (delta_7d - (-75.0)).abs() < f64::EPSILON,
+            "7d: 15.0 - 90.0 = -75.0"
+        );
+        assert!(
+            (delta_7ds - (-77.0)).abs() < f64::EPSILON,
+            "7ds: 8.0 - 85.0 = -77.0"
+        );
     }
 
     /// Test mixed deltas: some windows increase, some decrease.
@@ -1430,8 +1474,8 @@ mod window_delta_tests {
 
         let curr = PrevUsageSnapshot {
             taken_at: Utc::now(),
-            five_hour_pct: 55.0,      // +5.0 (increasing)
-            seven_day_pct: 58.0,      // -2.0 (slight decrease)
+            five_hour_pct: 55.0,     // +5.0 (increasing)
+            seven_day_pct: 58.0,     // -2.0 (slight decrease)
             weekly_scoped_pct: 62.0, // +7.0 (increasing)
         };
 
@@ -1449,9 +1493,18 @@ mod window_delta_tests {
 
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
-        assert!((delta_5h - 5.0).abs() < f64::EPSILON, "5h should increase by 5.0");
-        assert!((delta_7d - (-2.0)).abs() < f64::EPSILON, "7d should decrease by 2.0");
-        assert!((delta_7ds - 7.0).abs() < f64::EPSILON, "7ds should increase by 7.0");
+        assert!(
+            (delta_5h - 5.0).abs() < f64::EPSILON,
+            "5h should increase by 5.0"
+        );
+        assert!(
+            (delta_7d - (-2.0)).abs() < f64::EPSILON,
+            "7d should decrease by 2.0"
+        );
+        assert!(
+            (delta_7ds - 7.0).abs() < f64::EPSILON,
+            "7ds should increase by 7.0"
+        );
     }
 
     /// Test delta precision with very small changes.
@@ -1478,7 +1531,10 @@ mod window_delta_tests {
         const TOL: f64 = 1e-9;
         assert!((delta_5h - 0.1).abs() < TOL, "5h: 50.1 - 50.0 = 0.1");
         assert!((delta_7d - 0.05).abs() < TOL, "7d: 60.05 - 60.0 = 0.05");
-        assert!((delta_7ds - 0.001).abs() < TOL, "7ds: 55.001 - 55.0 = 0.001");
+        assert!(
+            (delta_7ds - 0.001).abs() < TOL,
+            "7ds: 55.001 - 55.0 = 0.001"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1686,7 +1742,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
 
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
@@ -1708,9 +1765,21 @@ mod window_delta_tests {
         // Verify: no panic occurred (test is still running)
         // Verify: delta computation was skipped (deltas weren't computed via calculate_window_pct_delta)
         // Verify: default values are used (deltas set to Some(0.0))
-        assert_eq!(p5h_delta, Some(0.0), "5h delta should be Some(0.0) on first poll");
-        assert_eq!(p7d_delta, Some(0.0), "7d delta should be Some(0.0) on first poll");
-        assert_eq!(p7ds_delta, Some(0.0), "7ds delta should be Some(0.0) on first poll");
+        assert_eq!(
+            p5h_delta,
+            Some(0.0),
+            "5h delta should be Some(0.0) on first poll"
+        );
+        assert_eq!(
+            p7d_delta,
+            Some(0.0),
+            "7d delta should be Some(0.0) on first poll"
+        );
+        assert_eq!(
+            p7ds_delta,
+            Some(0.0),
+            "7ds delta should be Some(0.0) on first poll"
+        );
     }
 
     /// Test first poll with varying current snapshot values.
@@ -1723,10 +1792,10 @@ mod window_delta_tests {
         use chrono::Utc;
 
         let test_cases = vec![
-            (10.0, 20.0, 15.0),   // Low utilization
-            (50.0, 60.0, 55.0),   // Medium utilization
-            (95.0, 98.0, 97.0),  // High utilization
-            (0.0, 0.0, 0.0),     // Zero utilization
+            (10.0, 20.0, 15.0), // Low utilization
+            (50.0, 60.0, 55.0), // Medium utilization
+            (95.0, 98.0, 97.0), // High utilization
+            (0.0, 0.0, 0.0),    // Zero utilization
         ];
 
         for (five_hour, seven_day, weekly_scoped) in test_cases {
@@ -1754,7 +1823,8 @@ mod window_delta_tests {
                         seven_day: curr.seven_day_pct,
                         weekly_scoped: curr.weekly_scoped_pct,
                     };
-                    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                    let (delta_5h, delta_7d, delta_7ds) =
+                        calculate_window_pct_delta(&prev_pct, &curr_pct);
                     p5h_delta = Some(delta_5h);
                     p7d_delta = Some(delta_7d);
                     p7ds_delta = Some(delta_7ds);
@@ -1773,19 +1843,25 @@ mod window_delta_tests {
                 p5h_delta,
                 Some(0.0),
                 "5h delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, weekly_scoped
+                five_hour,
+                seven_day,
+                weekly_scoped
             );
             assert_eq!(
                 p7d_delta,
                 Some(0.0),
                 "7d delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, weekly_scoped
+                five_hour,
+                seven_day,
+                weekly_scoped
             );
             assert_eq!(
                 p7ds_delta,
                 Some(0.0),
                 "7ds delta should be 0.0 for current values ({}, {}, {})",
-                five_hour, seven_day, weekly_scoped
+                five_hour,
+                seven_day,
+                weekly_scoped
             );
         }
     }
@@ -1824,7 +1900,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
                 p7ds_delta = Some(delta_7ds);
@@ -1845,8 +1922,8 @@ mod window_delta_tests {
         // Second poll: previous is now Some, deltas should be computed
         let curr_second: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
             taken_at: Utc::now(),
-            five_hour_pct: 12.5,  // +2.5
-            seven_day_pct: 22.0,  // +2.0
+            five_hour_pct: 12.5,     // +2.5
+            seven_day_pct: 22.0,     // +2.0
             weekly_scoped_pct: 18.0, // +3.0
         });
 
@@ -1866,7 +1943,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
                 p7ds_delta = Some(delta_7ds);
@@ -1880,9 +1958,18 @@ mod window_delta_tests {
         }
 
         // Verify second poll computes actual deltas
-        assert!((p5h_delta.unwrap() - 2.5).abs() < f64::EPSILON, "Second poll: 5h delta should be 2.5");
-        assert!((p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON, "Second poll: 7d delta should be 2.0");
-        assert!((p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON, "Second poll: 7ds delta should be 3.0");
+        assert!(
+            (p5h_delta.unwrap() - 2.5).abs() < f64::EPSILON,
+            "Second poll: 5h delta should be 2.5"
+        );
+        assert!(
+            (p7d_delta.unwrap() - 2.0).abs() < f64::EPSILON,
+            "Second poll: 7d delta should be 2.0"
+        );
+        assert!(
+            (p7ds_delta.unwrap() - 3.0).abs() < f64::EPSILON,
+            "Second poll: 7ds delta should be 3.0"
+        );
     }
 
     /// Test edge case: both previous and current snapshots are None.
@@ -1914,7 +2001,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
                 p7ds_delta = Some(delta_7ds);
@@ -1933,9 +2021,18 @@ mod window_delta_tests {
         // Verify: no panic occurred (test is still running)
         // Verify: delta computation was skipped
         // Verify: deltas remain None (not Some(0.0))
-        assert_eq!(p5h_delta, None, "5h delta should be None when no snapshots available");
-        assert_eq!(p7d_delta, None, "7d delta should be None when no snapshots available");
-        assert_eq!(p7ds_delta, None, "7ds delta should be None when no snapshots available");
+        assert_eq!(
+            p5h_delta, None,
+            "5h delta should be None when no snapshots available"
+        );
+        assert_eq!(
+            p7d_delta, None,
+            "7d delta should be None when no snapshots available"
+        );
+        assert_eq!(
+            p7ds_delta, None,
+            "7ds delta should be None when no snapshots available"
+        );
     }
 
     /// Test edge case: previous snapshot exists but current is None.
@@ -1973,7 +2070,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
                 p7ds_delta = Some(delta_7ds);
@@ -1992,9 +2090,18 @@ mod window_delta_tests {
         // Verify: no panic occurred (test is still running)
         // Verify: delta computation was skipped
         // Verify: deltas remain None (not Some(0.0))
-        assert_eq!(p5h_delta, None, "5h delta should be None when current snapshot is missing");
-        assert_eq!(p7d_delta, None, "7d delta should be None when current snapshot is missing");
-        assert_eq!(p7ds_delta, None, "7ds delta should be None when current snapshot is missing");
+        assert_eq!(
+            p5h_delta, None,
+            "5h delta should be None when current snapshot is missing"
+        );
+        assert_eq!(
+            p7d_delta, None,
+            "7d delta should be None when current snapshot is missing"
+        );
+        assert_eq!(
+            p7ds_delta, None,
+            "7ds delta should be None when current snapshot is missing"
+        );
     }
 
     /// Test that delta computation is explicitly skipped on first poll.
@@ -2043,7 +2150,10 @@ mod window_delta_tests {
         }
 
         // Verify: delta computation was NOT attempted
-        assert!(!delta_computation_attempted, "Delta computation should be skipped on first poll");
+        assert!(
+            !delta_computation_attempted,
+            "Delta computation should be skipped on first poll"
+        );
     }
 
     /// Test panic prevention with extreme utilization values.
@@ -2116,7 +2226,8 @@ mod window_delta_tests {
         };
 
         // Should not panic with zero values
-        let (delta_5h_zero, delta_7d_zero, delta_7ds_zero) = calculate_window_pct_delta(&prev_pct_zero, &curr_pct_zero);
+        let (delta_5h_zero, delta_7d_zero, delta_7ds_zero) =
+            calculate_window_pct_delta(&prev_pct_zero, &curr_pct_zero);
         assert_eq!(delta_5h_zero, 0.0);
         assert_eq!(delta_7d_zero, 0.0);
         assert_eq!(delta_7ds_zero, 0.0);
@@ -2156,7 +2267,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta = Some(delta_5h);
                 p7d_delta = Some(delta_7d);
                 p7ds_delta = Some(delta_7ds);
@@ -2173,9 +2285,21 @@ mod window_delta_tests {
         }
 
         // Verify first poll gets Some(0.0) default
-        assert_eq!(p5h_delta, Some(0.0), "First poll should default to Some(0.0)");
-        assert_eq!(p7d_delta, Some(0.0), "First poll should default to Some(0.0)");
-        assert_eq!(p7ds_delta, Some(0.0), "First poll should default to Some(0.0)");
+        assert_eq!(
+            p5h_delta,
+            Some(0.0),
+            "First poll should default to Some(0.0)"
+        );
+        assert_eq!(
+            p7d_delta,
+            Some(0.0),
+            "First poll should default to Some(0.0)"
+        );
+        assert_eq!(
+            p7ds_delta,
+            Some(0.0),
+            "First poll should default to Some(0.0)"
+        );
 
         // Contrast with (None, None) case which should remain None
         let mut p5h_delta_none: Option<f64> = None;
@@ -2195,7 +2319,8 @@ mod window_delta_tests {
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
                 p5h_delta_none = Some(delta_5h);
                 p7d_delta_none = Some(delta_7d);
                 p7ds_delta_none = Some(delta_7ds);
@@ -2211,9 +2336,18 @@ mod window_delta_tests {
         }
 
         // Verify (None, None) remains None (not Some(0.0))
-        assert_eq!(p5h_delta_none, None, "(None, None) should remain None, not Some(0.0)");
-        assert_eq!(p7d_delta_none, None, "(None, None) should remain None, not Some(0.0)");
-        assert_eq!(p7ds_delta_none, None, "(None, None) should remain None, not Some(0.0)");
+        assert_eq!(
+            p5h_delta_none, None,
+            "(None, None) should remain None, not Some(0.0)"
+        );
+        assert_eq!(
+            p7d_delta_none, None,
+            "(None, None) should remain None, not Some(0.0)"
+        );
+        assert_eq!(
+            p7ds_delta_none, None,
+            "(None, None) should remain None, not Some(0.0)"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -2286,9 +2420,18 @@ mod window_delta_tests {
         );
 
         let current = state.current_api_snapshot.as_ref().unwrap();
-        assert_eq!(current.taken_at, first_poll_time, "First snapshot timestamp");
-        assert!((current.five_hour_pct - 10.0).abs() < f64::EPSILON, "First snapshot 5h");
-        assert!((current.seven_day_pct - 20.0).abs() < f64::EPSILON, "First snapshot 7d");
+        assert_eq!(
+            current.taken_at, first_poll_time,
+            "First snapshot timestamp"
+        );
+        assert!(
+            (current.five_hour_pct - 10.0).abs() < f64::EPSILON,
+            "First snapshot 5h"
+        );
+        assert!(
+            (current.seven_day_pct - 20.0).abs() < f64::EPSILON,
+            "First snapshot 7d"
+        );
         assert!(
             (current.weekly_scoped_pct - 15.0).abs() < f64::EPSILON,
             "First snapshot 7ds"
@@ -2298,8 +2441,8 @@ mod window_delta_tests {
         let second_poll_time = Utc::now();
         let snapshot2 = PrevUsageSnapshot {
             taken_at: second_poll_time,
-            five_hour_pct: 12.5,  // +2.5 from first
-            seven_day_pct: 22.0, // +2.0 from first
+            five_hour_pct: 12.5,     // +2.5 from first
+            seven_day_pct: 22.0,     // +2.0 from first
             weekly_scoped_pct: 18.0, // +3.0 from first
         };
 
@@ -2320,9 +2463,18 @@ mod window_delta_tests {
 
         // Verify previous snapshot is the first snapshot
         let previous = state.previous_api_snapshot.as_ref().unwrap();
-        assert_eq!(previous.taken_at, first_poll_time, "Previous is first snapshot");
-        assert!((previous.five_hour_pct - 10.0).abs() < f64::EPSILON, "Previous 5h value");
-        assert!((previous.seven_day_pct - 20.0).abs() < f64::EPSILON, "Previous 7d value");
+        assert_eq!(
+            previous.taken_at, first_poll_time,
+            "Previous is first snapshot"
+        );
+        assert!(
+            (previous.five_hour_pct - 10.0).abs() < f64::EPSILON,
+            "Previous 5h value"
+        );
+        assert!(
+            (previous.seven_day_pct - 20.0).abs() < f64::EPSILON,
+            "Previous 7d value"
+        );
         assert!(
             (previous.weekly_scoped_pct - 15.0).abs() < f64::EPSILON,
             "Previous 7ds value"
@@ -2330,9 +2482,18 @@ mod window_delta_tests {
 
         // Verify current snapshot is the second snapshot
         let current = state.current_api_snapshot.as_ref().unwrap();
-        assert_eq!(current.taken_at, second_poll_time, "Current is second snapshot");
-        assert!((current.five_hour_pct - 12.5).abs() < f64::EPSILON, "Current 5h value");
-        assert!((current.seven_day_pct - 22.0).abs() < f64::EPSILON, "Current 7d value");
+        assert_eq!(
+            current.taken_at, second_poll_time,
+            "Current is second snapshot"
+        );
+        assert!(
+            (current.five_hour_pct - 12.5).abs() < f64::EPSILON,
+            "Current 5h value"
+        );
+        assert!(
+            (current.seven_day_pct - 22.0).abs() < f64::EPSILON,
+            "Current 7d value"
+        );
         assert!(
             (current.weekly_scoped_pct - 18.0).abs() < f64::EPSILON,
             "Current 7ds value"
@@ -2637,7 +2798,10 @@ mod window_delta_tests {
 
         // === Step 5: Verify default values are used ===
         // Test is still running = no panic occurred
-        assert!(!delta_computation_called, "Delta computation should be skipped on first poll");
+        assert!(
+            !delta_computation_called,
+            "Delta computation should be skipped on first poll"
+        );
         assert_eq!(
             state.p5h_delta,
             Some(0.0),
@@ -2701,17 +2865,35 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // Verify all deltas are positive (utilization increased)
-        assert!(delta_5h > 0.0, "5h delta should be positive with increased usage");
-        assert!(delta_7d > 0.0, "7d delta should be positive with increased usage");
-        assert!(delta_7ds > 0.0, "7ds delta should be positive with increased usage");
+        assert!(
+            delta_5h > 0.0,
+            "5h delta should be positive with increased usage"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7d delta should be positive with increased usage"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7ds delta should be positive with increased usage"
+        );
 
         // Verify exact delta values based on fixture documentation
         // baseline: 5h=12.5%, 7d=45.2%, 7ds=38.7%
         // after_5h: 5h=18.2%, 7d=46.8%, 7ds=40.3%
         // Expected deltas: 5h=+5.7%, 7d=+1.6%, 7ds=+1.6%
-        assert!((delta_5h - 5.7).abs() < 1e-9, "5h delta should be +5.7% (18.2 - 12.5)");
-        assert!((delta_7d - 1.6).abs() < 1e-9, "7d delta should be +1.6% (46.8 - 45.2)");
-        assert!((delta_7ds - 1.6).abs() < 1e-9, "7ds delta should be +1.6% (40.3 - 38.7)");
+        assert!(
+            (delta_5h - 5.7).abs() < 1e-9,
+            "5h delta should be +5.7% (18.2 - 12.5)"
+        );
+        assert!(
+            (delta_7d - 1.6).abs() < 1e-9,
+            "7d delta should be +1.6% (46.8 - 45.2)"
+        );
+        assert!(
+            (delta_7ds - 1.6).abs() < 1e-9,
+            "7ds delta should be +1.6% (40.3 - 38.7)"
+        );
     }
 
     /// Test consecutive snapshots with 7-day interval using fixtures.
@@ -2743,11 +2925,20 @@ mod window_delta_tests {
         assert!(delta_7ds > 0.0, "7ds delta should be positive after 7 days");
 
         // Expected deltas: 7d=+7.2%, 7ds=+7.4%
-        assert!((delta_7d - 7.2).abs() < 1e-9, "7d delta should be +7.2% (52.4 - 45.2)");
-        assert!((delta_7ds - 7.4).abs() < 1e-9, "7ds delta should be +7.4% (46.1 - 38.7)");
+        assert!(
+            (delta_7d - 7.2).abs() < 1e-9,
+            "7d delta should be +7.2% (52.4 - 45.2)"
+        );
+        assert!(
+            (delta_7ds - 7.4).abs() < 1e-9,
+            "7ds delta should be +7.4% (46.1 - 38.7)"
+        );
 
         // 5-hour window reset occurred, so delta should reflect new window value
-        assert!((delta_5h - 3.3).abs() < 1e-9, "5h delta should be +3.3% (15.8 - 12.5)");
+        assert!(
+            (delta_5h - 3.3).abs() < 1e-9,
+            "5h delta should be +3.3% (15.8 - 12.5)"
+        );
     }
 
     /// Test consecutive snapshots with 7-day same-weekday using fixtures.
@@ -2776,7 +2967,10 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // Should produce same deltas as 7-day fixture (same weekday progression)
-        assert!((delta_7d - 7.2).abs() < 1e-9, "7ds delta should match 7d fixture (+7.2%)");
+        assert!(
+            (delta_7d - 7.2).abs() < 1e-9,
+            "7ds delta should match 7d fixture (+7.2%)"
+        );
         assert!((delta_7ds - 7.4).abs() < 1e-9, "7ds delta should be +7.4%");
         assert!((delta_5h - 3.3).abs() < 1e-9, "5h delta should be +3.3%");
     }
@@ -2807,9 +3001,18 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // All deltas should be exactly zero for identical snapshots
-        assert_eq!(delta_5h, 0.0, "5h delta should be zero for identical snapshots");
-        assert_eq!(delta_7d, 0.0, "7d delta should be zero for identical snapshots");
-        assert_eq!(delta_7ds, 0.0, "7ds delta should be zero for identical snapshots");
+        assert_eq!(
+            delta_5h, 0.0,
+            "5h delta should be zero for identical snapshots"
+        );
+        assert_eq!(
+            delta_7d, 0.0,
+            "7d delta should be zero for identical snapshots"
+        );
+        assert_eq!(
+            delta_7ds, 0.0,
+            "7ds delta should be zero for identical snapshots"
+        );
     }
 
     /// Test snapshot pair fixtures for delta computation.
@@ -2833,9 +3036,18 @@ mod window_delta_tests {
             weekly_scoped: curr_5h.weekly_scoped_pct,
         };
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
-        assert!((delta_5h - 5.7).abs() < 1e-9, "5h pair should produce +5.7% delta");
-        assert!((delta_7d - 1.6).abs() < 1e-9, "5h pair should produce +1.6% 7d delta");
-        assert!((delta_7ds - 1.6).abs() < 1e-9, "5h pair should produce +1.6% 7ds delta");
+        assert!(
+            (delta_5h - 5.7).abs() < 1e-9,
+            "5h pair should produce +5.7% delta"
+        );
+        assert!(
+            (delta_7d - 1.6).abs() < 1e-9,
+            "5h pair should produce +1.6% 7d delta"
+        );
+        assert!(
+            (delta_7ds - 1.6).abs() < 1e-9,
+            "5h pair should produce +1.6% 7ds delta"
+        );
 
         // Test 7-day pair
         let (prev_7d, curr_7d) = snapshot_pair_7d();
@@ -2850,9 +3062,18 @@ mod window_delta_tests {
             weekly_scoped: curr_7d.weekly_scoped_pct,
         };
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
-        assert!((delta_5h - 3.3).abs() < 1e-9, "7d pair should produce +3.3% 5h delta");
-        assert!((delta_7d - 7.2).abs() < 1e-9, "7d pair should produce +7.2% 7d delta");
-        assert!((delta_7ds - 7.4).abs() < 1e-9, "7d pair should produce +7.4% 7ds delta");
+        assert!(
+            (delta_5h - 3.3).abs() < 1e-9,
+            "7d pair should produce +3.3% 5h delta"
+        );
+        assert!(
+            (delta_7d - 7.2).abs() < 1e-9,
+            "7d pair should produce +7.2% 7d delta"
+        );
+        assert!(
+            (delta_7ds - 7.4).abs() < 1e-9,
+            "7d pair should produce +7.4% 7ds delta"
+        );
 
         // Test 7ds pair (should match 7d pair)
         let (prev_7ds, curr_7ds) = snapshot_pair_7ds();
@@ -2866,10 +3087,20 @@ mod window_delta_tests {
             seven_day: curr_7ds.seven_day_pct,
             weekly_scoped: curr_7ds.weekly_scoped_pct,
         };
-        let (delta_5h_7ds, delta_7d_7ds, delta_7ds_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
-        assert!((delta_5h_7ds - delta_5h).abs() < 1e-9, "7ds pair should match 7d 5h delta");
-        assert!((delta_7d_7ds - delta_7d).abs() < 1e-9, "7ds pair should match 7d 7d delta");
-        assert!((delta_7ds_7ds - delta_7ds).abs() < 1e-9, "7ds pair should match 7d 7ds delta");
+        let (delta_5h_7ds, delta_7d_7ds, delta_7ds_7ds) =
+            calculate_window_pct_delta(&prev_pct, &curr_pct);
+        assert!(
+            (delta_5h_7ds - delta_5h).abs() < 1e-9,
+            "7ds pair should match 7d 5h delta"
+        );
+        assert!(
+            (delta_7d_7ds - delta_7d).abs() < 1e-9,
+            "7ds pair should match 7d 7d delta"
+        );
+        assert!(
+            (delta_7ds_7ds - delta_7ds).abs() < 1e-9,
+            "7ds pair should match 7d 7ds delta"
+        );
     }
 
     /// Test that fixtures with increased utilization produce positive deltas.
@@ -2885,9 +3116,9 @@ mod window_delta_tests {
 
         // Create snapshots with various increases
         let increases = vec![
-            (1.10, 10.0),  // +10% increase
-            (1.25, 25.0),  // +25% increase
-            (1.50, 50.0),  // +50% increase
+            (1.10, 10.0), // +10% increase
+            (1.25, 25.0), // +25% increase
+            (1.50, 50.0), // +50% increase
         ];
 
         for (multiplier, expected_percent_increase) in increases {
@@ -2913,21 +3144,42 @@ mod window_delta_tests {
             let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
             // All deltas should be positive
-            assert!(delta_5h > 0.0, "5h delta should be positive for +{}% increase", expected_percent_increase);
-            assert!(delta_7d > 0.0, "7d delta should be positive for +{}% increase", expected_percent_increase);
-            assert!(delta_7ds > 0.0, "7ds delta should be positive for +{}% increase", expected_percent_increase);
+            assert!(
+                delta_5h > 0.0,
+                "5h delta should be positive for +{}% increase",
+                expected_percent_increase
+            );
+            assert!(
+                delta_7d > 0.0,
+                "7d delta should be positive for +{}% increase",
+                expected_percent_increase
+            );
+            assert!(
+                delta_7ds > 0.0,
+                "7ds delta should be positive for +{}% increase",
+                expected_percent_increase
+            );
 
             // Verify delta magnitude matches expected percentage
             let expected_5h_delta = baseline.five_hour_pct * (multiplier - 1.0);
             let expected_7d_delta = baseline.seven_day_pct * (multiplier - 1.0);
             let expected_7ds_delta = baseline.weekly_scoped_pct * (multiplier - 1.0);
 
-            assert!((delta_5h - expected_5h_delta).abs() < 1e-9,
-                "5h delta should match expected increase for +{}%", expected_percent_increase);
-            assert!((delta_7d - expected_7d_delta).abs() < 1e-9,
-                "7d delta should match expected increase for +{}%", expected_percent_increase);
-            assert!((delta_7ds - expected_7ds_delta).abs() < 1e-9,
-                "7ds delta should match expected increase for +{}%", expected_percent_increase);
+            assert!(
+                (delta_5h - expected_5h_delta).abs() < 1e-9,
+                "5h delta should match expected increase for +{}%",
+                expected_percent_increase
+            );
+            assert!(
+                (delta_7d - expected_7d_delta).abs() < 1e-9,
+                "7d delta should match expected increase for +{}%",
+                expected_percent_increase
+            );
+            assert!(
+                (delta_7ds - expected_7ds_delta).abs() < 1e-9,
+                "7ds delta should match expected increase for +{}%",
+                expected_percent_increase
+            );
         }
     }
 
@@ -2937,7 +3189,9 @@ mod window_delta_tests {
     /// computation handles extreme values correctly.
     #[test]
     fn test_edge_case_fixture_snapshots_compute_deltas() {
-        use crate::snapshot_fixtures::{idle_snapshot, high_utilization_snapshot, post_reset_snapshot};
+        use crate::snapshot_fixtures::{
+            high_utilization_snapshot, idle_snapshot, post_reset_snapshot,
+        };
 
         // Test idle -> high utilization (large positive delta)
         let idle = idle_snapshot();
@@ -2958,9 +3212,18 @@ mod window_delta_tests {
         let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&idle_pct, &high_pct);
 
         // Should show large positive increase
-        assert!(delta_5h > 80.0, "5h delta should be > 80% from idle to high");
-        assert!(delta_7d > 90.0, "7d delta should be > 90% from idle to high");
-        assert!(delta_7ds > 90.0, "7ds delta should be > 90% from idle to high");
+        assert!(
+            delta_5h > 80.0,
+            "5h delta should be > 80% from idle to high"
+        );
+        assert!(
+            delta_7d > 90.0,
+            "7d delta should be > 90% from idle to high"
+        );
+        assert!(
+            delta_7ds > 90.0,
+            "7ds delta should be > 90% from idle to high"
+        );
 
         // Test high -> post-reset (negative delta, window reset scenario)
         let reset = post_reset_snapshot();
@@ -2971,15 +3234,28 @@ mod window_delta_tests {
             weekly_scoped: reset.weekly_scoped_pct,
         };
 
-        let (delta_5h_reset, delta_7d_reset, delta_7ds_reset) = calculate_window_pct_delta(&high_pct, &reset_pct);
+        let (delta_5h_reset, delta_7d_reset, delta_7ds_reset) =
+            calculate_window_pct_delta(&high_pct, &reset_pct);
 
         // Should show negative delta (window reset)
-        assert!(delta_5h_reset < 0.0, "5h delta should be negative after reset");
-        assert!(delta_7d_reset < 0.0, "7d delta should be negative after reset");
-        assert!(delta_7ds_reset < 0.0, "7ds delta should be negative after reset");
+        assert!(
+            delta_5h_reset < 0.0,
+            "5h delta should be negative after reset"
+        );
+        assert!(
+            delta_7d_reset < 0.0,
+            "7d delta should be negative after reset"
+        );
+        assert!(
+            delta_7ds_reset < 0.0,
+            "7ds delta should be negative after reset"
+        );
 
         // 5-hour reset should be dramatic (drops from 82.4% to 2.1%)
-        assert!((delta_5h_reset - (-80.3)).abs() < 0.1, "5h reset should drop ~80%");
+        assert!(
+            (delta_5h_reset - (-80.3)).abs() < 0.1,
+            "5h reset should drop ~80%"
+        );
     }
 
     /// Test that fixture snapshots produce correct time progression.
@@ -2997,15 +3273,29 @@ mod window_delta_tests {
 
         // Verify 5-hour progression
         let elapsed_5h = after_5h.taken_at.signed_duration_since(baseline.taken_at);
-        assert_eq!(elapsed_5h.num_hours(), 5, "5h snapshot should be 5 hours after baseline");
+        assert_eq!(
+            elapsed_5h.num_hours(),
+            5,
+            "5h snapshot should be 5 hours after baseline"
+        );
 
         // Verify 7-day progression
         let elapsed_7d = after_7d.taken_at.signed_duration_since(baseline.taken_at);
-        assert_eq!(elapsed_7d.num_days(), 7, "7d snapshot should be 7 days after baseline");
+        assert_eq!(
+            elapsed_7d.num_days(),
+            7,
+            "7d snapshot should be 7 days after baseline"
+        );
 
         // Verify monotonic time progression
-        assert!(after_5h.taken_at > baseline.taken_at, "after_5h should be later than baseline");
-        assert!(after_7d.taken_at > after_5h.taken_at, "after_7d should be later than after_5h");
+        assert!(
+            after_5h.taken_at > baseline.taken_at,
+            "after_5h should be later than baseline"
+        );
+        assert!(
+            after_7d.taken_at > after_5h.taken_at,
+            "after_7d should be later than after_5h"
+        );
     }
 
     /// Test delta computation tolerance for floating-point precision.
@@ -3022,7 +3312,7 @@ mod window_delta_tests {
         // Create snapshot with values that produce floating-point results
         let curr = make_snapshot(
             baseline.taken_at + chrono::Duration::hours(5),
-            baseline.five_hour_pct + 0.1,  // Small increment
+            baseline.five_hour_pct + 0.1, // Small increment
             baseline.seven_day_pct + 0.05,
             baseline.weekly_scoped_pct + 0.075,
         );
@@ -3043,9 +3333,18 @@ mod window_delta_tests {
 
         // Use appropriate tolerance for floating-point comparison
         const TOLERANCE: f64 = 1e-9;
-        assert!((delta_5h - 0.1).abs() < TOLERANCE, "5h delta should be 0.1 with tolerance");
-        assert!((delta_7d - 0.05).abs() < TOLERANCE, "7d delta should be 0.05 with tolerance");
-        assert!((delta_7ds - 0.075).abs() < TOLERANCE, "7ds delta should be 0.075 with tolerance");
+        assert!(
+            (delta_5h - 0.1).abs() < TOLERANCE,
+            "5h delta should be 0.1 with tolerance"
+        );
+        assert!(
+            (delta_7d - 0.05).abs() < TOLERANCE,
+            "7d delta should be 0.05 with tolerance"
+        );
+        assert!(
+            (delta_7ds - 0.075).abs() < TOLERANCE,
+            "7ds delta should be 0.075 with tolerance"
+        );
     }
 
     /// Test second poll handling when both previous and current snapshots exist.
@@ -3077,22 +3376,26 @@ mod window_delta_tests {
         let first_poll_previous: Option<PrevUsageSnapshot> = None;
 
         // ASSERTION 1: Verify first poll state
-        assert!(first_poll_previous.is_none(), "First poll: previous should be None");
-        assert!(first_poll_current.is_some(), "First poll: current should be Some");
+        assert!(
+            first_poll_previous.is_none(),
+            "First poll: previous should be None"
+        );
+        assert!(
+            first_poll_current.is_some(),
+            "First poll: current should be Some"
+        );
 
         // Verify first poll falls into (None, Some) branch (no delta computation)
         let first_poll_result = match (&first_poll_previous, &first_poll_current) {
-            (Some(_prev), Some(_curr)) => {
-                "should_not_happen"
-            }
-            (None, Some(_curr)) => {
-                "first_poll_skip"
-            }
+            (Some(_prev), Some(_curr)) => "should_not_happen",
+            (None, Some(_curr)) => "first_poll_skip",
             (None, None) => "no_snapshots",
             (Some(_prev), None) => "only_previous",
         };
-        assert_eq!(first_poll_result, "first_poll_skip",
-                   "First poll should fall into (None, Some) branch");
+        assert_eq!(
+            first_poll_result, "first_poll_skip",
+            "First poll should fall into (None, Some) branch"
+        );
 
         // Simulate the shift at the start of second poll (as in run_governor_cycle)
         // The previous snapshot becomes the first poll's current snapshot
@@ -3101,16 +3404,20 @@ mod window_delta_tests {
         // Simulate second poll: new current snapshot with increased utilization
         let second_poll_current: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
             taken_at: Utc::now(),
-            five_hour_pct: 12.5,      // +2.5 from previous
-            seven_day_pct: 22.0,      // +2.0 from previous
+            five_hour_pct: 12.5,     // +2.5 from previous
+            seven_day_pct: 22.0,     // +2.0 from previous
             weekly_scoped_pct: 18.0, // +3.0 from previous
         });
 
         // ASSERTION 2: Verify second poll state (both snapshots exist)
-        assert!(second_poll_previous.is_some(),
-                "Second poll: previous should be Some (transitioned from first poll current)");
-        assert!(second_poll_current.is_some(),
-                "Second poll: current should be Some (new poll data)");
+        assert!(
+            second_poll_previous.is_some(),
+            "Second poll: previous should be Some (transitioned from first poll current)"
+        );
+        assert!(
+            second_poll_current.is_some(),
+            "Second poll: current should be Some (new poll data)"
+        );
 
         // ASSERTION 3: Verify delta computation executes correctly with both snapshots
         // This simulates the check in run_governor_cycle:
@@ -3132,7 +3439,8 @@ mod window_delta_tests {
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
 
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
 
                 // Store the computed deltas for verification
                 delta_computation_result = Some((delta_5h, delta_7d, delta_7ds));
@@ -3154,26 +3462,41 @@ mod window_delta_tests {
         };
 
         // ASSERTION 4: Verify delta computation was executed (not skipped)
-        assert!(delta_computation_attempted,
-                "Delta computation should execute on second poll when both snapshots exist");
+        assert!(
+            delta_computation_attempted,
+            "Delta computation should execute on second poll when both snapshots exist"
+        );
 
         // ASSERTION 5: Verify the match fell into the correct (Some, Some) branch
-        assert_eq!(match_result, "delta_computed",
-                   "Second poll should match the (Some, Some) branch and compute deltas");
+        assert_eq!(
+            match_result, "delta_computed",
+            "Second poll should match the (Some, Some) branch and compute deltas"
+        );
 
         // ASSERTION 6: Verify computed deltas are correct (not None and not zero)
-        assert!(delta_computation_result.is_some(),
-                "Delta computation result should be Some on second poll");
+        assert!(
+            delta_computation_result.is_some(),
+            "Delta computation result should be Some on second poll"
+        );
 
         let (delta_5h, delta_7d, delta_7ds) = delta_computation_result.unwrap();
 
         // Verify exact delta values (current - previous)
-        assert!((delta_5h - 2.5).abs() < f64::EPSILON,
-                "5h delta should be 2.5% (12.5 - 10.0), got {}", delta_5h);
-        assert!((delta_7d - 2.0).abs() < f64::EPSILON,
-                "7d delta should be 2.0% (22.0 - 20.0), got {}", delta_7d);
-        assert!((delta_7ds - 3.0).abs() < f64::EPSILON,
-                "7ds delta should be 3.0% (18.0 - 15.0), got {}", delta_7ds);
+        assert!(
+            (delta_5h - 2.5).abs() < f64::EPSILON,
+            "5h delta should be 2.5% (12.5 - 10.0), got {}",
+            delta_5h
+        );
+        assert!(
+            (delta_7d - 2.0).abs() < f64::EPSILON,
+            "7d delta should be 2.0% (22.0 - 20.0), got {}",
+            delta_7d
+        );
+        assert!(
+            (delta_7ds - 3.0).abs() < f64::EPSILON,
+            "7ds delta should be 3.0% (18.0 - 15.0), got {}",
+            delta_7ds
+        );
 
         // ASSERTION 7: Verify no panic occurred - test reaches this point
         // (If we reach here, graceful handling succeeded)
@@ -3284,7 +3607,7 @@ fn distribute_workers_by_cost_priority(
     target_total: u32,
     burn_rate_by_model: &HashMap<String, state::ModelBurnRate>,
     pricing_config: &crate::config::GovernorConfig,
-    _cutoff_risk: bool,  // Reserved for future scale-down priority adjustments
+    _cutoff_risk: bool, // Reserved for future scale-down priority adjustments
 ) -> HashMap<String, u32> {
     // Base distribution: start from the current allocation and adjust gently by the
     // delta (minimising churn) — scale down sheds the most expensive workers first,
@@ -3758,9 +4081,13 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
         AlertType::EmergencyBrakeActivated => {
             // True positive if any window is actually at 98%+
             let forecast = &state.capacity_forecast;
-            [&forecast.five_hour, &forecast.seven_day, &forecast.weekly_scoped]
-                .iter()
-                .any(|w| w.current_utilization >= 98.0)
+            [
+                &forecast.five_hour,
+                &forecast.seven_day,
+                &forecast.weekly_scoped,
+            ]
+            .iter()
+            .any(|w| w.current_utilization >= 98.0)
         }
         AlertType::CollectorOffline => {
             // Collector offline is a true positive if data is genuinely stale (> 30 min)
@@ -3814,12 +4141,13 @@ pub fn run_governor_cycle(
         Ok(usage_data) => {
             // Extract weekly_scoped utilization from model-agnostic limits[] array
             // This ensures the rotated model's REAL pct feeds the EMA calculation
-            let weekly_scoped_util = usage_data.scoped_weekly()
+            let weekly_scoped_util = usage_data
+                .scoped_weekly()
                 .map(|(_, window)| window.utilization)
                 .unwrap_or(usage_data.weekly_scoped_utilization);
 
             let scoped_label = crate::state::weekly_scoped_display_label(
-                usage_data.weekly_scoped_model.as_deref()
+                usage_data.weekly_scoped_model.as_deref(),
             );
             log::info!(
                 "[governor] polled usage: {}={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
@@ -3873,7 +4201,7 @@ pub fn run_governor_cycle(
                 // The legacy sonnet_pct field is deprecated and NOT used for weekly_scoped calculations.
                 // New code should use weekly_scoped_pct (model-agnostic) instead.
                 // See state.rs lines 53-56 for the deprecated sonnet_pct field documentation.
-                sonnet_pct: 0.0,  // Deprecated - always 0.0, not used for weekly_scoped
+                sonnet_pct: 0.0, // Deprecated - always 0.0, not used for weekly_scoped
                 all_models_pct: usage_data.seven_day_utilization,
                 five_hour_pct: usage_data.five_hour_utilization,
                 sonnet_resets_at: usage_data.weekly_scoped_resets_at,
@@ -3894,7 +4222,9 @@ pub fn run_governor_cycle(
 
             // Calculate window deltas from consecutive API snapshots
             // Pure structure: if let pattern matching on both snapshots
-            if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot) {
+            if let (Some(prev), Some(curr)) =
+                (&state.previous_api_snapshot, &state.current_api_snapshot)
+            {
                 // Both snapshots available: proceed with delta computation
                 let prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
@@ -3906,7 +4236,8 @@ pub fn run_governor_cycle(
                     seven_day: curr.seven_day_pct,
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
-                let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
 
                 // Log computed window deltas
                 log::info!(
@@ -3947,9 +4278,7 @@ pub fn run_governor_cycle(
     //     hits 98%+. Once utilization drops (e.g. after a window reset), safe_mode should
     //     clear because the condition that triggered it no longer exists. Calibration-based
     //     safe_mode is NOT cleared here — that uses update_safe_mode_from_calibration().
-    if state.safe_mode.active
-        && state.safe_mode.trigger.as_deref() == Some("emergency_brake")
-    {
+    if state.safe_mode.active && state.safe_mode.trigger.as_deref() == Some("emergency_brake") {
         let max_util = [
             state.capacity_forecast.five_hour.current_utilization,
             state.capacity_forecast.seven_day.current_utilization,
@@ -4234,7 +4563,8 @@ pub fn run_governor_cycle(
                         &state.last_fleet_aggregate,
                         &baseline,
                     );
-                    let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
+                    let fleet_usd_hr =
+                        usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
 
                     let samples = state.burn_rate.fleet_pct_ema_samples;
                     let mut updated_any = false;
@@ -4301,8 +4631,7 @@ pub fn run_governor_cycle(
                             if samples == 0 {
                                 state.burn_rate.usd_per_pct_ema_weekly_scoped = ratio;
                             } else {
-                                state.burn_rate.usd_per_pct_ema_weekly_scoped = EMA_ALPHA
-                                    * ratio
+                                state.burn_rate.usd_per_pct_ema_weekly_scoped = EMA_ALPHA * ratio
                                     + (1.0 - EMA_ALPHA)
                                         * state.burn_rate.usd_per_pct_ema_weekly_scoped;
                             }
@@ -4391,7 +4720,8 @@ pub fn run_governor_cycle(
                 let reset_threshold = 1.0;
                 let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
                 let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-                let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
+                let weekly_scoped_reset =
+                    new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
                 if five_hour_reset || seven_day_reset || weekly_scoped_reset {
                     log::warn!(
@@ -4539,12 +4869,7 @@ pub fn run_governor_cycle(
     if let Ok(reset_time) = state.usage.sonnet_resets_at.parse::<DateTime<Utc>>() {
         hours_remaining.insert(
             "weekly_scoped".to_string(),
-            schedule::effective_hours_remaining_from(
-                now,
-                reset_time,
-                promotions,
-                "weekly_scoped",
-            ),
+            schedule::effective_hours_remaining_from(now, reset_time, promotions, "weekly_scoped"),
         );
     }
 
@@ -4574,7 +4899,8 @@ pub fn run_governor_cycle(
         );
         let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
         // Baseline dollars-per-pct ratio from agent config baseline_burn_rate
-        let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
+        let baseline_usd_per_pct =
+            baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
 
         let rate_for = |ema_val: f64, usd_per_pct: f64| -> f64 {
             if samples >= 1 && ema_val > 0.0 {
@@ -4772,7 +5098,8 @@ pub fn run_governor_cycle(
         // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
         // Falls back to baseline ratio from config when the learned ratio is unavailable.
         let baseline = get_sonnet_baseline_config(&state, agents);
-        let baseline_usd_per_pct = baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
+        let baseline_usd_per_pct =
+            baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
         let usd_per_pct = match *window {
             "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
             "seven_day" => state.burn_rate.usd_per_pct_ema_seven_day,
@@ -4825,33 +5152,34 @@ pub fn run_governor_cycle(
         // pessimistic p75 safe-worker path engages until real samples take over.
         // Calibrated windows (>= MIN_SAMPLES_FOR_EMA) are unaffected.
         //
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, state::EstimateQuality::ColdStart | state::EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                let base_per_worker = baseline.pct_per_worker_per_hour;
-                let seeded_fleet_pct = base_per_worker * current_total as f64;
-                // Mark the estimate uncertain: a fleet stddev on the order of the rate
-                // itself widens the confidence cone (cone_ratio > 1) so the pessimistic
-                // p75 exhaustion / safe-worker path engages. Using the full fleet rate
-                // as the spread is deliberately conservative for a wholly unmeasured window.
-                let widened_std_pct = seeded_fleet_pct;
-                log::info!(
-                    "[governor] {}: cold-start (no burn samples yet, util={:.1}%) — \
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            state::EstimateQuality::ColdStart | state::EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            // Mark the estimate uncertain: a fleet stddev on the order of the rate
+            // itself widens the confidence cone (cone_ratio > 1) so the pessimistic
+            // p75 exhaustion / safe-worker path engages. Using the full fleet rate
+            // as the spread is deliberately conservative for a wholly unmeasured window.
+            let widened_std_pct = seeded_fleet_pct;
+            log::info!(
+                "[governor] {}: cold-start (no burn samples yet, util={:.1}%) — \
                      seeding conservative base rate {:.3}%/worker/hr across {} worker(s) \
                      with widened uncertainty cone; estimate will self-correct as \
                      real samples accumulate",
-                    window,
-                    util,
-                    base_per_worker,
-                    current_total,
-                );
-                (seeded_fleet_pct, base_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr, pct_per_worker, std_pct_hr)
-            };
+                window,
+                util,
+                base_per_worker,
+                current_total,
+            );
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, pct_per_worker, std_pct_hr)
+        };
 
         let forecast = generate_window_forecast(
             window,
@@ -4893,8 +5221,7 @@ pub fn run_governor_cycle(
     let binding_window = windows
         .iter()
         .filter(|(name, _)| {
-            hours_remaining.contains_key(*name)
-                && !state.is_window_consecutively_absent(name)
+            hours_remaining.contains_key(*name) && !state.is_window_consecutively_absent(name)
         })
         .max_by(|(_, a), (_, b)| {
             a.risk_score
@@ -5015,10 +5342,7 @@ pub fn run_governor_cycle(
     };
     let eff_five_hour = hours_remaining.get("five_hour").copied().unwrap_or(0.0);
     let eff_seven_day = hours_remaining.get("seven_day").copied().unwrap_or(0.0);
-    let eff_weekly_scoped = hours_remaining
-        .get("weekly_scoped")
-        .copied()
-        .unwrap_or(0.0);
+    let eff_weekly_scoped = hours_remaining.get("weekly_scoped").copied().unwrap_or(0.0);
     // Effective hours for display: use the binding window's value
     let eff_display = match binding_window.as_str() {
         "five_hour" => eff_five_hour,
@@ -5115,8 +5439,7 @@ pub fn run_governor_cycle(
     // 4b. Underutilization sprint: burn spare use-or-lose capacity by boosting a
     // subscription generator toward its max when a window is under-used and resets
     // soon — but only while it has queued generation work, so the boost is productive.
-    let target =
-        apply_underutilization_sprint(&state, &pricing_config.sprint, agents, target, now);
+    let target = apply_underutilization_sprint(&state, &pricing_config.sprint, agents, target, now);
 
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
     //
@@ -5266,7 +5589,9 @@ pub fn run_governor_cycle(
                 // Scale up each agent individually based on distribution
                 let mut total_launched = 0;
                 for (agent_name, &target_count) in &target_distribution {
-                    if let Some(worker_config) = worker_configs.iter().find(|(name, _)| name == agent_name) {
+                    if let Some(worker_config) =
+                        worker_configs.iter().find(|(name, _)| name == agent_name)
+                    {
                         let current = *current_workers_map.get(agent_name).unwrap_or(&0);
                         if target_count > current {
                             let to_add = target_count - current;
@@ -5321,11 +5646,14 @@ pub fn run_governor_cycle(
                 let mut total_graceful = 0;
                 let mut total_forced = 0;
                 for (agent_name, &target_count) in &target_distribution {
-                    if let Some(worker_config) = worker_configs.iter().find(|(name, _)| name == agent_name) {
+                    if let Some(worker_config) =
+                        worker_configs.iter().find(|(name, _)| name == agent_name)
+                    {
                         let current = *current_workers_map.get(agent_name).unwrap_or(&0);
                         if target_count < current {
                             let to_remove = current - target_count;
-                            let result = worker::scale_down_graceful(to_remove, &worker_config.1, false);
+                            let result =
+                                worker::scale_down_graceful(to_remove, &worker_config.1, false);
                             total_graceful += result.graceful;
                             total_forced += result.force_killed;
                             log::info!(
@@ -5454,7 +5782,9 @@ pub fn run_governor_cycle(
             // is classified as a false positive (the consistency guard should suppress these,
             // but telemetry catches any that slip through).
             let is_true_positive = is_true_positive_alert(&alert.alert_type, &state);
-            state.alert_fp_telemetry.record(&alert.alert_type.to_string(), is_true_positive);
+            state
+                .alert_fp_telemetry
+                .record(&alert.alert_type.to_string(), is_true_positive);
 
             // Fire the alert: execute configured command (e.g. br create --type human)
             // and log to governor.log
@@ -5672,7 +6002,9 @@ mod tests {
     /// let snapshot = make_usage_snapshot_from_map(windows);
     /// assert_eq!(snapshot.get("five_hour"), Some(80.0));
     /// ```
-    pub fn make_usage_snapshot_from_map(windows: std::collections::HashMap<String, f64>) -> UsageSnapshot {
+    pub fn make_usage_snapshot_from_map(
+        windows: std::collections::HashMap<String, f64>,
+    ) -> UsageSnapshot {
         UsageSnapshot { windows }
     }
 
@@ -6104,8 +6436,7 @@ mod tests {
         let now = et(2026, 3, 16, 7, 35);
         let reset_time = now + chrono::Duration::days(2); // well past transition
 
-        let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_some(),
@@ -6125,8 +6456,7 @@ mod tests {
         let now = et(2026, 3, 16, 6, 0);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_none(),
@@ -6142,8 +6472,7 @@ mod tests {
         let now = et(2026, 3, 16, 13, 45);
         let reset_time = now + chrono::Duration::days(2);
 
-        let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 4, 4, "weekly_scoped");
 
         assert!(
             result.is_none(),
@@ -6162,8 +6491,7 @@ mod tests {
         // Let's test with current_total=1: post_target=floor(1*0.5)=0, effective=max(0,0)=0
         // Actually: post_target=0 < current_total=1, so effective_target = max(0, 0) = 0
         // Let's use current_total=2, target=2: post_target=1, effective=max(1,1)=1
-        let result =
-            compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "weekly_scoped");
+        let result = compute_pre_scale_target(now, 30, &promos, reset_time, 2, 2, "weekly_scoped");
         // post_target = floor(2 * 0.5) = 1, effective = max(1, 2-1) = max(1,1) = 1
         assert_eq!(result, Some(1));
 
@@ -6184,8 +6512,7 @@ mod tests {
         let reset_time = now + chrono::Duration::days(2);
 
         // pre_scale_minutes = 0 disables pre-scaling entirely
-        let result =
-            compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "weekly_scoped");
+        let result = compute_pre_scale_target(now, 0, &promos, reset_time, 4, 4, "weekly_scoped");
         assert!(
             result.is_none(),
             "pre_scale_minutes=0 should disable pre-scaling"
@@ -6458,11 +6785,11 @@ mod tests {
         let forecast = generate_window_forecast(
             "weekly_scoped",
             estimated_pct_hr,
-            50.0,                   // current utilization
-            90.0,                   // target ceiling
-            24.0,                   // hours remaining
-            estimated_pct_hr / 2.0, // mean per-worker (half fleet for 2 workers)
-            0.0,                    // std_pct_hr (no spread data in this test)
+            50.0,                               // current utilization
+            90.0,                               // target ceiling
+            24.0,                               // hours remaining
+            estimated_pct_hr / 2.0,             // mean per-worker (half fleet for 2 workers)
+            0.0,                                // std_pct_hr (no spread data in this test)
             state::EstimateQuality::Calibrated, // backward-compatible default for tests
         );
 
@@ -6496,19 +6823,20 @@ mod tests {
         };
 
         // Apply the seeding logic (matches the inline code in governor.rs)
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                let base_per_worker = baseline.pct_per_worker_per_hour;
-                let seeded_fleet_pct = base_per_worker * current_total as f64;
-                let widened_std_pct = seeded_fleet_pct;
-                (seeded_fleet_pct, base_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
-            };
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            let widened_std_pct = seeded_fleet_pct;
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+        };
 
         // Verify seeding occurred
         assert!(
@@ -6565,19 +6893,20 @@ mod tests {
             dollars_per_worker_per_hour: 5.0,
         };
 
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                let base_per_worker = baseline.pct_per_worker_per_hour;
-                let seeded_fleet_pct = base_per_worker * current_total as f64;
-                let widened_std_pct = seeded_fleet_pct;
-                (seeded_fleet_pct, base_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
-            };
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            let widened_std_pct = seeded_fleet_pct;
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+        };
 
         // Verify NO seeding occurred (util == 0 means absent window)
         assert_eq!(
@@ -6606,16 +6935,17 @@ mod tests {
             dollars_per_worker_per_hour: 5.0,
         };
 
-        let (fleet_pct_hr_seeded, _, _) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                panic!("calibrated window should never enter seeding logic");
-            } else {
-                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
-            };
+        let (fleet_pct_hr_seeded, _, _) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            panic!("calibrated window should never enter seeding logic");
+        } else {
+            (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+        };
 
         // Verify original values passed through unchanged
         assert_eq!(
@@ -6657,19 +6987,20 @@ mod tests {
         let baseline_pct_per_worker_hr = 1.5;
 
         // Apply the production seeding logic (matches governor.rs:4735-4787)
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                let base_per_worker = baseline_pct_per_worker_hr;
-                let seeded_fleet_pct = base_per_worker * current_total as f64;
-                let widened_std_pct = seeded_fleet_pct; // Conservative: use full fleet rate as spread
-                (seeded_fleet_pct, base_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
-            };
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            let base_per_worker = baseline_pct_per_worker_hr;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            let widened_std_pct = seeded_fleet_pct; // Conservative: use full fleet rate as spread
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, fleet_pct_hr / current_total as f64, 0.0)
+        };
 
         // ASSERT 1: Verify seeded base rate is NON-ZERO (the key safety fix)
         assert!(
@@ -6756,12 +7087,27 @@ mod tests {
 
         // Debug: Print forecast values to understand the safe_worker_count calculation
         eprintln!("DEBUG forecast values:");
-        eprintln!("  util: {}, target_ceiling: {}, remaining_pct: {}", util, target_ceiling, forecast.remaining_pct);
-        eprintln!("  hrs_remaining: {}, margin_hrs: {}", hrs_remaining, forecast.margin_hrs);
-        eprintln!("  fleet_pct_per_hour: {}, pct_per_worker: {}", forecast.fleet_pct_per_hour, pct_per_worker_seeded);
-        eprintln!("  predicted_exhaustion_hours: {}", forecast.predicted_exhaustion_hours);
+        eprintln!(
+            "  util: {}, target_ceiling: {}, remaining_pct: {}",
+            util, target_ceiling, forecast.remaining_pct
+        );
+        eprintln!(
+            "  hrs_remaining: {}, margin_hrs: {}",
+            hrs_remaining, forecast.margin_hrs
+        );
+        eprintln!(
+            "  fleet_pct_per_hour: {}, pct_per_worker: {}",
+            forecast.fleet_pct_per_hour, pct_per_worker_seeded
+        );
+        eprintln!(
+            "  predicted_exhaustion_hours: {}",
+            forecast.predicted_exhaustion_hours
+        );
         eprintln!("  safe_worker_count: {}", safe_workers);
-        eprintln!("  safe_worker_count_p75: {:?}", forecast.safe_worker_count_p75);
+        eprintln!(
+            "  safe_worker_count_p75: {:?}",
+            forecast.safe_worker_count_p75
+        );
         eprintln!("  cone_ratio: {}", forecast.cone_ratio);
 
         // safe_worker_count can legitimately be 0 in cold-start scenarios with tight margins
@@ -6782,7 +7128,8 @@ mod tests {
         assert!(
             safe_workers_p75 <= safe_workers,
             "p75 conservative safe workers ({}) must be <= p50 ({})",
-            safe_workers_p75, safe_workers
+            safe_workers_p75,
+            safe_workers
         );
 
         // Verify forecast structure is complete
@@ -6862,18 +7209,24 @@ mod tests {
         let current_workers = 3;
         let fleet_pct_hr_at_startup = 0.0; // No observed rate yet
 
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && first_poll_util > 0.0
-                && fleet_pct_hr_at_startup == 0.0
-                && current_workers > 0
-            {
-                let seeded_fleet_pct = baseline_pct_per_worker * current_workers as f64;
-                let widened_std_pct = seeded_fleet_pct; // Conservative wide uncertainty cone
-                (seeded_fleet_pct, baseline_pct_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr_at_startup, fleet_pct_hr_at_startup / current_workers as f64, 0.0)
-            };
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        )
+            && first_poll_util > 0.0
+            && fleet_pct_hr_at_startup == 0.0
+            && current_workers > 0
+        {
+            let seeded_fleet_pct = baseline_pct_per_worker * current_workers as f64;
+            let widened_std_pct = seeded_fleet_pct; // Conservative wide uncertainty cone
+            (seeded_fleet_pct, baseline_pct_per_worker, widened_std_pct)
+        } else {
+            (
+                fleet_pct_hr_at_startup,
+                fleet_pct_hr_at_startup / current_workers as f64,
+                0.0,
+            )
+        };
 
         // VERIFY 2: Seeded base rate is NON-ZERO (prevents infinite headroom)
         assert!(
@@ -6882,7 +7235,8 @@ mod tests {
             fleet_pct_hr_seeded
         );
         assert_eq!(
-            fleet_pct_hr_seeded, 4.5, // 1.5 * 3 workers
+            fleet_pct_hr_seeded,
+            4.5, // 1.5 * 3 workers
             "Seeded fleet rate should be 4.5%/hr (baseline * workers), got {}",
             fleet_pct_hr_seeded
         );
@@ -6917,8 +7271,7 @@ mod tests {
 
         // VERIFY 5: Forecast uses seeded rate (NOT 0.0, which would give infinite headroom)
         assert_eq!(
-            forecast.fleet_pct_per_hour,
-            fleet_pct_hr_seeded,
+            forecast.fleet_pct_per_hour, fleet_pct_hr_seeded,
             "Fleet burn rate should use seeded baseline (4.5%/hr), not 0.0 (infinite headroom)"
         );
         assert!(
@@ -6958,8 +7311,7 @@ mod tests {
 
         // VERIFY 9: No claim of 0% utilization (window exists this period)
         assert_eq!(
-            forecast.current_utilization,
-            first_poll_util,
+            forecast.current_utilization, first_poll_util,
             "Current utilization should reflect real API value (50%), not be claimed as 0%"
         );
 
@@ -7109,7 +7461,7 @@ mod tests {
 
     // --- Cost priority distribution tests ---
 
-    use crate::config::{GovernorConfig, PricingConfig, ModelPricing};
+    use crate::config::{GovernorConfig, ModelPricing, PricingConfig};
 
     #[test]
     fn distribute_scale_down_reduces_highest_cost_first() {
@@ -7194,7 +7546,11 @@ mod tests {
         // Opus should be reduced from 5 to 3 (highest cost first)
         assert_eq!(result.get("opus"), Some(&3), "Opus should be reduced first");
         // Sonnet should stay at 5
-        assert_eq!(result.get("sonnet"), Some(&5), "Sonnet should not be reduced");
+        assert_eq!(
+            result.get("sonnet"),
+            Some(&5),
+            "Sonnet should not be reduced"
+        );
         // Total should be 8
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
     }
@@ -7280,9 +7636,17 @@ mod tests {
         );
 
         // Sonnet should be filled first (lowest cost), from 2 to 6 (all 4 new workers)
-        assert_eq!(result.get("sonnet"), Some(&6), "Sonnet should be expanded first");
+        assert_eq!(
+            result.get("sonnet"),
+            Some(&6),
+            "Sonnet should be expanded first"
+        );
         // Opus should stay at 2 (no capacity needed yet)
-        assert_eq!(result.get("opus"), Some(&2), "Opus should not be expanded yet");
+        assert_eq!(
+            result.get("opus"),
+            Some(&2),
+            "Opus should not be expanded yet"
+        );
         // Total should be 8
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
     }
@@ -7370,7 +7734,11 @@ mod tests {
             Some(&1),
             "expensive pool must get its guaranteed min worker"
         );
-        assert_eq!(result.get("sonnet"), Some(&1), "cheap agent gets the remainder");
+        assert_eq!(
+            result.get("sonnet"),
+            Some(&1),
+            "cheap agent gets the remainder"
+        );
         assert_eq!(result.values().sum::<u32>(), 2, "Total should be 2");
     }
 
@@ -7455,11 +7823,23 @@ mod tests {
         );
 
         // Haiku should be filled to max (3)
-        assert_eq!(result.get("haiku"), Some(&3), "Haiku should be filled to max");
+        assert_eq!(
+            result.get("haiku"),
+            Some(&3),
+            "Haiku should be filled to max"
+        );
         // Sonnet should get remaining 2 workers (8 + 2 = 10)
-        assert_eq!(result.get("sonnet"), Some(&10), "Sonnet should get remaining workers");
+        assert_eq!(
+            result.get("sonnet"),
+            Some(&10),
+            "Sonnet should get remaining workers"
+        );
         // Total should be 13 (capped by capacity constraints)
-        assert_eq!(result.values().sum::<u32>(), 13, "Total should be 13 (capped by max_workers)");
+        assert_eq!(
+            result.values().sum::<u32>(),
+            13,
+            "Total should be 13 (capped by max_workers)"
+        );
     }
 
     #[test]
@@ -7538,8 +7918,16 @@ mod tests {
         );
 
         // Opus should be reduced first based on empirical burn rate ($12 > $4)
-        assert_eq!(result.get("opus"), Some(&3), "Opus should be reduced first based on empirical burn rate");
-        assert_eq!(result.get("sonnet"), Some(&5), "Sonnet should not be reduced");
+        assert_eq!(
+            result.get("opus"),
+            Some(&3),
+            "Opus should be reduced first based on empirical burn rate"
+        );
+        assert_eq!(
+            result.get("sonnet"),
+            Some(&5),
+            "Sonnet should not be reduced"
+        );
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
     }
 
@@ -7561,23 +7949,23 @@ mod tests {
     /// to compute percentage changes across polling intervals.
     #[test]
     fn test_consecutive_snapshot_delta_computation() {
-        use chrono::Utc;
         use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+        use chrono::Utc;
 
         // Setup: Create two consecutive API snapshots with known values
         // These represent the API readings from two consecutive poll cycles
         let previous_snapshot = PrevUsageSnapshot {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
-            five_hour_pct: 10.0,    // 5-hour window at 10%
-            seven_day_pct: 20.0,    // 7-day window at 20%
-            weekly_scoped_pct: 15.0,  // 7-day-sonnet window at 15%
+            five_hour_pct: 10.0,     // 5-hour window at 10%
+            seven_day_pct: 20.0,     // 7-day window at 20%
+            weekly_scoped_pct: 15.0, // 7-day-sonnet window at 15%
         };
 
         let current_snapshot = PrevUsageSnapshot {
             taken_at: Utc::now(),
-            five_hour_pct: 12.5,    // 5-hour window increased by 2.5%
-            seven_day_pct: 22.0,    // 7-day window increased by 2.0%
-            weekly_scoped_pct: 18.0,  // 7-day-sonnet window increased by 3.0%
+            five_hour_pct: 12.5,     // 5-hour window increased by 2.5%
+            seven_day_pct: 22.0,     // 7-day window increased by 2.0%
+            weekly_scoped_pct: 18.0, // 7-day-sonnet window increased by 3.0%
         };
 
         // Step 1: Convert snapshots to WindowPctSnapshot format for delta calculation
@@ -7603,27 +7991,49 @@ mod tests {
         // This represents the percentage change in utilization between consecutive API polls
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
+        let expected_delta_7ds =
+            current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Step 4: Verify computed deltas match expected calculation
         // The delta formula: current_pct - previous_pct = delta_pct
-        assert!((delta_5h - expected_delta_5h).abs() < f64::EPSILON,
+        assert!(
+            (delta_5h - expected_delta_5h).abs() < f64::EPSILON,
             "5-hour delta: computed {} should equal expected {} ({} - {})",
-            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert!((delta_7d - expected_delta_7d).abs() < f64::EPSILON,
+            delta_5h,
+            expected_delta_5h,
+            current_snapshot.five_hour_pct,
+            previous_snapshot.five_hour_pct
+        );
+        assert!(
+            (delta_7d - expected_delta_7d).abs() < f64::EPSILON,
             "7-day delta: computed {} should equal expected {} ({} - {})",
-            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
+            delta_7d,
+            expected_delta_7d,
+            current_snapshot.seven_day_pct,
+            previous_snapshot.seven_day_pct
+        );
+        assert!(
+            (delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            delta_7ds,
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
 
         // Step 5: Verify the specific expected values for this test case
-        assert!((expected_delta_5h - 2.5).abs() < f64::EPSILON,
-            "Expected 5-hour delta should be 12.5 - 10.0 = 2.5");
-        assert!((expected_delta_7d - 2.0).abs() < f64::EPSILON,
-            "Expected 7-day delta should be 22.0 - 20.0 = 2.0");
-        assert!((expected_delta_7ds - 3.0).abs() < f64::EPSILON,
-            "Expected 7-day-sonnet delta should be 18.0 - 15.0 = 3.0");
+        assert!(
+            (expected_delta_5h - 2.5).abs() < f64::EPSILON,
+            "Expected 5-hour delta should be 12.5 - 10.0 = 2.5"
+        );
+        assert!(
+            (expected_delta_7d - 2.0).abs() < f64::EPSILON,
+            "Expected 7-day delta should be 22.0 - 20.0 = 2.0"
+        );
+        assert!(
+            (expected_delta_7ds - 3.0).abs() < f64::EPSILON,
+            "Expected 7-day-sonnet delta should be 18.0 - 15.0 = 3.0"
+        );
 
         // Step 6: Populate delta fields in governor state structure
         // This simulates storing deltas in state.last_fleet_aggregate.window_pct_deltas
@@ -7635,20 +8045,41 @@ mod tests {
         };
 
         // Step 7: Assert that delta fields are correctly populated with expected values
-        assert!((window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
+        assert!(
+            (window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
             "State five_hour delta should be {} (from {} - {})",
-            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
+            expected_delta_5h,
+            current_snapshot.five_hour_pct,
+            previous_snapshot.five_hour_pct
+        );
+        assert!(
+            (window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
             "State seven_day delta should be {} (from {} - {})",
-            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
+            expected_delta_7d,
+            current_snapshot.seven_day_pct,
+            previous_snapshot.seven_day_pct
+        );
+        assert!(
+            (window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
             "State weekly_scoped delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
 
         // Verify all deltas are non-zero (indicating active consumption)
-        assert!(delta_5h > 0.0, "5-hour delta should be positive (increasing)");
-        assert!(delta_7d > 0.0, "7-day delta should be positive (increasing)");
-        assert!(delta_7ds > 0.0, "7-day-sonnet delta should be positive (increasing)");
+        assert!(
+            delta_5h > 0.0,
+            "5-hour delta should be positive (increasing)"
+        );
+        assert!(
+            delta_7d > 0.0,
+            "7-day delta should be positive (increasing)"
+        );
+        assert!(
+            delta_7ds > 0.0,
+            "7-day-sonnet delta should be positive (increasing)"
+        );
     }
 
     /// Test consecutive snapshot delta computation with window reset (negative deltas).
@@ -7658,23 +8089,23 @@ mod tests {
     /// boundary transitions.
     #[test]
     fn test_consecutive_snapshot_delta_with_window_reset() {
-        use chrono::Utc;
         use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+        use chrono::Utc;
 
         // Setup: Previous snapshot shows high utilization (near window limit)
         let previous_snapshot = PrevUsageSnapshot {
             taken_at: Utc::now() - chrono::Duration::seconds(60),
             five_hour_pct: 80.0,     // 5-hour window at 80% (near exhaustion)
             seven_day_pct: 90.0,     // 7-day window at 90% (near exhaustion)
-            weekly_scoped_pct: 85.0,  // 7-day-sonnet at 85%
+            weekly_scoped_pct: 85.0, // 7-day-sonnet at 85%
         };
 
         // Current snapshot shows window reset (utilization dropped)
         let current_snapshot = PrevUsageSnapshot {
             taken_at: Utc::now(),
-            five_hour_pct: 5.0,      // Window reset: 80% -> 5% (delta: -75.0)
-            seven_day_pct: 15.0,     // Window reset: 90% -> 15% (delta: -75.0)
-            weekly_scoped_pct: 8.0,  // Window reset: 85% -> 8% (delta: -77.0)
+            five_hour_pct: 5.0,     // Window reset: 80% -> 5% (delta: -75.0)
+            seven_day_pct: 15.0,    // Window reset: 90% -> 15% (delta: -75.0)
+            weekly_scoped_pct: 8.0, // Window reset: 85% -> 8% (delta: -77.0)
         };
 
         // Compute deltas
@@ -7696,26 +8127,48 @@ mod tests {
         // Delta formula: delta = current - previous (negative when window resets)
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
+        let expected_delta_7ds =
+            current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Verify computed deltas match expected calculation (negative for window reset)
-        assert!((delta_5h - expected_delta_5h).abs() < f64::EPSILON,
+        assert!(
+            (delta_5h - expected_delta_5h).abs() < f64::EPSILON,
             "5-hour delta: computed {} should equal expected {} ({} - {})",
-            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert!((delta_7d - expected_delta_7d).abs() < f64::EPSILON,
+            delta_5h,
+            expected_delta_5h,
+            current_snapshot.five_hour_pct,
+            previous_snapshot.five_hour_pct
+        );
+        assert!(
+            (delta_7d - expected_delta_7d).abs() < f64::EPSILON,
             "7-day delta: computed {} should equal expected {} ({} - {})",
-            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
+            delta_7d,
+            expected_delta_7d,
+            current_snapshot.seven_day_pct,
+            previous_snapshot.seven_day_pct
+        );
+        assert!(
+            (delta_7ds - expected_delta_7ds).abs() < f64::EPSILON,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            delta_7ds,
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
 
         // Verify the specific expected values for this window reset test case
-        assert!((expected_delta_5h - (-75.0)).abs() < f64::EPSILON,
-            "Expected 5-hour delta should be 5.0 - 80.0 = -75.0 (window reset)");
-        assert!((expected_delta_7d - (-75.0)).abs() < f64::EPSILON,
-            "Expected 7-day delta should be 15.0 - 90.0 = -75.0 (window reset)");
-        assert!((expected_delta_7ds - (-77.0)).abs() < f64::EPSILON,
-            "Expected 7-day-sonnet delta should be 8.0 - 85.0 = -77.0 (window reset)");
+        assert!(
+            (expected_delta_5h - (-75.0)).abs() < f64::EPSILON,
+            "Expected 5-hour delta should be 5.0 - 80.0 = -75.0 (window reset)"
+        );
+        assert!(
+            (expected_delta_7d - (-75.0)).abs() < f64::EPSILON,
+            "Expected 7-day delta should be 15.0 - 90.0 = -75.0 (window reset)"
+        );
+        assert!(
+            (expected_delta_7ds - (-77.0)).abs() < f64::EPSILON,
+            "Expected 7-day-sonnet delta should be 8.0 - 85.0 = -77.0 (window reset)"
+        );
 
         // Populate in state structure
         let window_pct_deltas = WindowPctDeltas {
@@ -7725,23 +8178,41 @@ mod tests {
         };
 
         // Verify state correctly captures negative deltas (matching expected calculation)
-        assert!((window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
+        assert!(
+            (window_pct_deltas.five_hour - expected_delta_5h).abs() < f64::EPSILON,
             "State five_hour delta should be {} (from {} - {})",
-            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert!((window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
+            expected_delta_5h,
+            current_snapshot.five_hour_pct,
+            previous_snapshot.five_hour_pct
+        );
+        assert!(
+            (window_pct_deltas.seven_day - expected_delta_7d).abs() < f64::EPSILON,
             "State seven_day delta should be {} (from {} - {})",
-            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert!((window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
+            expected_delta_7d,
+            current_snapshot.seven_day_pct,
+            previous_snapshot.seven_day_pct
+        );
+        assert!(
+            (window_pct_deltas.weekly_scoped - expected_delta_7ds).abs() < f64::EPSILON,
             "State weekly_scoped delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
 
         // Verify all deltas are negative (window reset condition)
-        assert!(window_pct_deltas.five_hour < 0.0,
-            "State five_hour delta should be negative (window reset)");
-        assert!(window_pct_deltas.seven_day < 0.0,
-            "State seven_day delta should be negative (window reset)");
-        assert!(window_pct_deltas.weekly_scoped < 0.0,
-            "State weekly_scoped delta should be negative (window reset)");
+        assert!(
+            window_pct_deltas.five_hour < 0.0,
+            "State five_hour delta should be negative (window reset)"
+        );
+        assert!(
+            window_pct_deltas.seven_day < 0.0,
+            "State seven_day delta should be negative (window reset)"
+        );
+        assert!(
+            window_pct_deltas.weekly_scoped < 0.0,
+            "State weekly_scoped delta should be negative (window reset)"
+        );
     }
 
     /// Test consecutive snapshot delta computation with identical values (zero deltas).
@@ -7751,8 +8222,8 @@ mod tests {
     /// idle periods or when the API percentage hasn't changed.
     #[test]
     fn test_consecutive_snapshot_delta_identical_snapshots() {
-        use chrono::Utc;
         use crate::state::{PrevUsageSnapshot, WindowPctDeltas};
+        use chrono::Utc;
 
         // Setup: Both snapshots have identical values (no consumption)
         let snapshot_values = PrevUsageSnapshot {
@@ -7785,26 +8256,51 @@ mod tests {
         // Delta formula: delta = current - previous (both are identical here)
         let expected_delta_5h = current_snapshot.five_hour_pct - previous_snapshot.five_hour_pct;
         let expected_delta_7d = current_snapshot.seven_day_pct - previous_snapshot.seven_day_pct;
-        let expected_delta_7ds = current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
+        let expected_delta_7ds =
+            current_snapshot.weekly_scoped_pct - previous_snapshot.weekly_scoped_pct;
 
         // Verify computed deltas match expected calculation (should be zero for identical snapshots)
-        assert_eq!(delta_5h, expected_delta_5h,
+        assert_eq!(
+            delta_5h,
+            expected_delta_5h,
             "5-hour delta: computed {} should equal expected {} ({} - {})",
-            delta_5h, expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert_eq!(delta_7d, expected_delta_7d,
+            delta_5h,
+            expected_delta_5h,
+            current_snapshot.five_hour_pct,
+            previous_snapshot.five_hour_pct
+        );
+        assert_eq!(
+            delta_7d,
+            expected_delta_7d,
             "7-day delta: computed {} should equal expected {} ({} - {})",
-            delta_7d, expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert_eq!(delta_7ds, expected_delta_7ds,
+            delta_7d,
+            expected_delta_7d,
+            current_snapshot.seven_day_pct,
+            previous_snapshot.seven_day_pct
+        );
+        assert_eq!(
+            delta_7ds,
+            expected_delta_7ds,
             "7-day-sonnet delta: computed {} should equal expected {} ({} - {})",
-            delta_7ds, expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            delta_7ds,
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
 
         // Verify all expected deltas are exactly zero (identical snapshots)
-        assert_eq!(expected_delta_5h, 0.0,
-            "Expected 5-hour delta should be 0.0 for identical snapshots");
-        assert_eq!(expected_delta_7d, 0.0,
-            "Expected 7-day delta should be 0.0 for identical snapshots");
-        assert_eq!(expected_delta_7ds, 0.0,
-            "Expected 7-day-sonnet delta should be 0.0 for identical snapshots");
+        assert_eq!(
+            expected_delta_5h, 0.0,
+            "Expected 5-hour delta should be 0.0 for identical snapshots"
+        );
+        assert_eq!(
+            expected_delta_7d, 0.0,
+            "Expected 7-day delta should be 0.0 for identical snapshots"
+        );
+        assert_eq!(
+            expected_delta_7ds, 0.0,
+            "Expected 7-day-sonnet delta should be 0.0 for identical snapshots"
+        );
 
         // Populate in state structure
         let window_pct_deltas = WindowPctDeltas {
@@ -7814,15 +8310,24 @@ mod tests {
         };
 
         // Verify state correctly shows zero deltas (matching expected calculation)
-        assert_eq!(window_pct_deltas.five_hour, expected_delta_5h,
+        assert_eq!(
+            window_pct_deltas.five_hour, expected_delta_5h,
             "State five_hour delta should be {} (from {} - {})",
-            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct);
-        assert_eq!(window_pct_deltas.seven_day, expected_delta_7d,
+            expected_delta_5h, current_snapshot.five_hour_pct, previous_snapshot.five_hour_pct
+        );
+        assert_eq!(
+            window_pct_deltas.seven_day, expected_delta_7d,
             "State seven_day delta should be {} (from {} - {})",
-            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct);
-        assert_eq!(window_pct_deltas.weekly_scoped, expected_delta_7ds,
+            expected_delta_7d, current_snapshot.seven_day_pct, previous_snapshot.seven_day_pct
+        );
+        assert_eq!(
+            window_pct_deltas.weekly_scoped,
+            expected_delta_7ds,
             "State weekly_scoped delta should be {} (from {} - {})",
-            expected_delta_7ds, current_snapshot.weekly_scoped_pct, previous_snapshot.weekly_scoped_pct);
+            expected_delta_7ds,
+            current_snapshot.weekly_scoped_pct,
+            previous_snapshot.weekly_scoped_pct
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -7899,9 +8404,9 @@ mod tests {
         let decision = apply_scaling(
             target,
             current_total,
-            2.0,  // hysteresis_band
-            3,    // max_up_per_cycle
-            2,    // max_down_per_cycle
+            2.0, // hysteresis_band
+            3,   // max_up_per_cycle
+            2,   // max_down_per_cycle
         );
 
         // 6. Verify the cycle completed without panic
@@ -7909,8 +8414,10 @@ mod tests {
         match decision {
             ScalingDecision::NoChange => {
                 // Expected: target and current are within hysteresis band
-                assert!(target >= current_total - 2 && target <= current_total + 2,
-                    "NoChange decision should be within hysteresis band");
+                assert!(
+                    target >= current_total - 2 && target <= current_total + 2,
+                    "NoChange decision should be within hysteresis band"
+                );
             }
             ScalingDecision::ScaleUp(n) => {
                 // Verify scale-up is reasonable
@@ -7927,8 +8434,14 @@ mod tests {
         }
 
         // 7. Verify state is consistent after the cycle
-        assert!(!state.workers.is_empty(), "State should retain workers after cycle");
-        assert_eq!(state.workers["test-agent"].current, 5, "Current workers unchanged");
+        assert!(
+            !state.workers.is_empty(),
+            "State should retain workers after cycle"
+        );
+        assert_eq!(
+            state.workers["test-agent"].current, 5,
+            "Current workers unchanged"
+        );
         assert!(!state.safe_mode.active, "Safe mode should not be active");
     }
 
@@ -7982,8 +8495,10 @@ mod tests {
 
         let decision = apply_scaling(target, 10, 2.0, 3, 2);
 
-        assert!(matches!(decision, ScalingDecision::EmergencyBrake),
-            "Should trigger EmergencyBrake decision at 99% utilization");
+        assert!(
+            matches!(decision, ScalingDecision::EmergencyBrake),
+            "Should trigger EmergencyBrake decision at 99% utilization"
+        );
     }
 
     /// Test governor cycle with scaling decision within hysteresis band.
@@ -8031,12 +8546,17 @@ mod tests {
             &ConeScalingConfig::default(),
         );
 
-        assert_eq!(target, 5, "Target should equal current at moderate utilization");
+        assert_eq!(
+            target, 5,
+            "Target should equal current at moderate utilization"
+        );
 
         let decision = apply_scaling(target, 5, 2.0, 3, 2);
 
-        assert!(matches!(decision, ScalingDecision::NoChange),
-            "Should decide NoChange when target equals current");
+        assert!(
+            matches!(decision, ScalingDecision::NoChange),
+            "Should decide NoChange when target equals current"
+        );
     }
 }
 
@@ -8318,8 +8838,7 @@ mod mock_poller_tests {
     /// Test that MockPoller can return custom utilization values.
     #[test]
     fn test_mock_poller_custom_utilization() {
-        let mut poller =
-            MockPoller::with_utilization(75.0, 80.0, 77.5);
+        let mut poller = MockPoller::with_utilization(75.0, 80.0, 77.5);
 
         let result = poller.poll();
 
@@ -8381,10 +8900,16 @@ mod mock_poller_tests {
         assert_eq!(poller.poll_count, 0, "Initial count should be 0");
 
         poller.poll().unwrap();
-        assert_eq!(poller.poll_count, 1, "Count should increment after first poll");
+        assert_eq!(
+            poller.poll_count, 1,
+            "Count should increment after first poll"
+        );
 
         poller.poll().unwrap();
-        assert_eq!(poller.poll_count, 2, "Count should increment after second poll");
+        assert_eq!(
+            poller.poll_count, 2,
+            "Count should increment after second poll"
+        );
 
         poller.reset_poll_count();
         assert_eq!(poller.poll_count, 0, "Count should reset to 0");
@@ -8561,15 +9086,15 @@ mod mock_poller_tests {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
-                true,  // dry_run = true
-                60,    // loop_interval
-                2.0,   // hysteresis_band
-                3,     // max_up_per_cycle
-                2,     // max_down_per_cycle
-                90.0,  // target_ceiling
+                true, // dry_run = true
+                60,   // loop_interval
+                2.0,  // hysteresis_band
+                3,    // max_up_per_cycle
+                2,    // max_down_per_cycle
+                90.0, // target_ceiling
                 &alert_config,
                 &agents,
-                0,     // pre_scale_minutes (disabled)
+                0, // pre_scale_minutes (disabled)
                 &promotions,
                 &composite_risk_config,
                 &cone_scaling_config,
@@ -8582,15 +9107,15 @@ mod mock_poller_tests {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
-                true,  // dry_run = true
-                60,    // loop_interval
-                2.0,   // hysteresis_band
-                3,     // max_up_per_cycle
-                2,     // max_down_per_cycle
-                90.0,  // target_ceiling
+                true, // dry_run = true
+                60,   // loop_interval
+                2.0,  // hysteresis_band
+                3,    // max_up_per_cycle
+                2,    // max_down_per_cycle
+                90.0, // target_ceiling
                 &alert_config,
                 &agents,
-                0,     // pre_scale_minutes (disabled)
+                0, // pre_scale_minutes (disabled)
                 &promotions,
                 &composite_risk_config,
                 &cone_scaling_config,
@@ -8599,10 +9124,16 @@ mod mock_poller_tests {
         };
 
         // 7. Verify the cycle completed successfully
-        assert!(result.is_ok(), "run_governor_cycle should return Ok(()) in dry_run mode");
+        assert!(
+            result.is_ok(),
+            "run_governor_cycle should return Ok(()) in dry_run mode"
+        );
 
         // 8. Verify state file was created (even if minimal)
-        assert!(state_path.exists(), "State file should be created after cycle run");
+        assert!(
+            state_path.exists(),
+            "State file should be created after cycle run"
+        );
 
         // 9. Verify no panic occurred (test reaching this point means no panic)
         // This is the key "smoke test" - the cycle runs without crashing
@@ -8625,8 +9156,8 @@ mod mock_poller_tests {
         let state_path = temp_dir.path().join("governor-state-first-poll.json");
 
         // 2. Verify initial state has no previous snapshot
-        let initial_state = crate::state::load_state(&state_path)
-            .expect("Failed to load initial state");
+        let initial_state =
+            crate::state::load_state(&state_path).expect("Failed to load initial state");
         assert!(
             initial_state.previous_api_snapshot.is_none(),
             "Initial state should have None previous_api_snapshot"
@@ -8675,15 +9206,15 @@ mod mock_poller_tests {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
-                true,  // dry_run = true
-                60,    // loop_interval
-                2.0,   // hysteresis_band
-                3,     // max_up_per_cycle
-                2,     // max_down_per_cycle
-                90.0,  // target_ceiling
+                true, // dry_run = true
+                60,   // loop_interval
+                2.0,  // hysteresis_band
+                3,    // max_up_per_cycle
+                2,    // max_down_per_cycle
+                90.0, // target_ceiling
                 &alert_config,
                 &agents,
-                0,     // pre_scale_minutes (disabled)
+                0, // pre_scale_minutes (disabled)
                 &promotions,
                 &composite_risk_config,
                 &cone_scaling_config,
@@ -8695,15 +9226,15 @@ mod mock_poller_tests {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
-                true,  // dry_run = true
-                60,    // loop_interval
-                2.0,   // hysteresis_band
-                3,     // max_up_per_cycle
-                2,     // max_down_per_cycle
-                90.0,  // target_ceiling
+                true, // dry_run = true
+                60,   // loop_interval
+                2.0,  // hysteresis_band
+                3,    // max_up_per_cycle
+                2,    // max_down_per_cycle
+                90.0, // target_ceiling
                 &alert_config,
                 &agents,
-                0,     // pre_scale_minutes (disabled)
+                0, // pre_scale_minutes (disabled)
                 &promotions,
                 &composite_risk_config,
                 &cone_scaling_config,
@@ -8724,8 +9255,8 @@ mod mock_poller_tests {
         );
 
         // 10. Load and verify the state after first poll
-        let final_state = crate::state::load_state(&state_path)
-            .expect("Failed to load final state");
+        let final_state =
+            crate::state::load_state(&state_path).expect("Failed to load final state");
 
         // On first successful poll:
         // - previous_api_snapshot should still be None (was None, shifted to None at start)
@@ -8793,8 +9324,8 @@ mod mock_poller_tests {
         // ========================================================================
 
         // 6. Verify initial state has no previous snapshot (first poll condition)
-        let initial_state = crate::state::load_state(&state_path)
-            .expect("Failed to load initial state");
+        let initial_state =
+            crate::state::load_state(&state_path).expect("Failed to load initial state");
         assert!(
             initial_state.previous_api_snapshot.is_none(),
             "Initial state should have None previous_api_snapshot (first poll)"
@@ -8809,15 +9340,15 @@ mod mock_poller_tests {
         let first_poll_result = run_governor_cycle(
             &mut poller1,
             &state_path,
-            true,  // dry_run = true
-            60,    // loop_interval
-            2.0,   // hysteresis_band
-            3,     // max_up_per_cycle
-            2,     // max_down_per_cycle
-            90.0,  // target_ceiling
+            true, // dry_run = true
+            60,   // loop_interval
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+            90.0, // target_ceiling
             &alert_config,
             &agents,
-            0,     // pre_scale_minutes (disabled)
+            0, // pre_scale_minutes (disabled)
             &promotions,
             &composite_risk_config,
             &cone_scaling_config,
@@ -8831,8 +9362,8 @@ mod mock_poller_tests {
         );
 
         // 9. Load state after first poll and verify snapshot state
-        let first_poll_state = crate::state::load_state(&state_path)
-            .expect("Failed to load state after first poll");
+        let first_poll_state =
+            crate::state::load_state(&state_path).expect("Failed to load state after first poll");
 
         // On first poll:
         // - previous_api_snapshot should still be None (was None, shifted to None at start of cycle)
@@ -8850,15 +9381,15 @@ mod mock_poller_tests {
         let second_poll_result = run_governor_cycle(
             &mut poller2,
             &state_path,
-            true,  // dry_run = true
-            60,    // loop_interval
-            2.0,   // hysteresis_band
-            3,     // max_up_per_cycle
-            2,     // max_down_per_cycle
-            90.0,  // target_ceiling
+            true, // dry_run = true
+            60,   // loop_interval
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+            90.0, // target_ceiling
             &alert_config,
             &agents,
-            0,     // pre_scale_minutes (disabled)
+            0, // pre_scale_minutes (disabled)
             &promotions,
             &composite_risk_config,
             &cone_scaling_config,
@@ -8872,8 +9403,8 @@ mod mock_poller_tests {
         );
 
         // 12. Load state after second poll
-        let second_poll_state = crate::state::load_state(&state_path)
-            .expect("Failed to load state after second poll");
+        let second_poll_state =
+            crate::state::load_state(&state_path).expect("Failed to load state after second poll");
 
         // 13. Verify no panic occurred in either poll (test reaching this point = success)
         // The key assertion is that the governor cycle handles:
@@ -8894,8 +9425,8 @@ mod mock_poller_tests {
     /// - 7-day Sonnet window: typically lower than all-models 7-day
     #[test]
     fn test_realistic_consecutive_api_polls() {
-        use chrono::Utc;
         use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
 
         // Scenario 1: Normal workload progression
         // Poll 1 (baseline): 5h=8%, 7d=42%, 7ds=35%
@@ -8929,13 +9460,28 @@ mod mock_poller_tests {
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // Verify realistic delta patterns
-        assert!((d5h - 2.5).abs() < f64::EPSILON, "5h delta: 10.5 - 8.0 = 2.5");
-        assert!((d7d - 1.0).abs() < f64::EPSILON, "7d delta: 43.0 - 42.0 = 1.0");
-        assert!((d7ds - 1.5).abs() < f64::EPSILON, "7ds delta: 36.5 - 35.0 = 1.5");
+        assert!(
+            (d5h - 2.5).abs() < f64::EPSILON,
+            "5h delta: 10.5 - 8.0 = 2.5"
+        );
+        assert!(
+            (d7d - 1.0).abs() < f64::EPSILON,
+            "7d delta: 43.0 - 42.0 = 1.0"
+        );
+        assert!(
+            (d7ds - 1.5).abs() < f64::EPSILON,
+            "7ds delta: 36.5 - 35.0 = 1.5"
+        );
 
         // 5-hour window should show fastest change (highest delta)
-        assert!(d5h > d7d, "5h delta should be > 7d delta (fastest changing)");
-        assert!(d7ds > d7d, "7ds delta should be > 7d delta (Sonnet usage more volatile)");
+        assert!(
+            d5h > d7d,
+            "5h delta should be > 7d delta (fastest changing)"
+        );
+        assert!(
+            d7ds > d7d,
+            "7ds delta should be > 7d delta (Sonnet usage more volatile)"
+        );
     }
 
     /// Test delta computation with minimal API changes (precision edge case).
@@ -8952,9 +9498,9 @@ mod mock_poller_tests {
         };
 
         let curr = crate::db::WindowPctSnapshot {
-            five_hour: 50.01,   // +0.01%
-            seven_day: 60.01,   // +0.01%
-            weekly_scoped: 55.01,  // +0.01%
+            five_hour: 50.01,     // +0.01%
+            seven_day: 60.01,     // +0.01%
+            weekly_scoped: 55.01, // +0.01%
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
@@ -9002,8 +9548,8 @@ mod mock_poller_tests {
     /// This is a critical edge case for the governor's prediction calibration.
     #[test]
     fn test_window_reset_boundary_transitions() {
-        use chrono::Utc;
         use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
 
         // Scenario: Window reset occurs between polls
         // Previous: near limit (98%, 95%, 97%)
@@ -9037,9 +9583,18 @@ mod mock_poller_tests {
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
         // All deltas should be large and negative (indicating reset)
-        assert!(d5h < -90.0, "5h delta should indicate reset (2.0 - 98.0 = -96.0)");
-        assert!(d7d < -90.0, "7d delta should indicate reset (3.0 - 95.0 = -92.0)");
-        assert!(d7ds < -90.0, "7ds delta should indicate reset (1.5 - 97.0 = -95.5)");
+        assert!(
+            d5h < -90.0,
+            "5h delta should indicate reset (2.0 - 98.0 = -96.0)"
+        );
+        assert!(
+            d7d < -90.0,
+            "7d delta should indicate reset (3.0 - 95.0 = -92.0)"
+        );
+        assert!(
+            d7ds < -90.0,
+            "7ds delta should indicate reset (1.5 - 97.0 = -95.5)"
+        );
 
         assert!((d5h - (-96.0)).abs() < f64::EPSILON);
         assert!((d7d - (-92.0)).abs() < f64::EPSILON);
@@ -9060,13 +9615,25 @@ mod mock_poller_tests {
 
         // First poll: only current snapshot should be set
         state.update_api_snapshot(now, 15.0, 45.0, 38.0);
-        assert!(state.previous_api_snapshot.is_none(), "Previous should be None after first poll");
-        assert!(state.current_api_snapshot.is_some(), "Current should be Some after first poll");
+        assert!(
+            state.previous_api_snapshot.is_none(),
+            "Previous should be None after first poll"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "Current should be Some after first poll"
+        );
 
         // Second poll: previous should now be set
         state.update_api_snapshot(now + chrono::Duration::seconds(60), 17.5, 47.0, 40.0);
-        assert!(state.previous_api_snapshot.is_some(), "Previous should be Some after second poll");
-        assert!(state.current_api_snapshot.is_some(), "Current should still be Some");
+        assert!(
+            state.previous_api_snapshot.is_some(),
+            "Previous should be Some after second poll"
+        );
+        assert!(
+            state.current_api_snapshot.is_some(),
+            "Current should still be Some"
+        );
 
         // Verify the chain: previous holds first poll data, current holds second
         let prev = state.previous_api_snapshot.as_ref().unwrap();
@@ -9109,19 +9676,28 @@ mod mock_poller_tests {
         };
 
         let curr = crate::db::WindowPctSnapshot {
-            five_hour: 25.0,   // +15.0 (rapid burn)
-            seven_day: 70.5,   // +0.5 (nearly flat)
-            weekly_scoped: 64.0,  // -1.0 (slight decrease due to older consumption rolling off)
+            five_hour: 25.0,     // +15.0 (rapid burn)
+            seven_day: 70.5,     // +0.5 (nearly flat)
+            weekly_scoped: 64.0, // -1.0 (slight decrease due to older consumption rolling off)
         };
 
         let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev, &curr);
 
-        assert!((d5h - 15.0).abs() < f64::EPSILON, "5h should increase rapidly");
+        assert!(
+            (d5h - 15.0).abs() < f64::EPSILON,
+            "5h should increase rapidly"
+        );
         assert!((d7d - 0.5).abs() < f64::EPSILON, "7d should be nearly flat");
-        assert!((d7ds - (-1.0)).abs() < f64::EPSILON, "7ds can decrease slightly");
+        assert!(
+            (d7ds - (-1.0)).abs() < f64::EPSILON,
+            "7ds can decrease slightly"
+        );
 
         // 5-hour delta should be much larger than 7-day deltas
-        assert!(d5h.abs() > 10.0 * d7d.abs(), "5h should change much faster than 7d");
+        assert!(
+            d5h.abs() > 10.0 * d7d.abs(),
+            "5h should change much faster than 7d"
+        );
     }
 
     /// Test delta computation with NaN/Infinity handling.
@@ -9176,7 +9752,11 @@ mod mock_poller_tests {
         let elapsed = start.elapsed();
 
         // Should complete 10,000 computations in under 100ms
-        assert!(elapsed.as_millis() < 100, "10,000 delta computations should complete in < 100ms, took {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 100,
+            "10,000 delta computations should complete in < 100ms, took {}ms",
+            elapsed.as_millis()
+        );
     }
 
     /// Test realistic fixture data from actual API response patterns.
@@ -9185,8 +9765,8 @@ mod mock_poller_tests {
     /// delta computation works with production-like values.
     #[test]
     fn test_realistic_api_fixture_data() {
-        use chrono::Utc;
         use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
 
         // Fixture based on actual API data (high Sonnet usage scenario)
         let fixtures = vec![
@@ -9227,13 +9807,38 @@ mod mock_poller_tests {
             let (d5h, d7d, d7ds) = calculate_window_pct_delta(&prev_pct, &curr_pct);
 
             // All deltas should be positive (increasing usage)
-            assert!(d5h > 0.0, "Interval {}-{}: 5h delta should be positive", i-1, i);
-            assert!(d7d > 0.0, "Interval {}-{}: 7d delta should be positive", i-1, i);
-            assert!(d7ds > 0.0, "Interval {}-{}: 7ds delta should be positive", i-1, i);
+            assert!(
+                d5h > 0.0,
+                "Interval {}-{}: 5h delta should be positive",
+                i - 1,
+                i
+            );
+            assert!(
+                d7d > 0.0,
+                "Interval {}-{}: 7d delta should be positive",
+                i - 1,
+                i
+            );
+            assert!(
+                d7ds > 0.0,
+                "Interval {}-{}: 7ds delta should be positive",
+                i - 1,
+                i
+            );
 
             // 5-hour should change fastest
-            assert!(d5h > d7d, "Interval {}-{}: 5h should change faster than 7d", i-1, i);
-            assert!(d7ds > d7d, "Interval {}-{}: 7ds should change faster than 7d", i-1, i);
+            assert!(
+                d5h > d7d,
+                "Interval {}-{}: 5h should change faster than 7d",
+                i - 1,
+                i
+            );
+            assert!(
+                d7ds > d7d,
+                "Interval {}-{}: 7ds should change faster than 7d",
+                i - 1,
+                i
+            );
         }
     }
 }
@@ -9241,7 +9846,7 @@ mod mock_poller_tests {
 #[cfg(test)]
 mod annotation_guard_tests {
     use super::*;
-    use chrono::{Utc, Duration};
+    use chrono::{Duration, Utc};
 
     /// Test Guard 1: Interval too short (< 2 minutes)
     #[test]
@@ -9252,7 +9857,10 @@ mod annotation_guard_tests {
         let elapsed_seconds = (t1 - t0).num_seconds().abs();
 
         // Guard should trigger
-        assert!(elapsed_seconds < 120, "Test setup: interval should be < 120s");
+        assert!(
+            elapsed_seconds < 120,
+            "Test setup: interval should be < 120s"
+        );
     }
 
     /// Test Guard 1 passes: Interval >= 2 minutes
@@ -9264,7 +9872,10 @@ mod annotation_guard_tests {
         let elapsed_seconds = (t1 - t0).num_seconds().abs();
 
         // Guard should not trigger
-        assert!(elapsed_seconds >= 120, "Test setup: interval should be >= 120s");
+        assert!(
+            elapsed_seconds >= 120,
+            "Test setup: interval should be >= 120s"
+        );
     }
 
     /// Test Guard 2: Worker count changed mid-interval
@@ -9274,7 +9885,10 @@ mod annotation_guard_tests {
         let workers_at_end = 7;
 
         // Guard should trigger - workers changed
-        assert_ne!(workers_at_start, workers_at_end, "Test setup: workers should differ");
+        assert_ne!(
+            workers_at_start, workers_at_end,
+            "Test setup: workers should differ"
+        );
     }
 
     /// Test Guard 2 passes: Worker count stable
@@ -9284,7 +9898,10 @@ mod annotation_guard_tests {
         let workers_at_end = 5;
 
         // Guard should not trigger
-        assert_eq!(workers_at_start, workers_at_end, "Test setup: workers should be equal");
+        assert_eq!(
+            workers_at_start, workers_at_end,
+            "Test setup: workers should be equal"
+        );
     }
 
     /// Test Guard 3: Window reset detected (utilization drop > 1%)
@@ -9297,7 +9914,7 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 18.5,  // Dropped 1.5% - should trigger
+            five_hour: 18.5, // Dropped 1.5% - should trigger
             seven_day: 46.0,
             weekly_scoped: 36.0,
         };
@@ -9309,8 +9926,10 @@ mod annotation_guard_tests {
         let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
         // At least one guard should trigger (5h dropped > 1%)
-        assert!(five_hour_reset || seven_day_reset || weekly_scoped_reset,
-                "Test setup: at least one window should show reset");
+        assert!(
+            five_hour_reset || seven_day_reset || weekly_scoped_reset,
+            "Test setup: at least one window should show reset"
+        );
     }
 
     /// Test Guard 3 passes: No window reset (normal utilization increase)
@@ -9323,7 +9942,7 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 21.5,  // Increased 1.5% - normal
+            five_hour: 21.5, // Increased 1.5% - normal
             seven_day: 46.0,
             weekly_scoped: 36.5,
         };
@@ -9335,8 +9954,10 @@ mod annotation_guard_tests {
         let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
 
         // No guard should trigger - all increased or stable
-        assert!(!(five_hour_reset || seven_day_reset || weekly_scoped_reset),
-                "Test setup: no window should show reset");
+        assert!(
+            !(five_hour_reset || seven_day_reset || weekly_scoped_reset),
+            "Test setup: no window should show reset"
+        );
     }
 
     /// Test Guard 3: Multiple windows reset
@@ -9349,9 +9970,9 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 22.0,   // Dropped 3%
-            seven_day: 48.0,   // Dropped 2%
-            weekly_scoped: 38.5,  // Dropped 1.5%
+            five_hour: 22.0,     // Dropped 3%
+            seven_day: 48.0,     // Dropped 2%
+            weekly_scoped: 38.5, // Dropped 1.5%
         };
 
         let reset_threshold = 1.0;
@@ -9382,25 +10003,33 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 22.0,   // Increased 2% - no reset
-            seven_day: 46.5,   // Increased 1.5%
-            weekly_scoped: 36.5,  // Increased 1.5%
+            five_hour: 22.0,     // Increased 2% - no reset
+            seven_day: 46.5,     // Increased 1.5%
+            weekly_scoped: 36.5, // Increased 1.5%
         };
 
         // Guard 1: Check interval
         let elapsed_seconds = (t1 - t0).num_seconds().abs();
-        assert!(elapsed_seconds >= 120, "Guard 1: interval should be sufficient");
+        assert!(
+            elapsed_seconds >= 120,
+            "Guard 1: interval should be sufficient"
+        );
 
         // Guard 2: Check worker stability
-        assert_eq!(workers_at_start, workers_at_end, "Guard 2: workers should be stable");
+        assert_eq!(
+            workers_at_start, workers_at_end,
+            "Guard 2: workers should be stable"
+        );
 
         // Guard 3: Check no window reset
         let reset_threshold = 1.0;
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
         let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
         let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-        assert!(!(five_hour_reset || seven_day_reset || weekly_scoped_reset),
-                "Guard 3: no window reset should occur");
+        assert!(
+            !(five_hour_reset || seven_day_reset || weekly_scoped_reset),
+            "Guard 3: no window reset should occur"
+        );
     }
 
     /// Test Guard 3 edge case: Exactly at threshold (1% drop = reset)
@@ -9413,7 +10042,7 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 18.99,  // Dropped 1.01% - just over threshold
+            five_hour: 18.99, // Dropped 1.01% - just over threshold
             seven_day: 45.0,
             weekly_scoped: 35.0,
         };
@@ -9436,7 +10065,7 @@ mod annotation_guard_tests {
         };
 
         let new_pct = db::WindowPctSnapshot {
-            five_hour: 19.01,  // Dropped 0.99% - just under threshold
+            five_hour: 19.01, // Dropped 0.99% - just under threshold
             seven_day: 45.0,
             weekly_scoped: 35.0,
         };
@@ -9446,7 +10075,10 @@ mod annotation_guard_tests {
         let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
 
         // Guard should not trigger (just barely)
-        assert!(!five_hour_reset, "Drop of 0.99% should not trigger reset guard");
+        assert!(
+            !five_hour_reset,
+            "Drop of 0.99% should not trigger reset guard"
+        );
     }
 
     /// Regression test: continuously-calibrated windows are unaffected by cold-start fixes.
@@ -9474,11 +10106,11 @@ mod annotation_guard_tests {
 
         // Continuously-calibrated window conditions
         let estimate_quality = EstimateQuality::Calibrated;
-        let util = 65.0;  // 65% utilization
-        let fleet_pct_hr = 2.5;  // non-zero burn rate from EMA
-        let current_total = 2;  // 2 workers
-        let pct_per_worker = fleet_pct_hr / current_total as f64;  // 1.25 %/worker/hr
-        let std_pct_hr = 0.8;  // realistic standard deviation from actual measurements
+        let util = 65.0; // 65% utilization
+        let fleet_pct_hr = 2.5; // non-zero burn rate from EMA
+        let current_total = 2; // 2 workers
+        let pct_per_worker = fleet_pct_hr / current_total as f64; // 1.25 %/worker/hr
+        let std_pct_hr = 0.8; // realistic standard deviation from actual measurements
 
         let target_ceiling = 90.0;
         let hrs_remaining = 24.0;
@@ -9487,8 +10119,10 @@ mod annotation_guard_tests {
         let baseline_pct_per_worker_hr = 1.5;
 
         // ASSERT 1: Verify seeding condition is NOT met due to estimate_quality
-        let should_seed = matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-            && util > 0.0
+        let should_seed = matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
             && fleet_pct_hr == 0.0
             && current_total > 0;
 
@@ -9499,35 +10133,39 @@ mod annotation_guard_tests {
         );
 
         // Apply the production seeding logic (matches governor.rs:4762-4787)
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) =
-            if matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-                && util > 0.0
-                && fleet_pct_hr == 0.0
-                && current_total > 0
-            {
-                let base_per_worker = baseline_pct_per_worker_hr;
-                let seeded_fleet_pct = base_per_worker * current_total as f64;
-                let widened_std_pct = seeded_fleet_pct;
-                (seeded_fleet_pct, base_per_worker, widened_std_pct)
-            } else {
-                (fleet_pct_hr, pct_per_worker, std_pct_hr)
-            };
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0
+        {
+            let base_per_worker = baseline_pct_per_worker_hr;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            let widened_std_pct = seeded_fleet_pct;
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, pct_per_worker, std_pct_hr)
+        };
 
         // ASSERT 2: Verify original values are preserved (not seeded)
         assert!(
             (fleet_pct_hr_seeded - fleet_pct_hr).abs() < 1e-9,
             "Continuously-calibrated window should preserve original fleet_pct_hr {}, got {}",
-            fleet_pct_hr, fleet_pct_hr_seeded
+            fleet_pct_hr,
+            fleet_pct_hr_seeded
         );
         assert!(
             (pct_per_worker_seeded - pct_per_worker).abs() < 1e-9,
             "Continuously-calibrated window should preserve original pct_per_worker {}, got {}",
-            pct_per_worker, pct_per_worker_seeded
+            pct_per_worker,
+            pct_per_worker_seeded
         );
         assert!(
             (std_pct_hr_seeded - std_pct_hr).abs() < 1e-9,
             "Continuously-calibrated window should preserve original std_pct_hr {}, got {}",
-            std_pct_hr, std_pct_hr_seeded
+            std_pct_hr,
+            std_pct_hr_seeded
         );
 
         // Generate forecast using the PRODUCTION path (generate_window_forecast)
@@ -9546,7 +10184,8 @@ mod annotation_guard_tests {
         assert!(
             (forecast_before_cold_fix.fleet_pct_per_hour - fleet_pct_hr).abs() < 1e-6,
             "Forecast should preserve calibrated EMA rate {}, got {}",
-            fleet_pct_hr, forecast_before_cold_fix.fleet_pct_per_hour
+            fleet_pct_hr,
+            forecast_before_cold_fix.fleet_pct_per_hour
         );
 
         // ASSERT 4: Verify forecast is flagged as Calibrated (not ColdStart/Insufficient)
@@ -9559,7 +10198,9 @@ mod annotation_guard_tests {
 
         // ASSERT 5: Verify forecast produces meaningful exhaustion prediction
         assert!(
-            forecast_before_cold_fix.predicted_exhaustion_hours.is_finite(),
+            forecast_before_cold_fix
+                .predicted_exhaustion_hours
+                .is_finite(),
             "Continuously-calibrated window should produce finite exhaustion hours, got {}",
             forecast_before_cold_fix.predicted_exhaustion_hours
         );
@@ -9574,7 +10215,7 @@ mod annotation_guard_tests {
         // This represents the "before cold-start fix" state
         let forecast_without_cold_logic = generate_window_forecast(
             "weekly_scoped",
-            fleet_pct_hr,  // Direct EMA, no seeding
+            fleet_pct_hr, // Direct EMA, no seeding
             util,
             target_ceiling,
             hrs_remaining,
@@ -9605,8 +10246,7 @@ mod annotation_guard_tests {
 
         // ASSERT 8: Verify both forecasts have the same quality
         assert_eq!(
-            forecast_before_cold_fix.estimate_quality,
-            forecast_without_cold_logic.estimate_quality,
+            forecast_before_cold_fix.estimate_quality, forecast_without_cold_logic.estimate_quality,
             "Estimate quality should be identical with and without cold-start logic"
         );
     }
@@ -9622,27 +10262,32 @@ mod annotation_guard_tests {
 
         // Window at the calibration threshold (exactly 3 samples)
         let estimate_quality = EstimateQuality::Calibrated;
-        let util = 80.0;  // 80% utilization
-        let fleet_pct_hr = 3.0;  // burn rate from exactly 3 samples
-        let current_total = 3;  // 3 workers
-        let pct_per_worker = fleet_pct_hr / current_total as f64;  // 1.0 %/worker/hr
-        let std_pct_hr = 0.5;  // smaller std at threshold
+        let util = 80.0; // 80% utilization
+        let fleet_pct_hr = 3.0; // burn rate from exactly 3 samples
+        let current_total = 3; // 3 workers
+        let pct_per_worker = fleet_pct_hr / current_total as f64; // 1.0 %/worker/hr
+        let std_pct_hr = 0.5; // smaller std at threshold
 
         let target_ceiling = 90.0;
-        let hrs_remaining = 8.0;  // shorter time horizon for higher pressure
+        let hrs_remaining = 8.0; // shorter time horizon for higher pressure
 
         // Verify seeding logic is bypassed
-        let should_seed = matches!(estimate_quality, EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples)
-            && util > 0.0
+        let should_seed = matches!(
+            estimate_quality,
+            EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
+        ) && util > 0.0
             && fleet_pct_hr == 0.0
             && current_total > 0;
 
-        assert!(!should_seed, "Window at calibration threshold must bypass seeding");
+        assert!(
+            !should_seed,
+            "Window at calibration threshold must bypass seeding"
+        );
 
         // Generate forecasts with and without cold-start logic
         let forecast_with_logic = generate_window_forecast(
             "five_hour",
-            fleet_pct_hr,  // EMA value bypasses seeding
+            fleet_pct_hr, // EMA value bypasses seeding
             util,
             target_ceiling,
             hrs_remaining,
@@ -9664,13 +10309,15 @@ mod annotation_guard_tests {
 
         // Verify numerical identity
         assert_eq!(
-            forecast_with_logic.safe_worker_count,
-            forecast_without_logic.safe_worker_count,
+            forecast_with_logic.safe_worker_count, forecast_without_logic.safe_worker_count,
             "Safe worker count should be identical at calibration threshold"
         );
 
         assert!(
-            (forecast_with_logic.predicted_exhaustion_hours - forecast_without_logic.predicted_exhaustion_hours).abs() < 1e-6,
+            (forecast_with_logic.predicted_exhaustion_hours
+                - forecast_without_logic.predicted_exhaustion_hours)
+                .abs()
+                < 1e-6,
             "Exhaustion prediction should be identical at calibration threshold"
         );
 
@@ -9935,8 +10582,7 @@ mod is_structurally_inactive_tests {
         assert!(
             result,
             "should return true at exact threshold ({}), got {}",
-            MIN_CONSECUTIVE_ABSENT,
-            result
+            MIN_CONSECUTIVE_ABSENT, result
         );
     }
 
@@ -9980,4 +10626,3 @@ mod is_structurally_inactive_tests {
         );
     }
 }
-

@@ -398,10 +398,7 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     // Safe mode warning
     if state.safe_mode.active {
         output.push_str("\n");
-        output.push_str(&colors.colorize(
-            "WARNING  SAFE MODE ACTIVE",
-            colors.bold_yellow
-        ));
+        output.push_str(&colors.colorize("WARNING  SAFE MODE ACTIVE", colors.bold_yellow));
         output.push_str("\n");
         output.push_str(&format!(
             "  Trigger: {}\n",
@@ -467,12 +464,7 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
                         .get(*at)
                         .map(|v| v.len())
                         .unwrap_or(0);
-                    output.push_str(&format!(
-                        "  {}: {:.0}% FP ({})\n",
-                        at,
-                        rate * 100.0,
-                        count
-                    ));
+                    output.push_str(&format!("  {}: {:.0}% FP ({})\n", at, rate * 100.0, count));
                 }
             }
         }
@@ -492,10 +484,8 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
                 output.push_str("\n");
             }
             StatusExitCode::Emergency => {
-                let warning = colors.colorize(
-                    "🚨 EMERGENCY: Governor is in safe mode",
-                    colors.bold_red,
-                );
+                let warning =
+                    colors.colorize("🚨 EMERGENCY: Governor is in safe mode", colors.bold_red);
                 output.push_str(&warning);
                 output.push_str("\n");
             }
@@ -514,10 +504,7 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
     let windows: HashMap<&str, &WindowForecast> = [
         ("five_hour", &state.capacity_forecast.five_hour),
         ("seven_day", &state.capacity_forecast.seven_day),
-        (
-            "weekly_scoped",
-            &state.capacity_forecast.weekly_scoped,
-        ),
+        ("weekly_scoped", &state.capacity_forecast.weekly_scoped),
     ]
     .into_iter()
     .collect();
@@ -954,7 +941,10 @@ mod tests {
         // Note: In test environment, stdout is not a TTY, so this will be false
         // but we're testing that the env var is properly checked
         let result = colors_enabled();
-        assert!(!result, "colors should be disabled when NO_COLOR is unset and not a TTY");
+        assert!(
+            !result,
+            "colors should be disabled when NO_COLOR is unset and not a TTY"
+        );
 
         // Restore original value
         if let Ok(val) = original {
@@ -972,8 +962,14 @@ mod tests {
         let result = colored_risk_indicator(&win, &colors);
 
         // Should not contain ANSI escape codes when NO_COLOR is set
-        assert!(!result.contains('\x1b'), "colored_risk_indicator should not contain ANSI codes when NO_COLOR is set");
-        assert!(result.contains("CUTOFF"), "should still contain the risk text");
+        assert!(
+            !result.contains('\x1b'),
+            "colored_risk_indicator should not contain ANSI codes when NO_COLOR is set"
+        );
+        assert!(
+            result.contains("CUTOFF"),
+            "should still contain the risk text"
+        );
 
         std::env::remove_var("NO_COLOR");
     }

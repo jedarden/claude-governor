@@ -1007,11 +1007,13 @@ pub fn aggregate_to_fleet(
 
         // Track cli vs sdk-cli usage for billing breakdown
         if inst.entrypoint == "sdk-cli" {
-            sdk_tokens += inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
+            sdk_tokens +=
+                inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
             sdk_cost += inst.total_usd;
         } else {
             // cli or any other entrypoint counts as subscription usage
-            cli_tokens += inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
+            cli_tokens +=
+                inst.input_n + inst.output_n + inst.r_cache_n + inst.w_cache_n + inst.w_cache_1h_n;
             cli_cost += inst.total_usd;
         }
     }
@@ -1604,7 +1606,10 @@ mod tests {
         );
 
         // Verify the original corrupt file no longer exists at its original path
-        assert!(!cursor_path.exists(), "original corrupt file should be renamed to backup");
+        assert!(
+            !cursor_path.exists(),
+            "original corrupt file should be renamed to backup"
+        );
 
         // Verify the backup contains the original corrupt content
         let backup_path = backup_files[0].path();
@@ -1664,7 +1669,10 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
 
                 if let Err(e) = store.save(&path_clone) {
-                    errors_clone.lock().unwrap().push(format!("thread {} save failed: {}", i, e));
+                    errors_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("thread {} save failed: {}", i, e));
                 }
             });
             handles.push(handle);
@@ -1684,7 +1692,10 @@ mod tests {
         );
 
         // Final file must exist and be valid JSON
-        assert!(cursor_path.exists(), "final cursor file should exist after concurrent saves");
+        assert!(
+            cursor_path.exists(),
+            "final cursor file should exist after concurrent saves"
+        );
         let loaded = CursorStore::load(&cursor_path).expect("final file must be valid JSON");
         // The final content is whichever writer won the rename race — just
         // verify it parses and is structurally valid (not empty/interleaved).
@@ -1869,7 +1880,10 @@ mod tests {
 
             // Should return None because "unknown" model doesn't start with "claude-"
             // (non-Anthropic models don't consume subscription quota)
-            assert!(result.is_none(), "unknown/non-Claude models should be filtered out");
+            assert!(
+                result.is_none(),
+                "unknown/non-Claude models should be filtered out"
+            );
         }
 
         #[test]
@@ -1912,7 +1926,10 @@ mod tests {
             let line: JsonlLine = serde_json::from_str(json).unwrap();
 
             let result = parse_usage_block(&line, path);
-            assert!(result.is_some(), "sdk-cli sessions should be accepted for visibility");
+            assert!(
+                result.is_some(),
+                "sdk-cli sessions should be accepted for visibility"
+            );
 
             let record = result.unwrap();
             assert_eq!(record.session_entrypoint, "sdk-cli");
@@ -1944,7 +1961,10 @@ mod tests {
             let line: JsonlLine = serde_json::from_str(json).unwrap();
 
             let result = parse_usage_block(&line, path);
-            assert!(result.is_some(), "legacy sessions without entrypoint should default to cli");
+            assert!(
+                result.is_some(),
+                "legacy sessions without entrypoint should default to cli"
+            );
 
             let record = result.unwrap();
             assert_eq!(record.session_entrypoint, "cli");
@@ -2220,8 +2240,7 @@ mod tests {
         fn record_type_and_window_name() {
             let now = base_now();
             let reset = reset_5h_from(now);
-            let rec =
-                compute_window_forecast("weekly_scoped", 80.0, 90.0, reset, now, 1.0, false);
+            let rec = compute_window_forecast("weekly_scoped", 80.0, 90.0, reset, now, 1.0, false);
 
             assert_eq!(rec.r, "w");
             assert_eq!(rec.win, "weekly_scoped");
