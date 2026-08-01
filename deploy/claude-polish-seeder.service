@@ -7,6 +7,10 @@ Description=cgov polish-loop seeder (top up the polish queue)
 
 [Service]
 Type=oneshot
+# systemd --user's default PATH on NixOS is just the systemd unit's own nix
+# store bin/ (no /run/current-system/sw/bin) — "env bash" fails with exit 127
+# without this override. Needed by any user unit that shells out.
+Environment=PATH=/run/current-system/sw/bin:%h/.local/bin:%h/.cargo/bin:/usr/bin:/bin
 ExecStart=%h/claude-governor/scripts/polish-seeder.sh
 # Push produced beads to the remote (Forgejo) each pass, best-effort — a non-ff
 # rejection just leaves them committed locally to push on a later pass.
