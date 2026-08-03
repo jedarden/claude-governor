@@ -9,12 +9,20 @@ use rusqlite::Connection;
 fn test_pluck_database_connectivity() {
     let db_path = PathBuf::from("/home/coding/claude-governor/.beads/beads.db");
 
+    // Define filter parameters
+    let labels_filter: Vec<&str> = vec![]; // Empty = no label inclusion filter
+    let exclude_labels_filter: Vec<&str> = vec!["deferred", "human", "blocked"];
+    let state_filter: &str = "open";
+
     // Log filter parameters - workspace_path
     println!("\n=== PLUCK FILTER PARAMETERS ===");
     println!("workspace_path: {}", db_path.display());
+    println!("labels (include filter): {:?}", labels_filter);
+    println!("exclude_labels (exclude filter): {:?}", exclude_labels_filter);
+    println!("state (status filter): {}", state_filter);
     println!("===============================\n");
 
-    let test_results = test_database_connection(&db_path);
+    let test_results = test_database_connection(&db_path, &labels_filter, &exclude_labels_filter, state_filter);
 
     // Print results for visibility
     println!("\n=== PLUCK DATABASE CONNECTIVITY TEST RESULTS ===");
@@ -61,7 +69,12 @@ struct DatabaseTestResults {
     errors: Vec<String>,
 }
 
-fn test_database_connection(db_path: &PathBuf) -> DatabaseTestResults {
+fn test_database_connection(
+    db_path: &PathBuf,
+    labels_filter: &[&str],
+    exclude_labels_filter: &[&str],
+    state_filter: &str
+) -> DatabaseTestResults {
     let mut results = DatabaseTestResults {
         file_exists: db_path.exists(),
         connection_ok: false,
@@ -170,6 +183,13 @@ fn test_database_connection(db_path: &PathBuf) -> DatabaseTestResults {
     }
 
     // Test 7: Simulate a Pluck query (filter by exclude_labels)
+    // Log the actual values being used in query construction
+    println!("\n=== PLUCK QUERY CONSTRUCTION ===");
+    println!("Using state filter: '{}'", state_filter);
+    println!("Using exclude_labels filter: {:?}", exclude_labels_filter);
+    println!("Using labels filter: {:?}", labels_filter);
+    println!("===============================\n");
+
     // Pluck excludes: deferred, human, blocked
     let pluck_query = "
         SELECT COUNT(DISTINCT i.id)
