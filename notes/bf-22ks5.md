@@ -91,5 +91,45 @@ pub fn has_valid_bead_store(workspace: &Path) -> bool {
 ## Conclusion
 Pluck's workspace path configuration is correct and fully accessible. The `/home/coding/claude-governor` workspace contains a valid `.beads/` directory with all required bead data files. No path or permission issues were detected.
 
+## NEEDLE Configuration Verification
+
+Additional verification from NEEDLE system perspective:
+
+### Configuration Location
+- **File:** `/home/coding/.config/needle/config.yaml`
+- **Workspace paths:**
+  - `workspace.default: /home/coding` ✅ exists (700 permissions)
+  - `workspace.home: /home/coding/.needle` ✅ exists (755 permissions)
+  - `strands.explore.workspace_root: /home/coding/` ✅ accessible
+
+### Multi-Workspace Discovery
+Pluck discovers **18+ workspaces** under `/home/coding/`:
+```
+/home/coding/.beads
+/home/coding/SIGIL/.beads
+/home/coding/claude-governor/.beads
+/home/coding/cgov-polish-queue/.beads
+/home/coding/NEEDLE/.beads
+/home/coding/declarative-config/.beads
+... (12+ more)
+```
+
+**Excluded workspace:** `/home/coding/SEAM` (from `~/.config/needle/explore-excluded`)
+
+### Database Integrity
+- **Current workspace:** `beads.db` (4.3 MB) - **1,208 total beads** - Integrity: `ok`
+- **Home workspace:** `beads.db` (368 KB) - **5 total beads** (0 open)
+- **Polish queue:** `beads.db` (2.4 MB) - **16 total beads** (meta-beads only)
+
+### Command Functionality
+All `bf` commands function correctly:
+- `bf ready` - ✅ Lists ready beads
+- `bf list` - ✅ Lists all beads
+- `bf show <id>` - ✅ Shows bead details
+- SQLite queries - ✅ Direct database access works
+
+## Final Status
+✅ **All verification passed** - No path, permission, or accessibility issues detected.
+
 ## Verification Date
 2026-08-03
