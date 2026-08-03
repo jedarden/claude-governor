@@ -8,6 +8,12 @@ use rusqlite::Connection;
 #[test]
 fn test_pluck_database_connectivity() {
     let db_path = PathBuf::from("/home/coding/claude-governor/.beads/beads.db");
+
+    // Log filter parameters - workspace_path
+    println!("\n=== PLUCK FILTER PARAMETERS ===");
+    println!("workspace_path: {}", db_path.display());
+    println!("===============================\n");
+
     let test_results = test_database_connection(&db_path);
 
     // Print results for visibility
