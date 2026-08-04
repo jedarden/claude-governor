@@ -9,7 +9,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
 use ureq::Agent;
@@ -375,7 +376,11 @@ impl Poller {
         &self.credentials_path
     }
 
-    /// Read and parse the credentials file
+    /// Read and parse the credentials file with validation.
+    ///
+    /// Validates that credentials are not corrupted (empty tokens, zero expiry).
+    /// This early detection prevents HTTP 400 errors from the refresh endpoint
+    /// when trying to use empty refresh tokens (see bead bf-56ywhe).
     fn read_credentials(&self) -> Result<Credentials> {
         let content = fs::read_to_string(&self.credentials_path).map_err(|_| {
             anyhow::anyhow!(PollerError::CredentialsNotFound(
@@ -383,17 +388,59 @@ impl Poller {
             ))
         })?;
 
-        serde_json::from_str(&content).map_err(|e: serde_json::Error| {
+        let creds: Credentials = serde_json::from_str(&content).map_err(|e: serde_json::Error| {
             anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
-        })
+        })?;
+
+        // Validate credentials are not corrupted
+        if creds.claude_ai_oauth.access_token.is_empty() {
+            anyhow::bail!(
+                "Credentials corrupted: access_token is empty (file: {})",
+                self.credentials_path.display()
+            );
+        }
+        if creds.claude_ai_oauth.refresh_token.is_empty() {
+            anyhow::bail!(
+                "Credentials corrupted: refresh_token is empty (file: {})",
+                self.credentials_path.display()
+            );
+        }
+        if creds.claude_ai_oauth.expires_at == 0 {
+            anyhow::bail!(
+                "Credentials corrupted: expires_at is zero (file: {})",
+                self.credentials_path.display()
+            );
+        }
+
+        Ok(creds)
     }
 
-    /// Write updated credentials back to the file
+    /// Write updated credentials back to the file using atomic write pattern.
+    ///
+    /// Uses temp file + atomic rename to prevent corruption from concurrent writes
+    /// or crashes mid-write. This addresses the root cause of recurring OAuth token
+    /// refresh failures (see bead bf-56ywhe).
     fn write_credentials(&self, creds: &Credentials) -> Result<()> {
         let content =
             serde_json::to_string_pretty(creds).context("Failed to serialize credentials")?;
 
-        fs::write(&self.credentials_path, content).context("Failed to write credentials file")?;
+        // Create temp file in same directory as target (ensures same filesystem)
+        let temp_path = self.credentials_path.with_extension("tmp");
+
+        // Write to temp file
+        {
+            let mut file = File::create(&temp_path)
+                .context("Failed to create temp credentials file")?;
+            file.write_all(content.as_bytes())
+                .context("Failed to write temp credentials file")?;
+            // fsync to ensure data is on disk before rename
+            file.sync_all()
+                .context("Failed to sync temp credentials file")?;
+        }
+
+        // Atomic rename - overwrites target if it exists
+        fs::rename(&temp_path, &self.credentials_path)
+            .context("Failed to rename temp credentials file")?;
 
         Ok(())
     }
