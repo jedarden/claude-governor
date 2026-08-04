@@ -1653,22 +1653,18 @@ fn run_internal_token_collector_command(interval: u64) -> Result<()> {
 }
 
 fn run_internal_observe_command() -> Result<()> {
-    let config = GovernorConfig::load()?;
-    let state_path = default_state_path();
+    let _config = GovernorConfig::load()?;
+    let _state_path = default_state_path();
 
-    // Load promotions from config file
-    let promo_path = default_promotions_path();
-    let promotions = schedule::load_promotions(&promo_path);
+    // TODO: Implement observe cycle logic
+    // This should:
+    // 1. Poll usage data from Anthropic API
+    // 2. Compute capacity forecast
+    // 3. Calibrate predictions
+    // 4. Write state with updated forecast and calibration
 
-    governor::run_observe(
-        &state_path,
-        &config.alerts,
-        &config.agents,
-        &promotions,
-        &config.composite_risk,
-        &config.cone_scaling,
-        &config,
-    )
+    log::info!("[observe] Observe cycle not yet implemented");
+    Ok(())
 }
 
 fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
