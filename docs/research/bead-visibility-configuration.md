@@ -6,12 +6,14 @@
 
 ## Executive Summary
 
-Bead visibility in Pluck is controlled by a **four-layer configuration system**:
+Bead visibility in Pluck is controlled by a **six-layer configuration system**:
 
-1. **Hardcoded defaults** (compile-time constants in NEEDLE binary)
-2. **Global NEEDLE configuration** (`~/.config/needle/config.yaml`)
-3. **Workspace exclusions** (`~/.config/needle/explore-excluded`)
-4. **Database-level filters** (SQLite query constraints in `get_ready_candidates`)
+1. **Database-level filters** (SQLite query constraints — highest priority, cannot be overridden)
+2. **Workspace .needle.yaml** (workspace-specific label exclusions, optional)
+3. **Global NEEDLE configuration** (`~/.config/needle/config.yaml`)
+4. **Hardcoded defaults** (compile-time constants in NEEDLE binary)
+5. **Workspace exclusions** (`~/.config/needle/explore-excluded`)
+6. **Workspace .beads/config.yaml** (bead lifecycle settings — does NOT affect visibility)
 
 This document maps every configuration source that affects whether Pluck can see and process beads.
 
@@ -215,7 +217,54 @@ These indexes ensure the visibility queries execute efficiently even with thousa
 
 ---
 
-## Layer 5: Per-Workspace Configuration (Optional)
+## Layer 5: Workspace-Specific NEEDLE Configuration (.needle.yaml)
+
+### Location
+- **File:** `<workspace>/.needle.yaml`
+- **Format:** YAML
+- **Scope:** Single workspace only
+- **Current state:** **NOT present** in `/home/coding/claude-governor/`
+
+### Purpose (When Present)
+Workspace-specific NEEDLE configuration can override global defaults for the Pluck strand and other NEEDLE components:
+```yaml
+# Example workspace-specific NEEDLE config
+strands:
+  pluck:
+    enabled: true
+    exclude_labels:
+      - deferred
+      - human
+      - blocked
+      - custom-workspace-label
+    split_after_failures: 3
+```
+
+### Real-World Example
+From `/home/coding/SIGIL/.needle.yaml`:
+```yaml
+strands:
+  pluck:
+    enabled: true
+    exclude_labels:
+      - deferred
+      - human
+      - blocked
+```
+
+### Behavior
+- **Override mechanism:** Workspace `.needle.yaml` settings replace global `config.yaml` settings for that workspace only
+- **Inheritance:** Settings not specified in `.needle.yaml` inherit from global config
+- **Scope:** Only affects NEEDLE operations run within that workspace directory
+
+### Priority
+**Workspace .needle.yaml > Global config.yaml > Hardcoded defaults**
+
+However, this workspace does **not** currently use workspace-specific overrides, so global defaults apply.
+
+---
+
+## Layer 6: Workspace-Specific Bead Configuration (.beads/config.yaml)
 
 ### Location
 - **File:** `<workspace>/.beads/config.yaml`
@@ -224,19 +273,47 @@ These indexes ensure the visibility queries execute efficiently even with thousa
 - **Current state:** **NOT present** in `/home/coding/claude-governor/.beads/`
 
 ### Purpose (When Present)
-Workspace-specific Pluck configuration can override global defaults:
+Workspace-specific bead-forge configuration controls bead scoring, claim TTL, and rotation policies:
 ```yaml
-# Example workspace-specific config
-exclude_labels:
-  - deferred
-  - custom-workspace-label
-claim_ttl_minutes: 60
+# Example workspace-specific bead config
+issue_prefixes:
+  - bf
+default_priority: 2
+default_type: task
+claim_ttl_minutes: 30
+scoring:
+  priority_weight: 0.4
+  blockers_weight: 0.3
+  age_weight: 0.2
+  labels_weight: 0.1
+```
+
+### Behavior
+- **Does NOT control visibility:** This config does NOT affect which beads are visible to Pluck
+- **Affects lifecycle:** Controls claim timeouts, rotation policies, and scoring weights
+- **Relationship:** Independent of Layer 5 (`.needle.yaml`) — they serve different purposes
+
+### Real-World Example
+From `/home/coding/NEEDLE/.beads/config.yaml`:
+```yaml
+issue_prefixes:
+- bf
+default_priority: 2
+default_type: task
+scoring:
+  priority_weight: 0.4
+  blockers_weight: 0.3
+  age_weight: 0.2
+  labels_weight: 0.1
+  max_age_hours: 20
+  max_blockers: 3
+claim_ttl_minutes: 30
 ```
 
 ### Priority
-**Per-workspace config > Global config > Hardcoded defaults**
+**Workspace .beads/config > Global bead-forge defaults**
 
-However, this workspace does **not** currently use per-workspace overrides, so global defaults apply.
+This workspace does **not** currently use workspace-specific bead configuration.
 
 ---
 
@@ -253,7 +330,11 @@ Does bead pass database filters? (Layer 4 SQL WHERE)
 ├─ No → INVISIBLE (status, ephemeral, pinned, is_template, deleted_at, blockers)
 └─ Yes → Continue
 
-Does bead have excluded labels? (Layer 2 config → Layer 1 defaults)
+Does workspace have .needle.yaml with custom exclude_labels? (Layer 5)
+├─ Yes → Use workspace-specific labels
+└─ No → Use global config labels (Layer 2) → fallback to defaults (Layer 1)
+
+Does bead have excluded labels? (from resolved config above)
 ├─ Yes → INVISIBLE to Pluck strand
 └─ No → VISIBLE to Pluck strand
 ```
@@ -261,9 +342,11 @@ Does bead have excluded labels? (Layer 2 config → Layer 1 defaults)
 ### Precedence Order (Highest to Lowest)
 
 1. **Database-level filters** (Layer 4) — Hard SQL constraints, cannot be overridden
-2. **Label exclusions** (Layer 2 config → Layer 1 defaults) — Can be customized in config.yaml
-3. **Workspace exclusions** (Layer 3) — Affects discovery, not direct access
-4. **Hardcoded defaults** (Layer 1) — Only when config.yaml has empty exclude_labels
+2. **Workspace .needle.yaml** (Layer 5) — Workspace-specific label exclusions, overrides global config
+3. **Global config.yaml** (Layer 2) — System-wide label exclusions, overrides hardcoded defaults
+4. **Hardcoded defaults** (Layer 1) — Fallback when config.yaml has empty exclude_labels
+5. **Workspace exclusions** (Layer 3) — Affects discovery only, not direct access
+6. **Workspace .beads/config.yaml** (Layer 6) — Does NOT affect visibility (lifecycle only)
 
 ### Modification Difficulty
 
@@ -273,6 +356,8 @@ Does bead have excluded labels? (Layer 2 config → Layer 1 defaults)
 | 2 | `~/.config/needle/config.yaml` | Easy (text edit) | Yes (cgov/NEEDLE) |
 | 3 | `~/.config/needle/explore-excluded` | Easy (text edit) | No (read on each discovery) |
 | 4 | Database schema | Very Hard (migration) | N/A |
+| 5 | `<workspace>/.needle.yaml` | Easy (create/edit text file) | No (per-workspace, read on launch) |
+| 6 | `<workspace>/.beads/config.yaml` | Easy (create/edit text file) | No (per-workspace, read on launch) |
 
 ---
 
@@ -280,20 +365,44 @@ Does bead have excluded labels? (Layer 2 config → Layer 1 defaults)
 
 ### Primary Visibility Control Files
 
-| File | Location | Format | Controls | Priority |
-|------|----------|--------|----------|----------|
-| `config.yaml` | `~/.config/needle/config.yaml` | YAML | Global label exclusions, workspace discovery | High |
-| `explore-excluded` | `~/.config/needle/explore-excluded` | Plain text | Workspace discovery exclusions | Medium |
-| `beads.db` | `<workspace>/.beads/beads.db` | SQLite | Database-level filters (status, ephemeral, etc.) | Highest |
-| Source code | `/home/coding/NEEDLE/src/strand/pluck.rs:21` | Rust | Default excluded labels (fallback) | Low |
+| Layer | File | Location | Format | Controls | Priority |
+|-------|------|----------|--------|----------|----------|
+| 4 | `beads.db` | `<workspace>/.beads/beads.db` | SQLite | Database-level filters (status, ephemeral, etc.) | Highest |
+| 5 | `.needle.yaml` | `<workspace>/.needle.yaml` | YAML | Workspace-specific label exclusions | High (per-workspace) |
+| 2 | `config.yaml` | `~/.config/needle/config.yaml` | YAML | Global label exclusions, workspace discovery | High (global) |
+| 3 | `explore-excluded` | `~/.config/needle/explore-excluded` | Plain text | Workspace discovery exclusions | Medium |
+| 1 | Source code | `/home/coding/NEEDLE/src/strand/pluck.rs:21` | Rust | Default excluded labels (fallback) | Low |
 
-### Secondary/Related Files
+### Secondary/Related Files (Do NOT Control Visibility)
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `config.yaml` (workspace) | `<workspace>/.beads/config.yaml` | Workspace-specific overrides (optional) |
-| `issues.jsonl` | `<workspace>/.beads/issues.jsonl` | Git-tracked checkpoint, not visibility control |
-| `adapters/*.yaml` | `~/.config/needle/adapters/` | Agent launch configs, not visibility |
+| File | Location | Purpose | Affects Visibility? |
+|------|----------|---------|-------------------|
+| `.beads/config.yaml` | `<workspace>/.beads/config.yaml` | Workspace-specific bead lifecycle config | **No** — scoring, claim TTL, rotation |
+| `issues.jsonl` | `<workspace>/.beads/issues.jsonl` | Git-tracked checkpoint | **No** — audit log only |
+| `adapters/*.yaml` | `~/.config/needle/adapters/` | Agent launch configs | **No** — agent execution only |
+| `governor.yaml` | `~/.config/claude-governor/governor.yaml` | Cgov worker management | **No** — capacity scaling only |
+
+### Discovered Workspace Configuration Examples
+
+#### Workspaces with Custom .needle.yaml
+
+| Workspace | Custom Settings | Notes |
+|-----------|----------------|-------|
+| `/home/coding/SIGIL` | `strands.pluck.exclude_labels: [deferred, human, blocked]` | Matches global defaults |
+| `/home/coding/NEEDLE` | No pluck config | Uses global defaults |
+| `/home/coding/spaxel` | No pluck config | Uses global defaults |
+
+**Note:** Most workspaces do NOT have `.needle.yaml` files and rely on global `~/.config/needle/config.yaml` settings.
+
+#### Workspaces with Custom .beads/config.yaml
+
+| Workspace | Custom Settings | Purpose |
+|-----------|----------------|---------|
+| `/home/coding/NEEDLE` | Custom claim TTL, scoring weights | Bead lifecycle only |
+| `/home/coding/SIGIL` | Secret protection allowlist | Security scanning only |
+| `/home/coding/mta-my-way` | Bead lifecycle config | Bead lifecycle only |
+
+**Note:** `.beads/config.yaml` files do **NOT** affect bead visibility — they control claim timeouts, rotation policies, and scoring weights.
 
 ---
 
@@ -323,9 +432,9 @@ strands:
 
 **Layer 4 (Database Filters):**
 - Enforced by SQL query in `get_ready_candidates()`
-- 20 open beads in database
-- 5 beads with excluded labels (deferred)
-- 15 ready beads visible to Pluck
+- 16 open beads in database
+- 6 beads filtered by excluded labels or other criteria
+- 10 ready beads visible to Pluck
 
 ### Verification Commands
 
@@ -338,15 +447,14 @@ cat ~/.config/needle/explore-excluded
 
 # Verify database-level visibility
 sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"
-# Output: 20
+# Output: 16
 
 # Verify label exclusions working
 sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open' AND id IN (SELECT issue_id FROM labels WHERE label IN ('deferred', 'human', 'blocked'));"
-# Output: 5
 
 # Verify ready candidates (after all filters)
 bf ready --limit 0 | grep -c "^\[bf-"
-# Output: 15
+# Output: 10
 ```
 
 ---
@@ -487,20 +595,26 @@ sqlite3 .beads/beads.db "SELECT DISTINCT label FROM labels;"
 
 ## Summary
 
-**Bead visibility is controlled by four distinct layers:**
+**Bead visibility is controlled by six distinct layers:**
 
-1. **Hardcoded defaults** (`["deferred", "human", "blocked"]` in `pluck.rs`)
-2. **Global config** (`strands.pluck.exclude_labels` in `config.yaml`)
-3. **Workspace exclusions** (`explore-excluded` file)
-4. **Database filters** (SQL WHERE clauses in `get_ready_candidates`)
+1. **Database-level filters** (Layer 4) — Hard SQL constraints in `get_ready_candidates()`, cannot be overridden
+2. **Workspace .needle.yaml** (Layer 5) — Workspace-specific label exclusions, overrides global config
+3. **Global config.yaml** (Layer 2) — System-wide label exclusions in `strands.pluck.exclude_labels`
+4. **Hardcoded defaults** (Layer 1) — Fallback `["deferred", "human", "blocked"]` in `pluck.rs`
+5. **Workspace exclusions** (Layer 3) — `explore-excluded` file, affects discovery only
+6. **Workspace .beads/config.yaml** (Layer 6) — Does NOT affect visibility (bead lifecycle only)
 
-**Precedence:** Database filters > Label exclusions (config > defaults) > Workspace exclusions > Hardcoded defaults
+**Precedence:** Database filters > Workspace .needle.yaml > Global config.yaml > Hardcoded defaults > Workspace exclusions
 
-**Key files:**
-- `~/.config/needle/config.yaml` — Primary visibility configuration
+**Key files that control visibility:**
+- `<workspace>/.beads/beads.db` — Database-level filters (highest priority, immutable at runtime)
+- `<workspace>/.needle.yaml` — Workspace-specific label exclusions (optional, overrides global)
+- `~/.config/needle/config.yaml` — Global visibility configuration (primary control)
 - `~/.config/needle/explore-excluded` — Workspace discovery exclusions
-- `<workspace>/.beads/beads.db` — Database-level filters (immutable at runtime)
-- `/home/coding/NEEDLE/src/strand/pluck.rs` — Default label constants (compile-time)
+- `/home/coding/NEEDLE/src/strand/pluck.rs` — Default label constants (compile-time fallback)
+
+**Files that do NOT affect visibility:**
+- `<workspace>/.beads/config.yaml` — Bead lifecycle configuration only (claim TTL, scoring, rotation)
 
 ---
 
