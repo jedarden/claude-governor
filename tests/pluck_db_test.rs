@@ -217,7 +217,22 @@ fn test_database_connection(
     println!("✓ State filter: '{}'", state_filter);
     println!("✓ Exclude labels: {:?} ({} labels)", exclude_labels_filter, exclude_labels_filter.len());
     println!("✓ Include labels: {:?} ({} labels)", labels_filter, labels_filter.len());
+    println!("✓ Assignee filter: always applied (IS NULL)");
     println!("========================\n");
+
+    // Verify query structure
+    println!("=== QUERY STRUCTURE VERIFICATION ===");
+    assert!(query_string.contains("SELECT COUNT(DISTINCT i.id)"), "Query must select distinct issue IDs");
+    assert!(query_string.contains("FROM issues i"), "Query must use issues table");
+    assert!(query_string.contains("LEFT JOIN labels"), "Query must join labels table");
+    assert!(query_string.contains(&format!("WHERE i.status = '{}'", state_filter)), "Query must filter by state");
+    assert!(query_string.contains("AND i.assignee IS NULL"), "Query must filter unassigned issues");
+    if !exclude_labels_filter.is_empty() {
+        assert!(query_string.contains("AND NOT EXISTS"), "Query must exclude specified labels");
+    }
+    println!("✓ Query structure is valid");
+    println!("✓ All expected clauses present");
+    println!("==================================\n");
 
     match conn.query_row(pluck_query, [], |row| row.get::<_, i64>(0)) {
         Ok(claimable_count) => {
@@ -225,6 +240,22 @@ fn test_database_connection(
             println!("Claimable issues (Pluck query result): {}", claimable_count);
             println!("✓ Query executed successfully");
             println!("==============================\n");
+
+            // Log query execution summary
+            println!("=== QUERY EXECUTION SUMMARY ===");
+            println!("✓ Query constructed and verified");
+            println!("✓ Database: {}", db_path.display());
+            println!("✓ Result: {} claimable issues", claimable_count);
+            println!("✓ Filters applied:");
+            println!("    - State: '{}'", state_filter);
+            println!("    - Assignee: IS NULL");
+            if !exclude_labels_filter.is_empty() {
+                println!("    - Excluded labels: {:?}", exclude_labels_filter);
+            }
+            if !labels_filter.is_empty() {
+                println!("    - Required labels: {:?}", labels_filter);
+            }
+            println!("================================\n");
         }
         Err(e) => {
             results.errors.push(format!("Failed to execute Pluck-style query: {}", e));
