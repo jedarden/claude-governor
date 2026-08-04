@@ -430,6 +430,10 @@ enum Commands {
         #[arg(short, long, default_value = "120")]
         interval: u64,
     },
+
+    /// Internal: Run a single observation cycle (poll, forecast, calibrate, write state)
+    #[command(hide = true, name = "_observe")]
+    _Observe {},
 }
 
 /// Format usage data for human consumption
@@ -1195,6 +1199,9 @@ fn main() -> Result<()> {
         Commands::_TokenCollector { interval } => {
             run_internal_token_collector_command(interval)?;
         }
+        Commands::_Observe {} => {
+            run_internal_observe_command()?;
+        }
     }
 
     Ok(())
@@ -1643,6 +1650,25 @@ fn run_internal_daemon_command(
 fn run_internal_token_collector_command(interval: u64) -> Result<()> {
     // Identical to collect --daemon — called by systemd unit file
     collector::run_daemon(interval)
+}
+
+fn run_internal_observe_command() -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let state_path = default_state_path();
+
+    // Load promotions from config file
+    let promo_path = default_promotions_path();
+    let promotions = schedule::load_promotions(&promo_path);
+
+    governor::run_observe(
+        &state_path,
+        &config.alerts,
+        &config.agents,
+        &promotions,
+        &config.composite_risk,
+        &config.cone_scaling,
+        &config,
+    )
 }
 
 fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {

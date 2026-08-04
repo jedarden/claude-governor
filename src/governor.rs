@@ -5992,6 +5992,530 @@ pub fn run_governor_cycle(
     Ok(())
 }
 
+/// Run a single observation cycle (poll, forecast, calibrate, write state)
+///
+/// This is the observe-only portion of the governor cycle — it handles:
+/// - Polling usage data from the Anthropic API
+/// - Running token collector to gather fleet usage
+/// - Computing burn-rate EMA and capacity forecasts
+/// - Maintaining confidence-cone calibration
+/// - Tracking safe-mode state
+/// - Writing governor-state.json with observe-owned fields
+///
+/// Scaling and alerting are NOT handled here — those stay in run_governor_cycle.
+/// This function runs once and exits cleanly (no daemon loop).
+pub fn run_observe(
+    state_path: &Path,
+    alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
+    promotions: &[Promotion],
+    composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
+    pricing_config: &crate::config::GovernorConfig,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    log::info!("[governor] === observe cycle start at {} ===", now.to_rfc3339());
+
+    // Create poller for live usage data
+    let credentials_path = pricing_config.credentials_path.clone();
+    let mut poller = match Poller::with_credentials_path(credentials_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to create poller: {}", e));
+        }
+    };
+
+    // Run observation phase (extracted from run_governor_cycle)
+    run_observe_cycle_internal(
+        &mut poller,
+        state_path,
+        alert_config,
+        agents,
+        promotions,
+        composite_risk_config,
+        cone_scaling_config,
+        pricing_config,
+        now,
+    )?;
+
+    log::info!("[governor] === observe cycle complete ===");
+    Ok(())
+}
+
+/// Internal implementation of observation logic
+///
+/// Extracted from run_governor_cycle to enable observation-only operation via the
+/// _observe subcommand. This function runs all observation logic: polling, forecasting,
+/// calibration, and state writing, but excludes scaling and alerting actions.
+///
+/// The observe cycle performs:
+/// 1. Poll usage data from Anthropic API
+/// 2. Run token collector pass
+/// 3. Update fleet aggregate from database
+/// 4. Count current workers
+/// 5. Compute burn rates and capacity forecast
+/// 6. Update confidence-cone calibration
+/// 7. Track safe-mode state
+/// 8. Write governor-state.json with observe-owned fields
+///
+/// Scaling decisions (step 6 in daemon) and alerting (step 8 in daemon) are NOT
+/// performed here.
+fn run_observe_cycle_internal(
+    poller: &mut Poller,
+    state_path: &Path,
+    _alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
+    _promotions: &[Promotion],
+    composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
+    pricing_config: &crate::config::GovernorConfig,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    // 1. Load current state
+    let mut state = state::load_state(state_path)?;
+
+    // 1a. Load baseline burn rates from config (warm state)
+    state.load_baseline_burn_rates_from_config(agents);
+
+    // 1b. Shift snapshot state before poll: current becomes previous
+    state.previous_api_snapshot = state.current_api_snapshot.take();
+
+    // 2. Poll Anthropic API for live usage data
+    match poller.poll() {
+        Ok(usage_data) => {
+            // Extract weekly_scoped utilization from model-agnostic limits[] array
+            let weekly_scoped_util = usage_data
+                .scoped_weekly()
+                .map(|(_, window)| window.utilization)
+                .unwrap_or(usage_data.weekly_scoped_utilization);
+
+            let scoped_label = crate::state::weekly_scoped_display_label(
+                usage_data.weekly_scoped_model.as_deref(),
+            );
+            log::info!(
+                "[governor] observe polled usage: {}={:.1}%, all_models={:.1}%, 5h={:.1}%{}",
+                scoped_label,
+                weekly_scoped_util,
+                usage_data.seven_day_utilization,
+                usage_data.five_hour_utilization,
+                if usage_data.stale { " (stale)" } else { "" },
+            );
+
+            // Detect weekly_scoped model identity change BEFORE updating state
+            let prev_model = state.usage.weekly_scoped_model.clone();
+            let new_model = usage_data.weekly_scoped_model.clone();
+
+            log::info!(
+                "[governor] weekly_scoped model change detection: prev_model={:?}, new_model={:?}, new_weekly_scoped_pct={:.2}%",
+                prev_model,
+                new_model,
+                weekly_scoped_util
+            );
+
+            let model_changed = crate::state::reset_weekly_scoped_on_model_change(
+                &prev_model,
+                &new_model,
+                &mut state.burn_rate,
+            );
+
+            // If model changed, clear the previous weekly_scoped snapshot
+            if model_changed {
+                if let Some(ref mut prev_snap) = state.previous_api_snapshot {
+                    log::info!(
+                        "[governor] clearing previous_api_snapshot.weekly_scoped_pct due to model change"
+                    );
+                    prev_snap.weekly_scoped_pct = 0.0;
+                }
+
+                // Reset fleet_pct_ema_samples to trigger cold-start seeding
+                log::info!(
+                    "[governor] resetting fleet_pct_ema_samples from {} to 0 due to model change",
+                    state.burn_rate.fleet_pct_ema_samples
+                );
+                state.burn_rate.fleet_pct_ema_samples = 0;
+            }
+
+            state.usage = state::UsageState {
+                weekly_scoped_pct: weekly_scoped_util,
+                sonnet_pct: 0.0, // Deprecated
+                all_models_pct: usage_data.seven_day_utilization,
+                five_hour_pct: usage_data.five_hour_utilization,
+                sonnet_resets_at: usage_data.weekly_scoped_resets_at,
+                seven_day_resets_at: usage_data.seven_day_resets_at,
+                five_hour_resets_at: usage_data.five_hour_resets_at,
+                stale: usage_data.stale,
+                weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
+            };
+            state.token_refresh_failing = usage_data.stale;
+
+            // Update current_api_snapshot with the new snapshot data
+            state.current_api_snapshot = Some(state::PrevUsageSnapshot {
+                taken_at: now,
+                five_hour_pct: usage_data.five_hour_utilization,
+                seven_day_pct: usage_data.seven_day_utilization,
+                weekly_scoped_pct: weekly_scoped_util,
+            });
+
+            // Calculate window deltas from consecutive API snapshots
+            if let (Some(prev), Some(curr)) =
+                (&state.previous_api_snapshot, &state.current_api_snapshot)
+            {
+                let prev_pct = crate::db::WindowPctSnapshot {
+                    five_hour: prev.five_hour_pct,
+                    seven_day: prev.seven_day_pct,
+                    weekly_scoped: prev.weekly_scoped_pct,
+                };
+                let curr_pct = crate::db::WindowPctSnapshot {
+                    five_hour: curr.five_hour_pct,
+                    seven_day: curr.seven_day_pct,
+                    weekly_scoped: curr.weekly_scoped_pct,
+                };
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&prev_pct, &curr_pct);
+
+                log::info!(
+                    "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}%",
+                    delta_5h, delta_7d, delta_7ds,
+                );
+
+                // Store computed deltas in governor state
+                state.p5h_delta = Some(delta_5h);
+                state.p7d_delta = Some(delta_7d);
+                state.p7ds_delta = Some(delta_7ds);
+            }
+        }
+        Err(e) => {
+            // Reset token_refresh_failing for non-auth errors
+            if let Some(pe) = e.downcast_ref::<crate::poller::PollerError>() {
+                match pe {
+                    crate::poller::PollerError::ApiRequestFailed(_)
+                    | crate::poller::PollerError::ApiError(_)
+                    | crate::poller::PollerError::ParseError(_) => {
+                        state.token_refresh_failing = false;
+                    }
+                    _ => {}
+                }
+            } else {
+                state.token_refresh_failing = false;
+            }
+            log::warn!("[governor] poll failed, keeping previous usage data: {}", e);
+        }
+    }
+
+    // 3. Clear emergency-brake-triggered safe_mode when utilization drops
+    if state.safe_mode.active && state.safe_mode.trigger.as_deref() == Some("emergency_brake") {
+        let max_util = [
+            state.capacity_forecast.five_hour.current_utilization,
+            state.capacity_forecast.seven_day.current_utilization,
+            state.capacity_forecast.weekly_scoped.current_utilization,
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max);
+        if max_util < EMERGENCY_BRAKE_THRESHOLD {
+            log::info!(
+                "[governor] clearing emergency_brake safe_mode — max utilization {:.1}% < {:.0}% threshold",
+                max_util,
+                EMERGENCY_BRAKE_THRESHOLD
+            );
+            state.safe_mode = state::SafeModeState::default();
+        }
+    }
+
+    // 4. Run token collector pass
+    match collector::run_collection_pass() {
+        Ok(result) => {
+            log::info!(
+                "[governor] collector pass: {} lines, {} instances, ${:.4} total",
+                result.lines_processed,
+                result.instance_records,
+                result.total_usd,
+            );
+        }
+        Err(e) => {
+            log::warn!("[governor] collector pass failed: {}", e);
+        }
+    }
+
+    // 5. Read latest fleet record from database
+    let db_path = collector::default_db_path();
+    if let Ok(conn) = db::open_db(&db_path) {
+        if let Ok(fleet_records) = db::query_last_fleets(&conn, 1) {
+            if let Some(fleet_json) = fleet_records.first() {
+                if let (Some(t0_str), Some(t1_str)) = (
+                    fleet_json.get("t0").and_then(|v| v.as_str()),
+                    fleet_json.get("t1").and_then(|v| v.as_str()),
+                ) {
+                    let t0: DateTime<Utc> = t0_str.parse().unwrap_or_else(|_| now);
+                    let t1: DateTime<Utc> = t1_str.parse().unwrap_or_else(|_| now);
+                    let workers = fleet_json
+                        .get("workers")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let total_usd = fleet_json
+                        .get("total-usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p75_usd_hr = fleet_json
+                        .get("p75-usd-hr")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let std_usd_hr = fleet_json
+                        .get("std-usd-hr")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p5h = fleet_json.get("p5h").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p7d = fleet_json.get("p7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p7ds = fleet_json.get("p7ds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let fleet_cache_eff = fleet_json
+                        .get("fleet-cache-eff")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+
+                    state.last_fleet_aggregate = state::FleetAggregate {
+                        t0,
+                        t1,
+                        sonnet_workers: workers,
+                        sonnet_usd_total: total_usd,
+                        sonnet_p75_usd_hr: p75_usd_hr,
+                        sonnet_std_usd_hr: std_usd_hr,
+                        window_pct_deltas: state::WindowPctDeltas {
+                            five_hour: p5h,
+                            seven_day: p7d,
+                            weekly_scoped: p7ds,
+                        },
+                        fleet_cache_eff,
+                        cache_eff_p25: 0.0,
+                        cli_tokens: 0,
+                        cli_cost: 0.0,
+                        sdk_tokens: 0,
+                        sdk_cost: 0.0,
+                    };
+
+                    log::debug!(
+                        "[governor] fleet aggregate: {} workers, ${:.2}/hr p75",
+                        workers, p75_usd_hr
+                    );
+                }
+            }
+        }
+    }
+
+    // 6. Count current workers (seed from config if empty)
+    if state.workers.is_empty() && !agents.is_empty() {
+        for (name, agent) in agents {
+            state.workers.insert(
+                name.clone(),
+                state::WorkerState {
+                    current: 0,
+                    target: 0,
+                    min: agent.min_workers,
+                    max: agent.max_workers,
+                },
+            );
+        }
+    }
+
+    // Build per-agent WorkerConfigs
+    let agent_worker_configs: Vec<(String, WorkerConfig)> = agents
+        .iter()
+        .map(|(name, agent)| (name.clone(), WorkerConfig::from_agent_config(agent)))
+        .collect();
+
+    let worker_configs: Vec<(String, WorkerConfig)> = if agent_worker_configs.is_empty() {
+        vec![("default".to_string(), WorkerConfig::default())]
+    } else {
+        agent_worker_configs
+    };
+
+    // Count workers across all configured agents
+    let mut total_tmux_count = 0usize;
+    for (_name, wc) in &worker_configs {
+        let wc_count = worker::count_workers(wc);
+        total_tmux_count += wc_count.tmux_count;
+    }
+
+    // Update worker state with current count
+    let mut current_workers_per_agent: HashMap<String, u32> = HashMap::new();
+    for (name, wc) in &worker_configs {
+        let wc_count = worker::count_workers(wc);
+        current_workers_per_agent.insert(name.clone(), wc_count.tmux_count as u32);
+    }
+
+    for (name, ws) in state.workers.iter_mut() {
+        ws.current = *current_workers_per_agent.get(name).unwrap_or(&0);
+    }
+
+    // 7. Compute burn rates and capacity forecast
+    let target_ceiling = pricing_config.daemon.target_ceiling;
+
+    // Save old snapshot before updating EMA
+    let old_snapshot = state.burn_rate.prev_usage_snapshot.clone();
+
+    // Update burn rate EMA and generate forecast
+    if !state.usage.stale {
+        let new_five_hour = state.usage.five_hour_pct;
+        let new_seven_day = state.usage.all_models_pct;
+        let new_weekly_scoped = state.usage.weekly_scoped_pct;
+
+        if let Some(snap) = old_snapshot.clone() {
+            const EMA_ALPHA: f64 = 0.2;
+            const MIN_ELAPSED_SECS: f64 = 60.0;
+            const MAX_ELAPSED_SECS: f64 = 1800.0;
+
+            let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
+
+            if elapsed_secs >= MIN_ELAPSED_SECS && elapsed_secs <= MAX_ELAPSED_SECS {
+                let old_pct = crate::db::WindowPctSnapshot {
+                    five_hour: snap.five_hour_pct,
+                    seven_day: snap.seven_day_pct,
+                    weekly_scoped: snap.weekly_scoped_pct,
+                };
+                let new_pct = crate::db::WindowPctSnapshot {
+                    five_hour: new_five_hour,
+                    seven_day: new_seven_day,
+                    weekly_scoped: new_weekly_scoped,
+                };
+                let (delta_5h, delta_7d, delta_7ds) =
+                    calculate_window_pct_delta(&old_pct, &new_pct);
+
+                let elapsed_hours = elapsed_secs / 3600.0;
+                let baseline = get_sonnet_baseline_config(&state, agents);
+                let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+                    &state.last_fleet_aggregate,
+                    &baseline,
+                );
+                let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
+
+                let samples = state.burn_rate.fleet_pct_ema_samples;
+
+                if delta_5h > 0.0 {
+                    let rate = delta_5h / elapsed_hours;
+                    if samples == 0 {
+                        state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
+                    } else {
+                        state.burn_rate.fleet_pct_hr_ema.five_hour =
+                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
+                    }
+                    if fleet_usd_hr > 0.0 {
+                        let ratio = fleet_usd_hr / rate;
+                        if samples == 0 {
+                            state.burn_rate.usd_per_pct_ema_five_hour = ratio;
+                        } else {
+                            state.burn_rate.usd_per_pct_ema_five_hour =
+                                EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
+                        }
+                    }
+                    state.burn_rate.fleet_pct_ema_samples += 1;
+                }
+
+                if delta_7d > 0.0 {
+                    let rate = delta_7d / elapsed_hours;
+                    if samples == 0 {
+                        state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
+                    } else {
+                        state.burn_rate.fleet_pct_hr_ema.seven_day =
+                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
+                    }
+                }
+
+                if delta_7ds > 0.0 {
+                    let rate = delta_7ds / elapsed_hours;
+                    if samples == 0 {
+                        state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
+                    } else {
+                        state.burn_rate.fleet_pct_hr_ema.weekly_scoped =
+                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
+                    }
+                }
+            }
+        }
+
+        // Update burn rate snapshot
+        state.burn_rate.prev_usage_snapshot = Some(state::PrevUsageSnapshot {
+            taken_at: now,
+            five_hour_pct: new_five_hour,
+            seven_day_pct: new_seven_day,
+            weekly_scoped_pct: new_weekly_scoped,
+        });
+    }
+
+    // Generate capacity forecast
+    let effective_composite_risk = composite_risk_config;
+    let effective_cone_scaling = cone_scaling_config;
+
+    state.capacity_forecast = generate_window_forecast(
+        &state.usage,
+        &state.burn_rate,
+        &state.last_fleet_aggregate,
+        target_ceiling,
+        effective_composite_risk,
+        effective_cone_scaling,
+    );
+
+    // Log forecast
+    log_capacity_forecast(
+        &state.capacity_forecast,
+        state.usage.weekly_scoped_model.as_deref(),
+    );
+
+    // 8. Update calibration from predictions
+    const WINDOW_RESET_THRESHOLD: f64 = 1.0;
+
+    if let Some(prev_snap) = old_snapshot {
+        let cur_5h = state.usage.five_hour_pct;
+        let cur_7d = state.usage.all_models_pct;
+        let cur_7ds = state.usage.weekly_scoped_pct;
+
+        let prev_5h = prev_snap.five_hour_pct;
+        let prev_7d = prev_snap.seven_day_pct;
+        let prev_7ds = prev_snap.weekly_scoped_pct;
+
+        let windows_to_check = [
+            ("five_hour", cur_5h, prev_5h),
+            ("seven_day", cur_7d, prev_7d),
+            ("weekly_scoped", cur_7ds, prev_7ds),
+        ];
+
+        for (window_name, current, previous) in windows_to_check {
+            if current < previous - WINDOW_RESET_THRESHOLD {
+                if let Some(pred) = state.pending_predictions.get(window_name) {
+                    let predicted_change = pred.predicted_final_pct - pred.starting_pct;
+                    let actual_change = previous - pred.starting_pct;
+
+                    let score = calibrator::score_prediction(
+                        window_name,
+                        predicted_change,
+                        actual_change,
+                        pred.prediction_time,
+                    );
+
+                    log::info!(
+                        "[governor] scored prediction for {}: predicted={:.2}%, actual={:.2}%, error={:+.2}%",
+                        window_name,
+                        predicted_change,
+                        actual_change,
+                        score.error,
+                    );
+
+                    if let Err(e) = calibrator::append_score(&score) {
+                        log::warn!("[governor] failed to append prediction score: {}", e);
+                    }
+
+                    state.pending_predictions.remove(window_name);
+                }
+            }
+        }
+    }
+
+    // 9. Write state (observe-owned fields only)
+    state.updated_at = now;
+    state::save_previous_state(&state, state_path)?;
+    state::save_state(&state, state_path)?;
+
+    log::info!("[governor] === observe cycle complete ===");
+    Ok(())
+}
+
 /// Run the governor daemon (infinite loop with graceful shutdown on SIGINT/SIGTERM)
 ///
 /// Executes `run_governor_cycle` every `loop_interval` seconds.
