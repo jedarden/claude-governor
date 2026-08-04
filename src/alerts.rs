@@ -4,7 +4,7 @@
 //! - Alert condition evaluation from governor state
 //! - Per-type cooldown deduplication to prevent alert spam
 //! - Alert severity classification
-//! - Firing alerts via configured command (default: br create --type human)
+//! - Firing alerts via configured command (default: bf create --type human)
 //! - Logging alerts to governor.log
 
 use chrono::{DateTime, Utc};
@@ -273,7 +273,7 @@ pub fn default_alert_log_path() -> PathBuf {
 /// This function:
 /// 1. Checks if alerts are enabled in config
 /// 2. Checks if the alert severity meets the minimum threshold
-/// 3. Executes the configured command (default: br create --type human "...")
+/// 3. Executes the configured command (default: bf create --type human "...")
 /// 4. Logs the alert to governor.log (with log rotation if config provided)
 ///
 /// Returns Ok(()) if the alert was fired successfully, or an error message.

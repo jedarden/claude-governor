@@ -529,7 +529,7 @@ impl Default for WindowOverrideConfig {
 /// Alert configuration
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct AlertConfig {
-    /// Command to execute when an alert fires (default: br create --type human)
+    /// Command to execute when an alert fires (default: bf create --type human)
     /// The alert message is appended as the last argument.
     #[serde(default = "default_alert_command")]
     pub command: Vec<String>,
@@ -568,7 +568,7 @@ pub struct AlertConfig {
 
 fn default_alert_command() -> Vec<String> {
     vec![
-        "br".to_string(),
+        "bf".to_string(),
         "create".to_string(),
         "--type".to_string(),
         "human".to_string(),

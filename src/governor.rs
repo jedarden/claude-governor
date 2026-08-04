@@ -5949,7 +5949,7 @@ pub fn run_governor_cycle(
                 .alert_fp_telemetry
                 .record(&alert.alert_type.to_string(), is_true_positive);
 
-            // Fire the alert: execute configured command (e.g. br create --type human)
+            // Fire the alert: execute configured command (e.g. bf create --type human)
             // and log to governor.log
             let log_rotation_config = Some((
                 pricing_config.daemon.log_max_bytes,
