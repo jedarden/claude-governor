@@ -19,7 +19,8 @@ stale_count=0
 
 for bead in $blocked_beads; do
     # Get the bead's current status to confirm it's actually blocked
-    status=$(bf show "$bead" --json 2>/dev/null | jq -r '.status // "unknown"' || echo "unknown")
+    # bf show returns an array, so we need to extract .[0].status
+    status=$(bf show "$bead" --json 2>/dev/null | jq -r '.[0].status // "unknown"' || echo "unknown")
 
     if [ "$status" != "blocked" ]; then
         continue
@@ -44,7 +45,7 @@ for bead in $blocked_beads; do
         # Check if all blockers are closed
         all_closed=true
         for blocker in $blocker_ids; do
-            blocker_status=$(bf show "$blocker" --json 2>/dev/null | jq -r '.status // "unknown"' || echo "unknown")
+            blocker_status=$(bf show "$blocker" --json 2>/dev/null | jq -r '.[0].status // "unknown"' || echo "unknown")
             if [ "$blocker_status" != "closed" ]; then
                 all_closed=false
                 break
