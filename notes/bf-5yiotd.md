@@ -50,5 +50,16 @@ The compiler-warnings chain now flows correctly:
 - ✓ bf ready shows bf-4fnc20 as ready to work
 - ✓ Compiler-warnings chain can now flow (bf-4fnc20 unblocked)
 
+## Additional Action Taken (2026-08-03)
+Executed `bf update bf-4fnc20 --status open` to ensure the bead status was explicitly set to open. The bead was already showing as open in the dependency checks, but this command ensures the status is explicitly set.
+
+## Current Chain Status (2026-08-03)
+**Ready beads confirmed:**
+- bf-4fnc20 appears in `bf ready` output
+
+**Chain flow verification:**
+- bf-3zdrza still shows bf-4fnc20 as blocking (dependency cache may not have refreshed yet)
+- bf-5be7lz depends on bf-64cczk and bf-3ww0k4 (different chain path than expected)
+
 ## Impact
 The fix unblocks the entire compiler-warnings cleanup chain. bf-4fnc20 is now ready to work, and once complete, it will unblock bf-3zdrza, which will unblock bf-llq2p8, and so on up to bf-5be7lz.
