@@ -6135,6 +6135,13 @@ fn run_observe_cycle_internal(
                 state.burn_rate.fleet_pct_ema_samples = 0;
             }
 
+            // Track consecutive_absent_polls for structurally inactive windows
+            // A window is "absent" if its resets_at field is empty (from window_or_default)
+            // Check BEFORE moving values into state.usage
+            let five_hour_present = !usage_data.five_hour_resets_at.is_empty();
+            let seven_day_present = !usage_data.seven_day_resets_at.is_empty();
+            let weekly_scoped_present = !usage_data.weekly_scoped_resets_at.is_empty();
+
             state.usage = state::UsageState {
                 weekly_scoped_pct: weekly_scoped_util,
                 sonnet_pct: 0.0, // Deprecated
@@ -6147,6 +6154,19 @@ fn run_observe_cycle_internal(
                 weekly_scoped_model: usage_data.weekly_scoped_model.clone(),
             };
             state.token_refresh_failing = usage_data.stale;
+
+            state.update_consecutive_absent_polls(
+                five_hour_present,
+                seven_day_present,
+                weekly_scoped_present,
+            );
+
+            log::debug!(
+                "[governor] consecutive_absent_polls: 5h={}, 7d={}, 7ds={}",
+                state.get_consecutive_absent_count("five_hour"),
+                state.get_consecutive_absent_count("seven_day"),
+                state.get_consecutive_absent_count("weekly_scoped"),
+            );
 
             // Update current_api_snapshot with the new snapshot data
             state.current_api_snapshot = Some(state::PrevUsageSnapshot {
@@ -6440,17 +6460,167 @@ fn run_observe_cycle_internal(
     }
 
     // Generate capacity forecast
-    let effective_composite_risk = composite_risk_config;
-    let effective_cone_scaling = cone_scaling_config;
-
-    state.capacity_forecast = generate_window_forecast(
-        &state.usage,
-        &state.burn_rate,
-        &state.last_fleet_aggregate,
-        target_ceiling,
-        effective_composite_risk,
-        effective_cone_scaling,
+    // Build effective hours remaining map from current usage data
+    let mut hours_remaining = std::collections::HashMap::new();
+    hours_remaining.insert(
+        "five_hour".to_string(),
+        (state.usage.five_hour_resets_at.parse::<DateTime<Utc>>()
+            .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
+            .unwrap_or(0.0)),
     );
+    hours_remaining.insert(
+        "seven_day".to_string(),
+        (state.usage.seven_day_resets_at.parse::<DateTime<Utc>>()
+            .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
+            .unwrap_or(0.0)),
+    );
+    hours_remaining.insert(
+        "weekly_scoped".to_string(),
+        (state.usage.sonnet_resets_at.parse::<DateTime<Utc>>()
+            .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
+            .unwrap_or(0.0)),
+    );
+
+    // Build current utilization map
+    let mut current_utilization = std::collections::HashMap::new();
+    current_utilization.insert("five_hour".to_string(), state.usage.five_hour_pct);
+    current_utilization.insert("seven_day".to_string(), state.usage.all_models_pct);
+    current_utilization.insert("weekly_scoped".to_string(), state.usage.weekly_scoped_pct);
+
+    // Build fleet_pct_per_hour map from burn_rate EMA
+    let mut fleet_pct_per_hour = std::collections::HashMap::new();
+    fleet_pct_per_hour.insert("five_hour".to_string(), state.burn_rate.fleet_pct_hr_ema.five_hour);
+    fleet_pct_per_hour.insert("seven_day".to_string(), state.burn_rate.fleet_pct_hr_ema.seven_day);
+    fleet_pct_per_hour.insert("weekly_scoped".to_string(), state.burn_rate.fleet_pct_hr_ema.weekly_scoped);
+
+    // Build capacity forecast for each window using burn_rate module
+    let mut five_hour_forecast = state::WindowForecast::default();
+    let mut seven_day_forecast = state::WindowForecast::default();
+    let mut weekly_scoped_forecast = state::WindowForecast::default();
+
+    let current_total = state.last_fleet_aggregate.sonnet_workers as f64;
+
+    for window in &["five_hour", "seven_day", "weekly_scoped"] {
+        let util = current_utilization.get(*window).copied().unwrap_or(0.0);
+        let hrs_left = hours_remaining.get(*window).copied().unwrap_or(0.0);
+        let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
+
+        // Get the base target ceiling for this specific window
+        let base_target_ceiling = pricing_config.daemon.get_target_ceiling_for_window(window);
+        let effective_target_ceiling = base_target_ceiling;
+
+        // Per-worker pct/hr rate for safe_worker_count calculation
+        let baseline = get_sonnet_baseline_config(&state, agents);
+        let pct_per_worker = if fleet_pct_hr > 0.0 {
+            fleet_pct_hr / current_total.max(1.0)
+        } else {
+            0.0
+        };
+
+        // Convert per-worker USD/hr stddev to pct/hr stddev
+        let baseline_usd_per_pct =
+            baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
+        let usd_per_pct = match *window {
+            "five_hour" => state.burn_rate.usd_per_pct_ema_five_hour,
+            "seven_day" => state.burn_rate.usd_per_pct_ema_seven_day,
+            "weekly_scoped" => state.burn_rate.usd_per_pct_ema_weekly_scoped,
+            _ => 0.0,
+        };
+        let effective_usd_per_pct = if usd_per_pct > 0.0 {
+            usd_per_pct
+        } else {
+            baseline_usd_per_pct
+        };
+        let std_pct_hr = state.last_fleet_aggregate.sonnet_std_usd_hr / effective_usd_per_pct;
+
+        // Compute estimate_quality based on EMA sample count
+        let ema_val = match *window {
+            "five_hour" => state.burn_rate.fleet_pct_hr_ema.five_hour,
+            "seven_day" => state.burn_rate.fleet_pct_hr_ema.seven_day,
+            "weekly_scoped" => state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+            _ => 0.0,
+        };
+        let estimate_quality = if state.burn_rate.fleet_pct_ema_samples >= 3 && ema_val > 0.0 {
+            state::EstimateQuality::Calibrated
+        } else if state.burn_rate.fleet_pct_ema_samples == 0 {
+            state::EstimateQuality::ColdStart
+        } else {
+            state::EstimateQuality::InsufficientSamples
+        };
+
+        // Cold-start base-rate seeding
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+            estimate_quality,
+            state::EstimateQuality::ColdStart | state::EstimateQuality::InsufficientSamples
+        ) && util > 0.0
+            && fleet_pct_hr == 0.0
+            && current_total > 0.0
+        {
+            let base_per_worker = baseline.pct_per_worker_per_hour;
+            let seeded_fleet_pct = base_per_worker * current_total as f64;
+            let widened_std_pct = seeded_fleet_pct;
+            (seeded_fleet_pct, base_per_worker, widened_std_pct)
+        } else {
+            (fleet_pct_hr, pct_per_worker, std_pct_hr)
+        };
+
+        let forecast = crate::burn_rate::generate_window_forecast(
+            window,
+            fleet_pct_hr_seeded,
+            util,
+            effective_target_ceiling,
+            hrs_left,
+            pct_per_worker_seeded,
+            std_pct_hr_seeded,
+            estimate_quality,
+        );
+
+        match *window {
+            "five_hour" => five_hour_forecast = forecast,
+            "seven_day" => seven_day_forecast = forecast,
+            "weekly_scoped" => weekly_scoped_forecast = forecast,
+            _ => {}
+        }
+    }
+
+    // Identify binding window (highest risk_score)
+    let windows = [
+        ("five_hour", &five_hour_forecast),
+        ("seven_day", &seven_day_forecast),
+        ("weekly_scoped", &weekly_scoped_forecast),
+    ];
+
+    let binding_window = windows
+        .iter()
+        .filter(|(name, _)| {
+            hours_remaining.contains_key(*name) && !state.is_window_consecutively_absent(name)
+        })
+        .max_by(|(_, a), (_, b)| {
+            a.risk_score
+                .partial_cmp(&b.risk_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_default();
+
+    // Set binding flag
+    if binding_window == "five_hour" {
+        five_hour_forecast.binding = true;
+    } else if binding_window == "seven_day" {
+        seven_day_forecast.binding = true;
+    } else if binding_window == "weekly_scoped" {
+        weekly_scoped_forecast.binding = true;
+    }
+
+    // Update state with new capacity forecast
+    state.capacity_forecast = state::CapacityForecast {
+        five_hour: five_hour_forecast,
+        seven_day: seven_day_forecast,
+        weekly_scoped: weekly_scoped_forecast,
+        binding_window: binding_window.clone(),
+        dollars_per_pct_7d_s: 0.0,
+        estimated_remaining_dollars: 0.0,
+    };
 
     // Log forecast
     log_capacity_forecast(
