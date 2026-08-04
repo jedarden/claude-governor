@@ -184,6 +184,9 @@ src/
 
 - `docs/plan/plan.md` — Complete system design plan
 - `docs/research/` — Research on API pricing, usage tracking, off-peak promotions
+- `docs/bead-visibility-troubleshooting.md` — Troubleshooting guide for bead visibility issues, common pitfalls, and configuration best practices
+- `docs/pluck-workspace-paths.md` — Workspace path configuration and discovery
+- `docs/pluck-query-results.md` — Query patterns and filter syntax reference
 
 ## License
 
