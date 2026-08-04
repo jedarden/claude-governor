@@ -19,10 +19,11 @@ fn test_pluck_database_connectivity() {
 
     // Log filter parameters - workspace_path
     println!("\n=== PLUCK FILTER PARAMETERS ===");
-    println!("workspace_path: {}", db_path.display());
-    println!("labels (include filter): {:?}", labels_filter);
-    println!("exclude_labels (exclude filter): {:?}", exclude_labels_filter);
-    println!("state (status filter): {}", state_filter);
+    println!("Workspace path: {}", db_path.display());
+    println!("State filter: '{}'", state_filter);
+    println!("Labels (include filter): {:?} ({} labels)", labels_filter, labels_filter.len());
+    println!("Exclude labels (exclude filter): {:?} ({} labels)", exclude_labels_filter, exclude_labels_filter.len());
+    println!("Assignee filter: 'IS NULL' (always filters unassigned issues)");
     println!("===============================\n");
 
     let test_results = test_database_connection(&db_path, &labels_filter, &exclude_labels_filter, state_filter);
@@ -261,19 +262,38 @@ fn construct_pluck_query(
 ) -> (String, Vec<String>) {
     let mut query_parts = Vec::new();
     let mut params = Vec::new();
+    let mut construction_log = Vec::new();
 
-    // Base query with hardcoded state filter value (Pluck uses hardcoded values)
+    // Log initial parameters
+    construction_log.push(format!("=== QUERY CONSTRUCTION START ==="));
+    construction_log.push(format!("Workspace: {}", db_path.display()));
+    construction_log.push(format!("Initial parameters provided:"));
+    construction_log.push(format!("  - state_filter: '{}'", state_filter));
+    construction_log.push(format!("  - labels_filter: {} labels", labels_filter.len()));
+    construction_log.push(format!("  - exclude_labels_filter: {} labels", exclude_labels_filter.len()));
+
+    // Step 1: Base query structure
     query_parts.push("SELECT COUNT(DISTINCT i.id)".to_string());
-    query_parts.push("FROM issues i".to_string());
-    query_parts.push("LEFT JOIN labels l ON l.issue_id = i.id".to_string());
-    query_parts.push(format!("WHERE i.status = '{}'", state_filter));
-    params.push(format!("state:{}", state_filter));
+    construction_log.push(format!("✓ Added SELECT clause for counting distinct issue IDs"));
 
-    // Add assignee filter (Pluck always filters for unassigned issues)
+    query_parts.push("FROM issues i".to_string());
+    construction_log.push(format!("✓ Added FROM clause (issues table aliased as 'i')"));
+
+    query_parts.push("LEFT JOIN labels l ON l.issue_id = i.id".to_string());
+    construction_log.push(format!("✓ Added LEFT JOIN for labels table"));
+
+    // Step 2: State filter (WHERE clause)
+    let where_clause = format!("WHERE i.status = '{}'", state_filter);
+    query_parts.push(where_clause);
+    params.push(format!("state:{}", state_filter));
+    construction_log.push(format!("✓ Added WHERE clause with state filter: '{}'", state_filter));
+
+    // Step 3: Assignee filter (always applied by Pluck)
     query_parts.push("AND i.assignee IS NULL".to_string());
     params.push("assignee:NULL".to_string());
+    construction_log.push(format!("✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)"));
 
-    // Add exclude_labels filter if provided
+    // Step 4: Exclude labels filter (NOT EXISTS clause)
     if !exclude_labels_filter.is_empty() {
         let labels_list = exclude_labels_filter
             .iter()
@@ -281,22 +301,26 @@ fn construct_pluck_query(
             .collect::<Vec<_>>()
             .join(", ");
 
-        query_parts.push(format!(
+        let exclude_clause = format!(
             "AND NOT EXISTS (\
                 SELECT 1 FROM labels \
                 WHERE issue_id = i.id \
                 AND label IN ({}) \
             )",
             labels_list
-        ));
+        );
+        query_parts.push(exclude_clause);
 
-        // Log excluded labels for verification
+        construction_log.push(format!("✓ Added exclude_labels filter (NOT EXISTS):"));
+        construction_log.push(format!("    Excluded labels: {:?}", exclude_labels_filter));
         for label in exclude_labels_filter {
             params.push(format!("exclude:{}", label));
         }
+    } else {
+        construction_log.push(format!("○ No exclude_labels filter (empty)"));
     }
 
-    // Add labels filter (include filter) if provided
+    // Step 5: Include labels filter (EXISTS clause)
     if !labels_filter.is_empty() {
         let labels_list = labels_filter
             .iter()
@@ -304,22 +328,40 @@ fn construct_pluck_query(
             .collect::<Vec<_>>()
             .join(", ");
 
-        query_parts.push(format!(
+        let include_clause = format!(
             "AND EXISTS (\
                 SELECT 1 FROM labels \
                 WHERE issue_id = i.id \
                 AND label IN ({}) \
             )",
             labels_list
-        ));
+        );
+        query_parts.push(include_clause);
 
-        // Log included labels for verification
+        construction_log.push(format!("✓ Added labels filter (EXISTS):"));
+        construction_log.push(format!("    Included labels: {:?}", labels_filter));
         for label in labels_filter {
             params.push(format!("include:{}", label));
         }
+    } else {
+        construction_log.push(format!("○ No labels filter (empty - no label inclusion requirement)"));
     }
 
     let query = query_parts.join("\n  ");
+
+    // Final verification summary
+    construction_log.push(format!("=== QUERY CONSTRUCTION COMPLETE ==="));
+    construction_log.push(format!("Total query components: {}", query_parts.len()));
+    construction_log.push(format!("Total filter parameters tracked: {}", params.len()));
+    construction_log.push(format!("Final query parameters: {:?}", params));
+    construction_log.push(format!("==============================="));
+
+    // Print construction log
+    println!("\n--- QUERY CONSTRUCTION LOG ---");
+    for log_entry in construction_log {
+        println!("{}", log_entry);
+    }
+    println!("-------------------------------\n");
 
     (query, params)
 }
