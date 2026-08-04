@@ -6004,6 +6004,25 @@ pub fn run_governor_cycle(
 ///
 /// Scaling and alerting are NOT handled here — those stay in run_governor_cycle.
 /// This function runs once and exits cleanly (no daemon loop).
+/// Output data returned by run_observe()
+///
+/// Contains the key observation data that can be printed by the _observe subcommand.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ObserveOutput {
+    pub timestamp: String,
+    pub success: bool,
+    pub message: String,
+    pub windows: Vec<WindowSummary>,
+}
+
+/// Summary of a single usage window
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowSummary {
+    pub name: String,
+    pub utilization: f64,
+    pub remaining_hours: f64,
+}
+
 pub fn run_observe(
     state_path: &Path,
     alert_config: &AlertConfig,
@@ -6012,7 +6031,7 @@ pub fn run_observe(
     composite_risk_config: &CompositeRiskConfig,
     cone_scaling_config: &ConeScalingConfig,
     pricing_config: &crate::config::GovernorConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ObserveOutput> {
     let now = Utc::now();
     log::info!("[governor] === observe cycle start at {} ===", now.to_rfc3339());
 
@@ -6039,7 +6058,34 @@ pub fn run_observe(
     )?;
 
     log::info!("[governor] === observe cycle complete ===");
-    Ok(())
+
+    // Load the updated state to return observation data
+    let state = state::load_state(state_path)?;
+
+    let forecast = &state.capacity_forecast;
+
+    Ok(ObserveOutput {
+        timestamp: now.to_rfc3339(),
+        success: true,
+        message: "Observation cycle completed successfully".to_string(),
+        windows: vec![
+            WindowSummary {
+                name: "five_hour".to_string(),
+                utilization: forecast.five_hour.current_utilization,
+                remaining_hours: forecast.five_hour.hours_remaining,
+            },
+            WindowSummary {
+                name: "seven_day".to_string(),
+                utilization: forecast.seven_day.current_utilization,
+                remaining_hours: forecast.seven_day.hours_remaining,
+            },
+            WindowSummary {
+                name: "weekly_scoped".to_string(),
+                utilization: forecast.weekly_scoped.current_utilization,
+                remaining_hours: forecast.weekly_scoped.hours_remaining,
+            },
+        ],
+    })
 }
 
 /// Internal implementation of observation logic
