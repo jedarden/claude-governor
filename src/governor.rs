@@ -140,6 +140,169 @@ fn is_structurally_inactive(window: &UsageWindow, state: &state::GovernorState) 
     is_inactive_by_consecutive_absence || is_inactive_by_api
 }
 
+// ---------------------------------------------------------------------------
+// Annotation Guard Helpers
+// ---------------------------------------------------------------------------
+
+/// Reasons why annotation of a window delta interval should be skipped.
+///
+/// Each variant represents a guard condition that, when triggered,
+/// indicates the interval is not suitable for reliable annotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Interval is too short (< 2 minutes elapsed) for meaningful delta computation
+    IntervalTooShort { elapsed_seconds: i64 },
+
+    /// Worker count changed mid-interval, violating the concurrent session assumption
+    WorkerCountChanged { workers_start: u32, workers_end: u32 },
+
+    /// Interval spans a window reset (utilization dropped significantly)
+    WindowReset {
+        five_hour_reset: bool,
+        seven_day_reset: bool,
+        weekly_scoped_reset: bool,
+    },
+}
+
+impl SkipReason {
+    /// Human-readable description of the skip reason
+    pub fn description(&self) -> String {
+        match self {
+            SkipReason::IntervalTooShort { elapsed_seconds } => {
+                format!("interval too short ({}s < 120s)", elapsed_seconds)
+            }
+            SkipReason::WorkerCountChanged { workers_start, workers_end } => {
+                format!("worker count changed mid-interval ({} -> {})", workers_start, workers_end)
+            }
+            SkipReason::WindowReset { five_hour_reset, seven_day_reset, weekly_scoped_reset } => {
+                let resets: Vec<&str> = [
+                    (*five_hour_reset).then_some("5h"),
+                    (*seven_day_reset).then_some("7d"),
+                    (*weekly_scoped_reset).then_some("7ds"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                format!("interval spans window reset ({})", resets.join(", "))
+            }
+        }
+    }
+}
+
+/// Minimum elapsed time (in seconds) required for annotation.
+///
+/// Intervals shorter than this threshold are considered too noisy
+/// for reliable delta computation.
+const MIN_ELAPSED_SECONDS: i64 = 120;
+
+/// Utilization drop threshold (in percentage points) for detecting window resets.
+///
+/// When utilization drops by more than this amount between polls, it indicates
+/// a window reset occurred.
+const WINDOW_RESET_THRESHOLD_PCT: f64 = 1.0;
+
+/// Check if the elapsed time meets the minimum requirement for annotation.
+///
+/// # Arguments
+/// * `t0` - Interval start timestamp
+/// * `t1` - Interval end timestamp
+///
+/// # Returns
+/// * `Some(SkipReason::IntervalTooShort)` - if elapsed time < 2 minutes
+/// * `None` - if elapsed time is sufficient for annotation
+///
+/// # Example
+/// ```ignore
+/// use chrono::Utc;
+/// let t0 = Utc::now();
+/// let t1 = t0 + chrono::Duration::seconds(90); // Only 90 seconds
+/// assert!(check_elapsed_minimum(t0, t1).is_some()); // Should skip
+///
+/// let t2 = t0 + chrono::Duration::seconds(180); // 3 minutes
+/// assert!(check_elapsed_minimum(t0, t2).is_none()); // Should proceed
+/// ```
+pub fn check_elapsed_minimum(t0: DateTime<Utc>, t1: DateTime<Utc>) -> Option<SkipReason> {
+    let elapsed_seconds = (t1 - t0).num_seconds().abs();
+
+    if elapsed_seconds < MIN_ELAPSED_SECONDS {
+        return Some(SkipReason::IntervalTooShort { elapsed_seconds });
+    }
+
+    None
+}
+
+/// Check if worker count remained stable during the interval.
+///
+/// # Arguments
+/// * `workers_start` - Worker count at interval start
+/// * `workers_end` - Worker count at interval end
+///
+/// # Returns
+/// * `Some(SkipReason::WorkerCountChanged)` - if worker count changed
+/// * `None` - if worker count is stable
+///
+/// # Example
+/// ```ignore
+/// // Worker count changed - should skip
+/// assert!(check_worker_count_stable(5, 7).is_some());
+///
+/// // Worker count stable - should proceed
+/// assert!(check_worker_count_stable(5, 5).is_none());
+/// ```
+pub fn check_worker_count_stable(workers_start: u32, workers_end: u32) -> Option<SkipReason> {
+    if workers_start != workers_end {
+        return Some(SkipReason::WorkerCountChanged {
+            workers_start,
+            workers_end,
+        });
+    }
+
+    None
+}
+
+/// Check if the interval spans a window reset.
+///
+/// A window reset is detected when any window's utilization drops by more than
+/// `WINDOW_RESET_THRESHOLD_PCT` percentage points between the old and new snapshots.
+/// This indicates the window's utilization counter rolled over, making the delta
+/// unreliable for annotation.
+///
+/// # Arguments
+/// * `old_pct` - Window utilization at interval start
+/// * `new_pct` - Window utilization at interval end
+///
+/// # Returns
+/// * `Some(SkipReason::WindowReset)` - if any window shows a reset
+/// * `None` - if no window reset is detected
+///
+/// # Example
+/// ```ignore
+/// let old_pct = db::WindowPctSnapshot { five_hour: 20.0, seven_day: 45.0, weekly_scoped: 35.0 };
+/// let new_pct = db::WindowPctSnapshot { five_hour: 18.5, seven_day: 46.0, weekly_scoped: 36.0 };
+///
+/// // 5-hour dropped 1.5% - should skip
+/// assert!(check_window_reset(&old_pct, &new_pct).is_some());
+///
+/// let new_pct2 = db::WindowPctSnapshot { five_hour: 21.5, seven_day: 46.5, weekly_scoped: 36.5 };
+/// // All increased or stable - should proceed
+/// assert!(check_window_reset(&old_pct, &new_pct2).is_none());
+/// ```
+pub fn check_window_reset(old_pct: &db::WindowPctSnapshot, new_pct: &db::WindowPctSnapshot) -> Option<SkipReason> {
+    let five_hour_reset = new_pct.five_hour < old_pct.five_hour - WINDOW_RESET_THRESHOLD_PCT;
+    let seven_day_reset = new_pct.seven_day < old_pct.seven_day - WINDOW_RESET_THRESHOLD_PCT;
+    let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - WINDOW_RESET_THRESHOLD_PCT;
+
+    if five_hour_reset || seven_day_reset || weekly_scoped_reset {
+        return Some(SkipReason::WindowReset {
+            five_hour_reset,
+            seven_day_reset,
+            weekly_scoped_reset,
+        });
+    }
+
+    None
+}
+
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSnapshot {
@@ -10327,6 +10490,357 @@ mod annotation_guard_tests {
             EstimateQuality::Calibrated,
             "Window at threshold should be Calibrated"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for guard helper functions
+    // -------------------------------------------------------------------------
+
+    /// Test check_elapsed_minimum: interval too short
+    #[test]
+    fn test_check_elapsed_minimum_short_interval_skips() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(90); // Only 90 seconds
+
+        let result = check_elapsed_minimum(t0, t1);
+
+        assert!(
+            result.is_some(),
+            "Should skip when interval is less than 120 seconds"
+        );
+        match result {
+            Some(SkipReason::IntervalTooShort { elapsed_seconds }) => {
+                assert_eq!(elapsed_seconds, 90);
+            }
+            _ => panic!("Expected IntervalTooShort, got {:?}", result),
+        }
+    }
+
+    /// Test check_elapsed_minimum: interval sufficient
+    #[test]
+    fn test_check_elapsed_minimum_sufficient_interval_proceeds() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(180); // 3 minutes
+
+        let result = check_elapsed_minimum(t0, t1);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when interval is >= 120 seconds"
+        );
+    }
+
+    /// Test check_elapsed_minimum: exactly at threshold
+    #[test]
+    fn test_check_elapsed_minimum_at_threshold_proceeds() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(120); // Exactly 2 minutes
+
+        let result = check_elapsed_minimum(t0, t1);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when interval is exactly 120 seconds"
+        );
+    }
+
+    /// Test check_elapsed_minimum: just below threshold
+    #[test]
+    fn test_check_elapsed_minimum_just_below_threshold_skips() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(119); // Just under 2 minutes
+
+        let result = check_elapsed_minimum(t0, t1);
+
+        assert!(
+            result.is_some(),
+            "Should skip when interval is just under 120 seconds"
+        );
+    }
+
+    /// Test check_elapsed_minimum: negative duration (t1 before t0)
+    #[test]
+    fn test_check_elapsed_minimum_negative_duration_abs_is_taken() {
+        let t1 = Utc::now();
+        let t0 = t1 + Duration::seconds(90); // t0 after t1 (negative elapsed)
+
+        let result = check_elapsed_minimum(t0, t1);
+
+        assert!(
+            result.is_some(),
+            "Should skip (abs() is taken, so 90s < 120s)"
+        );
+    }
+
+    /// Test check_worker_count_stable: worker count changed
+    #[test]
+    fn test_check_worker_count_stable_changed_skips() {
+        let result = check_worker_count_stable(5, 7);
+
+        assert!(
+            result.is_some(),
+            "Should skip when worker count changes"
+        );
+        match result {
+            Some(SkipReason::WorkerCountChanged {
+                workers_start,
+                workers_end,
+            }) => {
+                assert_eq!(workers_start, 5);
+                assert_eq!(workers_end, 7);
+            }
+            _ => panic!("Expected WorkerCountChanged, got {:?}", result),
+        }
+    }
+
+    /// Test check_worker_count_stable: worker count stable
+    #[test]
+    fn test_check_worker_count_stable_unchanged_proceeds() {
+        let result = check_worker_count_stable(5, 5);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when worker count is stable"
+        );
+    }
+
+    /// Test check_worker_count_stable: both zero (edge case)
+    #[test]
+    fn test_check_worker_count_stable_both_zero_proceeds() {
+        let result = check_worker_count_stable(0, 0);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when both counts are zero (stable)"
+        );
+    }
+
+    /// Test check_worker_count_stable: decrease in workers
+    #[test]
+    fn test_check_worker_count_stable_decrease_skips() {
+        let result = check_worker_count_stable(10, 3);
+
+        assert!(
+            result.is_some(),
+            "Should skip when worker count decreases"
+        );
+        match result {
+            Some(SkipReason::WorkerCountChanged {
+                workers_start,
+                workers_end,
+            }) => {
+                assert_eq!(workers_start, 10);
+                assert_eq!(workers_end, 3);
+            }
+            _ => panic!("Expected WorkerCountChanged, got {:?}", result),
+        }
+    }
+
+    /// Test check_window_reset: single window reset (5-hour)
+    #[test]
+    fn test_check_window_reset_single_window_skips() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 18.5, // Dropped 1.5%
+            seven_day: 46.0,
+            weekly_scoped: 36.0,
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(
+            result.is_some(),
+            "Should skip when any window drops > 1%"
+        );
+        match result {
+            Some(SkipReason::WindowReset {
+                five_hour_reset,
+                seven_day_reset,
+                weekly_scoped_reset,
+            }) => {
+                assert!(five_hour_reset, "5-hour should show reset");
+                assert!(!seven_day_reset, "7-day should not show reset");
+                assert!(!weekly_scoped_reset, "7ds should not show reset");
+            }
+            _ => panic!("Expected WindowReset, got {:?}", result),
+        }
+    }
+
+    /// Test check_window_reset: no reset (normal increase)
+    #[test]
+    fn test_check_window_reset_no_reset_proceeds() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.5, // Increased 1.5%
+            seven_day: 46.5,
+            weekly_scoped: 36.5,
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when no window drops > 1%"
+        );
+    }
+
+    /// Test check_window_reset: multiple windows reset
+    #[test]
+    fn test_check_window_reset_multiple_windows_skips() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 25.0,
+            seven_day: 50.0,
+            weekly_scoped: 40.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 22.0,     // Dropped 3%
+            seven_day: 48.0,     // Dropped 2%
+            weekly_scoped: 38.5, // Dropped 1.5%
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(
+            result.is_some(),
+            "Should skip when multiple windows reset"
+        );
+        match result {
+            Some(SkipReason::WindowReset {
+                five_hour_reset,
+                seven_day_reset,
+                weekly_scoped_reset,
+            }) => {
+                assert!(five_hour_reset, "5-hour should show reset");
+                assert!(seven_day_reset, "7-day should show reset");
+                assert!(weekly_scoped_reset, "7ds should show reset");
+            }
+            _ => panic!("Expected WindowReset, got {:?}", result),
+        }
+    }
+
+    /// Test check_window_reset: exactly at threshold
+    #[test]
+    fn test_check_window_reset_at_threshold_skips() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 18.99, // Dropped 1.01%
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(
+            result.is_some(),
+            "Should skip when drop is just over threshold (1.01%)"
+        );
+    }
+
+    /// Test check_window_reset: just below threshold
+    #[test]
+    fn test_check_window_reset_below_threshold_proceeds() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 19.01, // Dropped 0.99%
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(
+            result.is_none(),
+            "Should proceed when drop is just under threshold (0.99%)"
+        );
+    }
+
+    /// Test check_window_reset: stable (no change)
+    #[test]
+    fn test_check_window_reset_stable_proceeds() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+
+        let result = check_window_reset(&old_pct, &new_pct);
+
+        assert!(result.is_none(), "Should proceed when all windows are stable");
+    }
+
+    /// Test SkipReason::description() method
+    #[test]
+    fn test_skip_reason_description() {
+        let reason = SkipReason::IntervalTooShort { elapsed_seconds: 90 };
+        assert_eq!(reason.description(), "interval too short (90s < 120s)");
+
+        let reason = SkipReason::WorkerCountChanged {
+            workers_start: 5,
+            workers_end: 7,
+        };
+        assert_eq!(
+            reason.description(),
+            "worker count changed mid-interval (5 -> 7)"
+        );
+
+        let reason = SkipReason::WindowReset {
+            five_hour_reset: true,
+            seven_day_reset: false,
+            weekly_scoped_reset: true,
+        };
+        assert_eq!(reason.description(), "interval spans window reset (5h, 7ds)");
+    }
+
+    /// Test SkipReason::description() with all windows reset
+    #[test]
+    fn test_skip_reason_description_all_windows() {
+        let reason = SkipReason::WindowReset {
+            five_hour_reset: true,
+            seven_day_reset: true,
+            weekly_scoped_reset: true,
+        };
+        assert_eq!(
+            reason.description(),
+            "interval spans window reset (5h, 7d, 7ds)"
+        );
+    }
+
+    /// Test SkipReason::description() with no windows reset (shouldn't happen in practice)
+    #[test]
+    fn test_skip_reason_description_no_windows() {
+        let reason = SkipReason::WindowReset {
+            five_hour_reset: false,
+            seven_day_reset: false,
+            weekly_scoped_reset: false,
+        };
+        assert_eq!(reason.description(), "interval spans window reset ()");
     }
 }
 
