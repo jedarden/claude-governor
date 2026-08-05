@@ -66,3 +66,47 @@ now would regress that work, so it stays.
 
 - `cargo test` — all suites pass (736 lib tests + integration/doc suites, 0 failures)
 - `cargo fmt --check` — no diffs in the added region; the remaining diffs are pre-existing elsewhere in the file
+
+## Independent re-verification (2026-08-05, later session)
+
+Re-checked the above from scratch rather than trusting it. All of it holds:
+
+- `cargo build` clean; `cargo test` green — 736 lib tests + every integration
+  suite, 0 failures. The 27 `window_delta_tests` and
+  `mock_poller_tests::test_second_cycle_repolls_and_computes_window_deltas` all pass.
+- Both call sites are genuinely production code, not test-module code. The
+  `#[cfg(test)]` blocks in this file interleave, so this was worth confirming by
+  enclosing function rather than by line number: `run_governor_cycle` starts at
+  `governor.rs:4393` and `run_observe_cycle_internal` at `governor.rs:6231`; the
+  delta blocks sit inside their `Ok(usage_data)` arms. The large span
+  `governor.rs:1222-3789` is `mod window_delta_tests`, which is why grep shows
+  dozens of `calculate_window_pct_delta` hits that are not call sites.
+- The only production writes to the delta fields are `governor.rs:4536` and
+  `governor.rs:6370`. Every other `p5h_delta = ...` in the file is inside the
+  test module.
+- Rotation-before-poll confirmed at `governor.rs:4422` with the first-poll
+  comment intact, so the `(Some, Some)` guard is what makes first poll graceful.
+
+### New finding: deltas go stale for two cycles after a failed poll
+
+Not covered by this bead's acceptance criteria and **not fixed here**, but it
+falls out of the rotation ordering and is worth recording.
+
+Rotation happens *before* the poll, and the `Err` arm never touches
+`current_api_snapshot` or the delta fields. So a failed poll leaves:
+
+- cycle N (poll fails): `previous = Some(last good)`, `current = None` → guard
+  does not match, and the `Some(..)` deltas from cycle N−1 are **retained, not
+  cleared**.
+- cycle N+1 (poll succeeds): rotation sets `previous = current.take() = None`,
+  so the guard still does not match — deltas remain the stale cycle N−1 values
+  even though a fresh reading is now in hand.
+
+Net effect: one poll failure produces a two-cycle window in which
+`p5h/p7d/p7ds_delta` are non-`None` but describe an interval that has already
+scrolled past. Nothing panics, so this is graceful in the sense the bead
+required — but any downstream consumer that reads the deltas without checking
+snapshot freshness will silently use them. Worth a follow-up bead; interacts with
+bf-9mtsa ("Initialize delta fields for first poll case"), since a decision to
+initialize these fields explicitly should cover the failure path too, not just
+the first poll.
