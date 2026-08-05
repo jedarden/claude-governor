@@ -11550,11 +11550,23 @@ mod mock_poller_tests {
     /// The cycle's safe_mode clear check (step 1b) runs against the forecast it
     /// loaded from disk, which is what a real governor sees at the top of the
     /// cycle following the brake.
+    ///
+    /// `scored_at_entry` is pinned to `u32::MAX` to keep the *other* safe_mode
+    /// exit out of the picture. Step 5a calls `update_safe_mode_from_calibration`
+    /// against `calibrator::read_all_scores()`, which reads the machine's real
+    /// `~/.needle/state/prediction-accuracy.jsonl` — the cycle is not hermetic, so
+    /// whatever the host governor has logged would otherwise decide this test. That
+    /// path exits only when `predictions_since_entry >= 3`, and
+    /// `predictions_since_entry` is `total_samples.saturating_sub(scored_at_entry)`,
+    /// so `u32::MAX` holds it at 0 for any ambient score count. What survives the
+    /// cycle is then the emergency-brake decision alone, which is what these two
+    /// tests are about.
     fn seed_braked_state(state_path: &std::path::Path, utilization: f64) {
         let mut state = state::GovernorState::new();
         state.safe_mode.active = true;
         state.safe_mode.trigger = Some("emergency_brake".to_string());
         state.safe_mode.entered_at = Some(Utc::now());
+        state.safe_mode.scored_at_entry = u32::MAX;
         state.capacity_forecast.five_hour.current_utilization = utilization;
         state.capacity_forecast.seven_day.current_utilization = utilization;
         state.capacity_forecast.weekly_scoped.current_utilization = utilization;

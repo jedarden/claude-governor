@@ -38,28 +38,50 @@ the persisted state file, not on a re-implementation of the cycle.
 
 ## Results
 
-- `cargo build --all-targets` — no errors.
-- `cargo test` — 737 lib + 71 integration + 13 doctests pass.
+- `cargo build --all-targets` / `cargo check --all-targets` — no errors.
+- `cargo test` — **738 lib + all integration suites + doctests pass, 0 failed.**
 - 13 `first_poll` tests pass, including the `state.rs` transition tests and the
   `governor.rs` first-poll → second-poll flow.
+- 37 `mock_poller_tests` pass, which is where the three required cases live.
 
-### One pre-existing failure, not from this work
+### The one failure, now fixed
 
 `governor::mock_poller_tests::test_cycle_holds_emergency_brake_safe_mode_at_98_percent`
-fails. It fails identically on the unmodified tree (verified by stashing this
-bead's changes), and it passed earlier in the same session — it is
-environment-dependent, not a regression here.
+failed on the first pass of this bead. It was not a regression — it fails
+identically at `b6c18b0`, the commit before this bead's work (verified in a
+detached worktree, not by stashing).
 
-Cause: `run_governor_cycle` is not hermetic. It calls
-`collector::run_collection_pass()` and reads `collector::default_db_path()`
-unconditionally, so the live governor database participates in the test. The
-prediction-accuracy exit path (`governor.rs:4290`, `check_safe_mode_exit`) clears
-`safe_mode` once `stats.total_samples` and the median error from that live DB
-cross their thresholds — which is what happened between the two runs. The test
-seeds `safe_mode.active = true` and expects it to survive the cycle.
+Exact cause, traced rather than assumed:
 
-This is a test-isolation defect in the emergency-brake test, unrelated to
-snapshot handling; it deserves its own bead rather than a fix smuggled in here.
+- Step 5a of the cycle (`governor.rs:5285`) calls `calibrator::read_all_scores()`,
+  which reads `~/.needle/state/prediction-accuracy.jsonl`
+  (`calibrator.rs:292`) — the machine's real file, with no injection seam.
+- That file held 99 scores with `|median_error| = 1.31`.
+- `update_safe_mode_from_calibration` (`governor.rs:4290`) exits safe_mode when
+  `median_error_abs < 8.0` **and** `predictions_since_entry >= 3` **and**
+  `total_samples >= 5`. The seeded state left `scored_at_entry` at 0, so
+  `predictions_since_entry` was `99 - 0 = 99`. All three held, and
+  `*safe_mode = SafeModeState::default()` wiped both `active` and the
+  `emergency_brake` trigger before the assertion ran.
+- The earlier pass in the same session simply caught the file below 5 samples.
+  Some of those 99 scores were appended by the test runs themselves.
+
+Fix (`seed_braked_state`): pin `safe_mode.scored_at_entry = u32::MAX`. Because
+`predictions_since_entry` is `total_samples.saturating_sub(scored_at_entry)`, it
+stays 0 for any ambient score count, so the calibration exit cannot fire and the
+two brake tests observe only the emergency-brake decision they are about. Both
+now pass, and `test_cycle_clears_emergency_brake_safe_mode_below_98_percent` is
+strengthened by it — its clear now provably comes from step 1b rather than from
+ambient calibration data agreeing by luck.
+
+That is a local fix for two tests. The underlying non-hermeticity is filed as
+**bf-1p1gr** (every other cycle test is still exposed, and the cycle writes to
+the developer's real `~/.needle` state). A second finding from the same trace is
+filed as **bf-2wizx**: the calibration exit branches on `safe_mode.active` alone,
+ignoring `trigger`, so it can release an emergency brake while utilization is
+still ≥98% — and it runs at 5285, before the safe-mode-conditioned hysteresis,
+composite-risk and ceiling overrides are chosen at 5303–5360. Behavioural
+question, deliberately not answered inside this bead.
 
 ## Changes made
 
@@ -80,7 +102,22 @@ Warning cleanup, confined to the first-poll / snapshot code:
   used, `baseline_snapshot` in `governor_cycle_snapshot_test.rs`) and simplified
   a `match` clippy flagged in the flow test.
 
-The remaining warnings in `governor.rs` (unused variables around lines
-5492–8233, unnecessary parentheses in the forecast helpers) are pre-existing and
-sit in unrelated code; they were left alone. Likewise the repo's existing
-`cargo fmt` drift — only the regions touched here are rustfmt-clean.
+Test-isolation fix, second pass:
+
+- `seed_braked_state` pins `scored_at_entry` (see above), with the reasoning in a
+  doc comment on the helper so the next reader does not "clean up" the sentinel.
+
+### Warnings: the one acceptance criterion not fully met
+
+"Compiles without errors or warnings" holds for the code this bead covers — the
+snapshot rotation and delta block (`governor.rs` ~4420–4600) and
+`mock_poller_tests` are warning-free. A clean `cargo check --all-targets` still
+emits **28 warnings elsewhere**, all pre-existing: `burn_rate.rs`, `alerts.rs`,
+`narrator.rs`, `capacity_summary.rs`, `poller.rs`, unrelated `governor.rs`
+regions (5492–8233), and three integration test files.
+
+They were not swept here, for two reasons. Several are loaded-then-never-asserted
+bindings in *other* beads' test files — silencing them with `_` would hide a real
+test gap, so each needs a judgement call. And this repo has parallel agents in
+flight; a 9-file mechanical sweep invites conflicts for no gain to this bead.
+Filed with the full per-file list as **bf-5qbwr**.
