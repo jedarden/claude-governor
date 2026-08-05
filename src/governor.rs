@@ -2754,9 +2754,15 @@ mod window_delta_tests {
             // consecutive polling cycles. A positive delta indicates increasing utilization,
             // while a negative delta indicates decreasing utilization.
             //
-            // Example: if 5-hour utilization was 10.0% in the previous snapshot and is
-            // now 12.5% in the current snapshot, the 5-hour delta is 12.5 - 10.0 = 2.5
-            // percentage points.
+            // The operands are percent-of-quota readings, so the result is a signed
+            // difference in *percentage points* — not a ratio and not a relative
+            // percent change. Example: 5-hour utilization of 10.0% in the previous
+            // snapshot and 12.5% in the current one gives 12.5 - 10.0 = 2.5
+            // percentage points, not 25%.
+            //
+            // The sign matters on the production path too, where a window reset drives
+            // every delta negative; see
+            // `mock_poller_tests::test_cycle_computes_negative_deltas_when_windows_reset`.
 
             // Document the expected calculations (hoisted above this block) for clarity
             assert!(
@@ -11016,9 +11022,53 @@ mod mock_poller_tests {
         let current = saved
             .current_api_snapshot
             .expect("second cycle should record its own reading as current");
+        // All three fields, not just 5h: each one is the input side of a delta
+        // assertion below, so leaving 7d/7ds unchecked would anchor those deltas
+        // to numbers the test never confirmed the cycle actually stored.
         assert_eq!(current.five_hour_pct, 14.0);
+        assert_eq!(current.seven_day_pct, 25.0);
+        assert_eq!(current.weekly_scoped_pct, 33.0);
 
-        // Deltas are current − previous, computed by the cycle from the two snapshots.
+        // === Delta value verification ===
+        // Formula (`calculate_window_pct_delta`): delta = current − previous, per
+        // window. The operands are percent-of-quota readings, so a delta is a
+        // signed difference in *percentage points* — not a ratio and not a
+        // relative percent change. Here 5h moves 10.0% → 14.0%, which is a delta
+        // of 4.0 points, not 40%.
+        //
+        // Expected values are derived from the snapshot pair the cycle itself
+        // persisted, so the assertions track the cycle's own inputs rather than
+        // restating the fixture. The literal checks that follow pin the fixture
+        // arithmetic, so the two together fail if either side drifts.
+        let expected_5h_delta = current.five_hour_pct - previous.five_hour_pct;
+        let expected_7d_delta = current.seven_day_pct - previous.seven_day_pct;
+        let expected_7ds_delta = current.weekly_scoped_pct - previous.weekly_scoped_pct;
+
+        assert_eq!(
+            saved.p5h_delta,
+            Some(expected_5h_delta),
+            "5h delta should be current ({}) − previous ({})",
+            current.five_hour_pct,
+            previous.five_hour_pct
+        );
+        assert_eq!(
+            saved.p7d_delta,
+            Some(expected_7d_delta),
+            "7d delta should be current ({}) − previous ({})",
+            current.seven_day_pct,
+            previous.seven_day_pct
+        );
+        assert_eq!(
+            saved.p7ds_delta,
+            Some(expected_7ds_delta),
+            "weekly_scoped delta should be current ({}) − previous ({})",
+            current.weekly_scoped_pct,
+            previous.weekly_scoped_pct
+        );
+
+        // The fixture's three deltas are distinct (4.0 / 5.0 / 3.0), so a cycle
+        // that crossed the windows up — writing the 7ds delta into p7d, say —
+        // fails here rather than passing on shape alone.
         assert_eq!(saved.p5h_delta, Some(4.0), "5h delta should be 14.0 - 10.0");
         assert_eq!(saved.p7d_delta, Some(5.0), "7d delta should be 25.0 - 20.0");
         assert_eq!(
@@ -11026,6 +11076,74 @@ mod mock_poller_tests {
             Some(3.0),
             "weekly_scoped delta should be 33.0 - 30.0"
         );
+    }
+
+    /// A cycle whose windows *drop* records negative deltas, not their magnitude.
+    ///
+    /// The delta formula is signed — `current − previous` — and a window reset is
+    /// the case that depends on it: utilization falls, and the cycle must persist
+    /// the drop as a negative number so downstream forecasting sees a reset rather
+    /// than a burn. The reset tests elsewhere in this file
+    /// (`test_window_reset_boundary_transitions`,
+    /// `test_negative_deltas_window_reset`) call `calculate_window_pct_delta`
+    /// directly; this one drives the sign through `run_governor_cycle` and the
+    /// persisted state file, which is where an `.abs()` or a flipped operand order
+    /// would actually hurt.
+    #[test]
+    fn test_cycle_computes_negative_deltas_when_windows_reset() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        // Cycle 1: windows near exhaustion.
+        let mut poller = MockPoller::with_utilization(80.0, 90.0, 85.0);
+        run_cycle(&mut poller, &state_path).expect("first cycle should succeed");
+
+        // Cycle 2: the windows have rolled over and counting restarted.
+        poller.set_usage_data({
+            let mut data = MockPoller::with_utilization(5.0, 15.0, 8.0)
+                .usage_data
+                .expect("with_utilization always sets usage data");
+            data.stale = false;
+            data
+        });
+        run_cycle(&mut poller, &state_path).expect("second cycle should succeed");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        let previous = saved
+            .previous_api_snapshot
+            .expect("second cycle should shift cycle 1's reading into previous_api_snapshot");
+        let current = saved
+            .current_api_snapshot
+            .expect("second cycle should record its own reading as current");
+
+        // Same formula as the increasing case: delta = current − previous, in
+        // signed percentage points. Falling utilization makes each delta negative.
+        let expected_5h_delta = current.five_hour_pct - previous.five_hour_pct;
+        let expected_7d_delta = current.seven_day_pct - previous.seven_day_pct;
+        let expected_7ds_delta = current.weekly_scoped_pct - previous.weekly_scoped_pct;
+
+        assert_eq!(
+            saved.p5h_delta,
+            Some(expected_5h_delta),
+            "5h delta should be 5.0 - 80.0 = -75.0"
+        );
+        assert_eq!(
+            saved.p7d_delta,
+            Some(expected_7d_delta),
+            "7d delta should be 15.0 - 90.0 = -75.0"
+        );
+        assert_eq!(
+            saved.p7ds_delta,
+            Some(expected_7ds_delta),
+            "weekly_scoped delta should be 8.0 - 85.0 = -77.0"
+        );
+
+        // The sign is the point: magnitudes alone would survive an `.abs()`.
+        assert_eq!(saved.p5h_delta, Some(-75.0));
+        assert_eq!(saved.p7d_delta, Some(-75.0));
+        assert_eq!(saved.p7ds_delta, Some(-77.0));
     }
 
     /// The cycle writes both the state file and the previous-state rollover file,
