@@ -354,6 +354,8 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 
 **File:** `~/.needle/state/governor-state.json`
 
+**Note:** The sample below is illustrative, with values drawn from the historical March 2026 Off-Peak 2x promotion window (hence `"is_promo_active": true` and `"promo_multiplier": 2.0`). Under the shipped configuration — `config/promotions.json` containing an empty array `[]` — `is_promo_active` is `false` and `promo_multiplier` is `1.0`.
+
 ```json
 {
   "updated_at": "2026-03-18T14:30:00Z",
@@ -837,6 +839,8 @@ Peak:     no  (promo 2x active, off-peak until 08:00 ET)
 Last cycle: 14s ago  |  Next: in 4m46s
 ```
 
+The `Peak:` line above is illustrative output captured during the historical March 2026 Off-Peak 2x promotion. With the shipped empty `promotions.json` (`[]`), no promotion is in effect and the line carries no promo annotation.
+
 **Daemon management via `cgov`:** `cgov enable/disable/start/stop/restart` abstract over systemd user services (Linux) and tmux sessions (fallback), so callers never need to know the underlying mechanism.
 
 ---
@@ -1224,6 +1228,8 @@ cgov doctor — 2026-03-18 14:30 ET
 ──────────────────────────────────────────
 19 passed · 2 warnings · 0 failed
 ```
+
+The `⚠ Promotion dates` line above is illustrative, from the historical March 2026 Off-Peak 2x promotion window. With the shipped empty `promotions.json` (`[]`) this check passes with `No promotions configured`.
 
 **Note:** The implementation includes ~20 health checks covering OAuth, API, collector, state files, heartbeats, burn rates, pricing, promotions, database integrity, configuration, tmux, alerts, disk space, daemon status, logs, prediction accuracy, Claude CLI installation, and subscription session presence. The table above shows all implemented checks.
 
@@ -1740,6 +1746,7 @@ Peak:     no  (promo 2x active, off-peak until 08:00 ET)
 Last cycle: 14s ago  |  Next: in 4m46s
 ```
 
+- As in Component 10, the `Peak:` line is illustrative output from the historical March 2026 Off-Peak 2x promotion; with the shipped empty `promotions.json` (`[]`) it carries no promo annotation
 - Color coding: green = OK, yellow = approaching ceiling, red = cutoff risk
 - Falls back to plain ASCII when `NO_COLOR` is set or stdout is not a TTY
 - `--watch` clears terminal and re-renders on a 30s interval
@@ -2054,7 +2061,7 @@ claude-governor/
 
 4. **Bead state after forced kill:** If a worker is killed mid-task, the bead remains `IN_PROGRESS` until the stale claim threshold fires. Prefer graceful shutdown to avoid this.
 
-5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after this date, `promotions.json` was reverted to an empty array `[]`, which is the correct default when no promotion is running (flat 1.0 multiplier).
+5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after that date `promotions.json` was reverted to an empty array `[]`. That is the current shipped state — `config/promotions.json` in this repository contains `[]` — and it is the correct default whenever no promotion is running (flat 1.0 multiplier). An expired promotion left in the file is a configuration error the `promotion_dates` doctor check flags.
 
 6. **Multiple accounts / credential rotation:** The poller assumes a single `~/.claude/.credentials.json`. If multiple accounts are used, parameterize the credentials path.
 
