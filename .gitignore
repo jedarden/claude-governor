@@ -1,3 +1,10 @@
 /target
 /.beads
 __pycache__/
+
+# Backup and debug artifacts from revert/verify cycles
+*.backup
+*.before-revert
+*.with-fixes
+output_*.txt
+test-outputs/
