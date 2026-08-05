@@ -88,3 +88,62 @@ so the contract is checked from the public API too.
   collector DB, writes to the developer's `~/.needle`). The MockPoller tests here
   inherit that exposure.
 - bf-5qbwr (28 pre-existing warnings elsewhere in the tree).
+
+## Independent re-verification (2026-08-05, second session)
+
+The bead was re-dispatched: 13eb0db was committed and pushed, but the bead was
+never closed. Re-ran everything from the committed tree rather than trusting the
+numbers above.
+
+**Suite.** `cargo test` — **833 passed, 0 failed, 8 ignored**, matching the count
+recorded above exactly (738 lib + 81 across 15 integration suites + 14 doctests).
+No panics. `cargo test --lib first_poll` — 12 passed;
+`cargo test --test governor_cycle_snapshot_test` — 9 passed.
+
+**The suite is not vacuous.** A green run is what the first session found here
+too, and it meant nothing then. So the arm under test was deliberately broken —
+`window_deltas_from_snapshots`'s catch-all changed from `(None, None, None)` to
+`(Some(0.0), Some(0.0), Some(0.0))`, i.e. exactly the contract the old replica
+tests asserted — and the suite re-run:
+
+```
+11 failed:
+  window_delta_tests::test_delta_computation_skipped_on_first_poll
+  window_delta_tests::test_zero_delta_reported_only_when_a_baseline_exists
+  window_delta_tests::test_first_poll_governor_state_no_panic_deltas_stay_none
+  window_delta_tests::test_first_poll_no_previous_snapshot
+  window_delta_tests::test_first_poll_reports_no_deltas
+  window_delta_tests::test_first_poll_reports_no_deltas_regardless_of_current_values
+  window_delta_tests::test_consecutive_polls_after_first_poll_computes_deltas
+  window_delta_tests::test_no_snapshots_available_no_panic
+  window_delta_tests::test_previous_snapshot_without_current_no_panic
+  mock_poller_tests::test_delta_fields_across_governor_cycles
+  mock_poller_tests::test_cycle_clears_stale_deltas_when_previous_snapshot_is_missing
+```
+
+Both acceptance-criteria tests are in that list, and so are the two MockPoller
+tests that drive real `run_governor_cycle` cycles — so the criteria are checked
+against production behaviour, not against a copy of it. `src/governor.rs` was
+restored (`git checkout --`) and the full suite re-run green: 833/0/8.
+
+**Wiring confirmed by inspection.** `run_governor_cycle` (src/governor.rs:4055)
+assigns its three delta fields from `window_deltas_from_snapshots`
+(src/governor.rs:4174); `run_observe_cycle_internal` does the same at :2754.
+`grep` for the old inlined `match (&previous_api_snapshot, ...)` blocks and for
+first-poll `Some(0.0)` returns nothing in either `src/governor.rs` or
+`tests/governor_cycle_snapshot_test.rs` — no replica survived the rewrite.
+
+**Lints.** `cargo clippy --all-targets` exits 0: 198 warnings, **0 errors**. (The
+"15 lib / 18 lib-test" figure above was the rustc-only count surfaced by
+`cargo test`; 198 is the full count with `clippy::` lints included, still the
+pre-existing set under bf-5qbwr.) Two land inside the regions this bead touched
+and both predate it: `clippy::manual_range_contains` at :1874 (introduced by
+2218165, bf-37wkv) and `clippy::too_many_arguments` on `run_governor_cycle`'s
+signature. None are in `window_deltas_from_snapshots` or the rewritten tests.
+
+Note for anyone re-running this: in this environment `cargo clippy`/`check`/
+`build` emit nothing on the human-readable stderr path, which reads as "clean"
+but is not evidence of anything. Use `--message-format=json`, or `-- -D warnings`
+and check the exit code (101 here, since warnings exist).
+
+All four acceptance criteria met.
