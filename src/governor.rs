@@ -9240,13 +9240,14 @@ mod tests {
 
     /// Test basic governor cycle flow without external dependencies.
     ///
-    /// This test establishes the basic testing infrastructure for governor cycles
-    /// by testing the core decision-making logic: target computation and scaling decisions.
-    /// It verifies that a governor cycle can execute without panicking using a single
-    /// usage snapshot.
+    /// Drives the decision half of a cycle from a single usage snapshot —
+    /// `compute_target_workers` then `apply_scaling` — with no poller, database or
+    /// tmux involved, and pins both results.
     ///
-    /// This serves as the foundation for more complex integration tests that can
-    /// add external dependencies (poller, database, worker management) as needed.
+    /// This is the in-process floor, not the end-to-end cycle: the full
+    /// `run_governor_cycle` (poll → persist → decide) is covered against
+    /// `MockPoller` in `mock_poller_tests`, starting with
+    /// `test_governor_cycle_smoke`.
     #[test]
     fn test_governor_cycle_basic_flow() {
         // 1. Create a minimal governor state
@@ -9313,29 +9314,22 @@ mod tests {
             2,   // max_down_per_cycle
         );
 
-        // 6. Verify the cycle completed without panic
-        // (The fact we reached here means no panic occurred)
-        match decision {
-            ScalingDecision::NoChange => {
-                // Expected: target and current are within hysteresis band
-                assert!(
-                    target >= current_total - 2 && target <= current_total + 2,
-                    "NoChange decision should be within hysteresis band"
-                );
-            }
-            ScalingDecision::ScaleUp(n) => {
-                // Verify scale-up is reasonable
-                assert!(n > 0 && n <= 3, "ScaleUp should be 1-3 workers");
-            }
-            ScalingDecision::ScaleDown(n) => {
-                // Verify scale-down is reasonable
-                assert!(n > 0 && n <= 2, "ScaleDown should be 1-2 workers");
-            }
-            ScalingDecision::EmergencyBrake => {
-                // Should not trigger at moderate utilization
-                panic!("EmergencyBrake should not trigger at 50% utilization");
-            }
-        }
+        // 6. A single snapshot has exactly one right answer, so assert it rather
+        //    than accepting whatever came back: the binding window is
+        //    weekly_scoped, whose safe_worker_count is 7, and 7 is within the
+        //    2.0 hysteresis band of the current 5, so nothing moves.
+        assert_eq!(
+            target, 7,
+            "target should be the binding (weekly_scoped) window's safe_worker_count"
+        );
+        assert!(
+            matches!(decision, ScalingDecision::NoChange),
+            "target {} vs current {} is inside the 2.0 hysteresis band, so the \
+             decision should be NoChange, got {:?}",
+            target,
+            current_total,
+            decision
+        );
 
         // 7. Verify state is consistent after the cycle
         assert!(
