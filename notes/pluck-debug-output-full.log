@@ -1,0 +1,265 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 723 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+
+running 1 test
+
+=== PLUCK FILTER PARAMETERS ===
+Workspace path: /home/coding/claude-governor/.beads/beads.db
+State filter: 'open'
+Labels (include filter): [] (0 labels)
+Exclude labels (exclude filter): ["deferred", "human", "blocked"] (3 labels)
+Assignee filter: 'IS NULL' (always filters unassigned issues)
+===============================
+
+
+--- QUERY CONSTRUCTION LOG ---
+=== QUERY CONSTRUCTION START ===
+Workspace: /home/coding/claude-governor/.beads/beads.db
+Initial parameters provided:
+  - state_filter: 'open'
+  - labels_filter: 0 labels
+  - exclude_labels_filter: 3 labels
+✓ Added SELECT clause for counting distinct issue IDs
+✓ Added FROM clause (issues table aliased as 'i')
+✓ Added LEFT JOIN for labels table
+✓ Added WHERE clause with state filter: 'open'
+✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)
+✓ Added exclude_labels filter (NOT EXISTS):
+    Excluded labels: ["deferred", "human", "blocked"]
+○ No labels filter (empty - no label inclusion requirement)
+=== QUERY CONSTRUCTION COMPLETE ===
+Total query components: 6
+Total filter parameters tracked: 5
+Final query parameters: ["state:open", "assignee:NULL", "exclude:deferred", "exclude:human", "exclude:blocked"]
+===============================
+-------------------------------
+
+
+=== PLUCK QUERY CONSTRUCTION ===
+Workspace path: /home/coding/claude-governor/.beads/beads.db
+State filter: 'open'
+Labels filter (include): []
+Exclude labels filter: ["deferred", "human", "blocked"]
+--- CONSTRUCTED QUERY ---
+SELECT COUNT(DISTINCT i.id)
+  FROM issues i
+  LEFT JOIN labels l ON l.issue_id = i.id
+  WHERE i.status = 'open'
+  AND i.assignee IS NULL
+  AND NOT EXISTS (SELECT 1 FROM labels WHERE issue_id = i.id AND label IN ('deferred', 'human', 'blocked') )
+Query parameters: ["state:open", "assignee:NULL", "exclude:deferred", "exclude:human", "exclude:blocked"]
+===============================
+
+=== QUERY VERIFICATION ===
+✓ Query constructed from provided filter parameters
+✓ Workspace path: /home/coding/claude-governor/.beads/beads.db
+✓ State filter: 'open'
+✓ Exclude labels: ["deferred", "human", "blocked"] (3 labels)
+✓ Include labels: [] (0 labels)
+✓ Assignee filter: always applied (IS NULL)
+========================
+
+=== QUERY STRUCTURE VERIFICATION ===
+✓ Query structure is valid
+✓ All expected clauses present
+==================================
+
+=== QUERY EXECUTION RESULTS ===
+Claimable issues (Pluck query result): 36
+✓ Query executed successfully
+==============================
+
+=== QUERY EXECUTION SUMMARY ===
+✓ Query constructed and verified
+✓ Database: /home/coding/claude-governor/.beads/beads.db
+✓ Result: 36 claimable issues
+✓ Filters applied:
+    - State: 'open'
+    - Assignee: IS NULL
+    - Excluded labels: ["deferred", "human", "blocked"]
+================================
+
+Issues excluded by Pluck filters: 83
+
+=== PLUCK DATABASE CONNECTIVITY TEST RESULTS ===
+Database path: /home/coding/claude-governor/.beads/beads.db
+File exists: true
+Connection successful: true
+Database integrity check: true
+Database schema valid: true
+Total issues in database: 1262
+Open issues: 41
+Issues with labels: 768
+Test errors: None
+===================================================
+
+test test_pluck_database_connectivity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+
+running 1 test
+
+=== SYSTEMATIC PLUCK FILTER COMBINATION TEST ===
+Database path: /home/coding/claude-governor/.beads/beads.db
+================================================
+
+✓ BASE - No filters: 1262 issues
+✓ Only state = 'open': 41 issues
+✓ Only assignee IS NULL: 373 issues
+✓ Only exclude_labels (deferred, human, blocked): 1179 issues
+✓ state + assignee: 40 issues
+✓ state + exclude_labels: 36 issues
+✓ assignee + exclude_labels: 369 issues
+✓ FULL QUERY - state + assignee + exclude_labels: 36 issues
+
+=== ANALYSIS ===
+Total scenarios tested: 8
+Blocking conditions found: 0
+
+=== FILTER IMPACT ANALYSIS ===
+Base count (no filters): 1262
+BASE - No filters: Δ=0 (0% reduction)
+Only state = 'open': Δ=1221 (96.75118858954042% reduction)
+Only assignee IS NULL: Δ=889 (70.44374009508716% reduction)
+Only exclude_labels (deferred, human, blocked): Δ=83 (6.576862123613313% reduction)
+state + assignee: Δ=1222 (96.83042789223455% reduction)
+state + exclude_labels: Δ=1226 (97.1473851030111% reduction)
+assignee + exclude_labels: Δ=893 (70.7606973058637% reduction)
+FULL QUERY - state + assignee + exclude_labels: Δ=1226 (97.1473851030111% reduction)
+=========================
+
+=== BLOCKING CONDITION IDENTIFICATION ===
+=========================================
+
+test test_pluck_filter_combinations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 2 tests
+
+=== DOT PATH RESOLUTION TEST ===
+Showing how '.' resolves in different contexts
+
+Rust std::env::current_dir(): /home/coding/claude-governor
+
+=== PLUCK WORKSPACE MISMATCH TEST ===
+Testing if workspace='.' resolves to wrong directory
+
+PathBuf::from('.'): .
+
+--- Testing: Current workspace (correct) ---
+Workspace path: /home/coding/claude-governor
+canonicalize('.'): /home/coding/claude-governor
+Database path: /home/coding/claude-governor/.beads/beads.db
+
+Parent directory database:
+  Path: /home/coding/.beads/beads.db
+  Exists: true
+
+Current directory database:
+  Path: /home/coding/claude-governor/.beads/beads.db
+  Exists: true
+
+💡 ISSUE: If Pluck resolves '.' to parent instead of current,
+   it queries the wrong database and finds 0 ready beads!
+=====================================
+
+test test_dot_path_resolution ... ok
+✅ Connection successful
+   Total issues: 1262
+   Open issues: 41
+   Ready beads (Pluck query): 36
+
+--- Testing: Parent workspace (wrong - where '.' resolves) ---
+Workspace path: /home/coding
+Database path: /home/coding/.beads/beads.db
+✅ Connection successful
+   Total issues: 5
+   Open issues: 0
+   Ready beads (Pluck query): 0
+   ⚠️  BLOCKING: Pluck would return 0 candidates here!
+   💡 This explains why Pluck starves when workspace='.'
+
+=== ROOT CAUSE ANALYSIS ===
+Problem: Pluck uses workspace='.' which resolves differently than expected
+
+Current directory resolution:
+  - In shell: cwd = /home/coding/claude-governor
+  - In NEEDLE: workspace='.' → /home/coding (parent!)
+
+Result:
+  - Correct database: /home/coding/claude-governor/.beads/beads.db → 36 ready beads
+  - Wrong database:   /home/coding/.beads/beads.db → 0 ready beads
+
+💡 SOLUTION: Pluck needs absolute workspace path, not relative '.'
+==============================
+
+test test_pluck_workspace_mismatch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
