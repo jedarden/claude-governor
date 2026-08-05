@@ -1,5 +1,11 @@
 /target
-/.beads
+# Beads: track ONLY the issues.jsonl checkpoint. It survives a fresh clone / db
+# rebuild and is what makes beads visible to other hosts (see CLAUDE.md §6).
+# Everything else under .beads/ is per-machine runtime state — the live SQLite
+# store and its timestamped backups, .bf_history rotation, traces, recovery
+# dirs, locks and merge artifacts — and must stay out of git.
+/.beads/*
+!/.beads/issues.jsonl
 __pycache__/
 
 # Backup and debug artifacts from revert/verify cycles
