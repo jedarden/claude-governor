@@ -4536,6 +4536,23 @@ pub fn run_governor_cycle(
                 state.p5h_delta = Some(delta_5h);
                 state.p7d_delta = Some(delta_7d);
                 state.p7ds_delta = Some(delta_7ds);
+            } else {
+                // No previous snapshot to subtract from — the first poll after
+                // governor start / state clear, or the poll after a failed one
+                // (the failure leaves current_api_snapshot None, so the next
+                // rotation shifts None into previous). Initialize every delta
+                // field explicitly rather than leaving whatever the last cycle
+                // wrote: a retained Some(..) here describes an interval that has
+                // already scrolled past, and downstream consumers cannot tell it
+                // from a fresh reading. None — not Some(0.0) — because "no
+                // baseline" is not the same claim as "no change".
+                state.p5h_delta = None;
+                state.p7d_delta = None;
+                state.p7ds_delta = None;
+
+                log::debug!(
+                    "[governor] no previous API snapshot; window deltas cleared (first poll or poll following a failure)"
+                );
             }
         }
         Err(e) => {
@@ -6370,6 +6387,18 @@ fn run_observe_cycle_internal(
                 state.p5h_delta = Some(delta_5h);
                 state.p7d_delta = Some(delta_7d);
                 state.p7ds_delta = Some(delta_7ds);
+            } else {
+                // No previous snapshot to subtract from (first poll, or the poll
+                // after a failed one). Clear every delta field explicitly so a
+                // stale Some(..) from an earlier cycle is not mistaken for a
+                // reading of the current interval. Mirrors run_governor_cycle.
+                state.p5h_delta = None;
+                state.p7d_delta = None;
+                state.p7ds_delta = None;
+
+                log::debug!(
+                    "[governor] no previous API snapshot; window deltas cleared (first poll or poll following a failure)"
+                );
             }
         }
         Err(e) => {
@@ -11029,6 +11058,58 @@ mod mock_poller_tests {
                 Some(current_reading),
                 "{} delta must not be the current reading — that is a subtraction against a missing baseline",
                 label
+            );
+        }
+    }
+
+    /// Without a previous snapshot the cycle clears the delta fields instead of
+    /// leaving whatever an earlier cycle wrote.
+    ///
+    /// This is the (None, Some) branch again, but from the state a failed poll
+    /// leaves behind: the failure never writes `current_api_snapshot`, so the
+    /// next cycle's rotation shifts `None` into `previous_api_snapshot` while
+    /// `p5h/p7d/p7ds_delta` still hold the last successfully computed interval.
+    /// Before the delta fields were initialized explicitly, those stale values
+    /// survived the cycle and read as a delta for an interval that had already
+    /// scrolled past. Seeded deltas here are deliberately unlike anything the
+    /// poll could produce (9.9 / 8.8 / 7.7), so retention is unambiguous.
+    #[test]
+    fn test_cycle_clears_stale_deltas_when_previous_snapshot_is_missing() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        let mut state = state::GovernorState::new();
+        state.p5h_delta = Some(9.9);
+        state.p7d_delta = Some(8.8);
+        state.p7ds_delta = Some(7.7);
+        state::save_state(&state, &state_path).expect("failed to seed state file");
+
+        let mut poller = MockPoller::with_utilization(42.5, 63.25, 57.75);
+        run_cycle(&mut poller, &state_path).expect("cycle should succeed, not panic");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            saved.previous_api_snapshot.is_none(),
+            "precondition: the cycle really did run the (None, Some) path"
+        );
+
+        for (label, delta, stale) in [
+            ("5h", saved.p5h_delta, 9.9_f64),
+            ("7d", saved.p7d_delta, 8.8),
+            ("weekly_scoped", saved.p7ds_delta, 7.7),
+        ] {
+            assert_ne!(
+                delta,
+                Some(stale),
+                "{} delta must not retain the value from before the gap",
+                label
+            );
+            assert_eq!(
+                delta, None,
+                "{} delta should be None with no baseline to subtract from, got {:?}",
+                label, delta
             );
         }
     }
