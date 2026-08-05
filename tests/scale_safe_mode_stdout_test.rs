@@ -286,3 +286,77 @@ fn manual_scale_target_does_not_influence_next_cycle_target() {
          not reassert as the notification claims"
     );
 }
+
+/// Build a safe-mode state carrying a *populated* binding-window forecast, with the worker's
+/// `target` manually scaled to `manual_target`.
+///
+/// The wide cone (`cone_ratio` = p75/p25 = 4.0) drives `compute_target_workers` down the
+/// conservative p75 branch, so the next cycle's target comes from `safe_worker_count_p75`.
+fn make_state_with_forecast(manual_target: u32) -> GovernorState {
+    let mut state = make_state(true);
+    for worker in state.workers.values_mut() {
+        worker.target = manual_target;
+    }
+
+    state.capacity_forecast.five_hour = state::WindowForecast {
+        target_ceiling: 85.0,
+        current_utilization: 60.0,
+        remaining_pct: 25.0,
+        hours_remaining: 3.0,
+        fleet_pct_per_hour: 6.0,
+        predicted_exhaustion_hours: 4.0,
+        binding: true,
+        safe_worker_count: Some(5),
+        safe_worker_count_p75: Some(FORECAST_DERIVED_TARGET),
+        exh_hrs_p25: 2.0,
+        exh_hrs_p50: 4.0,
+        exh_hrs_p75: 8.0,
+        cone_ratio: 4.0,
+        ..Default::default()
+    };
+    state.capacity_forecast.binding_window = "five_hour".to_string();
+
+    state
+}
+
+/// The target the forecast in `make_state_with_forecast` implies: its `safe_worker_count_p75`.
+///
+/// Deliberately distinct from both the manual scale targets used below and the workers'
+/// `current` (2), so an assertion on it cannot be satisfied by the manual target leaking
+/// through *or* by the "hold at current" fallback.
+const FORECAST_DERIVED_TARGET: u32 = 3;
+
+/// Stronger form of the test above: safe mode reasserts a *forecast-derived* target, and the
+/// manual scale is discarded no matter how large it was.
+///
+/// The preceding test builds its state from `make_state`, whose `capacity_forecast` is empty.
+/// With no forecast, `compute_target_workers` short-circuits to "hold at current" — so that
+/// test never exercises the forecast-driven branch that does the actual reasserting, and it
+/// only ever compares two runs against each other. Here the binding window is populated, so
+/// the recomputed target is pinned to a concrete third value that neither the manual target
+/// nor the hold-at-current fallback could produce.
+#[test]
+fn safe_mode_reasserts_forecast_derived_target_over_manual_scale() {
+    use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
+    use claude_governor::governor::compute_target_workers;
+
+    let composite_risk = CompositeRiskConfig::default();
+    let cone_scaling = ConeScalingConfig::default();
+
+    // Every manual override an operator could have applied — including the worker max —
+    // must be recomputed away to the same forecast-derived target.
+    for manual_target in [2, 4, 9, 10] {
+        let target = compute_target_workers(
+            &make_state_with_forecast(manual_target),
+            85.0,
+            &composite_risk,
+            &cone_scaling,
+        );
+
+        assert_eq!(
+            target, FORECAST_DERIVED_TARGET,
+            "after a manual scale to {manual_target}, the next cycle should reassert the \
+             forecast-derived target {FORECAST_DERIVED_TARGET}, but computed {target}"
+        );
+    }
+}
