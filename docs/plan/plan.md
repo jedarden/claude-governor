@@ -1226,7 +1226,7 @@ cgov doctor — 2026-03-18 14:30 ET
 ✓ Claude print installed   v2.1.78
 ✓ Subscription session     active (claude-code-glm47-charlie)
 ──────────────────────────────────────────
-19 passed · 2 warnings · 0 failed
+20 passed · 1 warning · 0 failed
 ```
 
 The `⚠ Promotion dates` line above is illustrative, from the historical March 2026 Off-Peak 2x promotion window. With the shipped empty `promotions.json` (`[]`) this check passes with `No promotions configured`.
