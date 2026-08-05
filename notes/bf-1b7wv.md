@@ -79,6 +79,26 @@ after each.
 In each case the newly added derived assertion fires before the literal one, so
 the failure message names the snapshot operands rather than a bare number.
 
+## Independent re-verification (2026-08-05, redispatch)
+
+The bead was redispatched after its work had already been committed and pushed as
+`c5150d7` — the commit landed but the bead was never closed. Rather than trust the
+commit message, the claims above were re-checked from scratch:
+
+- Both delta tests exist and execute (`test_second_cycle_repolls_and_computes_window_deltas`,
+  `test_cycle_computes_negative_deltas_when_windows_reset`).
+- The `.abs()` mutation was re-applied to `calculate_window_pct_delta`: the reset
+  test fails with `left: Some(75.0)` / `right: Some(-75.0)`, and the **derived**
+  assertion is the one that fires — confirming the negative test is not tautological
+  despite deriving its expectations (the trailing literal pins `-75.0`/`-75.0`/`-77.0`
+  hold the values down).
+- The 7d/7ds crosswire mutation was re-applied: the positive test fails with
+  `7d delta should be current (25) − previous (20)`, `left: Some(3.0)` / `right: Some(5.0)`.
+- `src/governor.rs` was restored after each mutation and confirmed byte-identical
+  to HEAD (`git diff` empty).
+
+No code changes were needed; the acceptance criteria were already met.
+
 ## Verification
 
 - `cargo test --lib` → 735 passed, 0 failed (734 before; +1 new test).
