@@ -30,6 +30,7 @@ use crate::config::{
 };
 use crate::db;
 use crate::poller::Poller;
+use crate::poller::UsagePoller;
 use crate::poller::UsageWindow;
 use crate::schedule::{self, Promotion};
 use crate::state;
@@ -4269,7 +4270,7 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
 ///
 /// This is the core loop body executed every `loop_interval` seconds.
 pub fn run_governor_cycle(
-    poller: &mut Poller,
+    poller: &mut impl UsagePoller,
     state_path: &Path,
     dry_run: bool,
     loop_interval: u64,
@@ -4300,7 +4301,7 @@ pub fn run_governor_cycle(
     state.previous_api_snapshot = state.current_api_snapshot.take();
 
     // 1a. Poll Anthropic API for live usage data
-    match poller.poll() {
+    match poller.poll_usage() {
         Ok(usage_data) => {
             // Extract weekly_scoped utilization from model-agnostic limits[] array
             // This ensures the rotated model's REAL pct feeds the EMA calculation
@@ -9690,6 +9691,14 @@ impl Default for MockPoller {
     }
 }
 
+/// Lets `MockPoller` stand in for the real `Poller` in `run_governor_cycle`.
+#[cfg(test)]
+impl UsagePoller for MockPoller {
+    fn poll_usage(&mut self) -> anyhow::Result<crate::poller::UsageData> {
+        self.poll()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock Poller Tests
 // ---------------------------------------------------------------------------
@@ -9932,6 +9941,36 @@ mod mock_poller_tests {
     // Governor cycle smoke tests
     // ---------------------------------------------------------------------------
 
+    /// Minimal `AlertConfig` for cycle tests.
+    ///
+    /// Alerts are disabled so a cycle never shells out to the configured alert
+    /// command (`bf create ...`) from a test process.
+    fn smoke_alert_config() -> crate::config::AlertConfig {
+        crate::config::AlertConfig {
+            enabled: false,
+            ..crate::config::AlertConfig::default()
+        }
+    }
+
+    /// Minimal `GovernorConfig` for cycle tests: empty pricing table, empty agents,
+    /// alerts disabled, everything else at its default.
+    fn smoke_governor_config() -> crate::config::GovernorConfig {
+        use std::collections::HashMap;
+
+        crate::config::GovernorConfig {
+            pricing: crate::config::PricingConfig {
+                models: HashMap::new(),
+            },
+            sprint: crate::config::SprintConfig::default(),
+            daemon: crate::config::DaemonConfig::default(),
+            alerts: smoke_alert_config(),
+            composite_risk: crate::config::CompositeRiskConfig::default(),
+            cone_scaling: crate::config::ConeScalingConfig::default(),
+            agents: HashMap::new(),
+            credentials_path: None,
+        }
+    }
+
     /// Basic smoke test for governor cycle - verifies the cycle runs without panicking.
     ///
     /// This test creates a minimal environment and calls run_governor_cycle with
@@ -9941,7 +9980,7 @@ mod mock_poller_tests {
     /// - The cycle handles minimal state gracefully
     ///
     /// The test uses:
-    /// - Real Poller with test credentials (gracefully handles missing credentials)
+    /// - `MockPoller` with a simple success response (no credentials, no network)
     /// - Temporary directory for state files
     /// - Minimal config fixtures
     #[test]
@@ -9949,87 +9988,54 @@ mod mock_poller_tests {
         use std::collections::HashMap;
         use tempfile::TempDir;
 
-        // 1. Create temporary directory for state files
+        // 1. Create temporary directory for state files (fresh state, no prior poll)
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let state_path = temp_dir.path().join("governor-state.json");
 
-        // 2. Create poller (will use default credentials path, or fail gracefully)
-        let poller_result = crate::poller::Poller::new();
+        // 2. Mock poller with a simple success response — keeps the cycle off the
+        //    real API so the test needs neither credentials nor network.
+        let mut poller = MockPoller::new();
 
-        // 3. Create minimal config objects with defaults
-        let alert_config = crate::config::AlertConfig::default();
+        // 3. Minimal config fixtures
+        let alert_config = smoke_alert_config();
         let composite_risk_config = crate::config::CompositeRiskConfig::default();
         let cone_scaling_config = crate::config::ConeScalingConfig::default();
+        let pricing_config = smoke_governor_config();
 
-        // Create minimal pricing config with required fields
-        let pricing_config = crate::config::GovernorConfig {
-            pricing: crate::config::PricingConfig {
-                models: HashMap::new(),
-            },
-            sprint: crate::config::SprintConfig::default(),
-            daemon: crate::config::DaemonConfig::default(),
-            alerts: crate::config::AlertConfig::default(),
-            composite_risk: crate::config::CompositeRiskConfig::default(),
-            cone_scaling: crate::config::ConeScalingConfig::default(),
-            agents: HashMap::new(),
-            credentials_path: None,
-        };
-
-        // 4. Create minimal agents HashMap (empty is OK for smoke test)
+        // 4. Empty agents map and promotions list (nothing to scale in a smoke test)
         let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
-
-        // 5. Create empty promotions list
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
-        // 6. Run the governor cycle with dry_run=true
-        //
-        // Note: Even if poller creation fails (no credentials), the test verifies
-        // that the governor cycle handles errors gracefully and returns Ok(())
-        let result = if let Ok(mut poller) = poller_result {
-            run_governor_cycle(
-                &mut poller,
-                &state_path,
-                true, // dry_run = true
-                60,   // loop_interval
-                2.0,  // hysteresis_band
-                3,    // max_up_per_cycle
-                2,    // max_down_per_cycle
-                90.0, // target_ceiling
-                &alert_config,
-                &agents,
-                0, // pre_scale_minutes (disabled)
-                &promotions,
-                &composite_risk_config,
-                &cone_scaling_config,
-                &pricing_config,
-            )
-        } else {
-            // Poller creation failed - verify that run_governor_cycle handles this gracefully
-            // by creating a default poller and testing the cycle
-            let mut poller = crate::poller::Poller::default();
-            run_governor_cycle(
-                &mut poller,
-                &state_path,
-                true, // dry_run = true
-                60,   // loop_interval
-                2.0,  // hysteresis_band
-                3,    // max_up_per_cycle
-                2,    // max_down_per_cycle
-                90.0, // target_ceiling
-                &alert_config,
-                &agents,
-                0, // pre_scale_minutes (disabled)
-                &promotions,
-                &composite_risk_config,
-                &cone_scaling_config,
-                &pricing_config,
-            )
-        };
+        // 5. Run the governor cycle with dry_run=true
+        let result = run_governor_cycle(
+            &mut poller,
+            &state_path,
+            true, // dry_run = true
+            60,   // loop_interval
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+            90.0, // target_ceiling
+            &alert_config,
+            &agents,
+            0, // pre_scale_minutes (disabled)
+            &promotions,
+            &composite_risk_config,
+            &cone_scaling_config,
+            &pricing_config,
+        );
 
-        // 7. Verify the cycle completed successfully
+        // 6. Verify the cycle completed successfully
         assert!(
             result.is_ok(),
-            "run_governor_cycle should return Ok(()) in dry_run mode"
+            "run_governor_cycle should return Ok(()) in dry_run mode, got: {:?}",
+            result.err()
+        );
+
+        // 7. Verify the cycle actually consumed the mock (not some other data source)
+        assert_eq!(
+            poller.poll_count, 1,
+            "cycle should poll the mock poller exactly once"
         );
 
         // 8. Verify state file was created (even if minimal)
@@ -10038,8 +10044,15 @@ mod mock_poller_tests {
             "State file should be created after cycle run"
         );
 
-        // 9. Verify no panic occurred (test reaching this point means no panic)
-        // This is the key "smoke test" - the cycle runs without crashing
+        // 9. Verify the mock's usage data landed in the persisted state
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(
+            saved.usage.five_hour_pct, 50.0,
+            "persisted state should carry the mock poller's 5h utilization"
+        );
+
+        // 10. Reaching this point means the cycle ran without panicking — the point
+        //     of the smoke test.
     }
 
     /// Test that run_governor_cycle handles None prev_snapshot without panicking.
@@ -10743,6 +10756,426 @@ mod mock_poller_tests {
                 i
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Governor cycle behavior tests
+    // -----------------------------------------------------------------------
+    //
+    // These drive the real `run_governor_cycle` against `MockPoller` and assert
+    // on what the cycle itself produced (the persisted state file), rather than
+    // re-implementing the cycle's steps in the test. Every assertion below is
+    // about a value the production code wrote.
+    //
+    // Two things a cycle does are NOT reachable in-process and so are not
+    // asserted here: the scaling *decision* reads live worker counts from tmux
+    // (`worker::count_workers`), which is always 0 in a test process, and the
+    // `EmergencyBrake` decision arm requires `current > 0`. The emergency brake
+    // is therefore pinned at the two points the cycle does reach: the forecast
+    // it persists, and the safe_mode clear/hold decision it makes against the
+    // 98% threshold.
+
+    /// Run one governor cycle in dry-run mode with the smoke fixtures.
+    ///
+    /// Keeps the 15-argument call in one place so each test below reads as
+    /// "arrange state → run cycle → assert on persisted state".
+    fn run_cycle(poller: &mut MockPoller, state_path: &std::path::Path) -> anyhow::Result<()> {
+        use std::collections::HashMap;
+
+        let alert_config = smoke_alert_config();
+        let composite_risk_config = crate::config::CompositeRiskConfig::default();
+        let cone_scaling_config = crate::config::ConeScalingConfig::default();
+        let pricing_config = smoke_governor_config();
+        let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
+        let promotions: Vec<crate::schedule::Promotion> = Vec::new();
+
+        run_governor_cycle(
+            poller,
+            state_path,
+            true, // dry_run — never touches tmux
+            60,   // loop_interval
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+            90.0, // target_ceiling
+            &alert_config,
+            &agents,
+            0, // pre_scale_minutes (disabled)
+            &promotions,
+            &composite_risk_config,
+            &cone_scaling_config,
+            &pricing_config,
+        )
+    }
+
+    /// The cycle polls exactly once and the polled numbers reach persisted state.
+    ///
+    /// Utilizations are deliberately unlike `MockPoller`'s defaults (50/60/55),
+    /// so the test fails if the cycle ever ignores the poll result and writes
+    /// defaults or zeros instead.
+    #[test]
+    fn test_cycle_polls_once_and_persists_polled_usage() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        // 5h=42.5, 7d=63.25, weekly_scoped=57.75
+        let mut poller = MockPoller::with_utilization(42.5, 63.25, 57.75);
+
+        run_cycle(&mut poller, &state_path).expect("cycle should return Ok in dry-run");
+
+        assert_eq!(
+            poller.poll_count, 1,
+            "cycle should call poll_usage() exactly once"
+        );
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(
+            saved.usage.five_hour_pct, 42.5,
+            "5h utilization from the poll should be persisted"
+        );
+        assert_eq!(
+            saved.usage.all_models_pct, 63.25,
+            "7d (all models) utilization from the poll should be persisted"
+        );
+        assert_eq!(
+            saved.usage.weekly_scoped_pct, 57.75,
+            "weekly_scoped utilization from the poll should be persisted"
+        );
+        assert!(
+            !saved.usage.stale,
+            "fresh poll data should not be marked stale"
+        );
+        assert!(
+            !saved.token_refresh_failing,
+            "a successful, non-stale poll should clear token_refresh_failing"
+        );
+
+        // The poll also becomes the current snapshot; nothing precedes it on cycle 1.
+        let current = saved
+            .current_api_snapshot
+            .expect("cycle should record the poll as current_api_snapshot");
+        assert_eq!(current.five_hour_pct, 42.5);
+        assert_eq!(current.seven_day_pct, 63.25);
+        assert_eq!(current.weekly_scoped_pct, 57.75);
+        assert!(
+            saved.previous_api_snapshot.is_none(),
+            "first cycle has no previous snapshot to shift into place"
+        );
+    }
+
+    /// A second cycle re-polls, shifts the snapshot, and computes window deltas.
+    #[test]
+    fn test_second_cycle_repolls_and_computes_window_deltas() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        let mut poller = MockPoller::with_utilization(10.0, 20.0, 30.0);
+        run_cycle(&mut poller, &state_path).expect("first cycle should succeed");
+
+        // Same poller instance across both cycles: the count must keep climbing.
+        poller.set_usage_data({
+            let mut data = MockPoller::with_utilization(14.0, 25.0, 33.0)
+                .usage_data
+                .expect("with_utilization always sets usage data");
+            data.stale = false;
+            data
+        });
+        run_cycle(&mut poller, &state_path).expect("second cycle should succeed");
+
+        assert_eq!(
+            poller.poll_count, 2,
+            "each cycle should poll once — two cycles, two polls"
+        );
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(
+            saved.usage.five_hour_pct, 14.0,
+            "state should carry the newest poll, not the first one"
+        );
+
+        let previous = saved
+            .previous_api_snapshot
+            .expect("second cycle should shift cycle 1's reading into previous_api_snapshot");
+        assert_eq!(previous.five_hour_pct, 10.0);
+        assert_eq!(previous.seven_day_pct, 20.0);
+        assert_eq!(previous.weekly_scoped_pct, 30.0);
+
+        let current = saved
+            .current_api_snapshot
+            .expect("second cycle should record its own reading as current");
+        assert_eq!(current.five_hour_pct, 14.0);
+
+        // Deltas are current − previous, computed by the cycle from the two snapshots.
+        assert_eq!(saved.p5h_delta, Some(4.0), "5h delta should be 14.0 - 10.0");
+        assert_eq!(saved.p7d_delta, Some(5.0), "7d delta should be 25.0 - 20.0");
+        assert_eq!(
+            saved.p7ds_delta,
+            Some(3.0),
+            "weekly_scoped delta should be 33.0 - 30.0"
+        );
+    }
+
+    /// The cycle writes both the state file and the previous-state rollover file,
+    /// stamping `updated_at` forward on every run.
+    #[test]
+    fn test_cycle_writes_state_to_disk_each_run() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+        assert!(
+            !state_path.exists(),
+            "precondition: no state file before the first cycle"
+        );
+
+        let before_first = Utc::now();
+        let mut poller = MockPoller::new();
+        run_cycle(&mut poller, &state_path).expect("first cycle should succeed");
+
+        assert!(
+            state_path.exists(),
+            "cycle should write the state file to disk"
+        );
+        let first = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            first.updated_at >= before_first,
+            "updated_at should be stamped with this cycle's timestamp"
+        );
+
+        run_cycle(&mut poller, &state_path).expect("second cycle should succeed");
+
+        let second = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            second.updated_at > first.updated_at,
+            "each cycle should advance updated_at (first {}, second {})",
+            first.updated_at,
+            second.updated_at,
+        );
+
+        // The rollover copy lets the next cycle diff against the prior write.
+        // `governor-state.json` -> `governor-state.prev.json` (see state::save_previous_state).
+        let prev_path = temp_dir.path().join("governor-state.prev.json");
+        assert!(
+            prev_path.exists(),
+            "cycle should also write the previous-state file at {}",
+            prev_path.display()
+        );
+    }
+
+    /// Seed a state file whose persisted forecast sits at `utilization` on every
+    /// window, with emergency-brake safe_mode already active.
+    ///
+    /// The cycle's safe_mode clear check (step 1b) runs against the forecast it
+    /// loaded from disk, which is what a real governor sees at the top of the
+    /// cycle following the brake.
+    fn seed_braked_state(state_path: &std::path::Path, utilization: f64) {
+        let mut state = state::GovernorState::new();
+        state.safe_mode.active = true;
+        state.safe_mode.trigger = Some("emergency_brake".to_string());
+        state.safe_mode.entered_at = Some(Utc::now());
+        state.capacity_forecast.five_hour.current_utilization = utilization;
+        state.capacity_forecast.seven_day.current_utilization = utilization;
+        state.capacity_forecast.weekly_scoped.current_utilization = utilization;
+        state::save_state(&state, state_path).expect("failed to seed state file");
+    }
+
+    /// At exactly 98% the brake holds: safe_mode stays active through the cycle.
+    ///
+    /// Paired with the 97.9% test below, this pins the threshold itself — a
+    /// change to `EMERGENCY_BRAKE_THRESHOLD` breaks exactly one of the two.
+    #[test]
+    fn test_cycle_holds_emergency_brake_safe_mode_at_98_percent() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+        seed_braked_state(&state_path, 98.0);
+
+        // Poll far below the threshold: only the braked forecast should matter here.
+        let mut poller = MockPoller::with_utilization(10.0, 10.0, 10.0);
+        run_cycle(&mut poller, &state_path).expect("cycle should succeed");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            saved.safe_mode.active,
+            "safe_mode should remain active while utilization is at the 98% threshold"
+        );
+        assert_eq!(
+            saved.safe_mode.trigger.as_deref(),
+            Some("emergency_brake"),
+            "the emergency_brake trigger should survive the cycle"
+        );
+    }
+
+    /// A hair below 98% the brake releases: the cycle clears safe_mode.
+    #[test]
+    fn test_cycle_clears_emergency_brake_safe_mode_below_98_percent() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+        seed_braked_state(&state_path, 97.9);
+
+        let mut poller = MockPoller::with_utilization(10.0, 10.0, 10.0);
+        run_cycle(&mut poller, &state_path).expect("cycle should succeed");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            !saved.safe_mode.active,
+            "safe_mode should clear once utilization falls below the 98% threshold"
+        );
+        assert_eq!(
+            saved.safe_mode.trigger, None,
+            "clearing safe_mode should drop the emergency_brake trigger"
+        );
+    }
+
+    /// A cycle polling 98%+ persists a forecast that drives the target to zero.
+    ///
+    /// `compute_target_workers` is the production function the cycle itself calls
+    /// for the target; here it is re-run against the forecast the cycle wrote, so
+    /// the assertion covers "poll → forecast → brake" end to end. The 50% control
+    /// case shows the zero is the brake, not an artifact of the empty test fleet.
+    #[test]
+    fn test_cycle_forecast_at_98_percent_forces_zero_target() {
+        use tempfile::TempDir;
+
+        let composite_risk_config = crate::config::CompositeRiskConfig::default();
+        let cone_scaling_config = crate::config::ConeScalingConfig::default();
+
+        // A worker entry is required for compute_target_workers to have min/max
+        // bounds to clamp into; the cycle keeps the entry and zeroes its `current`
+        // (no tmux sessions in a test process).
+        let seed_worker = |state_path: &std::path::Path| {
+            let mut state = state::GovernorState::new();
+            state.workers.insert(
+                "test-agent".to_string(),
+                state::WorkerState {
+                    current: 0,
+                    target: 0,
+                    min: 1,
+                    max: 10,
+                },
+            );
+            state::save_state(&state, state_path).expect("failed to seed state file");
+        };
+
+        // Braked case: 98.5% on the 5-hour window.
+        let braked_dir = TempDir::new().expect("Failed to create temp dir");
+        let braked_path = braked_dir.path().join("governor-state.json");
+        seed_worker(&braked_path);
+        let mut braked_poller = MockPoller::with_utilization(98.5, 60.0, 55.0);
+        run_cycle(&mut braked_poller, &braked_path).expect("cycle should succeed");
+
+        let braked = state::load_state(&braked_path).expect("state should load back");
+        assert!(
+            braked.capacity_forecast.five_hour.current_utilization >= EMERGENCY_BRAKE_THRESHOLD,
+            "the cycle should carry the polled 98.5% into the persisted 5h forecast, got {:.2}%",
+            braked.capacity_forecast.five_hour.current_utilization
+        );
+        assert_eq!(
+            compute_target_workers(&braked, 90.0, &composite_risk_config, &cone_scaling_config),
+            0,
+            "a window at or above 98% should brake the target to 0 workers"
+        );
+
+        // Control: same fleet, same fixtures, utilization well below the threshold.
+        let calm_dir = TempDir::new().expect("Failed to create temp dir");
+        let calm_path = calm_dir.path().join("governor-state.json");
+        seed_worker(&calm_path);
+        let mut calm_poller = MockPoller::with_utilization(50.0, 60.0, 55.0);
+        run_cycle(&mut calm_poller, &calm_path).expect("cycle should succeed");
+
+        let calm = state::load_state(&calm_path).expect("state should load back");
+        assert!(
+            calm.capacity_forecast.five_hour.current_utilization < EMERGENCY_BRAKE_THRESHOLD,
+            "control case should stay below the brake threshold, got {:.2}%",
+            calm.capacity_forecast.five_hour.current_utilization
+        );
+        assert!(
+            compute_target_workers(&calm, 90.0, &composite_risk_config, &cone_scaling_config) > 0,
+            "below the threshold the target should be non-zero — otherwise the braked \
+             assertion above proves nothing"
+        );
+    }
+
+    /// A failing poll is absorbed: the cycle still returns Ok, keeps the last good
+    /// usage numbers, and writes state.
+    #[test]
+    fn test_cycle_survives_poll_failure_and_keeps_previous_usage() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        // Cycle 1 succeeds and establishes known-good usage numbers.
+        let mut good_poller = MockPoller::with_utilization(42.0, 61.0, 58.0);
+        run_cycle(&mut good_poller, &state_path).expect("first cycle should succeed");
+        let before = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(before.usage.five_hour_pct, 42.0, "precondition");
+
+        // Cycle 2 polls into an error.
+        let mut failing_poller = MockPoller::with_error("Simulated API failure");
+        let result = run_cycle(&mut failing_poller, &state_path);
+
+        assert!(
+            result.is_ok(),
+            "a poll failure should not abort the cycle, got: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            failing_poller.poll_count, 1,
+            "the cycle should have attempted the poll"
+        );
+
+        let after = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(
+            after.usage.five_hour_pct, 42.0,
+            "failed poll should leave the last good 5h utilization in place"
+        );
+        assert_eq!(
+            after.usage.all_models_pct, 61.0,
+            "failed poll should leave the last good 7d utilization in place"
+        );
+        assert_eq!(
+            after.usage.weekly_scoped_pct, 58.0,
+            "failed poll should leave the last good weekly_scoped utilization in place"
+        );
+        assert!(
+            after.updated_at > before.updated_at,
+            "the cycle should still complete and write state after a poll failure"
+        );
+    }
+
+    /// Stale poll data is accepted but flagged, so downstream logic can tell that
+    /// the numbers came from a failing token refresh rather than a fresh read.
+    #[test]
+    fn test_cycle_flags_stale_poll_data() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+
+        let mut poller = MockPoller::with_stale_data();
+        run_cycle(&mut poller, &state_path).expect("cycle should succeed on stale data");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            saved.usage.stale,
+            "stale poll data should be flagged in state"
+        );
+        assert!(
+            saved.token_refresh_failing,
+            "stale data should set token_refresh_failing"
+        );
+        assert_eq!(
+            saved.usage.five_hour_pct, 50.0,
+            "stale data is still applied — stale numbers beat no numbers"
+        );
     }
 }
 

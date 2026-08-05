@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -121,6 +121,11 @@ pub struct ScaleDownResult {
 ///
 /// This provides a consistency check - if heartbeat and tmux counts differ,
 /// something may be wrong (stale heartbeats, orphaned sessions, etc.)
+///
+/// Orphaned heartbeats (stale, with no matching tmux session) are swept by
+/// [`read_heartbeats`] and excluded from `heartbeat_count`, so a count that went
+/// inconsistent because a worker died without cleanup returns to consistent once
+/// its heartbeat ages past [`STALE_HEARTBEAT_THRESHOLD`].
 pub fn count_workers(config: &WorkerConfig) -> WorkerCount {
     // Count heartbeat files, filtered to this agent's session prefix
     let heartbeat_count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
@@ -376,11 +381,51 @@ pub fn scale_down_graceful(n: u32, config: &WorkerConfig, dry_run: bool) -> Scal
 /// Find workers to stop, preferring idle workers.
 ///
 /// Returns up to `n` session names, sorted by idle status and heartbeat age.
+///
+/// Only workers whose tmux session is currently live are eligible: a heartbeat
+/// without a matching tmux session belongs to a worker that is already gone, and
+/// signalling it would send SIGINT/kill to a nonexistent session.
 fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
-    let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+    // One tmux snapshot for both the orphan sweep and the liveness filter, so
+    // selection can never disagree with what cleanup just saw.
+    let (_, tmux_sessions) = count_tmux_sessions(&config.session_prefix);
+    let live_sessions: HashSet<String> = tmux_sessions.into_iter().collect();
+
+    let heartbeats = read_heartbeats_with_sessions(
+        &config.heartbeat_dir,
+        &config.session_prefix,
+        &live_sessions,
+    );
+
+    select_workers_to_stop(n, heartbeats, &live_sessions)
+}
+
+/// Pick up to `n` shutdown candidates from `heartbeats`, restricted to `live_sessions`.
+///
+/// Split out from [`find_workers_to_stop`] so the selection rules can be tested
+/// against an explicit set of live tmux sessions.
+fn select_workers_to_stop(
+    n: usize,
+    heartbeats: HashMap<String, Heartbeat>,
+    live_sessions: &HashSet<String>,
+) -> Vec<String> {
+    // Drop candidates whose tmux session is gone — a stale heartbeat that outlived
+    // its session, or a fresh heartbeat from a worker that died seconds ago.
+    let mut workers: Vec<_> = heartbeats
+        .into_iter()
+        .filter(|(session, _)| {
+            let live = live_sessions.contains(session);
+            if !live {
+                log::debug!(
+                    "[worker] skipping {} as a shutdown candidate: no live tmux session",
+                    session
+                );
+            }
+            live
+        })
+        .collect();
 
     // Sort workers: idle first, then by heartbeat age (oldest first)
-    let mut workers: Vec<_> = heartbeats.into_iter().collect();
     workers.sort_by(|a, b| {
         // Prefer idle workers
         match (a.1.is_idle, b.1.is_idle) {
@@ -412,6 +457,20 @@ fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
 /// - If the tmux session exists, the heartbeat is retained but treated as executing
 ///   (never selected for shutdown based on an outdated idle status)
 fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbeat> {
+    let (_, tmux_sessions) = count_tmux_sessions(session_prefix);
+    let tmux_sessions_set: HashSet<String> = tmux_sessions.into_iter().collect();
+    read_heartbeats_with_sessions(dir, session_prefix, &tmux_sessions_set)
+}
+
+/// [`read_heartbeats`] against an already-taken snapshot of live tmux sessions.
+///
+/// Callers that also need the session list (to filter shutdown candidates, say)
+/// query tmux once and pass the result here.
+fn read_heartbeats_with_sessions(
+    dir: &Path,
+    session_prefix: &str,
+    tmux_sessions_set: &HashSet<String>,
+) -> HashMap<String, Heartbeat> {
     let mut heartbeats = HashMap::new();
     let now = Utc::now();
     let stale_threshold = ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD);
@@ -431,10 +490,6 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
             return heartbeats;
         }
     };
-
-    // Get the current tmux sessions for this prefix
-    let (_, tmux_sessions) = count_tmux_sessions(session_prefix);
-    let tmux_sessions_set: std::collections::HashSet<String> = tmux_sessions.into_iter().collect();
 
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -458,12 +513,21 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
 
                         if !session_exists {
                             // Session no longer exists, remove orphaned heartbeat file
-                            log::info!(
-                                "[worker] removing stale heartbeat for session {} (session not in tmux, age={}s)",
-                                hb.session,
-                                age.num_seconds()
-                            );
-                            let _ = fs::remove_file(&path);
+                            match fs::remove_file(&path) {
+                                Ok(()) => log::info!(
+                                    "[worker] removed orphaned heartbeat for session {} at {} (session not in tmux, age={}s)",
+                                    hb.session,
+                                    path.display(),
+                                    age.num_seconds()
+                                ),
+                                Err(e) => log::warn!(
+                                    "[worker] failed to remove orphaned heartbeat for session {} at {}: {}",
+                                    hb.session,
+                                    path.display(),
+                                    e
+                                ),
+                            }
+                            // Excluded from the returned map either way — the session is gone.
                             continue;
                         }
 
@@ -573,6 +637,61 @@ mod tests {
         }
     }
 
+    /// Build a live-session set from session names.
+    fn live(sessions: &[&str]) -> HashSet<String> {
+        sessions.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A real detached tmux session, killed when the guard drops.
+    ///
+    /// Tests that exercise the tmux liveness check end-to-end need an actual
+    /// session; `None` means tmux is unavailable and the caller should skip.
+    struct TmuxSession {
+        name: String,
+    }
+
+    impl TmuxSession {
+        fn new(name: &str) -> Option<Self> {
+            let started = Command::new("tmux")
+                .args(["new-session", "-d", "-s", name, "sleep", "60"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            started.then(|| Self {
+                name: name.to_string(),
+            })
+        }
+    }
+
+    impl Drop for TmuxSession {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.name])
+                .output();
+        }
+    }
+
+    /// Write a heartbeat `age_secs` old for `session`; returns its path.
+    fn write_heartbeat(
+        config: &WorkerConfig,
+        session: &str,
+        age_secs: i64,
+        is_idle: bool,
+    ) -> PathBuf {
+        fs::create_dir_all(&config.heartbeat_dir).unwrap();
+        let heartbeat = serde_json::json!({
+            "session": session,
+            "timestamp": (Utc::now() - ChronoDuration::seconds(age_secs)).to_rfc3339(),
+            "is_idle": is_idle,
+            "current_task": null,
+            "model": "sonnet",
+        });
+        let path = config.heartbeat_dir.join(format!("{session}.json"));
+        fs::write(&path, serde_json::to_string_pretty(&heartbeat).unwrap()).unwrap();
+        path
+    }
+
     #[test]
     fn count_heartbeat_files_empty_dir() {
         let temp = TempDir::new().unwrap();
@@ -659,7 +778,16 @@ mod tests {
             format!(r#"{{"session":"test-worker-idle","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
         ).unwrap();
 
-        let to_stop = find_workers_to_stop(1, &config);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            &live(&["test-worker-busy", "test-worker-idle"]),
+        );
+        let to_stop = select_workers_to_stop(
+            1,
+            heartbeats,
+            &live(&["test-worker-busy", "test-worker-idle"]),
+        );
 
         // Should prefer idle worker
         assert_eq!(to_stop, vec!["test-worker-idle"]);
@@ -686,7 +814,13 @@ mod tests {
             ).unwrap();
         }
 
-        let to_stop = find_workers_to_stop(2, &config);
+        let all_sessions: HashSet<String> = (0..5).map(|i| format!("test-worker-{}", i)).collect();
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            &all_sessions,
+        );
+        let to_stop = select_workers_to_stop(2, heartbeats, &all_sessions);
 
         assert_eq!(to_stop.len(), 2);
     }
@@ -715,17 +849,15 @@ mod tests {
     fn scale_down_graceful_dry_run() {
         let temp = TempDir::new().unwrap();
         let mut config = test_config(&temp);
-        config.heartbeat_dir = temp.path().join("heartbeats");
-        fs::create_dir_all(&config.heartbeat_dir).unwrap();
+        config.session_prefix = "cgov-dryrun-test".to_string();
 
-        // Create a fresh heartbeat file
-        let fresh_timestamp = (Utc::now() - ChronoDuration::seconds(30))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        fs::write(
-            config.heartbeat_dir.join("test-worker-1.json"),
-            format!(r#"{{"session":"test-worker-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
-        ).unwrap();
+        // A dry run still selects real candidates, so the worker needs a live session.
+        let session = "cgov-dryrun-test-1";
+        let Some(_tmux) = TmuxSession::new(session) else {
+            eprintln!("skipping scale_down_graceful_dry_run: tmux unavailable");
+            return;
+        };
+        write_heartbeat(&config, session, 30, true);
 
         let result = scale_down_graceful(1, &config, true);
 
@@ -733,6 +865,7 @@ mod tests {
         assert_eq!(result.signaled, 1);
         assert_eq!(result.graceful, 1);
         assert_eq!(result.force_killed, 0);
+        assert_eq!(result.sessions, vec![session]);
     }
 
     #[test]
@@ -1002,13 +1135,114 @@ mod tests {
         )
         .unwrap();
 
-        // find_workers_to_stop should only return the fresh worker
-        // (stale worker was removed by read_heartbeats)
-        let to_stop = find_workers_to_stop(10, &config);
+        // Selection should only return the fresh worker whose session is live
+        // (the stale worker's heartbeat was removed by read_heartbeats)
+        let live_sessions = live(&["test-worker-fresh-idle"]);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            &live_sessions,
+        );
+        let to_stop = select_workers_to_stop(10, heartbeats, &live_sessions);
 
         // Should only have the fresh idle worker, not the stale one
         assert_eq!(to_stop.len(), 1);
         assert_eq!(to_stop[0], "test-worker-fresh-idle");
+    }
+
+    /// Acceptance (a): orphaned heartbeats are excluded from the worker count, so a
+    /// count that went inconsistent when a worker died recovers to consistent.
+    #[test]
+    fn count_workers_recovers_consistency_after_orphan_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(&temp);
+        config.session_prefix = "cgov-count-recovery-test".to_string();
+
+        let live_session = "cgov-count-recovery-test-live";
+        let Some(_tmux) = TmuxSession::new(live_session) else {
+            eprintln!("skipping count_workers_recovers_consistency_after_orphan_cleanup: tmux unavailable");
+            return;
+        };
+
+        // One live worker, plus a fresh heartbeat left behind by a worker that just died.
+        write_heartbeat(&config, live_session, 5, false);
+        let orphan = "cgov-count-recovery-test-dead";
+        let orphan_path = write_heartbeat(&config, orphan, 5, true);
+
+        // While the orphan's heartbeat is still fresh it is counted, and the count
+        // disagrees with tmux — this is the inconsistency the sweep has to clear.
+        let before = count_workers(&config);
+        assert_eq!(before.heartbeat_count, 2);
+        assert_eq!(before.tmux_count, 1);
+        assert!(
+            !before.consistent,
+            "stale-but-fresh orphan should skew the count"
+        );
+        assert!(orphan_path.exists());
+
+        // Age the orphan past the staleness threshold; the next count sweeps it.
+        write_heartbeat(&config, orphan, STALE_HEARTBEAT_THRESHOLD + 10, true);
+
+        let after = count_workers(&config);
+        assert_eq!(after.heartbeat_count, 1, "orphan must not be counted");
+        assert_eq!(after.tmux_count, 1);
+        assert!(
+            after.consistent,
+            "consistency must recover after orphan cleanup"
+        );
+        assert!(
+            !orphan_path.exists(),
+            "orphaned heartbeat file should be removed"
+        );
+    }
+
+    /// Acceptance (b): a worker whose tmux session is gone is never a shutdown
+    /// candidate, even when its heartbeat is fresh, idle, and the oldest on disk.
+    #[test]
+    fn select_workers_to_stop_excludes_dead_sessions() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(&temp);
+
+        // Oldest heartbeat, idle — first in sort order, but its session is dead.
+        write_heartbeat(&config, "test-worker-dead", 50, true);
+        // Newer idle worker with a live session.
+        write_heartbeat(&config, "test-worker-live", 10, true);
+
+        let live_sessions = live(&["test-worker-live"]);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            &live_sessions,
+        );
+
+        // Both heartbeats survive the sweep (both are fresh), but only one is eligible.
+        assert_eq!(heartbeats.len(), 2, "fresh heartbeats are not removed");
+
+        let to_stop = select_workers_to_stop(2, heartbeats, &live_sessions);
+        assert_eq!(to_stop, vec!["test-worker-live"]);
+    }
+
+    /// End-to-end: `find_workers_to_stop` queries tmux itself and returns only sessions
+    /// that actually exist, so scale-down never signals a nonexistent session.
+    #[test]
+    fn find_workers_to_stop_returns_only_live_sessions() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(&temp);
+        config.session_prefix = "cgov-stopsel-test".to_string();
+
+        let live_session = "cgov-stopsel-test-live";
+        let Some(_tmux) = TmuxSession::new(live_session) else {
+            eprintln!("skipping find_workers_to_stop_returns_only_live_sessions: tmux unavailable");
+            return;
+        };
+
+        // Dead worker: idle and older, so it would sort first without the liveness filter.
+        write_heartbeat(&config, "cgov-stopsel-test-dead", 50, true);
+        write_heartbeat(&config, live_session, 10, true);
+
+        let to_stop = find_workers_to_stop(5, &config);
+
+        assert_eq!(to_stop, vec![live_session]);
     }
 
     #[test]
