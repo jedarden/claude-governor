@@ -30,6 +30,7 @@ use crate::config::{
 };
 use crate::db;
 use crate::poller::Poller;
+use crate::poller::UsagePoller;
 use crate::poller::UsageWindow;
 use crate::schedule::{self, Promotion};
 use crate::state;
@@ -4269,7 +4270,7 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
 ///
 /// This is the core loop body executed every `loop_interval` seconds.
 pub fn run_governor_cycle(
-    poller: &mut Poller,
+    poller: &mut impl UsagePoller,
     state_path: &Path,
     dry_run: bool,
     loop_interval: u64,
@@ -4300,7 +4301,7 @@ pub fn run_governor_cycle(
     state.previous_api_snapshot = state.current_api_snapshot.take();
 
     // 1a. Poll Anthropic API for live usage data
-    match poller.poll() {
+    match poller.poll_usage() {
         Ok(usage_data) => {
             // Extract weekly_scoped utilization from model-agnostic limits[] array
             // This ensures the rotated model's REAL pct feeds the EMA calculation
@@ -9690,6 +9691,14 @@ impl Default for MockPoller {
     }
 }
 
+/// Lets `MockPoller` stand in for the real `Poller` in `run_governor_cycle`.
+#[cfg(test)]
+impl UsagePoller for MockPoller {
+    fn poll_usage(&mut self) -> anyhow::Result<crate::poller::UsageData> {
+        self.poll()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock Poller Tests
 // ---------------------------------------------------------------------------
@@ -9932,6 +9941,36 @@ mod mock_poller_tests {
     // Governor cycle smoke tests
     // ---------------------------------------------------------------------------
 
+    /// Minimal `AlertConfig` for cycle tests.
+    ///
+    /// Alerts are disabled so a cycle never shells out to the configured alert
+    /// command (`bf create ...`) from a test process.
+    fn smoke_alert_config() -> crate::config::AlertConfig {
+        crate::config::AlertConfig {
+            enabled: false,
+            ..crate::config::AlertConfig::default()
+        }
+    }
+
+    /// Minimal `GovernorConfig` for cycle tests: empty pricing table, empty agents,
+    /// alerts disabled, everything else at its default.
+    fn smoke_governor_config() -> crate::config::GovernorConfig {
+        use std::collections::HashMap;
+
+        crate::config::GovernorConfig {
+            pricing: crate::config::PricingConfig {
+                models: HashMap::new(),
+            },
+            sprint: crate::config::SprintConfig::default(),
+            daemon: crate::config::DaemonConfig::default(),
+            alerts: smoke_alert_config(),
+            composite_risk: crate::config::CompositeRiskConfig::default(),
+            cone_scaling: crate::config::ConeScalingConfig::default(),
+            agents: HashMap::new(),
+            credentials_path: None,
+        }
+    }
+
     /// Basic smoke test for governor cycle - verifies the cycle runs without panicking.
     ///
     /// This test creates a minimal environment and calls run_governor_cycle with
@@ -9941,7 +9980,7 @@ mod mock_poller_tests {
     /// - The cycle handles minimal state gracefully
     ///
     /// The test uses:
-    /// - Real Poller with test credentials (gracefully handles missing credentials)
+    /// - `MockPoller` with a simple success response (no credentials, no network)
     /// - Temporary directory for state files
     /// - Minimal config fixtures
     #[test]
@@ -9949,87 +9988,54 @@ mod mock_poller_tests {
         use std::collections::HashMap;
         use tempfile::TempDir;
 
-        // 1. Create temporary directory for state files
+        // 1. Create temporary directory for state files (fresh state, no prior poll)
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let state_path = temp_dir.path().join("governor-state.json");
 
-        // 2. Create poller (will use default credentials path, or fail gracefully)
-        let poller_result = crate::poller::Poller::new();
+        // 2. Mock poller with a simple success response — keeps the cycle off the
+        //    real API so the test needs neither credentials nor network.
+        let mut poller = MockPoller::new();
 
-        // 3. Create minimal config objects with defaults
-        let alert_config = crate::config::AlertConfig::default();
+        // 3. Minimal config fixtures
+        let alert_config = smoke_alert_config();
         let composite_risk_config = crate::config::CompositeRiskConfig::default();
         let cone_scaling_config = crate::config::ConeScalingConfig::default();
+        let pricing_config = smoke_governor_config();
 
-        // Create minimal pricing config with required fields
-        let pricing_config = crate::config::GovernorConfig {
-            pricing: crate::config::PricingConfig {
-                models: HashMap::new(),
-            },
-            sprint: crate::config::SprintConfig::default(),
-            daemon: crate::config::DaemonConfig::default(),
-            alerts: crate::config::AlertConfig::default(),
-            composite_risk: crate::config::CompositeRiskConfig::default(),
-            cone_scaling: crate::config::ConeScalingConfig::default(),
-            agents: HashMap::new(),
-            credentials_path: None,
-        };
-
-        // 4. Create minimal agents HashMap (empty is OK for smoke test)
+        // 4. Empty agents map and promotions list (nothing to scale in a smoke test)
         let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
-
-        // 5. Create empty promotions list
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
-        // 6. Run the governor cycle with dry_run=true
-        //
-        // Note: Even if poller creation fails (no credentials), the test verifies
-        // that the governor cycle handles errors gracefully and returns Ok(())
-        let result = if let Ok(mut poller) = poller_result {
-            run_governor_cycle(
-                &mut poller,
-                &state_path,
-                true, // dry_run = true
-                60,   // loop_interval
-                2.0,  // hysteresis_band
-                3,    // max_up_per_cycle
-                2,    // max_down_per_cycle
-                90.0, // target_ceiling
-                &alert_config,
-                &agents,
-                0, // pre_scale_minutes (disabled)
-                &promotions,
-                &composite_risk_config,
-                &cone_scaling_config,
-                &pricing_config,
-            )
-        } else {
-            // Poller creation failed - verify that run_governor_cycle handles this gracefully
-            // by creating a default poller and testing the cycle
-            let mut poller = crate::poller::Poller::default();
-            run_governor_cycle(
-                &mut poller,
-                &state_path,
-                true, // dry_run = true
-                60,   // loop_interval
-                2.0,  // hysteresis_band
-                3,    // max_up_per_cycle
-                2,    // max_down_per_cycle
-                90.0, // target_ceiling
-                &alert_config,
-                &agents,
-                0, // pre_scale_minutes (disabled)
-                &promotions,
-                &composite_risk_config,
-                &cone_scaling_config,
-                &pricing_config,
-            )
-        };
+        // 5. Run the governor cycle with dry_run=true
+        let result = run_governor_cycle(
+            &mut poller,
+            &state_path,
+            true, // dry_run = true
+            60,   // loop_interval
+            2.0,  // hysteresis_band
+            3,    // max_up_per_cycle
+            2,    // max_down_per_cycle
+            90.0, // target_ceiling
+            &alert_config,
+            &agents,
+            0, // pre_scale_minutes (disabled)
+            &promotions,
+            &composite_risk_config,
+            &cone_scaling_config,
+            &pricing_config,
+        );
 
-        // 7. Verify the cycle completed successfully
+        // 6. Verify the cycle completed successfully
         assert!(
             result.is_ok(),
-            "run_governor_cycle should return Ok(()) in dry_run mode"
+            "run_governor_cycle should return Ok(()) in dry_run mode, got: {:?}",
+            result.err()
+        );
+
+        // 7. Verify the cycle actually consumed the mock (not some other data source)
+        assert_eq!(
+            poller.poll_count, 1,
+            "cycle should poll the mock poller exactly once"
         );
 
         // 8. Verify state file was created (even if minimal)
@@ -10038,8 +10044,15 @@ mod mock_poller_tests {
             "State file should be created after cycle run"
         );
 
-        // 9. Verify no panic occurred (test reaching this point means no panic)
-        // This is the key "smoke test" - the cycle runs without crashing
+        // 9. Verify the mock's usage data landed in the persisted state
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert_eq!(
+            saved.usage.five_hour_pct, 50.0,
+            "persisted state should carry the mock poller's 5h utilization"
+        );
+
+        // 10. Reaching this point means the cycle ran without panicking — the point
+        //     of the smoke test.
     }
 
     /// Test that run_governor_cycle handles None prev_snapshot without panicking.

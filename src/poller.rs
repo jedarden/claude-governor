@@ -702,6 +702,21 @@ impl Default for Poller {
     }
 }
 
+/// Source of usage data for a governor cycle.
+///
+/// The real [`Poller`] hits the Anthropic usage API; tests substitute a mock so a
+/// cycle can be exercised without credentials or network access.
+pub trait UsagePoller {
+    /// Fetch the current usage snapshot.
+    fn poll_usage(&mut self) -> Result<UsageData>;
+}
+
+impl UsagePoller for Poller {
+    fn poll_usage(&mut self) -> Result<UsageData> {
+        self.poll()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
