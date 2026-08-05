@@ -2538,6 +2538,10 @@ mod window_delta_tests {
     /// - Both snapshots are stored in the GovernorState in sequence
     /// - The snapshot shift behavior (current becomes previous) works correctly
     /// - Delta computation uses both snapshots correctly
+    /// - The delta fields are populated in the state: `p5h_delta`/`p7d_delta`/
+    ///   `p7ds_delta` and `last_fleet_aggregate.window_pct_deltas` are all Some
+    ///   and non-zero, and each carries the delta implied by the two snapshots
+    /// - Those fields survive serialization into the persisted state shape
     /// - Consecutive polling is demonstrated through state transitions
     #[test]
     fn test_consecutive_snapshots_governor_cycle() {
@@ -2673,6 +2677,14 @@ mod window_delta_tests {
         );
 
         // === Verify consecutive polling behavior: compute deltas ===
+        // Expected deltas, derived from the two snapshots' own fields rather than
+        // from anything the delta code produced. Every delta assertion below —
+        // state fields, fleet aggregate, serialized state — is anchored to these,
+        // so the test tracks the snapshot inputs and not its own output.
+        let expected_5h_delta = snapshot2.five_hour_pct - snapshot1.five_hour_pct;
+        let expected_7d_delta = snapshot2.seven_day_pct - snapshot1.seven_day_pct;
+        let expected_7ds_delta = snapshot2.weekly_scoped_pct - snapshot1.weekly_scoped_pct;
+
         // This simulates the delta computation that happens in run_governor_cycle
         if let (Some(prev), Some(curr)) =
             (&state.previous_api_snapshot, &state.current_api_snapshot)
@@ -2708,6 +2720,33 @@ mod window_delta_tests {
                 "After computing, 7ds delta should be Some"
             );
 
+            // Populated means more than Some(_): the first poll path writes
+            // Some(0.0) (see test_first_poll_governor_state_no_panic_default_deltas),
+            // so a delta that is still 0.0 here would mean the second snapshot
+            // never reached the delta computation. The three snapshot values all
+            // moved, so all three deltas must be non-zero.
+            assert_ne!(
+                state.p5h_delta.unwrap(),
+                0.0,
+                "5h delta should be non-zero after two snapshots ({} -> {})",
+                snapshot1.five_hour_pct,
+                snapshot2.five_hour_pct
+            );
+            assert_ne!(
+                state.p7d_delta.unwrap(),
+                0.0,
+                "7d delta should be non-zero after two snapshots ({} -> {})",
+                snapshot1.seven_day_pct,
+                snapshot2.seven_day_pct
+            );
+            assert_ne!(
+                state.p7ds_delta.unwrap(),
+                0.0,
+                "7ds delta should be non-zero after two snapshots ({} -> {})",
+                snapshot1.weekly_scoped_pct,
+                snapshot2.weekly_scoped_pct
+            );
+
             // === Delta value verification: manual calculation vs computed ===
             // Delta formula: delta = current_snapshot_pct - previous_snapshot_pct
             //
@@ -2719,12 +2758,7 @@ mod window_delta_tests {
             // now 12.5% in the current snapshot, the 5-hour delta is 12.5 - 10.0 = 2.5
             // percentage points.
 
-            // Calculate expected delta values manually from known snapshot inputs
-            let expected_5h_delta = snapshot2.five_hour_pct - snapshot1.five_hour_pct;
-            let expected_7d_delta = snapshot2.seven_day_pct - snapshot1.seven_day_pct;
-            let expected_7ds_delta = snapshot2.weekly_scoped_pct - snapshot1.weekly_scoped_pct;
-
-            // Document the expected calculations for clarity
+            // Document the expected calculations (hoisted above this block) for clarity
             assert!(
                 (expected_5h_delta - 2.5).abs() < f64::EPSILON,
                 "Expected 5h delta calculation: 12.5 - 10.0 = 2.5 percentage points"
@@ -2797,8 +2831,12 @@ mod window_delta_tests {
             "precondition: fresh last_fleet_aggregate should have a zero 7ds delta"
         );
 
-        // After computing deltas from consecutive snapshots, update last_fleet_aggregate
-        // This simulates what run_governor_cycle does when it stores fleet aggregate deltas
+        // After computing deltas from consecutive snapshots, update last_fleet_aggregate.
+        // Production reaches the same values by a longer route: run_governor_cycle
+        // annotates the interval's `f` row with the computed deltas
+        // (`db::annotate_window_pct_deltas`) and then reads that row back into
+        // last_fleet_aggregate.window_pct_deltas from `p5h`/`p7d`/`p7ds`. This
+        // assignment stands in for that round trip, which needs a database.
         state.last_fleet_aggregate.window_pct_deltas.five_hour = state.p5h_delta.unwrap();
         state.last_fleet_aggregate.window_pct_deltas.seven_day = state.p7d_delta.unwrap();
         state.last_fleet_aggregate.window_pct_deltas.weekly_scoped = state.p7ds_delta.unwrap();
@@ -2820,19 +2858,84 @@ mod window_delta_tests {
             state.last_fleet_aggregate.window_pct_deltas.weekly_scoped
         );
 
-        // Verify window_pct_deltas structure matches expected delta values
+        // Verify the whole window_pct_deltas structure matches the deltas implied by
+        // the two snapshots — field by field, so a mis-wired field (e.g. seven_day
+        // fed from the 7ds delta) fails here rather than passing on shape alone.
+        let aggregate_deltas = &state.last_fleet_aggregate.window_pct_deltas;
         assert!(
-            (state.last_fleet_aggregate.window_pct_deltas.five_hour - 2.5).abs() < f64::EPSILON,
-            "window_pct_deltas.five_hour should match computed delta (2.5)"
+            (aggregate_deltas.five_hour - expected_5h_delta).abs() < f64::EPSILON,
+            "window_pct_deltas.five_hour ({}) should match the 5h delta from the snapshots ({})",
+            aggregate_deltas.five_hour,
+            expected_5h_delta
         );
         assert!(
-            (state.last_fleet_aggregate.window_pct_deltas.seven_day - 2.0).abs() < f64::EPSILON,
-            "window_pct_deltas.seven_day should match computed delta (2.0)"
+            (aggregate_deltas.seven_day - expected_7d_delta).abs() < f64::EPSILON,
+            "window_pct_deltas.seven_day ({}) should match the 7d delta from the snapshots ({})",
+            aggregate_deltas.seven_day,
+            expected_7d_delta
         );
         assert!(
-            (state.last_fleet_aggregate.window_pct_deltas.weekly_scoped - 3.0).abs() < f64::EPSILON,
-            "window_pct_deltas.weekly_scoped should match computed delta (3.0)"
+            (aggregate_deltas.weekly_scoped - expected_7ds_delta).abs() < f64::EPSILON,
+            "window_pct_deltas.weekly_scoped ({}) should match the 7ds delta from the snapshots ({})",
+            aggregate_deltas.weekly_scoped,
+            expected_7ds_delta
         );
+
+        // === Verify the delta fields survive serialization ===
+        // The governor persists state to governor-state.json between cycles, so a
+        // delta that lives only in memory is not populated in any useful sense: the
+        // next cycle and `cgov status` both read it back from disk. Serializing here
+        // pins the field names and catches a rename or a `#[serde(skip)]` that would
+        // silently drop the deltas from the persisted state.
+        let serialized = serde_json::to_value(&state).expect("GovernorState should serialize");
+
+        for (field, expected) in [
+            ("p5h_delta", expected_5h_delta),
+            ("p7d_delta", expected_7d_delta),
+            ("p7ds_delta", expected_7ds_delta),
+        ] {
+            let value = serialized
+                .get(field)
+                .unwrap_or_else(|| panic!("serialized state should contain a {} field", field));
+            let value = value
+                .as_f64()
+                .unwrap_or_else(|| panic!("{} should serialize as a number, got {}", field, value));
+            assert!(
+                (value - expected).abs() < f64::EPSILON,
+                "serialized {} ({}) should carry the computed delta ({})",
+                field,
+                value,
+                expected
+            );
+        }
+
+        let serialized_aggregate = serialized
+            .get("last_fleet_aggregate")
+            .and_then(|v| v.get("window_pct_deltas"))
+            .expect("serialized state should contain last_fleet_aggregate.window_pct_deltas");
+
+        for (field, expected) in [
+            ("five_hour", expected_5h_delta),
+            ("seven_day", expected_7d_delta),
+            ("weekly_scoped", expected_7ds_delta),
+        ] {
+            let value = serialized_aggregate
+                .get(field)
+                .unwrap_or_else(|| panic!("window_pct_deltas should contain a {} field", field));
+            let value = value.as_f64().unwrap_or_else(|| {
+                panic!(
+                    "window_pct_deltas.{} should serialize as a number, got {}",
+                    field, value
+                )
+            });
+            assert!(
+                (value - expected).abs() < f64::EPSILON,
+                "serialized window_pct_deltas.{} ({}) should carry the computed delta ({})",
+                field,
+                value,
+                expected
+            );
+        }
 
         // === Verify consecutive polling through state transitions ===
         // The key demonstration of consecutive polling is:
