@@ -458,12 +458,21 @@ fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbea
 
                         if !session_exists {
                             // Session no longer exists, remove orphaned heartbeat file
-                            log::info!(
-                                "[worker] removing stale heartbeat for session {} (session not in tmux, age={}s)",
-                                hb.session,
-                                age.num_seconds()
-                            );
-                            let _ = fs::remove_file(&path);
+                            match fs::remove_file(&path) {
+                                Ok(()) => log::info!(
+                                    "[worker] removed orphaned heartbeat for session {} at {} (session not in tmux, age={}s)",
+                                    hb.session,
+                                    path.display(),
+                                    age.num_seconds()
+                                ),
+                                Err(e) => log::warn!(
+                                    "[worker] failed to remove orphaned heartbeat for session {} at {}: {}",
+                                    hb.session,
+                                    path.display(),
+                                    e
+                                ),
+                            }
+                            // Excluded from the returned map either way — the session is gone.
                             continue;
                         }
 
