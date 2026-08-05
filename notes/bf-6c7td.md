@@ -22,11 +22,14 @@ literals stripped so braces inside them do not skew the count):
 |------|--------------------------------|---------|
 | 2393 | 1 | `{` opens the Some-Some body |
 | 2404 | 1 | the call — still inside, block never closed in between |
-| 2516 | 0 | `} else {` closes the body |
+| 2516 | 1 | `} else {` — the `}` closes the body, the `{` opens the else-arm, so the running depth is net-neutral here |
+| 2518 | 0 | `}` ends the whole `if let … else` construct |
 
-Depth is `1` continuously from 2393 through 2404 and first returns to `0` at
-2516 (`} else {`), then the construct fully ends at 2518. So no intervening `}`
-closes the block before the call, and the call is not in the else-arm.
+Depth is `1` continuously from 2393 through 2404, so no intervening `}` closes
+the block before the call. The body's own closing brace is the `}` at the head
+of line 2516, giving `2393 < 2404 < 2516` — the call is inside the body and not
+in the else-arm. Because `} else {` is net-neutral, the raw depth counter does
+not return to `0` until 2518, where the full construct ends.
 
 The block header for reference:
 
