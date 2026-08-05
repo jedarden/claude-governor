@@ -9,7 +9,6 @@
 
 use chrono::Utc;
 use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
-use claude_governor::db;
 use claude_governor::governor::{
     apply_scaling, compute_target_workers, ScalingDecision, UsageSnapshot, WINDOW_FIVE_HOUR,
     WINDOW_SEVEN_DAY, WINDOW_WEEKLY_SCOPED,
@@ -314,39 +313,11 @@ fn test_second_poll_with_delta_computation() {
     });
 
     // Now both snapshots are Some - compute deltas
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (Some(prev), Some(curr)) => {
-            let prev_pct = crate::db::WindowPctSnapshot {
-                five_hour: prev.five_hour_pct,
-                seven_day: prev.seven_day_pct,
-                weekly_scoped: prev.weekly_scoped_pct,
-            };
-            let curr_pct = crate::db::WindowPctSnapshot {
-                five_hour: curr.five_hour_pct,
-                seven_day: curr.seven_day_pct,
-                weekly_scoped: curr.weekly_scoped_pct,
-            };
-            let (delta_5h, delta_7d, delta_7ds) =
-                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-            p5h_delta = Some(delta_5h);
-            p7d_delta = Some(delta_7d);
-            p7ds_delta = Some(delta_7ds);
-        }
-        (None, Some(_curr)) => {
-            // First poll: no previous snapshot available
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        (None, None) | (Some(_), None) => {
-            // Neither snapshot available OR only previous available: leave as None
-        }
-    }
+    let (p5h_delta, p7d_delta, p7ds_delta) =
+        claude_governor::governor::window_deltas_from_snapshots(
+            state.previous_api_snapshot.as_ref(),
+            state.current_api_snapshot.as_ref(),
+        );
 
     // Verify delta computation: should have computed actual deltas, not Some(0.0)
     assert_eq!(
@@ -396,40 +367,11 @@ fn test_poll_failure_current_snapshot_remains_none() {
     );
 
     // Now attempt delta computation with (Some(previous), None(current))
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (Some(prev), Some(curr)) => {
-            let prev_pct = crate::db::WindowPctSnapshot {
-                five_hour: prev.five_hour_pct,
-                seven_day: prev.seven_day_pct,
-                weekly_scoped: prev.weekly_scoped_pct,
-            };
-            let curr_pct = crate::db::WindowPctSnapshot {
-                five_hour: curr.five_hour_pct,
-                seven_day: curr.seven_day_pct,
-                weekly_scoped: curr.weekly_scoped_pct,
-            };
-            let (delta_5h, delta_7d, delta_7ds) =
-                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-            p5h_delta = Some(delta_5h);
-            p7d_delta = Some(delta_7d);
-            p7ds_delta = Some(delta_7ds);
-        }
-        (None, Some(_curr)) => {
-            // First poll: no previous snapshot available
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        (None, None) | (Some(_), None) => {
-            // Neither snapshot available OR only previous available: leave as None
-            // This is the poll failure case: (Some(previous), None(current))
-        }
-    }
+    let (p5h_delta, p7d_delta, p7ds_delta) =
+        claude_governor::governor::window_deltas_from_snapshots(
+            state.previous_api_snapshot.as_ref(),
+            state.current_api_snapshot.as_ref(),
+        );
 
     // Verify: deltas should remain None, not Some(0.0)
     assert_eq!(
@@ -453,9 +395,11 @@ fn test_first_poll_no_previous_snapshot() {
     // This is the initial bootstrap condition when the governor starts:
     // - previous_api_snapshot is None (no prior poll data)
     // - current_api_snapshot is Some (first successful poll just completed)
-    // - Expected: deltas should be Some(0.0) for all windows (not None)
+    // - Expected: deltas are None for all windows, not Some(0.0) — there is no
+    //   baseline, so no window has a measured change to report
     //
-    // This matches the (None, Some(_curr)) arm in run_governor_cycle (line 3128-3133)
+    // Calls window_deltas_from_snapshots, the same function run_governor_cycle
+    // assigns its delta fields from.
 
     let mut state = state::GovernorState::new();
 
@@ -479,57 +423,16 @@ fn test_first_poll_no_previous_snapshot() {
     );
 
     // Now compute deltas with (None, Some(current))
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (Some(prev), Some(curr)) => {
-            // Both snapshots available: compute actual deltas
-            let prev_pct = crate::db::WindowPctSnapshot {
-                five_hour: prev.five_hour_pct,
-                seven_day: prev.seven_day_pct,
-                weekly_scoped: prev.weekly_scoped_pct,
-            };
-            let curr_pct = crate::db::WindowPctSnapshot {
-                five_hour: curr.five_hour_pct,
-                seven_day: curr.seven_day_pct,
-                weekly_scoped: curr.weekly_scoped_pct,
-            };
-            let (delta_5h, delta_7d, delta_7ds) =
-                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-            p5h_delta = Some(delta_5h);
-            p7d_delta = Some(delta_7d);
-            p7ds_delta = Some(delta_7ds);
-        }
-        (None, Some(_curr)) => {
-            // First poll: no previous snapshot available
-            // This is the edge case we're testing
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        (None, None) | (Some(_), None) => {
-            // Neither snapshot available OR only previous available: leave as None
-        }
-    }
-
-    // Verify: on first poll, all deltas should be Some(0.0), not None
-    assert_eq!(
-        p5h_delta,
-        Some(0.0),
-        "5h delta should be Some(0.0) on first poll (no previous snapshot)"
+    let deltas = claude_governor::governor::window_deltas_from_snapshots(
+        state.previous_api_snapshot.as_ref(),
+        state.current_api_snapshot.as_ref(),
     );
+
+    // Verify: on first poll, every delta is None — no baseline, nothing measured
     assert_eq!(
-        p7d_delta,
-        Some(0.0),
-        "7d delta should be Some(0.0) on first poll (no previous snapshot)"
-    );
-    assert_eq!(
-        p7ds_delta,
-        Some(0.0),
-        "7ds delta should be Some(0.0) on first poll (no previous snapshot)"
+        deltas,
+        (None, None, None),
+        "deltas should be None on first poll (no previous snapshot), not Some(0.0)"
     );
 }
 
@@ -556,38 +459,17 @@ fn test_first_poll_with_realistic_values() {
     assert!(state.previous_api_snapshot.is_none());
     assert!(state.current_api_snapshot.is_some());
 
-    // Compute deltas using the same logic as run_governor_cycle
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (None, Some(_curr)) => {
-            // First poll: all deltas are 0.0
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        _ => {
-            // Other cases not applicable for first poll
-        }
-    }
-
-    // Verify: with realistic values, first poll still produces Some(0.0) for all deltas
-    assert_eq!(
-        p5h_delta,
-        Some(0.0),
-        "5h delta should be Some(0.0) on first poll with realistic values"
+    // Compute deltas using the same call run_governor_cycle makes
+    let deltas = claude_governor::governor::window_deltas_from_snapshots(
+        state.previous_api_snapshot.as_ref(),
+        state.current_api_snapshot.as_ref(),
     );
+
+    // Verify: realistic utilization values do not conjure a baseline either
     assert_eq!(
-        p7d_delta,
-        Some(0.0),
-        "7d delta should be Some(0.0) on first poll with realistic values"
-    );
-    assert_eq!(
-        p7ds_delta,
-        Some(0.0),
-        "7ds delta should be Some(0.0) on first poll with realistic values"
+        deltas,
+        (None, None, None),
+        "first poll with realistic values should still report no deltas"
     );
 }
 
@@ -643,37 +525,12 @@ fn test_identical_snapshots_produce_zero_deltas() {
     assert_ne!(prev.taken_at, curr.taken_at);
     assert!(curr.taken_at > prev.taken_at);
 
-    // Compute deltas using the same logic as run_governor_cycle
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (Some(prev), Some(curr)) => {
-            let prev_pct = crate::db::WindowPctSnapshot {
-                five_hour: prev.five_hour_pct,
-                seven_day: prev.seven_day_pct,
-                weekly_scoped: prev.weekly_scoped_pct,
-            };
-            let curr_pct = crate::db::WindowPctSnapshot {
-                five_hour: curr.five_hour_pct,
-                seven_day: curr.seven_day_pct,
-                weekly_scoped: curr.weekly_scoped_pct,
-            };
-            let (delta_5h, delta_7d, delta_7ds) =
-                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-            p5h_delta = Some(delta_5h);
-            p7d_delta = Some(delta_7d);
-            p7ds_delta = Some(delta_7ds);
-        }
-        (None, Some(_curr)) => {
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        (None, None) | (Some(_), None) => {}
-    }
+    // Compute deltas using the same call run_governor_cycle makes
+    let (p5h_delta, p7d_delta, p7ds_delta) =
+        claude_governor::governor::window_deltas_from_snapshots(
+            state.previous_api_snapshot.as_ref(),
+            state.current_api_snapshot.as_ref(),
+        );
 
     // Verify: with identical snapshot values, all deltas should be 0.0
     // Use f64::EPSILON for floating-point tolerance
@@ -751,36 +608,11 @@ fn test_identical_snapshots_with_realistic_fixture_values() {
     );
 
     // Compute deltas
-    let mut p5h_delta: Option<f64> = None;
-    let mut p7d_delta: Option<f64> = None;
-    let mut p7ds_delta: Option<f64> = None;
-
-    match (&state.previous_api_snapshot, &state.current_api_snapshot) {
-        (Some(prev), Some(curr)) => {
-            let prev_pct = crate::db::WindowPctSnapshot {
-                five_hour: prev.five_hour_pct,
-                seven_day: prev.seven_day_pct,
-                weekly_scoped: prev.weekly_scoped_pct,
-            };
-            let curr_pct = crate::db::WindowPctSnapshot {
-                five_hour: curr.five_hour_pct,
-                seven_day: curr.seven_day_pct,
-                weekly_scoped: curr.weekly_scoped_pct,
-            };
-            let (delta_5h, delta_7d, delta_7ds) =
-                claude_governor::governor::calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-            p5h_delta = Some(delta_5h);
-            p7d_delta = Some(delta_7d);
-            p7ds_delta = Some(delta_7ds);
-        }
-        (None, Some(_curr)) => {
-            p5h_delta = Some(0.0);
-            p7d_delta = Some(0.0);
-            p7ds_delta = Some(0.0);
-        }
-        (None, None) | (Some(_), None) => {}
-    }
+    let (p5h_delta, p7d_delta, p7ds_delta) =
+        claude_governor::governor::window_deltas_from_snapshots(
+            state.previous_api_snapshot.as_ref(),
+            state.current_api_snapshot.as_ref(),
+        );
 
     // Verify all deltas are exactly 0.0 with realistic values
     assert!(
