@@ -10199,13 +10199,161 @@ mod mock_poller_tests {
         //     of the smoke test.
     }
 
+    /// End-to-end check of the conditional delta computation in `run_governor_cycle`.
+    ///
+    /// Every other test of this logic either re-implements the `(Some, Some)` /
+    /// else split inline or drives the real `Poller` (which has no credentials
+    /// under test, so the cycle never reaches the delta block). This one runs
+    /// the production path with `MockPoller` and asserts what lands in the
+    /// persisted state across four cycles:
+    ///
+    /// 1. First poll — no previous snapshot, so all three delta fields stay `None`.
+    /// 2. Second poll — both snapshots present, so the deltas are the exact
+    ///    per-window differences between the two polls.
+    /// 3. Failed poll — the `Err` arm keeps the last-known usage data and never
+    ///    reaches the delta block, so cycle 2's deltas remain.
+    /// 4. Poll after the failure — the failed cycle left `current_api_snapshot`
+    ///    None, which the rotation shifts into `previous`, so the else branch
+    ///    clears the stale deltas back to `None`.
+    #[test]
+    fn test_delta_fields_across_governor_cycles() {
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state-deltas.json");
+
+        let alert_config = smoke_alert_config();
+        let composite_risk_config = crate::config::CompositeRiskConfig::default();
+        let cone_scaling_config = crate::config::ConeScalingConfig::default();
+        let pricing_config = smoke_governor_config();
+        let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
+        let promotions: Vec<crate::schedule::Promotion> = Vec::new();
+
+        // Runs one cycle in dry-run mode and hands back the persisted state.
+        let run_cycle = |poller: &mut MockPoller| -> state::GovernorState {
+            run_governor_cycle(
+                poller,
+                &state_path,
+                true, // dry_run — no agent scaling side effects
+                60,   // loop_interval
+                2.0,  // hysteresis_band
+                3,    // max_up_per_cycle
+                2,    // max_down_per_cycle
+                90.0, // target_ceiling
+                &alert_config,
+                &agents,
+                0, // pre_scale_minutes (disabled)
+                &promotions,
+                &composite_risk_config,
+                &cone_scaling_config,
+                &pricing_config,
+            )
+            .expect("governor cycle should succeed in dry_run mode");
+            state::load_state(&state_path).expect("state should load back")
+        };
+
+        // --- Cycle 1: first poll, no baseline to subtract from -------------
+        let mut poller1 = MockPoller::with_utilization(10.0, 40.0, 30.0);
+        let after_first = run_cycle(&mut poller1);
+
+        assert!(
+            after_first.previous_api_snapshot.is_none(),
+            "first poll: previous_api_snapshot should still be None"
+        );
+        assert!(
+            after_first.current_api_snapshot.is_some(),
+            "first poll: current_api_snapshot should hold the poll just taken"
+        );
+        assert_eq!(
+            (
+                after_first.p5h_delta,
+                after_first.p7d_delta,
+                after_first.p7ds_delta
+            ),
+            (None, None, None),
+            "first poll: no baseline, so deltas stay None (not Some(0.0))"
+        );
+
+        // --- Cycle 2: both snapshots present, deltas computed --------------
+        let mut poller2 = MockPoller::with_utilization(15.0, 42.0, 33.5);
+        let after_second = run_cycle(&mut poller2);
+
+        let prev = after_second
+            .previous_api_snapshot
+            .as_ref()
+            .expect("second poll: cycle 1's reading should have rotated into previous");
+        assert_eq!(prev.five_hour_pct, 10.0, "previous snapshot = cycle 1's 5h");
+        assert_eq!(prev.seven_day_pct, 40.0, "previous snapshot = cycle 1's 7d");
+        assert_eq!(
+            prev.weekly_scoped_pct, 30.0,
+            "previous snapshot = cycle 1's 7ds"
+        );
+
+        let d5h = after_second.p5h_delta.expect("second poll: 5h delta computed");
+        let d7d = after_second.p7d_delta.expect("second poll: 7d delta computed");
+        let d7ds = after_second
+            .p7ds_delta
+            .expect("second poll: 7ds delta computed");
+        assert!(
+            (d5h - 5.0).abs() < f64::EPSILON,
+            "5h delta should be 15.0 - 10.0 = 5.0, got {d5h}"
+        );
+        assert!(
+            (d7d - 2.0).abs() < f64::EPSILON,
+            "7d delta should be 42.0 - 40.0 = 2.0, got {d7d}"
+        );
+        assert!(
+            (d7ds - 3.5).abs() < f64::EPSILON,
+            "7ds delta should be 33.5 - 30.0 = 3.5, got {d7ds}"
+        );
+
+        // --- Cycle 3: poll fails, delta block is never reached --------------
+        let mut failing = MockPoller::with_error("simulated API failure");
+        let after_failure = run_cycle(&mut failing);
+
+        assert!(
+            after_failure.current_api_snapshot.is_none(),
+            "failed poll: current_api_snapshot should be empty (rotated out, nothing to replace it)"
+        );
+        assert_eq!(
+            (
+                after_failure.p5h_delta,
+                after_failure.p7d_delta,
+                after_failure.p7ds_delta
+            ),
+            (Some(d5h), Some(d7d), Some(d7ds)),
+            "failed poll: the Err arm keeps the last-known usage data untouched"
+        );
+
+        // --- Cycle 4: poll after the failure, deltas cleared again ----------
+        let mut poller4 = MockPoller::with_utilization(21.0, 45.0, 38.0);
+        let after_recovery = run_cycle(&mut poller4);
+
+        assert!(
+            after_recovery.previous_api_snapshot.is_none(),
+            "poll after a failure: the empty current rotates into previous"
+        );
+        assert_eq!(
+            (
+                after_recovery.p5h_delta,
+                after_recovery.p7d_delta,
+                after_recovery.p7ds_delta
+            ),
+            (None, None, None),
+            "poll after a failure: stale deltas from cycle 2 must be cleared, \
+             not carried into an interval they do not describe"
+        );
+    }
+
     /// Test that run_governor_cycle handles None prev_snapshot without panicking.
     ///
     /// This test verifies the first-poll scenario where previous_api_snapshot is None:
     /// - Fresh state with no prior poll data (previous_api_snapshot = None)
     /// - run_governor_cycle should complete without panic
     /// - Initial state should be handled gracefully
-    /// - Deltas should be Some(0.0) for all windows (as per line 3128-3133 in run_governor_cycle)
+    /// - Deltas stay None for all windows (no baseline ≠ no change) — asserted
+    ///   end-to-end in `test_delta_fields_across_governor_cycles`
     #[test]
     fn test_first_poll_none_prev_snapshot_no_panic() {
         use std::collections::HashMap;
@@ -10331,7 +10479,7 @@ mod mock_poller_tests {
     /// Test that run_governor_cycle handles first and second polls correctly.
     ///
     /// This test verifies the complete first-poll → second-poll transition:
-    /// - First poll: prev_snapshot is None, delta computation is skipped (Some(0.0))
+    /// - First poll: prev_snapshot is None, delta computation is skipped (deltas None)
     /// - Second poll: both snapshots exist, delta computation executes
     /// - No panics occur in either scenario
     ///
