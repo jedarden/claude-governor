@@ -1,0 +1,164 @@
+# Pluck Debug Output - Complete Analysis
+
+**Date:** 2026-08-04
+**Task:** Run Pluck with debug output to capture search process and identify filtering failures
+**Workspace:** /home/coding/claude-governor
+
+## Executive Summary
+
+Pluck (NEEDLE's work-selection strand) is failing to correctly filter out beads with the `deferred` label. The bug is in the bead store query mechanism used by both `bf ready` and NEEDLE's Pluck strand.
+
+## Commands Used
+
+### 1. Basic Pluck Query (bf ready)
+```bash
+bf ready --limit 0
+```
+
+### 2. JSON Output for Analysis
+```bash
+bf ready --limit 0 --format json
+```
+
+### 3. Direct Database Query
+```bash
+sqlite3 .beads/beads.db "SELECT id, title FROM issues WHERE status = 'open' LIMIT 10;"
+```
+
+### 4. Label Check
+```bash
+sqlite3 .beads/beads.db "SELECT label FROM labels WHERE issue_id = 'bf-156nn7';"
+```
+
+## Key Findings
+
+### Database Statistics
+
+| Metric | Count |
+|--------|-------|
+| Total open issues | 41 |
+| Open with deferred label | 5 |
+| Open with human label | 0 |
+| Open with blocked label | 0 |
+| In blocked_cache | 35 |
+| Expected ready beads (SQL) | 5 |
+| Actual beads returned by bf ready | 6 |
+
+### The Bug: bf-156nn7 Incorrectly Included
+
+**Expected ready beads (from correct SQL query):**
+- bf-3uj0g1 (priority 3)
+- bf-2mwvej (priority 2)
+- bf-30v7ac (priority 2)
+- bf-5obd11 (priority 2)
+- bf-uc3582 (priority 2)
+
+**Actually returned by bf ready:**
+- bf-5obd11 (priority 2, impact=1, float=500)
+- bf-30v7ac (priority 2, impact=1, float=333.33)
+- bf-uc3582 (priority 2, impact=1, float=111.11)
+- **bf-156nn7 (priority 1, impact=0, float=1000)** ← INCORRECTLY INCLUDED
+- bf-2mwvej (priority 2, impact=0, float=1000)
+- bf-3uj0g1 (priority 3, impact=0, float=1000)
+
+### Verification of bf-156nn7 Labels
+
+```bash
+$ sqlite3 .beads/beads.db "SELECT label FROM labels WHERE issue_id = 'bf-156nn7';"
+deferred
+failure-count:1
+plan-gap
+```
+
+**bf-156nn7 HAS the 'deferred' label but is still being returned by `bf ready`**
+
+This is a direct violation of Pluck's filtering contract, which should exclude all beads with the 'deferred' label.
+
+## Correct SQL Query for Ready Beads
+
+```sql
+SELECT id, title, priority
+FROM issues
+WHERE status = 'open'
+  AND ephemeral = 0
+  AND pinned = 0
+  AND is_template = 0
+  AND id NOT IN (
+    SELECT issue_id FROM labels
+    WHERE label IN ('deferred', 'human', 'blocked')
+  )
+  AND id NOT IN (
+    SELECT issue_id FROM blocked_issues_cache
+  )
+ORDER BY priority DESC, id;
+```
+
+## Pluck Configuration (From NEEDLE)
+
+**Source:** `/home/coding/NEEDLE/src/strand/pluck.rs:13`
+
+```rust
+const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
+```
+
+**Expected Behavior:**
+- Pluck should exclude all beads with 'deferred', 'human', or 'blocked' labels
+- Filtering is applied twice: once via bead store query, once defensively in the strand
+- Custom exclude_labels override defaults completely (not merged)
+
+## Root Cause Analysis
+
+The bug appears to be in the bead store query mechanism within bead-forge (the `bf` CLI). When `bf ready` queries the database, it's not properly filtering out beads with the 'deferred' label.
+
+This affects:
+1. Interactive `bf ready` commands
+2. NEEDLE's Pluck strand (which uses the same bead store interface)
+3. Any automated workers that rely on accurate bead filtering
+
+## Output Files Generated
+
+1. `/tmp/pluck-ready-output.json` - JSON output from bf ready
+2. `/tmp/pluck-ready-debug.log` - Attempted RUST_LOG debug output (no additional verbosity available)
+3. `/tmp/pluck-ready-trace.log` - Attempted RUST_LOG trace output (no additional verbosity available)
+
+## Next Steps for Investigation
+
+1. **Examine bead-forge source code** to find the query logic for `bf ready`
+2. **Check if the label filter is being applied correctly** in the SQL construction
+3. **Verify the defensive filter in Pluck strand** is actually being called
+4. **Test with different label combinations** to see if this is a broader filtering issue
+
+## Related Beads
+
+- bf-2qh8h (this bead): Run Pluck with debug output
+- bf-156nn7: The bead incorrectly included (has 'deferred' label)
+- bf-2mwvej: OPS-GATED bead about Pluck investigation issues
+- bf-4c4ip: Previous attempt to run Pluck with verbose debug output
+- bf-28oar: Verify and log Pluck query construction with exact filters
+
+## Environment Details
+
+- **Workspace:** /home/coding/claude-governor
+- **Bead store:** /home/coding/claude-governor/.beads/
+- **Database:** /home/coding/claude-governor/.beads/beads.db
+- **NEEDLE source:** /home/coding/NEEDLE/src/strand/pluck.rs
+- **NEEDLE config:** ~/.config/needle/config.yaml
+- **bf version:** bead-forge (br-compatible CLI)
+
+## Verification Commands
+
+Run these commands to reproduce the issue:
+
+```bash
+# Show expected ready beads
+sqlite3 .beads/beads.db "SELECT id FROM issues WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND is_template = 0 AND id NOT IN (SELECT issue_id FROM labels WHERE label IN ('deferred', 'human', 'blocked')) AND id NOT IN (SELECT issue_id FROM blocked_issues_cache);"
+
+# Show actual ready beads (buggy)
+bf ready --limit 0 --format json | jq -r '.[].id'
+
+# Verify bf-156nn7 has deferred label
+sqlite3 .beads/beads.db "SELECT label FROM labels WHERE issue_id = 'bf-156nn7';"
+```
+
+Expected: Both queries should return the same IDs (excluding bf-156nn7).
+Actual: Second query includes bf-156nn7 despite it having the 'deferred' label.
