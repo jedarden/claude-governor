@@ -10980,6 +10980,59 @@ mod mock_poller_tests {
         );
     }
 
+    /// The first cycle has nothing to subtract from, so it must not invent a delta.
+    ///
+    /// `run_governor_cycle` guards the delta computation behind a
+    /// `(Some(prev), Some(curr))` match. The failure this pins is the guard being
+    /// dropped or weakened to `unwrap_or_default()` on the previous snapshot: the
+    /// cycle would then subtract against an implicit 0.0 baseline and persist the
+    /// full current reading (42.5 / 63.25 / 57.75) as if the fleet had burned that
+    /// much in one interval — a fabricated spike straight into the burn-rate inputs.
+    ///
+    /// The assertion is deliberately "absent or zero" rather than "is_none": either
+    /// answer is a graceful first poll, and pinning the exact representation here
+    /// would collide with bf-9mtsa, which explicitly initializes these fields.
+    #[test]
+    fn test_first_cycle_does_not_fabricate_deltas_without_a_previous_snapshot() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let state_path = temp_dir.path().join("governor-state.json");
+        assert!(
+            !state_path.exists(),
+            "precondition: no persisted state, so the cycle starts with no previous snapshot"
+        );
+
+        let mut poller = MockPoller::with_utilization(42.5, 63.25, 57.75);
+        run_cycle(&mut poller, &state_path).expect("first cycle should succeed, not panic");
+
+        let saved = state::load_state(&state_path).expect("state should load back");
+        assert!(
+            saved.previous_api_snapshot.is_none(),
+            "precondition: the first cycle really did run the (None, Some) path"
+        );
+
+        for (label, delta, current_reading) in [
+            ("5h", saved.p5h_delta, 42.5_f64),
+            ("7d", saved.p7d_delta, 63.25),
+            ("weekly_scoped", saved.p7ds_delta, 57.75),
+        ] {
+            assert_eq!(
+                delta.unwrap_or(0.0),
+                0.0,
+                "{} delta should be absent or zero on the first poll, got {:?}",
+                label,
+                delta
+            );
+            assert_ne!(
+                delta,
+                Some(current_reading),
+                "{} delta must not be the current reading — that is a subtraction against a missing baseline",
+                label
+            );
+        }
+    }
+
     /// A second cycle re-polls, shifts the snapshot, and computes window deltas.
     #[test]
     fn test_second_cycle_repolls_and_computes_window_deltas() {
