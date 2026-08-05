@@ -2515,14 +2515,23 @@ mod window_delta_tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Consecutive snapshots test - full governor cycle simulation
+    // Consecutive snapshots test - state-level poll bookkeeping
     // ---------------------------------------------------------------------------
 
     /// Test that two consecutive snapshots simulate consecutive polling behavior.
     ///
     /// This test creates two distinct snapshots with different known values and
-    /// simulates running the governor cycle twice, storing both snapshots to demonstrate
-    /// consecutive polling behavior.
+    /// walks `GovernorState` through the snapshot bookkeeping two polls apart,
+    /// demonstrating consecutive polling behavior.
+    ///
+    /// Scope: this is the state + delta half of a cycle, not `run_governor_cycle`
+    /// itself — no poller, database, or state file is involved. The shift here
+    /// mirrors the production ordering, which shifts `current -> previous` at the
+    /// top of the cycle (`run_governor_cycle`, "shift snapshots" step) and only
+    /// writes a new `current` once the poll succeeds, so a failed poll leaves the
+    /// prior reading in `previous_api_snapshot`. For the end-to-end version that
+    /// really runs two cycles against a poller, see
+    /// `mock_poller_tests::test_second_cycle_repolls_and_computes_window_deltas`.
     ///
     /// The test verifies:
     /// - Two distinct snapshots are created with different utilization values
@@ -2771,18 +2780,21 @@ mod window_delta_tests {
         // the governor state also stores deltas in the last_fleet_aggregate.window_pct_deltas
         // structure. This is critical for fleet-level delta tracking and reporting.
 
-        // Verify last_fleet_aggregate exists and has window_pct_deltas field
-        assert!(
-            state.last_fleet_aggregate.window_pct_deltas.five_hour >= 0.0,
-            "last_fleet_aggregate.window_pct_deltas.five_hour field should exist and be valid"
+        // Precondition: a fresh aggregate carries exactly zero deltas, so the
+        // non-zero assertions below can only pass because the two snapshots were
+        // actually differenced. (Deltas are signed — a window reset makes them
+        // negative — so the precondition is `== 0.0`, not `>= 0.0`.)
+        assert_eq!(
+            state.last_fleet_aggregate.window_pct_deltas.five_hour, 0.0,
+            "precondition: fresh last_fleet_aggregate should have a zero 5h delta"
         );
-        assert!(
-            state.last_fleet_aggregate.window_pct_deltas.seven_day >= 0.0,
-            "last_fleet_aggregate.window_pct_deltas.seven_day field should exist and be valid"
+        assert_eq!(
+            state.last_fleet_aggregate.window_pct_deltas.seven_day, 0.0,
+            "precondition: fresh last_fleet_aggregate should have a zero 7d delta"
         );
-        assert!(
-            state.last_fleet_aggregate.window_pct_deltas.weekly_scoped >= 0.0,
-            "last_fleet_aggregate.window_pct_deltas.weekly_scoped field should exist and be valid"
+        assert_eq!(
+            state.last_fleet_aggregate.window_pct_deltas.weekly_scoped, 0.0,
+            "precondition: fresh last_fleet_aggregate should have a zero 7ds delta"
         );
 
         // After computing deltas from consecutive snapshots, update last_fleet_aggregate
