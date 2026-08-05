@@ -2285,13 +2285,13 @@ mod window_delta_tests {
             weekly_scoped_pct: 35.0,
         });
 
-        let mut delta_computation_attempted = false;
-
-        // Track whether delta computation was attempted
-        match (&previous_api_snapshot, &current_api_snapshot) {
+        // Track whether delta computation was attempted. The flag is the match's
+        // value rather than a pre-seeded `mut` binding, so every arm has to state
+        // its answer — an arm that forgets to set it fails to compile instead of
+        // silently inheriting `false` and passing the assertion below for free.
+        let delta_computation_attempted = match (&previous_api_snapshot, &current_api_snapshot) {
             (Some(prev), Some(curr)) => {
                 // This branch should NOT be reached on first poll
-                delta_computation_attempted = true;
                 let _prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
@@ -2303,15 +2303,12 @@ mod window_delta_tests {
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&_prev_pct, &_curr_pct);
+                true
             }
-            (None, Some(_curr)) => {
-                // First poll: delta computation skipped
-                delta_computation_attempted = false;
-            }
-            (None, None) | (Some(_), None) => {
-                delta_computation_attempted = false;
-            }
-        }
+            // First poll: delta computation skipped
+            (None, Some(_curr)) => false,
+            (None, None) | (Some(_), None) => false,
+        };
 
         // Verify: delta computation was NOT attempted
         assert!(
@@ -3045,12 +3042,13 @@ mod window_delta_tests {
         // === Step 3: Verify no panic occurs during delta computation ===
         // Simulate the delta computation logic from run_governor_cycle
         // This matches the pattern at lines 2012-2057 in run_governor_cycle
-        let mut delta_computation_called = false;
-
-        match (&state.previous_api_snapshot, &state.current_api_snapshot) {
+        // The flag is the match's value, not a pre-seeded `mut` binding: every arm
+        // must state whether it computed a delta, so a new arm cannot inherit
+        // `false` and pass the assertion below without saying anything.
+        let snapshots = (&state.previous_api_snapshot, &state.current_api_snapshot);
+        let delta_computation_called = match snapshots {
             (Some(prev), Some(curr)) => {
                 // This branch computes deltas - should NOT execute on first poll
-                delta_computation_called = true;
                 let _prev_pct = crate::db::WindowPctSnapshot {
                     five_hour: prev.five_hour_pct,
                     seven_day: prev.seven_day_pct,
@@ -3062,24 +3060,23 @@ mod window_delta_tests {
                     weekly_scoped: curr.weekly_scoped_pct,
                 };
                 let _deltas = calculate_window_pct_delta(&_prev_pct, &_curr_pct);
+                true
             }
             (None, Some(_curr)) => {
                 // === Step 4: Verify delta computation is skipped ===
                 // First poll: no previous snapshot available
                 // This branch should be reached, confirming delta computation is skipped
-                delta_computation_called = false;
 
                 // Set default values (Some(0.0)) as run_governor_cycle does
                 state.p5h_delta = Some(0.0);
                 state.p7d_delta = Some(0.0);
                 state.p7ds_delta = Some(0.0);
+                false
             }
-            (None, None) | (Some(_), None) => {
-                // These cases represent error states or uninitialized state
-                // Should not occur on a successful first poll
-                delta_computation_called = false;
-            }
-        }
+            // These cases represent error states or uninitialized state
+            // Should not occur on a successful first poll
+            (None, None) | (Some(_), None) => false,
+        };
 
         // === Step 5: Verify default values are used ===
         // Test is still running = no panic occurred
@@ -3550,7 +3547,6 @@ mod window_delta_tests {
     #[test]
     fn test_fixture_snapshots_produce_correct_time_progression() {
         use crate::snapshot_fixtures::{baseline_snapshot, snapshot_after_5h, snapshot_after_7d};
-        use chrono::Duration;
 
         let baseline = baseline_snapshot();
         let after_5h = snapshot_after_5h();
@@ -3590,7 +3586,6 @@ mod window_delta_tests {
     #[test]
     fn test_fixture_delta_computation_with_fp_tolerance() {
         use crate::snapshot_fixtures::{baseline_snapshot, make_snapshot};
-        use chrono::Duration;
 
         let baseline = baseline_snapshot();
 
@@ -10466,11 +10461,23 @@ mod mock_poller_tests {
         let final_state =
             crate::state::load_state(&state_path).expect("Failed to load final state");
 
-        // On first successful poll:
-        // - previous_api_snapshot should still be None (was None, shifted to None at start)
-        // - current_api_snapshot should be Some (first successful poll data)
-        // NOTE: The actual poll might fail if no credentials, so we check the state is valid
-        // The key assertion is that the cycle didn't panic with None prev_snapshot
+        // On the first cycle the rotation shifts None into previous, so there is
+        // nothing to subtract from whether or not the poll itself succeeded. This
+        // test drives a real `Poller`, so an unconfigured environment leaves
+        // current_api_snapshot None too; both outcomes share the invariant below.
+        assert!(
+            final_state.previous_api_snapshot.is_none(),
+            "first cycle: previous_api_snapshot should still be None after the rotation"
+        );
+        assert_eq!(
+            (
+                final_state.p5h_delta,
+                final_state.p7d_delta,
+                final_state.p7ds_delta
+            ),
+            (None, None, None),
+            "first cycle: no baseline to subtract from, so no delta should be written"
+        );
 
         // 11. Verify no panic occurred (test reaching this point means no panic)
         // This is the key assertion - run_governor_cycle handled None prev_snapshot gracefully
@@ -10495,12 +10502,8 @@ mod mock_poller_tests {
         let state_path = temp_dir.path().join("governor-state-flow.json");
 
         // 2. Create poller helper function (will use default credentials path, or fail gracefully)
-        let create_poller = || -> crate::poller::Poller {
-            match crate::poller::Poller::new() {
-                Ok(poller) => poller,
-                Err(_) => crate::poller::Poller::default(),
-            }
-        };
+        let create_poller =
+            || -> crate::poller::Poller { crate::poller::Poller::new().unwrap_or_default() };
 
         // 3. Create minimal config objects with defaults
         let alert_config = crate::config::AlertConfig::default();
@@ -10579,6 +10582,19 @@ mod mock_poller_tests {
         //
         // Note: If credentials aren't configured, the poll will fail and current_api_snapshot
         // will remain None. The test should handle both cases gracefully.
+        assert!(
+            first_poll_state.previous_api_snapshot.is_none(),
+            "First poll: previous_api_snapshot should still be None after the rotation"
+        );
+        assert_eq!(
+            (
+                first_poll_state.p5h_delta,
+                first_poll_state.p7d_delta,
+                first_poll_state.p7ds_delta
+            ),
+            (None, None, None),
+            "First poll: no previous snapshot to subtract from, so no delta should be written"
+        );
 
         // ========================================================================
         // SECOND POLL: Verify both snapshots exist and delta computation works
@@ -10614,11 +10630,64 @@ mod mock_poller_tests {
         let second_poll_state =
             crate::state::load_state(&state_path).expect("Failed to load state after second poll");
 
-        // 13. Verify no panic occurred in either poll (test reaching this point = success)
-        // The key assertion is that the governor cycle handles:
-        // - First poll (None prev_snapshot) gracefully
-        // - Second poll (prev_snapshot may be Some or None) gracefully
-        // - No panics occur during snapshot state transitions
+        // 13. The second cycle rotated the first cycle's reading into previous, so
+        // previous_api_snapshot must now match whatever the first cycle recorded as
+        // current — Some(reading) when the poll succeeded, None when it failed.
+        // (`PrevUsageSnapshot` has no PartialEq, so compare the fields.)
+        let windows = |s: &crate::state::PrevUsageSnapshot| {
+            (s.five_hour_pct, s.seven_day_pct, s.weekly_scoped_pct)
+        };
+        assert_eq!(
+            second_poll_state
+                .previous_api_snapshot
+                .as_ref()
+                .map(windows),
+            first_poll_state.current_api_snapshot.as_ref().map(windows),
+            "Second poll: the first cycle's current snapshot should rotate into previous"
+        );
+
+        // 14. Deltas exist exactly when both snapshots do, and equal current − previous.
+        // Written as one match so the assertion holds whether or not the real poller
+        // reached the API in this environment — the point is that the cycle never
+        // invents a delta it has no baseline for, and never skips one it can compute.
+        match (
+            &second_poll_state.previous_api_snapshot,
+            &second_poll_state.current_api_snapshot,
+        ) {
+            (Some(prev), Some(curr)) => {
+                assert_eq!(
+                    second_poll_state.p5h_delta,
+                    Some(curr.five_hour_pct - prev.five_hour_pct),
+                    "Second poll: 5h delta should be current − previous"
+                );
+                assert_eq!(
+                    second_poll_state.p7d_delta,
+                    Some(curr.seven_day_pct - prev.seven_day_pct),
+                    "Second poll: 7d delta should be current − previous"
+                );
+                assert_eq!(
+                    second_poll_state.p7ds_delta,
+                    Some(curr.weekly_scoped_pct - prev.weekly_scoped_pct),
+                    "Second poll: weekly_scoped delta should be current − previous"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    (
+                        second_poll_state.p5h_delta,
+                        second_poll_state.p7d_delta,
+                        second_poll_state.p7ds_delta
+                    ),
+                    (None, None, None),
+                    "Second poll: with a snapshot missing there is no interval to describe, \
+                     so every delta should be cleared"
+                );
+            }
+        }
+
+        // No panic occurred in either poll (test reaching this point = success):
+        // the governor cycle handled the first poll (None prev_snapshot), the
+        // second poll, and the snapshot state transitions between them.
     }
 
     // ---------------------------------------------------------------------------

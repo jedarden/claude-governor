@@ -540,7 +540,7 @@ fn test_first_poll_with_realistic_values() {
     // This demonstrates that the first poll behavior works with realistic
     // utilization data, not just test values.
 
-    use claude_governor::snapshot_fixtures::{baseline_snapshot, make_snapshot};
+    use claude_governor::snapshot_fixtures::make_snapshot;
 
     let mut state = state::GovernorState::new();
 

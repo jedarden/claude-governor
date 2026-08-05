@@ -11,7 +11,7 @@
 //! - Consecutive snapshot (7 days later, same weekday) with increased usage
 
 use crate::state::PrevUsageSnapshot;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -554,6 +554,8 @@ pub fn weekly_scoped_present_3_consecutive_polls() -> Vec<PrevUsageSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the same-weekday assertions need Datelike; the fixtures themselves don't.
+    use chrono::Datelike;
 
     #[test]
     fn test_baseline_snapshot_has_realistic_values() {
