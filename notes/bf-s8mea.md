@@ -531,3 +531,80 @@ that models 5h).
 
 `~/.cargo/bin/cargo test`: exit 0 — 744 lib tests (740 plus the 4 added here),
 every integration binary, and the doctests, 0 failed.
+
+---
+
+## bf-1fwf5 — Umbrella close: independent re-verification
+
+The four child beads above did the work. This section is the umbrella's own
+check, run from scratch rather than taken on the children's word, and the
+disposition of each acceptance criterion.
+
+### The re-run
+
+Same command bf-4o9bk used, on the tree as it stands after bf-3r0is:
+
+```
+RUST_LOG=info ~/.cargo/bin/cargo test --test delta_logging_runtime_test -- --nocapture
+```
+
+Path used: **the fixture-driven integration test**, not a live run and not the
+simulator — for the reasons bf-2m9rt established (the simulator never enters a
+cycle function; `run_observe` builds a real `Poller` and so needs credentials).
+The two lines under test, verbatim from this run:
+
+```
+[INFO] [governor] no previous snapshot yet (first poll or poll following a failure); window deltas unavailable this poll. current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T07:16:05.639Z]
+[INFO] [governor] window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T07:16:05.639Z → 2026-08-06T07:16:07.061Z, Δt=1.4s]
+```
+
+Byte-identical to the bf-4o9bk capture apart from the wall clock and `Δt`
+(1.4s here against 1.5s there — the gap between the two `run_governor_cycle`
+calls, which is host timing, not format). Cycle 1 carried no `window deltas:`
+line and cycle 2 no `no previous snapshot` line, as the contract requires. This
+is a fourth data point for **F3**: the surrounding lines moved again (`29 lines,
+$0.4623` for the collector pass; `exhausts in infh` on cycle 2 where the earlier
+run had finite figures), the two delta lines did not.
+
+Re-checked against the fixtures independently: `5h` 18.2 − 12.5 = 5.7, `7d`
+46.8 − 45.2 = 1.6, `7ds` 40.3 − 38.7 = 1.6 — all three match the printed signed
+values, each drawn from its own window's pair. The `previous` instant in cycle
+2's line (`…05.639Z`) is byte-identical to cycle 1's no-baseline instant and to
+cycle 1's `cycle start` truncated to milliseconds, so the rotation is intact.
+`07:16:07.061119 − 07:16:05.639366 = 1.4218s`, which `Δt` renders `1.4s`.
+
+Also checked `format_elapsed` (`src/governor.rs:1213`) by reading rather than by
+running, since its interesting cases are boundaries the capture cannot reach:
+rounding to tenths happens *before* the unit is chosen, so 59.95s yields
+`tenths == 600` and renders `1m0s` rather than `60.0s`, and 3599.6s yields
+`secs == 3600` and renders `1h0m` rather than `60m0s`. Negative intervals keep
+their sign (`-5.0s`) instead of clamping. The unit tests bf-3r0is added cover
+each of these.
+
+### Acceptance criteria
+
+| Criterion | Status |
+| --- | --- |
+| Cycle 1 and cycle 2 excerpts recorded in `notes/bf-s8mea.md` | Met — bf-4o9bk's full-cycle captures above, plus this re-run |
+| Lines readable, numbers agree with the snapshots behind them | Met — hand-checked twice, independently; readability was the one real defect (F2) and is fixed |
+| Format problems fixed in `src/governor.rs` or filed | Met — F2 fixed (`format_snapshot_instant`, `format_elapsed`); F1 filed as **bf-1v9x8** (open, P3); F3 and F4 are not defects |
+| `cargo test` passes | Met — `~/.cargo/bin/cargo test` exit 0: 744 lib tests, every integration binary, 16 doctests, 0 failed |
+
+### Known limits of this verification
+
+Stated plainly rather than left implied:
+
+- **No live daemon run.** These lines were produced by `run_governor_cycle`
+  driven by a fake poller — the same function and the same emit sites the daemon
+  uses, so the rendered text is the daemon's text, but the poll itself was not a
+  real API call. A live run needs credentials.
+- **Cluster B (`_observe`) was verified by construction, not by execution.**
+  `run_observe_cycle_internal` is private and takes a concrete `Poller`. Since
+  bf-4yj6o routed both clusters through the same two formatters, its rendered
+  text is covered; its *reachability* is not exercised here.
+- **The rendered interval is wall clock, not modelled time** (F1). In the live
+  daemon the poll sits at the top of the cycle, so the printed `Δt` is the true
+  gap plus the cycle's runtime; in this fixture harness it is 1.4s for a pair
+  that models 5h. bf-1v9x8 covers the fix.
+
+No production code changed for this bead.
