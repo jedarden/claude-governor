@@ -608,3 +608,83 @@ Stated plainly rather than left implied:
   that models 5h. bf-1v9x8 covers the fix.
 
 No production code changed for this bead.
+
+---
+
+## bf-s8mea — Umbrella close: the logging itself
+
+The top-level bead. Its two blockers — **bf-3z0vo** (compute the deltas in the
+cycle) and **bf-1fwf5** (verify the logging end to end) — are both closed, and
+the feature beads underneath them (bf-omuq9 the formatter, bf-4yj6o both cycle
+paths, bf-nr365 the no-baseline line, bf-3r0is the timestamp/interval fix)
+landed the code this bead asked for. This section is the umbrella's own check of
+each acceptance criterion against the tree as it stands, re-derived rather than
+inherited from the sections above.
+
+### Where the logging lives
+
+Four emit sites, two per cycle path, both rendering through the same two pure
+formatters (`format_window_deltas` `src/governor.rs:1272`,
+`format_no_previous_snapshot` `:1334`):
+
+| Path | Deltas | No baseline | Defensive |
+| --- | --- | --- | --- |
+| `run_governor_cycle` (daemon) | `src/governor.rs:4529` INFO | `:4543` INFO | `:4550` DEBUG |
+| `run_observe_cycle_internal` (`_observe`) | `src/governor.rs:6385` INFO | `:6413` INFO | `:6420` DEBUG |
+
+Both paths key off the same `(prev, curr)` snapshot pair and clear
+`p5h_delta` / `p7d_delta` / `p7ds_delta` explicitly on the no-baseline branch, so
+a stale `Some(..)` from an earlier cycle cannot be read as a measurement of the
+current interval.
+
+### Acceptance criteria
+
+| Criterion | Status |
+| --- | --- |
+| Deltas logged at INFO after each poll | Met — `log::info!` at all four sites above; the emit sits before the collector pass, so nothing downstream can suppress it |
+| Format includes window names and percentage values | Met — `5h` / `7d` / `7ds`, each with a signed delta and its own `(prev→curr)` pair |
+| Timestamp and window labels included | Met — both snapshot instants to millisecond precision, plus `Δt` (bf-3r0is) |
+| First poll logs a clear 'no previous snapshot' message | Met — prints the message and the current percentages, and deliberately no deltas, not even zeros |
+| `cargo test` passes | Met — `~/.cargo/bin/cargo test` exit 0: 744 lib tests, 17 integration binaries, 16 doctests, 0 failed |
+| Manual run shows logs appearing correctly | Met — capture below |
+| **Do NOT write to SQLite** | **Honoured** — see below |
+
+### The no-SQLite constraint, checked directly
+
+The deltas are written only to `GovernorState` (`src/state.rs:829-837`), which
+persists as JSON through `save_state` → `serde_json::to_writer_pretty`
+(`src/state.rs:1130-1140`). `src/db.rs` has no `p5h_delta` / `p7d_delta` /
+`p7ds_delta` column, binding or insert — grepping the whole crate, every
+occurrence outside `governor.rs` is either the state definition, a test fixture
+initialiser, or a doc comment in `snapshot_fixtures.rs`. Nothing on this path
+touches SQLite.
+
+### Manual run
+
+```
+RUST_LOG=info ~/.cargo/bin/cargo test --test delta_logging_runtime_test -- --nocapture
+```
+
+```
+[INFO] [governor] no previous snapshot yet (first poll or poll following a failure); window deltas unavailable this poll. current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T07:40:07.611Z]
+[INFO] [governor] window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T07:40:07.611Z → 2026-08-06T07:40:09.069Z, Δt=1.5s]
+```
+
+Re-checked from the fixtures without reference to the earlier captures:
+`18.2 − 12.5 = 5.7`, `46.8 − 45.2 = 1.6`, `40.3 − 38.7 = 1.6`, each drawn from
+its own window's pair. Cycle 1's instant is byte-identical to cycle 2's
+`previous`, so the rotation holds; `07:40:09.069 − 07:40:07.611 = 1.458s`
+renders `Δt=1.5s`. A fifth data point for **F3**: the two delta lines are
+identical to every prior run apart from the wall clock, while the surrounding
+cycle lines moved again.
+
+### What this bead did not do
+
+No production code changed here — the blockers had already landed all of it, and
+inventing a change to justify a commit would be worse than recording that. The
+one known gap stays open and owned: **bf-1v9x8** (P3) covers F1, the fact that
+`UsageData` carries no poll timestamp, so the rendered interval is the cycle's
+wall-clock gap rather than the true time between readings. That is a poller
+data-model change, out of scope for delta *logging*. Cluster B's reachability is
+still verified by construction rather than by execution, for the credential
+reason bf-2m9rt established.
