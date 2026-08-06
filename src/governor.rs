@@ -1188,6 +1188,47 @@ pub fn calculate_window_pct_delta(
     (delta_5h, delta_7d, delta_7ds)
 }
 
+/// Render a snapshot instant for a delta log line.
+///
+/// `to_rfc3339()` emits nanosecond precision, which put 9 fractional digits —
+/// 6 of them meaningless for a poll that happens once a minute — into every
+/// timestamp of every delta line. Milliseconds keep the two instants precise
+/// enough that a reader can still check [`format_elapsed`] against them by
+/// hand, while cutting the bracketed pair from 76 characters to 60.
+fn format_snapshot_instant(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Render the interval between two snapshots compactly.
+///
+/// A delta without its duration is not a rate: `+5.70%` over 1.4s and the same
+/// `+5.70%` over 5h are opposite readings, and making an operator subtract two
+/// RFC 3339 strings in their head to tell them apart is what the delta line
+/// exists to avoid. Rendered units get coarser as the interval grows, so the
+/// number stays short at any scale a poll gap can reach.
+///
+/// A negative interval (a backwards clock, or snapshots rotated out of order)
+/// is printed with a leading `-` rather than being clamped, because silently
+/// showing `0.0s` would hide exactly the anomaly worth seeing.
+fn format_elapsed(delta: chrono::Duration) -> String {
+    let millis = delta.num_milliseconds();
+    let sign = if millis < 0 { "-" } else { "" };
+    // Round to the printed precision *before* choosing the unit, so a value
+    // that rounds up across a boundary cannot render as e.g. `60.0s`.
+    let tenths = (millis.unsigned_abs() + 50) / 100;
+    if tenths < 600 {
+        format!("{sign}{}.{}s", tenths / 10, tenths % 10)
+    } else {
+        let secs = (tenths + 5) / 10;
+        if secs < 3600 {
+            format!("{sign}{}m{}s", secs / 60, secs % 60)
+        } else {
+            let mins = (secs + 30) / 60;
+            format!("{sign}{}h{}m", mins / 60, mins % 60)
+        }
+    }
+}
+
 /// Render one human-readable line describing the window percentage deltas
 /// between two consecutive API poll snapshots.
 ///
@@ -1210,7 +1251,8 @@ pub fn calculate_window_pct_delta(
 ///
 /// # Returns
 /// A line naming all three windows (`5h`, `7d`, `7ds`) with signed deltas, the
-/// previous and current percentages, and both snapshot timestamps.
+/// previous and current percentages, both snapshot timestamps, and the elapsed
+/// interval between them.
 ///
 /// # Example
 /// ```
@@ -1223,7 +1265,9 @@ pub fn calculate_window_pct_delta(
 /// let curr_at = "2026-08-05T12:05:00Z".parse::<DateTime<Utc>>().unwrap();
 /// let line = format_window_deltas(&prev, &curr, prev_at, curr_at);
 /// assert!(line.contains("5h=+2.50%"));
-/// assert!(line.contains("2026-08-05T12:05:00+00:00"));
+/// assert!(line.contains("2026-08-05T12:05:00.000Z"));
+/// // The interval is spelled out, so the delta can be read as a rate.
+/// assert!(line.contains("Δt=5m0s"));
 /// ```
 pub fn format_window_deltas(
     prev: &crate::db::WindowPctSnapshot,
@@ -1234,7 +1278,7 @@ pub fn format_window_deltas(
     let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(prev, curr);
     format!(
         "window deltas: 5h={:+.2}% ({:.2}%→{:.2}%), 7d={:+.2}% ({:.2}%→{:.2}%), \
-         7ds={:+.2}% ({:.2}%→{:.2}%) [{} → {}]",
+         7ds={:+.2}% ({:.2}%→{:.2}%) [{} → {}, Δt={}]",
         delta_5h,
         prev.five_hour,
         curr.five_hour,
@@ -1244,8 +1288,9 @@ pub fn format_window_deltas(
         delta_7ds,
         prev.weekly_scoped,
         curr.weekly_scoped,
-        prev_at.to_rfc3339(),
-        curr_at.to_rfc3339(),
+        format_snapshot_instant(prev_at),
+        format_snapshot_instant(curr_at),
+        format_elapsed(curr_at - prev_at),
     )
 }
 
@@ -1283,6 +1328,7 @@ pub fn format_window_deltas(
 /// let line = format_no_previous_snapshot(&curr, curr_at);
 /// assert!(line.contains("no previous snapshot"));
 /// assert!(line.contains("5h=12.50%"));
+/// assert!(line.contains("2026-08-05T12:05:00.000Z"));
 /// assert!(!line.contains("0.00%"));
 /// ```
 pub fn format_no_previous_snapshot(
@@ -1295,7 +1341,7 @@ pub fn format_no_previous_snapshot(
         curr.five_hour,
         curr.seven_day,
         curr.weekly_scoped,
-        curr_at.to_rfc3339(),
+        format_snapshot_instant(curr_at),
     )
 }
 
@@ -1476,7 +1522,7 @@ mod window_delta_tests {
             format_window_deltas(&prev, &curr, prev_at, curr_at),
             "window deltas: 5h=+2.50% (10.00%→12.50%), 7d=+2.00% (20.00%→22.00%), \
              7ds=+3.00% (15.00%→18.00%) \
-             [2026-08-05T12:00:00+00:00 → 2026-08-05T12:05:00+00:00]"
+             [2026-08-05T12:00:00.000Z → 2026-08-05T12:05:00.000Z, Δt=5m0s]"
         );
     }
 
@@ -1503,8 +1549,126 @@ mod window_delta_tests {
             format_window_deltas(&prev, &curr, prev_at, curr_at),
             "window deltas: 5h=-5.00% (20.00%→15.00%), 7d=-8.00% (30.00%→22.00%), \
              7ds=-7.00% (25.00%→18.00%) \
-             [2026-08-05T12:00:00+00:00 → 2026-08-05T17:30:00+00:00]"
+             [2026-08-05T12:00:00.000Z → 2026-08-05T17:30:00.000Z, Δt=5h30m]"
         );
+    }
+
+    /// The sub-second gap a real poll pair produces must survive into the line.
+    ///
+    /// This is the case that motivated the format: the runtime capture in
+    /// `notes/bf-s8mea.md` had two instants 1.43s apart rendered at nanosecond
+    /// precision, so the one number a reader needs — the interval — had to be
+    /// worked out by subtracting two 30-character strings. Milliseconds keep
+    /// `Δt` checkable against the timestamps that bracket it.
+    #[test]
+    fn test_format_window_deltas_subsecond_interval_is_readable() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 45.2,
+            weekly_scoped: 38.7,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 18.2,
+            seven_day: 46.8,
+            weekly_scoped: 40.3,
+        };
+        let prev_at = "2026-08-06T06:45:40.917196817Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let curr_at = "2026-08-06T06:45:42.350087396Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        let line = format_window_deltas(&prev, &curr, prev_at, curr_at);
+
+        assert_eq!(
+            line,
+            "window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), \
+             7ds=+1.60% (38.70%→40.30%) \
+             [2026-08-06T06:45:40.917Z → 2026-08-06T06:45:42.350Z, Δt=1.4s]"
+        );
+        // The six nanosecond digits that carried no information are gone.
+        assert!(
+            !line.contains("917196817"),
+            "line still carries nanoseconds"
+        );
+    }
+
+    /// A backwards clock is shown, not hidden behind a clamped `0.0s`.
+    #[test]
+    fn test_format_window_deltas_negative_interval_keeps_its_sign() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 20.0,
+            weekly_scoped: 15.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 22.0,
+            weekly_scoped: 18.0,
+        };
+        let prev_at = "2026-08-05T12:00:05Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let curr_at = "2026-08-05T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        let line = format_window_deltas(&prev, &curr, prev_at, curr_at);
+        assert!(
+            line.ends_with("Δt=-5.0s]"),
+            "backwards interval should print signed, got: {line}"
+        );
+    }
+
+    /// Units coarsen as the interval grows, and rounding never spills a field
+    /// past its own range (no `60.0s`, no `60m0s`).
+    #[test]
+    fn test_format_elapsed_units_and_boundaries() {
+        let ms = chrono::Duration::milliseconds;
+        assert_eq!(format_elapsed(ms(0)), "0.0s");
+        assert_eq!(format_elapsed(ms(1_430)), "1.4s");
+        assert_eq!(format_elapsed(ms(59_949)), "59.9s");
+        // Rounds up to a full minute: rendered as 1m0s, never 60.0s.
+        assert_eq!(format_elapsed(ms(59_950)), "1m0s");
+        assert_eq!(format_elapsed(ms(60_000)), "1m0s");
+        assert_eq!(format_elapsed(ms(300_000)), "5m0s");
+        assert_eq!(format_elapsed(ms(3_599_400)), "59m59s");
+        // Rounds up to a full hour: rendered as 1h0m, never 60m0s.
+        assert_eq!(format_elapsed(ms(3_599_600)), "1h0m");
+        assert_eq!(format_elapsed(ms(3_600_000)), "1h0m");
+        assert_eq!(format_elapsed(chrono::Duration::hours(5)), "5h0m");
+        assert_eq!(format_elapsed(ms(-1_430)), "-1.4s");
+        assert_eq!(format_elapsed(ms(-300_000)), "-5m0s");
+    }
+
+    /// The no-baseline line carries the same millisecond instant format, and
+    /// still prints no deltas — not even zeros.
+    #[test]
+    fn test_format_no_previous_snapshot_line() {
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 45.2,
+            weekly_scoped: 38.7,
+        };
+        let curr_at = "2026-08-06T06:45:40.917196817Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        let line = format_no_previous_snapshot(&curr, curr_at);
+
+        assert_eq!(
+            line,
+            "no previous snapshot yet (first poll or poll following a failure); \
+             window deltas unavailable this poll. \
+             current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T06:45:40.917Z]"
+        );
+        assert!(
+            !line.contains("917196817"),
+            "line still carries nanoseconds"
+        );
+        // No interval is claimed: there is no previous instant to measure from.
+        assert!(!line.contains("Δt"), "no-baseline line must not claim a Δt");
     }
 
     #[test]

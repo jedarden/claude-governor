@@ -196,6 +196,12 @@ the fixtures' `taken_at`, since the cycle stamps its own snapshots.
 
 ## bf-4o9bk — The real cycle 1 / cycle 2 output, and the arithmetic checked by hand
 
+> **Re-captured after bf-3r0is.** The excerpts and the hand-check below were
+> refreshed from a run made *after* the timestamp fix bf-3r0is applied, so this
+> section shows the final output rather than the format it found. The findings
+> at the end are as bf-4o9bk wrote them; each one's resolution is in the
+> bf-3r0is section that follows.
+
 ### Which path produced these
 
 **The integration test** — `tests/delta_logging_runtime_test.rs`, the harness
@@ -234,8 +240,12 @@ design. The timestamps that do appear are the cycle wall-clock instants:
 
 | | Cycle wall clock (`let now = Utc::now()`, `src/governor.rs:4237`) |
 | --- | --- |
-| cycle 1 | `2026-08-06T06:45:40.917196817+00:00` |
-| cycle 2 | `2026-08-06T06:45:42.350087396+00:00` |
+| cycle 1 | `2026-08-06T06:50:51.731050204+00:00` |
+| cycle 2 | `2026-08-06T06:50:53.187327079+00:00` |
+
+The delta lines render these to milliseconds (`…51.731Z`, `…53.187Z`) — see the
+bf-3r0is section; the `=== cycle start ===` lines quoted below are a different
+log site and still print nanoseconds.
 
 ### Cycle 1 — no previous snapshot
 
@@ -245,25 +255,25 @@ Verbatim, the full set of records the harness captured during the first
 
 ```
 ===== BEGIN CYCLE 1 =====
-[INFO] [governor] === cycle start at 2026-08-06T06:45:40.917196817+00:00 ===
+[INFO] [governor] === cycle start at 2026-08-06T06:50:51.731050204+00:00 ===
 [INFO] [governor] polled usage: weekly_scoped=38.7%, all_models=45.2%, 5h=12.5%
 [INFO] [governor] weekly_scoped model change detection: prev_model=None, new_model=None, new_weekly_scoped_pct=38.70%
-[INFO] [governor] no previous snapshot yet (first poll or poll following a failure); window deltas unavailable this poll. current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T06:45:40.917196817+00:00]
-[INFO] [collector] no new usage data found
-[INFO] [governor] collector pass: 1 lines, 0 instances, $0.0000 total
+[INFO] [governor] no previous snapshot yet (first poll or poll following a failure); window deltas unavailable this poll. current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T06:50:51.731Z]
+[WARN] Unknown model 'claude-opus-5', falling back to 'claude-opus-4-7' for pricing — add it to governor.yaml
+[INFO] [collector] pass complete: 18 lines, 1 instances, $0.4362 total
+[INFO] [governor] collector pass: 18 lines, 1 instances, $0.4362 total
 [INFO] [governor] workers: 0 active (0 heartbeats, 0 tmux sessions, consistent=true, agents=1)
 [INFO] [governor] EMA input: weekly_scoped_model=None, weekly_scoped_pct=38.70% (this is the actual pct from the rotated model)
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
-[INFO] [governor] 5h: 77.5% remaining, resets in 4.0h — exhausts in infh
-[INFO] [governor] 7d: 44.8% remaining, resets in 120.0h — exhausts in infh
-[INFO] [governor] weekly_scoped: 51.3% remaining, resets in 120.0h BINDING — exhausts in infh
-[INFO] [governor] → binding window weekly_scoped: insufficient burn rate data, will hold at current worker count
+[INFO] [governor] 5h: 77.5% remaining, resets in 4.0h — exhausts in 49.4h at 12 workers
+[INFO] [governor] 7d: 44.8% remaining, resets in 120.0h CUTOFF_RISK — exhausts in 28.5h at 0 workers
+[INFO] [governor] weekly_scoped: 51.3% remaining, resets in 120.0h BINDING CUTOFF_RISK — exhausts in 32.7h at 0 workers
+[INFO] [governor] → safe_worker_count: 0 workers from binding window weekly_scoped
 [INFO] [governor] target workers: 0 (ceiling: 90%)
 [INFO] [governor] no scaling action this cycle (dry-run)
-[INFO] [governor] alert FP rate: 0.0% (1 total recorded)
 [INFO] [governor] === cycle complete (decision: NoChange, next in 60s) ===
 ===== END CYCLE 1 =====
 ```
@@ -276,25 +286,26 @@ deltas, not even zeros.
 
 ```
 ===== BEGIN CYCLE 2 =====
-[INFO] [governor] === cycle start at 2026-08-06T06:45:42.350087396+00:00 ===
+[INFO] [governor] === cycle start at 2026-08-06T06:50:53.187327079+00:00 ===
 [INFO] [governor] polled usage: weekly_scoped=40.3%, all_models=46.8%, 5h=18.2%
 [INFO] [governor] weekly_scoped model change detection: prev_model=None, new_model=None, new_weekly_scoped_pct=40.30%
-[INFO] [governor] window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:45:40.917196817+00:00 → 2026-08-06T06:45:42.350087396+00:00]
-[INFO] [collector] no new usage data found
-[INFO] [governor] collector pass: 0 lines, 0 instances, $0.0000 total
+[INFO] [governor] window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:50:51.731Z → 2026-08-06T06:50:53.187Z, Δt=1.5s]
+[WARN] Unknown model 'claude-opus-5', falling back to 'claude-opus-4-20250514' for pricing — add it to governor.yaml
+[INFO] [collector] pass complete: 2 lines, 1 instances, $0.0952 total
+[INFO] [governor] collector pass: 2 lines, 1 instances, $0.0952 total
 [INFO] [governor] workers: 0 active (0 heartbeats, 0 tmux sessions, consistent=true, agents=1)
 [INFO] [governor] EMA input: weekly_scoped_model=None, weekly_scoped_pct=40.30% (this is the actual pct from the rotated model)
+[WARN] [governor] skipping window delta annotation: worker count changed mid-interval (1 -> 0)
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
 [WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
-[INFO] [governor] 5h: 71.8% remaining, resets in 4.0h — exhausts in infh
-[INFO] [governor] 7d: 43.2% remaining, resets in 120.0h — exhausts in infh
-[INFO] [governor] weekly_scoped: 49.7% remaining, resets in 120.0h BINDING — exhausts in infh
-[INFO] [governor] → binding window weekly_scoped: insufficient burn rate data, will hold at current worker count
+[INFO] [governor] 5h: 71.8% remaining, resets in 4.0h — exhausts in 209.6h at 52 workers
+[INFO] [governor] 7d: 43.2% remaining, resets in 120.0h — exhausts in 126.1h at 1 workers
+[INFO] [governor] weekly_scoped: 49.7% remaining, resets in 120.0h BINDING — exhausts in 145.1h at 1 workers
+[INFO] [governor] → safe_worker_count: 1 workers from binding window weekly_scoped
 [INFO] [governor] target workers: 0 (ceiling: 90%)
 [INFO] [governor] no scaling action this cycle (dry-run)
-[INFO] [governor] alert FP rate: 0.0% (1 total recorded)
 [INFO] [governor] === cycle complete (decision: NoChange, next in 60s) ===
 ===== END CYCLE 2 =====
 ```
@@ -307,7 +318,7 @@ the cycle stops reporting one missing.
 Isolating the line:
 
 ```
-window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:45:40.917196817+00:00 → 2026-08-06T06:45:42.350087396+00:00]
+window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:50:51.731Z → 2026-08-06T06:50:53.187Z, Δt=1.5s]
 ```
 
 **Percentages against the fixtures.** Each window's `(a→b)` pair must be
@@ -344,17 +355,23 @@ the exact decimal arithmetic, so the printed values agree with the hand
 computation. This is why the check is stated to two decimals and not more.
 
 **Both snapshot timestamps appear.** The line ends with two RFC 3339 instants,
-`prev.taken_at → curr.taken_at`. Cross-checking them against the rest of the
-capture:
+`prev.taken_at → curr.taken_at`, rendered to milliseconds. Cross-checking them
+against the rest of the capture:
 
-- the second, `…06:45:42.350087396+00:00`, is byte-identical to cycle 2's
-  `=== cycle start at … ===` line;
-- the first, `…06:45:40.917196817+00:00`, is byte-identical to **cycle 1's**
-  `cycle start` line *and* to the single timestamp in cycle 1's no-baseline
-  line.
+- the second, `2026-08-06T06:50:53.187Z`, is cycle 2's `=== cycle start at
+  2026-08-06T06:50:53.187327079+00:00 ===` truncated to milliseconds;
+- the first, `2026-08-06T06:50:51.731Z`, is **cycle 1's** `cycle start`
+  (`…51.731050204+00:00`) truncated the same way, *and* is byte-identical to the
+  single timestamp in cycle 1's no-baseline line — that one is rendered by the
+  same helper, so the two agree exactly.
 
 That is the rotation working end to end: the instant cycle 1 stamped onto
 `current_api_snapshot` is exactly the instant cycle 2 reports as `previous`.
+
+**The interval agrees with the timestamps it sits beside.** `53.187 − 51.731 =
+1.456 s`, which `Δt` renders to one decimal as `1.5s`. That subtraction is
+doable by eye from the printed pair, which is the point of dropping the six
+nanosecond digits rather than the whole fractional part.
 
 ### Findings for the next bead
 
@@ -405,3 +422,112 @@ observations F1–F3 are the only defects, and none of them is a wrong value.
 0 failed. The `dump_cycle` addition is print-only and changes no assertion;
 `two_cycles_emit_the_delta_log_lines` still passes. No production code changed by
 this bead.
+
+---
+
+## bf-3r0is — Resolving the formatting findings
+
+Closing bead for **bf-1fwf5**. Each of bf-4o9bk's four findings is settled
+below: two needed no code (one was an explicit "nothing wrong"), one is fixed in
+`src/governor.rs`, one is out of scope and now has a bead.
+
+**Nothing here changes a number.** F4 stands: every delta, percentage pair and
+timestamp bf-4o9bk checked was already correct, and this bead re-checked them
+against the post-fix capture above. The changes are to how the timestamps and
+the interval are *rendered*.
+
+### Disposition
+
+| Finding | Verdict | Where it went |
+| --- | --- | --- |
+| **F1** — fixture `taken_at` never reaches the line, so the interval is wall-clock, not modelled time | Real, out of scope | Follow-up bead **bf-1v9x8** |
+| **F2** — nanosecond timestamps are unreadable and the interval must be computed mentally | Real, fixed here | `src/governor.rs` — `format_snapshot_instant`, `format_elapsed` |
+| **F3** — surrounding lines vary between runs; the two delta lines do not | Not a defect in these lines | No action; reconfirmed, see below |
+| **F4** — no mismatch in any number | Not a defect | No action |
+
+No finding was left unaddressed, and none of the five specific problems the bead
+listed (wrong sign, missing window label, missing timestamp, misleading
+precision, truncated line) turned out to be present beyond the misleading
+precision of F2 — signs, labels and timestamps were all correct, and no line was
+truncated.
+
+### F2 — the fix
+
+Two private helpers in `src/governor.rs`, used by both formatters:
+
+- **`format_snapshot_instant`** renders an instant with
+  `to_rfc3339_opts(SecondsFormat::Millis, true)`. Milliseconds rather than
+  seconds because the two timestamps and the new `Δt` have to stay checkable
+  against each other by hand — with seconds precision the capture above would
+  read `…51Z → …53Z, Δt=1.5s`, and a reader would be right to distrust it. The
+  bracketed pair drops from 76 characters to 60, and `Z` replaces `+00:00`.
+- **`format_elapsed`** renders the interval, coarsening units as it grows:
+  `1.4s`, `5m0s`, `5h30m`. A delta without its duration is not a rate, and this
+  is the number an operator needs to judge whether `+5.70%` is alarming.
+  Negative intervals (backwards clock, snapshots rotated out of order) print
+  signed rather than clamped to `0.0s`, so the anomaly stays visible.
+
+Before and after, on the same two snapshots:
+
+```
+window deltas: … 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:45:40.917196817+00:00 → 2026-08-06T06:45:42.350087396+00:00]
+window deltas: … 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:50:51.731Z → 2026-08-06T06:50:53.187Z, Δt=1.5s]
+```
+
+`format_no_previous_snapshot` gets the same instant rendering and deliberately
+**no** `Δt` — there is no previous instant to measure from, and a `Δt=0.0s`
+there would be the same fabrication as the `0.00%` deltas that function already
+refuses to print.
+
+### Tests locking the format in
+
+In `src/governor.rs`, module `governor::window_delta_tests`:
+
+| Test | Locks |
+| --- | --- |
+| `test_format_window_deltas_positive` (updated) | full line, `Δt=5m0s` over a 5-minute gap |
+| `test_format_window_deltas_negative` (updated) | full line, `Δt=5h30m` over a 5.5-hour gap |
+| `test_format_window_deltas_subsecond_interval_is_readable` (new) | the exact capture above, byte for byte, plus the absence of the nanosecond digits |
+| `test_format_window_deltas_negative_interval_keeps_its_sign` (new) | `Δt=-5.0s` for a backwards clock |
+| `test_format_elapsed_units_and_boundaries` (new) | unit selection, sign, and that rounding never spills a field past its range — `59.950s` renders `1m0s`, never `60.0s`; `3599.6s` renders `1h0m`, never `60m0s` |
+| `test_format_no_previous_snapshot_line` (new) | full no-baseline line; that function had assertions only in its doctest before |
+
+Both doctests were updated to match. `tests/delta_logging_runtime_test.rs`
+needed no change — it asserts on the `window deltas:` / `no previous snapshot`
+substrings, which the fix does not touch.
+
+### F3 — reconfirmed, still not actionable
+
+The run that produced the refreshed excerpts is a third data point for F3: its
+cycle 1 reports `collector pass: 18 lines, 1 instances, $0.4362 total` and
+`CUTOFF_RISK` on two windows, against `1 lines, 0 instances, $0.0000` and no
+risk flags in bf-4o9bk's run and a different tail again in the run before that.
+The two delta lines were identical across all three apart from the wall clock.
+That is the property the verification rests on, so no fix is warranted — the
+finding is a caveat for anyone tempted to assert on the *other* lines of this
+capture, and no test does.
+
+### F1 — why it became a bead rather than a fix
+
+`format_window_deltas` takes `prev_at` / `curr_at` as arguments; it renders
+faithfully whatever the cycle hands it. The problem is upstream: `UsageData`
+(`src/poller.rs:236-260`) has no field for when the reading was taken, so
+`run_governor_cycle` stamps `taken_at: Utc::now()` (`src/governor.rs:4328`) and
+the fixture's own `taken_at` is discarded on the way in. Fixing that means
+adding a field to the poller's data model and deciding what a poll timestamp
+means for a cached or stale response — a production change well outside delta
+*logging*. Filed as **bf-1v9x8** (P3), with the acceptance criterion that a
+two-cycle test with readings hours apart must render the fixture interval rather
+than the wall-clock gap between cycles.
+
+Worth being precise about the blast radius, since F1 now also applies to the
+`Δt` this bead added: in the live daemon the poll happens at the top of the
+cycle, so the rendered interval is the true one plus the cycle's own runtime —
+close enough to read as a rate. It is only badly wrong where the poll and the
+cycle are separated, as in the fixture-driven harness (1.5s rendered for a pair
+that models 5h).
+
+### Test status
+
+`~/.cargo/bin/cargo test`: exit 0 — 744 lib tests (740 plus the 4 added here),
+every integration binary, and the doctests, 0 failed.
