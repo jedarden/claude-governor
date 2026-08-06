@@ -1689,7 +1689,7 @@ safe_mode:
 1. Implement `src/alerts.rs`:
    - Check each alert condition against thresholds
    - Check if alert already fired this period (dedup by cooldown in state file)
-   - Create HUMAN-type bead via configured alert command (default: `br create --type human "..."`)
+   - Create HUMAN-type bead via configured alert command (default: `bf create --type human "..."`)
    - Log alert to `governor.log`
 
 2. Add `last_fired` per-type tracking to state file.
