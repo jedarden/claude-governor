@@ -1302,4 +1302,16 @@ daemon:
         // Unknown window still uses global default
         assert_eq!(config.daemon.get_target_ceiling_for_window("unknown"), 95.0);
     }
+
+    /// Locks in `bf` as the alert CLI. The deprecated `br` shim must never
+    /// reappear here — a silent regression would send every alert to a command
+    /// that no longer creates beads.
+    #[test]
+    fn test_default_alert_command_uses_bf() {
+        let cmd = default_alert_command();
+        assert_eq!(cmd[0], "bf");
+        assert_eq!(cmd, vec!["bf", "create", "--type", "human"]);
+
+        assert_eq!(AlertConfig::default().command[0], "bf");
+    }
 }
