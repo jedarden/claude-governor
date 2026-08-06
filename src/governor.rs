@@ -1467,12 +1467,8 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 ///   (end-to-end, two real cycles)
 ///
 /// ## 2. First poll with no baseline returns no deltas — COVERED
-/// - `test_first_poll_no_previous_snapshot`
 /// - `test_first_poll_reports_no_deltas`
 /// - `test_first_poll_reports_no_deltas_regardless_of_current_values`
-/// - `test_delta_computation_skipped_on_first_poll`
-/// - `test_no_snapshots_available_no_panic` (neither snapshot present)
-/// - `test_previous_snapshot_without_current_no_panic` (current missing)
 /// - `test_first_poll_governor_state_no_panic_deltas_stay_none`
 /// - `test_format_no_previous_snapshot_line` (the rendered line)
 /// - Field-by-field, one test per missing-baseline pairing, each documenting why
@@ -1545,6 +1541,30 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - **G4 — log lines vs. numbers.** `tests/delta_logging_runtime_test.rs`
 ///   proves both lines reach the log and in what order, but asserts nothing about
 ///   the numbers they carry (self-documented there as a separate bead).
+///
+/// ## Deduplication (bead bf-laii4)
+/// Five tests were removed as strictly subsumed by another test in this module.
+/// Each is listed with the test that already covers it, so a future reader can
+/// tell "deleted as redundant" apart from "coverage silently dropped":
+/// - `test_first_poll_no_previous_snapshot` — same `(None, Some)` call on the
+///   same 10/20/15 reading as `test_first_poll_reports_no_deltas`; its extra
+///   assertion was `previous.is_none()` on a literal `None`.
+/// - `test_delta_computation_skipped_on_first_poll` — same 25/45/35 reading as
+///   `test_missing_baseline_first_poll_yields_none_in_every_field`, which also
+///   asserts per window and spells out the fabricated-baseline contrast.
+/// - `test_no_snapshots_available_no_panic` — the `(None, None)` pairing, now
+///   `test_missing_both_snapshots_yield_none_in_every_field`.
+/// - `test_previous_snapshot_without_current_no_panic` — the `(Some, None)`
+///   pairing, now `test_missing_current_snapshot_yields_none_in_every_field`.
+/// - `test_second_poll_with_both_snapshots` — 120 lines that re-implemented the
+///   match arms of `window_deltas_from_snapshots` in the test body and asserted
+///   against that copy, so it could not fail if the real function changed. The
+///   only arithmetic it exercised is `test_calculate_window_pct_delta_basic`;
+///   the branch selection it meant to check is pinned to the real function by
+///   `test_both_snapshots_present_match_calculate_window_pct_delta`.
+///
+/// All four `Option` pairings of `window_deltas_from_snapshots` remain covered
+/// after the removals — see case 2 above and the per-function inventory.
 #[cfg(test)]
 mod window_delta_tests {
     use super::*;
@@ -1923,43 +1943,6 @@ mod window_delta_tests {
             delta_7ds, 0.0,
             "7ds delta should be zero for identical snapshots"
         );
-    }
-
-    /// Test first poll handling when no previous snapshot exists.
-    ///
-    /// On the first poll (after governor start or state clear), previous_api_snapshot
-    /// is None, so deltas cannot be computed. The code handles this gracefully by
-    /// only computing deltas when both previous and current snapshots exist.
-    #[test]
-    fn test_first_poll_no_previous_snapshot() {
-        use crate::state::PrevUsageSnapshot;
-        use chrono::Utc;
-
-        // Simulate first poll: only current snapshot exists
-        let current = PrevUsageSnapshot {
-            taken_at: Utc::now(),
-            five_hour_pct: 10.0,
-            seven_day_pct: 20.0,
-            weekly_scoped_pct: 15.0,
-        };
-        let previous: Option<PrevUsageSnapshot> = None;
-
-        // ASSERTION 1: Verify snapshot state before the call
-        assert!(
-            previous.is_none(),
-            "Previous snapshot should be None on first poll"
-        );
-
-        // ASSERTION 2: the governor reports nothing — delta computation is
-        // skipped rather than run against a stand-in baseline
-        assert_eq!(
-            window_deltas_from_snapshots(previous.as_ref(), Some(&current)),
-            (None, None, None),
-            "first poll should compute no deltas"
-        );
-
-        // ASSERTION 3: Verify no panic occurred - test reaches this point
-        // (If we reach here, graceful handling succeeded)
     }
 
     /// Test that delta calculation uses the correct window fields.
@@ -2434,92 +2417,6 @@ mod window_delta_tests {
         assert!(
             (p7ds_delta.expect("second poll: 7ds delta computed") - 3.0).abs() < f64::EPSILON,
             "Second poll: 7ds delta should be 3.0"
-        );
-    }
-
-    /// Test edge case: both previous and current snapshots are None.
-    ///
-    /// Verifies panic prevention and graceful handling when no snapshot data is available.
-    /// This can occur during governor initialization or when the collector is offline.
-    #[test]
-    fn test_no_snapshots_available_no_panic() {
-        use crate::state::PrevUsageSnapshot;
-
-        // Edge case: neither snapshot available (e.g., collector offline, initialization)
-        let previous_api_snapshot: Option<PrevUsageSnapshot> = None;
-        let current_api_snapshot: Option<PrevUsageSnapshot> = None;
-
-        // Verify: no panic occurred (the test is still running)
-        // Verify: delta computation was skipped, deltas remain None (not Some(0.0))
-        assert_eq!(
-            window_deltas_from_snapshots(
-                previous_api_snapshot.as_ref(),
-                current_api_snapshot.as_ref()
-            ),
-            (None, None, None),
-            "deltas should be None when no snapshots are available"
-        );
-    }
-
-    /// Test edge case: previous snapshot exists but current is None.
-    ///
-    /// Verifies panic prevention and graceful handling when the current poll fails
-    /// to produce a snapshot (e.g., API error, timeout).
-    #[test]
-    fn test_previous_snapshot_without_current_no_panic() {
-        use crate::state::PrevUsageSnapshot;
-        use chrono::Utc;
-
-        // Edge case: previous exists but current is None (e.g., API error in current poll)
-        let previous_api_snapshot: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
-            taken_at: Utc::now() - chrono::Duration::seconds(60),
-            five_hour_pct: 10.0,
-            seven_day_pct: 20.0,
-            weekly_scoped_pct: 15.0,
-        });
-        let current_api_snapshot: Option<PrevUsageSnapshot> = None;
-
-        // Verify: no panic occurred (the test is still running)
-        // Verify: delta computation was skipped, deltas remain None (not Some(0.0))
-        assert_eq!(
-            window_deltas_from_snapshots(
-                previous_api_snapshot.as_ref(),
-                current_api_snapshot.as_ref()
-            ),
-            (None, None, None),
-            "deltas should be None when the current snapshot is missing"
-        );
-    }
-
-    /// Test that delta computation is explicitly skipped on first poll.
-    ///
-    /// Verifies that when previous_api_snapshot is None, the delta computation
-    /// logic is bypassed entirely, not just returning zero values.
-    #[test]
-    fn test_delta_computation_skipped_on_first_poll() {
-        use crate::state::PrevUsageSnapshot;
-        use chrono::Utc;
-
-        // Every window is non-zero, so the two ways of *not* skipping are both
-        // visible in the return value: subtracting against a real baseline is
-        // impossible here, and subtracting against a fabricated zero baseline
-        // would surface as Some(25.0) / Some(45.0) / Some(35.0).
-        let current = PrevUsageSnapshot {
-            taken_at: Utc::now(),
-            five_hour_pct: 25.0,
-            seven_day_pct: 45.0,
-            weekly_scoped_pct: 35.0,
-        };
-
-        let deltas = window_deltas_from_snapshots(None, Some(&current));
-
-        // The computing branch always yields three Somes, so an all-None result
-        // is itself the evidence that the arithmetic was bypassed rather than
-        // run and coerced to a placeholder.
-        assert_eq!(
-            deltas,
-            (None, None, None),
-            "delta computation should be skipped on first poll, not run against a stand-in baseline"
         );
     }
 
@@ -4028,161 +3925,6 @@ mod window_delta_tests {
             (delta_7ds - 0.075).abs() < TOLERANCE,
             "7ds delta should be 0.075 with tolerance"
         );
-    }
-
-    /// Test second poll handling when both previous and current snapshots exist.
-    ///
-    /// This test verifies the governor works correctly on subsequent polls when both
-    /// prev_snapshot and current snapshot are available. It simulates the transition
-    /// from first poll (None prev) to a second poll (Some prev, Some curr) and verifies
-    /// delta computation executes successfully with both snapshots.
-    ///
-    /// This test mirrors the comprehensive assertion pattern from test_first_poll_no_previous_snapshot
-    /// (bf-151vi) but for the subsequent poll scenario.
-    #[test]
-    fn test_second_poll_with_both_snapshots() {
-        use crate::state::PrevUsageSnapshot;
-        use chrono::Utc;
-
-        // Track whether delta computation was attempted
-        let mut delta_computation_attempted = false;
-        let mut delta_computation_result = None;
-
-        // Simulate first poll state: current snapshot exists, previous is None
-        let first_poll_current: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
-            taken_at: Utc::now() - chrono::Duration::seconds(60),
-            five_hour_pct: 10.0,
-            seven_day_pct: 20.0,
-            weekly_scoped_pct: 15.0,
-        });
-
-        let first_poll_previous: Option<PrevUsageSnapshot> = None;
-
-        // ASSERTION 1: Verify first poll state
-        assert!(
-            first_poll_previous.is_none(),
-            "First poll: previous should be None"
-        );
-        assert!(
-            first_poll_current.is_some(),
-            "First poll: current should be Some"
-        );
-
-        // Verify first poll falls into (None, Some) branch (no delta computation)
-        let first_poll_result = match (&first_poll_previous, &first_poll_current) {
-            (Some(_prev), Some(_curr)) => "should_not_happen",
-            (None, Some(_curr)) => "first_poll_skip",
-            (None, None) => "no_snapshots",
-            (Some(_prev), None) => "only_previous",
-        };
-        assert_eq!(
-            first_poll_result, "first_poll_skip",
-            "First poll should fall into (None, Some) branch"
-        );
-
-        // Simulate the shift at the start of second poll (as in run_governor_cycle)
-        // The previous snapshot becomes the first poll's current snapshot
-        let second_poll_previous = first_poll_current;
-
-        // Simulate second poll: new current snapshot with increased utilization
-        let second_poll_current: Option<PrevUsageSnapshot> = Some(PrevUsageSnapshot {
-            taken_at: Utc::now(),
-            five_hour_pct: 12.5,     // +2.5 from previous
-            seven_day_pct: 22.0,     // +2.0 from previous
-            weekly_scoped_pct: 18.0, // +3.0 from previous
-        });
-
-        // ASSERTION 2: Verify second poll state (both snapshots exist)
-        assert!(
-            second_poll_previous.is_some(),
-            "Second poll: previous should be Some (transitioned from first poll current)"
-        );
-        assert!(
-            second_poll_current.is_some(),
-            "Second poll: current should be Some (new poll data)"
-        );
-
-        // ASSERTION 3: Verify delta computation executes correctly with both snapshots
-        // This simulates the check in run_governor_cycle:
-        // if let (Some(prev), Some(curr)) = (&state.previous_api_snapshot, &state.current_api_snapshot)
-        let match_result = match (&second_poll_previous, &second_poll_current) {
-            (Some(prev), Some(curr)) => {
-                // Expected on second poll: both snapshots exist
-                delta_computation_attempted = true;
-
-                let prev_pct = crate::db::WindowPctSnapshot {
-                    five_hour: prev.five_hour_pct,
-                    seven_day: prev.seven_day_pct,
-                    weekly_scoped: prev.weekly_scoped_pct,
-                };
-
-                let curr_pct = crate::db::WindowPctSnapshot {
-                    five_hour: curr.five_hour_pct,
-                    seven_day: curr.seven_day_pct,
-                    weekly_scoped: curr.weekly_scoped_pct,
-                };
-
-                let (delta_5h, delta_7d, delta_7ds) =
-                    calculate_window_pct_delta(&prev_pct, &curr_pct);
-
-                // Store the computed deltas for verification
-                delta_computation_result = Some((delta_5h, delta_7d, delta_7ds));
-
-                "delta_computed"
-            }
-            (None, Some(_curr)) => {
-                // Should NOT happen on second poll (previous exists)
-                "first_poll_skip"
-            }
-            (None, None) => {
-                // Should NOT happen on second poll (both should exist)
-                "no_snapshots"
-            }
-            (Some(_prev), None) => {
-                // Should NOT happen in normal flow (current should exist after successful poll)
-                "only_previous"
-            }
-        };
-
-        // ASSERTION 4: Verify delta computation was executed (not skipped)
-        assert!(
-            delta_computation_attempted,
-            "Delta computation should execute on second poll when both snapshots exist"
-        );
-
-        // ASSERTION 5: Verify the match fell into the correct (Some, Some) branch
-        assert_eq!(
-            match_result, "delta_computed",
-            "Second poll should match the (Some, Some) branch and compute deltas"
-        );
-
-        // ASSERTION 6: Verify computed deltas are correct (not None and not zero)
-        assert!(
-            delta_computation_result.is_some(),
-            "Delta computation result should be Some on second poll"
-        );
-
-        let (delta_5h, delta_7d, delta_7ds) = delta_computation_result.unwrap();
-
-        // Verify exact delta values (current - previous)
-        assert!(
-            (delta_5h - 2.5).abs() < f64::EPSILON,
-            "5h delta should be 2.5% (12.5 - 10.0), got {}",
-            delta_5h
-        );
-        assert!(
-            (delta_7d - 2.0).abs() < f64::EPSILON,
-            "7d delta should be 2.0% (22.0 - 20.0), got {}",
-            delta_7d
-        );
-        assert!(
-            (delta_7ds - 3.0).abs() < f64::EPSILON,
-            "7ds delta should be 3.0% (18.0 - 15.0), got {}",
-            delta_7ds
-        );
-
-        // ASSERTION 7: Verify no panic occurred - test reaches this point
-        // (If we reach here, graceful handling succeeded)
     }
 }
 
