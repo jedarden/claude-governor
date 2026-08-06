@@ -1754,4 +1754,121 @@ mod tests {
             "usd_per_pct_7ds should be NULL when p7ds is NULL"
         );
     }
+
+    #[test]
+    fn annotate_window_pct_deltas_leaves_the_jsonl_untouched() {
+        // The JSONL is the authoritative log and `rebuild_from_jsonl()` replays it
+        // over a dropped schema. Annotation therefore has to stay DB-only: anything
+        // it wrote back to the JSONL would either be replayed as a duplicate record
+        // or silently rewrite history the collector owns. Guard that here, because
+        // a write-back is an easy "improvement" for a future change to add.
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("token-history.jsonl");
+        let db_path = temp_dir.path().join("token-history.db");
+
+        let t0_parsed: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1_parsed: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+        // The collector serialises t0/t1 with `to_rfc3339()`, and annotation matches
+        // on that same rendering — write the fixture the way the collector would.
+        let t0 = t0_parsed.to_rfc3339();
+        let t1 = t1_parsed.to_rfc3339();
+
+        let lines = [
+            serde_json::json!({
+                "r": "i", "ts": t1,
+                "t0": t0, "t1": t1,
+                "sess": "session-a", "sid": "a", "model": "sonnet",
+                "pk": 1, "hr_et": 10, "dow": 2,
+                "input-n": 0, "input-usd": 0.0,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": 0.10, "cache-eff": 0.0,
+            }),
+            serde_json::json!({
+                "r": "i", "ts": t1,
+                "t0": t0, "t1": t1,
+                "sess": "session-b", "sid": "b", "model": "sonnet",
+                "pk": 1, "hr_et": 10, "dow": 2,
+                "input-n": 0, "input-usd": 0.0,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": 0.30, "cache-eff": 0.0,
+            }),
+            serde_json::json!({
+                "r": "f", "ts": t1,
+                "t0": t0, "t1": t1,
+                "pk": 1, "hr_et": 10, "dow": 2, "workers": 2,
+                "total-usd": 0.40, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+                "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+            }),
+        ];
+        let jsonl_body = lines
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&jsonl_path, &jsonl_body).unwrap();
+
+        let count = rebuild_from_jsonl(&jsonl_path, &db_path).unwrap();
+        assert_eq!(count, 3, "all three fixture records should load");
+
+        let before_bytes = fs::read(&jsonl_path).unwrap();
+        let before_mtime = fs::metadata(&jsonl_path).unwrap().modified().unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        let old_pct = WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 70.0,
+            weekly_scoped: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 50.8,
+            seven_day: 70.8,
+            weekly_scoped: 70.8,
+        };
+        annotate_window_pct_deltas(&conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 2, 2).unwrap();
+
+        // Anchor the test: annotation must actually have done its work, otherwise
+        // "the JSONL is unchanged" would pass for the boring reason that nothing ran.
+        let annotated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL AND t0 = ? AND t1 = ?",
+                params![t0, t1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(annotated, 2, "both instance rows should have been annotated");
+
+        let after_bytes = fs::read(&jsonl_path).unwrap();
+        assert_eq!(
+            after_bytes, before_bytes,
+            "annotation must not modify the JSONL; it is DB-only"
+        );
+        assert_eq!(
+            fs::metadata(&jsonl_path).unwrap().modified().unwrap(),
+            before_mtime,
+            "annotation must not even rewrite the JSONL with identical content"
+        );
+
+        // The annotation must also not survive a rebuild: the JSONL carries no p7ds,
+        // so replaying it drops the derived columns back to NULL.
+        rebuild_from_jsonl(&jsonl_path, &db_path).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        let still_annotated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_annotated, 0,
+            "rebuild replays the JSONL, which never carried the annotation"
+        );
+    }
 }
