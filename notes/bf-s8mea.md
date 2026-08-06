@@ -139,3 +139,55 @@ Sketch of the harness the follow-up bead should build (not implemented here):
 count are all fault-tolerant (`match … Err => warn!`, `if let Ok(conn)`) and,
 as noted above, all run *after* the emit, so a machine without `~/.claude` data
 or a fleet DB still reaches both log lines.
+
+---
+
+## bf-3i9t2 — Two-cycle harness that captures the delta log output
+
+Built the harness bf-2m9rt specified, as `tests/delta_logging_runtime_test.rs`
+(one test: `two_cycles_emit_the_delta_log_lines`). No production code changed.
+
+Shape, as sketched in the section above:
+
+- `TestLogger` over `OnceLock<Mutex<Vec<(Level, String)>>>` (the pattern from
+  `tests/heartbeat_orphan_cleanup_test.rs:18-43`), installed once at
+  `LevelFilter::Info` — this binary owns the process-global logger.
+- `FakePoller`, a local `impl claude_governor::poller::UsagePoller` that returns
+  a scripted `Vec<UsageData>`, one reading per cycle. No credentials, no
+  network, no un-gating of `MockPoller`.
+- Readings built from `snapshot_fixtures::snapshot_pair_5h()` — 5h 12.5→18.2%,
+  7d 45.2→46.8%, 7ds 38.7→40.3%. `limits` is empty so `scoped_weekly()` is
+  `None` and the cycle falls back to `weekly_scoped_utilization`;
+  `weekly_scoped_model` is held at `None` across both polls so the
+  model-rotation EMA reset never fires.
+- Two `run_governor_cycle` calls against a `TempDir` state path with
+  `dry_run = true`, cycle 1 starting with no state file on disk.
+
+Assertions are sliced by log index (`log_len()` before each cycle), so a cycle-2
+assertion cannot be satisfied by a cycle-1 record. Per cycle: the expected line
+appears exactly once, at `Level::Info`, and the *other* line does not appear at
+all. `poller.polls == 2` at the end confirms both cycles actually polled.
+
+Negative check (the criterion that the test fails if the emit is removed), run
+by editing `src/governor.rs` and restoring it:
+
+| Emit removed | Result |
+| --- | --- |
+| both (`:4365` and `:4379`) | FAILED at the cycle-1 no-baseline assertion |
+| `format_window_deltas` only (`:4365`) | FAILED at the cycle-2 window-deltas assertion |
+| neither (restored) | ok |
+
+So each of the two emits is independently load-bearing for this test.
+
+Confirmed on the way through: the delta lines really do precede the collector
+pass and the worker count, and those later stages ran and logged on a host with
+no fleet DB configured without failing the cycle — `run_governor_cycle` returned
+`Ok` both times.
+
+`cargo test` (via `~/.cargo/bin/cargo`): 740 lib tests plus all integration
+binaries pass, including the new one.
+
+Scope kept to presence, level and ordering of the two lines. Checking the
+numbers they carry against the fixture inputs is the next bead — note that the
+timestamps in the rendered line come from `Utc::now()` at cycle time, not from
+the fixtures' `taken_at`, since the cycle stamps its own snapshots.
