@@ -1411,6 +1411,83 @@ pub fn window_deltas_from_snapshots(
     }
 }
 
+/// Project a poll snapshot onto the three window percentages a delta is made of.
+///
+/// [`crate::state::PrevUsageSnapshot`] also carries `taken_at`, which the
+/// arithmetic must not see; [`crate::db::WindowPctSnapshot`] is the three
+/// percentages alone. Both cycle paths used to open-code this field-by-field,
+/// which is exactly the shape of copy where `seven_day` quietly gets fed
+/// `weekly_scoped_pct`.
+fn window_pct_of(snap: &crate::state::PrevUsageSnapshot) -> crate::db::WindowPctSnapshot {
+    crate::db::WindowPctSnapshot {
+        five_hour: snap.five_hour_pct,
+        seven_day: snap.seven_day_pct,
+        weekly_scoped: snap.weekly_scoped_pct,
+    }
+}
+
+/// Compute a poll's window deltas and log the one line that describes them.
+///
+/// The governor polls from two places — `run_governor_cycle` (the daemon) and
+/// `run_observe_cycle_internal` (the observe-only subcommand) — and both owe the
+/// operator the same account of what the poll measured. They had drifted into
+/// two copies of the same decision: one matched on
+/// [`window_deltas_from_snapshots`], the other re-derived the branch from the
+/// two `Option`s directly. Same behaviour today, but nothing held them together,
+/// and a fix applied to one would have silently missed the other. This is that
+/// step, once.
+///
+/// Logging is the only side effect: nothing is written to state, to SQLite, or
+/// to disk. The caller assigns the returned tuple into `p5h_delta` /
+/// `p7d_delta` / `p7ds_delta` itself.
+///
+/// # Arguments
+/// - `previous`: snapshot from the previous poll cycle, `None` before the first
+///   successful poll or after a failed one
+/// - `current`: snapshot from this poll cycle
+///
+/// # Returns
+/// `(p5h_delta, p7d_delta, p7ds_delta)` exactly as
+/// [`window_deltas_from_snapshots`] defines them — `Some` only when both
+/// snapshots are present, `None` (never `Some(0.0)`) otherwise.
+///
+/// # Logging
+/// - Both snapshots present: [`format_window_deltas`] at INFO.
+/// - Current only (no baseline): [`format_no_previous_snapshot`] at INFO, so the
+///   poll still leaves a readable trace instead of going silent.
+/// - No current snapshot at all: one DEBUG line — there is no reading to report.
+pub fn compute_and_log_window_deltas(
+    previous: Option<&crate::state::PrevUsageSnapshot>,
+    current: Option<&crate::state::PrevUsageSnapshot>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let deltas = window_deltas_from_snapshots(previous, current);
+
+    match (previous, current) {
+        (Some(prev), Some(curr)) => {
+            log::info!(
+                "[governor] {}",
+                format_window_deltas(
+                    &window_pct_of(prev),
+                    &window_pct_of(curr),
+                    prev.taken_at,
+                    curr.taken_at,
+                )
+            );
+        }
+        (None, Some(curr)) => {
+            log::info!(
+                "[governor] {}",
+                format_no_previous_snapshot(&window_pct_of(curr), curr.taken_at)
+            );
+        }
+        (_, None) => {
+            log::debug!("[governor] no current API snapshot; window deltas cleared for this poll");
+        }
+    }
+
+    deltas
+}
+
 /// Apportion a total delta to a specific session based on USD weight.
 ///
 /// When a fleet-wide percentage delta is observed, this function computes
@@ -1460,6 +1537,11 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - `test_snapshot_pair_deltas_equal_fixture_field_difference` (all three
 ///   pairs, expectation derived from the fixture rather than from literals
 ///   copied out of its doc comment — bead bf-1o5pq)
+/// - `test_compute_and_log_window_deltas_consecutive_snapshots` (via
+///   `compute_and_log_window_deltas` — the function both cycle paths call and
+///   whose result they assign into the state delta fields, bead bf-3g4ew)
+/// - `test_compute_and_log_window_deltas_matches_pure_helper` (all four
+///   `Option` pairings; pins the logging wrapper to `window_deltas_from_snapshots`)
 /// - `test_delta_uses_correct_window_fields` (no field cross-wiring)
 /// - `test_consecutive_snapshots_governor_cycle` (state shift + persistence)
 /// - `tests::test_consecutive_snapshot_delta_computation`
@@ -1908,6 +1990,81 @@ mod window_delta_tests {
             (delta_7ds - 3.0).abs() < f64::EPSILON,
             "7ds delta = 18.0 - 15.0 = 3.0"
         );
+    }
+
+    /// Consecutive snapshots produce the correct deltas through the function
+    /// both cycle paths actually call.
+    ///
+    /// The other tests in this module pin `calculate_window_pct_delta` and
+    /// `window_deltas_from_snapshots`. `run_governor_cycle` and
+    /// `run_observe_cycle_internal` call neither directly — they call
+    /// `compute_and_log_window_deltas` and assign its result straight into
+    /// `p5h_delta` / `p7d_delta` / `p7ds_delta`. This asserts on that function,
+    /// so the arithmetic the governor stores is covered and not merely the
+    /// arithmetic a helper one level down performs.
+    #[test]
+    fn test_compute_and_log_window_deltas_consecutive_snapshots() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        let prev = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            weekly_scoped_pct: 15.0,
+        };
+        let curr = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 12.5,
+            seven_day_pct: 22.0,
+            weekly_scoped_pct: 18.0,
+        };
+
+        let (p5h, p7d, p7ds) = compute_and_log_window_deltas(Some(&prev), Some(&curr));
+
+        assert_eq!(p5h, Some(2.5), "5h delta = 12.5 - 10.0");
+        assert_eq!(p7d, Some(2.0), "7d delta = 22.0 - 20.0");
+        assert_eq!(p7ds, Some(3.0), "7ds delta = 18.0 - 15.0");
+    }
+
+    /// `compute_and_log_window_deltas` decides exactly what
+    /// `window_deltas_from_snapshots` decides, on every `Option` pairing.
+    ///
+    /// The wrapper exists to attach a log line to the decision, not to change
+    /// it. Were it ever to diverge — clamping the no-baseline case to
+    /// `Some(0.0)`, say — the governor would persist a fabricated zero while
+    /// the extensively tested pure helper kept reporting `None`. Checking all
+    /// four pairings keeps the wrapper honest about being a wrapper.
+    #[test]
+    fn test_compute_and_log_window_deltas_matches_pure_helper() {
+        use crate::state::PrevUsageSnapshot;
+        use chrono::Utc;
+
+        let prev = PrevUsageSnapshot {
+            taken_at: Utc::now() - chrono::Duration::seconds(60),
+            five_hour_pct: 10.0,
+            seven_day_pct: 20.0,
+            weekly_scoped_pct: 15.0,
+        };
+        let curr = PrevUsageSnapshot {
+            taken_at: Utc::now(),
+            five_hour_pct: 12.5,
+            seven_day_pct: 22.0,
+            weekly_scoped_pct: 18.0,
+        };
+
+        for (previous, current, label) in [
+            (Some(&prev), Some(&curr), "both snapshots present"),
+            (None, Some(&curr), "first poll: no baseline"),
+            (Some(&prev), None, "failed poll: no current reading"),
+            (None, None, "no snapshots at all"),
+        ] {
+            assert_eq!(
+                compute_and_log_window_deltas(previous, current),
+                window_deltas_from_snapshots(previous, current),
+                "{label}: logging wrapper must not change the decision"
+            );
+        }
     }
 
     /// Test that identical snapshots produce zero deltas.
@@ -4887,61 +5044,17 @@ pub fn run_governor_cycle(
                 weekly_scoped_pct: weekly_scoped_util,
             });
 
-            // Calculate window deltas from consecutive API snapshots. The
-            // decision — including what the first poll reports — lives in
-            // window_deltas_from_snapshots so tests can assert against it
-            // directly instead of re-implementing the match.
-            let (p5h_delta, p7d_delta, p7ds_delta) = window_deltas_from_snapshots(
+            // Calculate window deltas from consecutive API snapshots and log
+            // what this poll measured. The decision — including what the first
+            // poll reports — lives in window_deltas_from_snapshots so tests can
+            // assert against it directly instead of re-implementing the match;
+            // compute_and_log_window_deltas wraps it with the log line so the
+            // observe cycle emits exactly the same thing. Nothing is persisted
+            // here: the assignment below is the only write.
+            let (p5h_delta, p7d_delta, p7ds_delta) = compute_and_log_window_deltas(
                 state.previous_api_snapshot.as_ref(),
                 state.current_api_snapshot.as_ref(),
             );
-
-            match (
-                p5h_delta,
-                p7d_delta,
-                p7ds_delta,
-                state.previous_api_snapshot.as_ref(),
-                state.current_api_snapshot.as_ref(),
-            ) {
-                // The deltas are matched only to confirm a baseline exists;
-                // format_window_deltas recomputes them from the same two
-                // snapshots, so both cycle paths render one identical line.
-                (Some(_), Some(_), Some(_), Some(prev), Some(curr)) => {
-                    let prev_pct = crate::db::WindowPctSnapshot {
-                        five_hour: prev.five_hour_pct,
-                        seven_day: prev.seven_day_pct,
-                        weekly_scoped: prev.weekly_scoped_pct,
-                    };
-                    let curr_pct = crate::db::WindowPctSnapshot {
-                        five_hour: curr.five_hour_pct,
-                        seven_day: curr.seven_day_pct,
-                        weekly_scoped: curr.weekly_scoped_pct,
-                    };
-                    log::info!(
-                        "[governor] {}",
-                        format_window_deltas(&prev_pct, &curr_pct, prev.taken_at, curr.taken_at)
-                    );
-                }
-                // No baseline: say so at INFO and report the percentages this
-                // poll just recorded, so the cycle is not silent about why the
-                // delta line is missing. No delta fields are written here.
-                (_, _, _, _, Some(curr)) => {
-                    let curr_pct = crate::db::WindowPctSnapshot {
-                        five_hour: curr.five_hour_pct,
-                        seven_day: curr.seven_day_pct,
-                        weekly_scoped: curr.weekly_scoped_pct,
-                    };
-                    log::info!(
-                        "[governor] {}",
-                        format_no_previous_snapshot(&curr_pct, curr.taken_at)
-                    );
-                }
-                _ => {
-                    log::debug!(
-                        "[governor] no current API snapshot; window deltas cleared for this poll"
-                    );
-                }
-            }
 
             // Assign unconditionally: on the no-baseline path these are None, so
             // a stale Some(..) from the previous cycle cannot survive into an
@@ -6756,63 +6869,20 @@ fn run_observe_cycle_internal(
                 weekly_scoped_pct: weekly_scoped_util,
             });
 
-            // Calculate window deltas from consecutive API snapshots
-            if let (Some(prev), Some(curr)) =
-                (&state.previous_api_snapshot, &state.current_api_snapshot)
-            {
-                let prev_pct = crate::db::WindowPctSnapshot {
-                    five_hour: prev.five_hour_pct,
-                    seven_day: prev.seven_day_pct,
-                    weekly_scoped: prev.weekly_scoped_pct,
-                };
-                let curr_pct = crate::db::WindowPctSnapshot {
-                    five_hour: curr.five_hour_pct,
-                    seven_day: curr.seven_day_pct,
-                    weekly_scoped: curr.weekly_scoped_pct,
-                };
-                let (delta_5h, delta_7d, delta_7ds) =
-                    calculate_window_pct_delta(&prev_pct, &curr_pct);
+            // Calculate window deltas from consecutive API snapshots, sharing
+            // one implementation with run_governor_cycle so both cycle paths
+            // decide and report identically.
+            let (p5h_delta, p7d_delta, p7ds_delta) = compute_and_log_window_deltas(
+                state.previous_api_snapshot.as_ref(),
+                state.current_api_snapshot.as_ref(),
+            );
 
-                log::info!(
-                    "[governor] {}",
-                    format_window_deltas(&prev_pct, &curr_pct, prev.taken_at, curr.taken_at)
-                );
-
-                // Store computed deltas in governor state
-                state.p5h_delta = Some(delta_5h);
-                state.p7d_delta = Some(delta_7d);
-                state.p7ds_delta = Some(delta_7ds);
-            } else {
-                // No previous snapshot to subtract from (first poll, or the poll
-                // after a failed one). Clear every delta field explicitly so a
-                // stale Some(..) from an earlier cycle is not mistaken for a
-                // reading of the current interval. Mirrors run_governor_cycle.
-                state.p5h_delta = None;
-                state.p7d_delta = None;
-                state.p7ds_delta = None;
-
-                // Say so at INFO, naming the percentages this poll recorded,
-                // rather than leaving the cycle silent. Same rendering as
-                // run_governor_cycle so both paths emit one identical line.
-                match state.current_api_snapshot.as_ref() {
-                    Some(curr) => {
-                        let curr_pct = crate::db::WindowPctSnapshot {
-                            five_hour: curr.five_hour_pct,
-                            seven_day: curr.seven_day_pct,
-                            weekly_scoped: curr.weekly_scoped_pct,
-                        };
-                        log::info!(
-                            "[governor] {}",
-                            format_no_previous_snapshot(&curr_pct, curr.taken_at)
-                        );
-                    }
-                    None => {
-                        log::debug!(
-                            "[governor] no current API snapshot; window deltas cleared for this poll"
-                        );
-                    }
-                }
-            }
+            // Assign unconditionally: on the no-baseline path these are None, so
+            // a stale Some(..) from the previous cycle cannot survive into an
+            // interval it does not describe.
+            state.p5h_delta = p5h_delta;
+            state.p7d_delta = p7d_delta;
+            state.p7ds_delta = p7ds_delta;
         }
         Err(e) => {
             // Reset token_refresh_failing for non-auth errors
