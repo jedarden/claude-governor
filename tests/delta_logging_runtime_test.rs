@@ -81,6 +81,22 @@ fn log_len() -> usize {
         .len()
 }
 
+/// Print every record captured in `from..to`, verbatim, under a banner.
+///
+/// The assertions below only check that a line is present; this exists so the
+/// exact rendered text can be read off a real run (`cargo test -- --nocapture`)
+/// and pasted into a write-up rather than reconstructed by hand from the
+/// format strings. It is inert under the default harness capture.
+fn dump_cycle(label: &str, from: usize, to: usize) {
+    let logs = TEST_LOGS.get_or_init(|| Mutex::new(Vec::new()));
+    let logs = logs.lock().unwrap();
+    println!("===== BEGIN {label} =====");
+    for (level, msg) in logs.iter().take(to).skip(from) {
+        println!("[{level}] {msg}");
+    }
+    println!("===== END {label} =====");
+}
+
 /// Records captured at or after `from`, filtered to those containing `pattern`.
 fn logs_containing_since(from: usize, pattern: &str) -> Vec<(log::Level, String)> {
     TEST_LOGS
@@ -236,6 +252,7 @@ fn two_cycles_emit_the_delta_log_lines() {
     let cycle1_start = log_len();
     drive_cycle(&mut poller, &state_path).expect("cycle 1 should complete");
     let cycle1_end = log_len();
+    dump_cycle("CYCLE 1", cycle1_start, cycle1_end);
 
     let no_baseline = logs_containing_since(cycle1_start, "no previous snapshot");
     assert_eq!(
@@ -256,6 +273,7 @@ fn two_cycles_emit_the_delta_log_lines() {
 
     // --- Cycle 2: cycle 1's reading rotates into previous ------------------
     drive_cycle(&mut poller, &state_path).expect("cycle 2 should complete");
+    dump_cycle("CYCLE 2", cycle1_end, log_len());
 
     let deltas = logs_containing_since(cycle1_end, "window deltas:");
     assert_eq!(

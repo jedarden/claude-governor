@@ -191,3 +191,217 @@ Scope kept to presence, level and ordering of the two lines. Checking the
 numbers they carry against the fixture inputs is the next bead — note that the
 timestamps in the rendered line come from `Utc::now()` at cycle time, not from
 the fixtures' `taken_at`, since the cycle stamps its own snapshots.
+
+---
+
+## bf-4o9bk — The real cycle 1 / cycle 2 output, and the arithmetic checked by hand
+
+### Which path produced these
+
+**The integration test** — `tests/delta_logging_runtime_test.rs`, the harness
+bf-3i9t2 built. Not the simulator (it never enters a cycle function) and not a
+live run (that needs credentials; `run_observe` builds a real `Poller`
+internally, and the daemon path is the same poll).
+
+Command, run from the repo root:
+
+```
+RUST_LOG=info ~/.cargo/bin/cargo test --test delta_logging_runtime_test -- --nocapture
+```
+
+`RUST_LOG` is inert here and is recorded only because the bead asked for it: the
+harness owns the process-global logger itself and pins
+`log::set_max_level(LevelFilter::Info)`
+(`tests/delta_logging_runtime_test.rs:64-72`), so the level is INFO regardless of
+the environment. The only change this bead made to the harness is `dump_cycle`
+(`:85-99`), which prints each cycle's captured records verbatim between banners;
+the assertions are untouched.
+
+### The inputs that produced the excerpts
+
+Both readings come from `snapshot_fixtures::snapshot_pair_5h()` =
+`(baseline_snapshot(), snapshot_after_5h())`, converted to `UsageData` by
+`usage_data_from` (`tests/delta_logging_runtime_test.rs:134`).
+
+| Fixture | `taken_at` | `five_hour_pct` | `seven_day_pct` | `weekly_scoped_pct` |
+| --- | --- | --- | --- | --- |
+| `baseline_snapshot()` (`src/snapshot_fixtures.rs:82`) — cycle 1's poll | `2026-03-18T10:00:00Z` | 12.5 | 45.2 | 38.7 |
+| `snapshot_after_5h()` (`src/snapshot_fixtures.rs:120`) — cycle 2's poll | `2026-03-18T15:00:00Z` | 18.2 | 46.8 | 40.3 |
+
+The `taken_at` column is listed because the bead asked for it, but see
+finding **F1** — those two timestamps do **not** appear in the output, by
+design. The timestamps that do appear are the cycle wall-clock instants:
+
+| | Cycle wall clock (`let now = Utc::now()`, `src/governor.rs:4237`) |
+| --- | --- |
+| cycle 1 | `2026-08-06T06:45:40.917196817+00:00` |
+| cycle 2 | `2026-08-06T06:45:42.350087396+00:00` |
+
+### Cycle 1 — no previous snapshot
+
+Verbatim, the full set of records the harness captured during the first
+`run_governor_cycle` call. `[LEVEL] ` is the harness's own prefix from
+`dump_cycle`; everything after it is the record as emitted.
+
+```
+===== BEGIN CYCLE 1 =====
+[INFO] [governor] === cycle start at 2026-08-06T06:45:40.917196817+00:00 ===
+[INFO] [governor] polled usage: weekly_scoped=38.7%, all_models=45.2%, 5h=12.5%
+[INFO] [governor] weekly_scoped model change detection: prev_model=None, new_model=None, new_weekly_scoped_pct=38.70%
+[INFO] [governor] no previous snapshot yet (first poll or poll following a failure); window deltas unavailable this poll. current: 5h=12.50%, 7d=45.20%, 7ds=38.70% [2026-08-06T06:45:40.917196817+00:00]
+[INFO] [collector] no new usage data found
+[INFO] [governor] collector pass: 1 lines, 0 instances, $0.0000 total
+[INFO] [governor] workers: 0 active (0 heartbeats, 0 tmux sessions, consistent=true, agents=1)
+[INFO] [governor] EMA input: weekly_scoped_model=None, weekly_scoped_pct=38.70% (this is the actual pct from the rotated model)
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[INFO] [governor] 5h: 77.5% remaining, resets in 4.0h — exhausts in infh
+[INFO] [governor] 7d: 44.8% remaining, resets in 120.0h — exhausts in infh
+[INFO] [governor] weekly_scoped: 51.3% remaining, resets in 120.0h BINDING — exhausts in infh
+[INFO] [governor] → binding window weekly_scoped: insufficient burn rate data, will hold at current worker count
+[INFO] [governor] target workers: 0 (ceiling: 90%)
+[INFO] [governor] no scaling action this cycle (dry-run)
+[INFO] [governor] alert FP rate: 0.0% (1 total recorded)
+[INFO] [governor] === cycle complete (decision: NoChange, next in 60s) ===
+===== END CYCLE 1 =====
+```
+
+The line under test is the fourth one. No `window deltas:` line appears anywhere
+in the cycle, which is the contract: cycle 1 has no baseline and prints no
+deltas, not even zeros.
+
+### Cycle 2 — computed deltas
+
+```
+===== BEGIN CYCLE 2 =====
+[INFO] [governor] === cycle start at 2026-08-06T06:45:42.350087396+00:00 ===
+[INFO] [governor] polled usage: weekly_scoped=40.3%, all_models=46.8%, 5h=18.2%
+[INFO] [governor] weekly_scoped model change detection: prev_model=None, new_model=None, new_weekly_scoped_pct=40.30%
+[INFO] [governor] window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:45:40.917196817+00:00 → 2026-08-06T06:45:42.350087396+00:00]
+[INFO] [collector] no new usage data found
+[INFO] [governor] collector pass: 0 lines, 0 instances, $0.0000 total
+[INFO] [governor] workers: 0 active (0 heartbeats, 0 tmux sessions, consistent=true, agents=1)
+[INFO] [governor] EMA input: weekly_scoped_model=None, weekly_scoped_pct=40.30% (this is the actual pct from the rotated model)
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[WARN] [governor] no subscription agents configured, using default baseline for dollar staleness checks
+[INFO] [governor] 5h: 71.8% remaining, resets in 4.0h — exhausts in infh
+[INFO] [governor] 7d: 43.2% remaining, resets in 120.0h — exhausts in infh
+[INFO] [governor] weekly_scoped: 49.7% remaining, resets in 120.0h BINDING — exhausts in infh
+[INFO] [governor] → binding window weekly_scoped: insufficient burn rate data, will hold at current worker count
+[INFO] [governor] target workers: 0 (ceiling: 90%)
+[INFO] [governor] no scaling action this cycle (dry-run)
+[INFO] [governor] alert FP rate: 0.0% (1 total recorded)
+[INFO] [governor] === cycle complete (decision: NoChange, next in 60s) ===
+===== END CYCLE 2 =====
+```
+
+No `no previous snapshot` line appears in cycle 2 — the baseline rotated in, so
+the cycle stops reporting one missing.
+
+### Hand-check of the cycle 2 numbers
+
+Isolating the line:
+
+```
+window deltas: 5h=+5.70% (12.50%→18.20%), 7d=+1.60% (45.20%→46.80%), 7ds=+1.60% (38.70%→40.30%) [2026-08-06T06:45:40.917196817+00:00 → 2026-08-06T06:45:42.350087396+00:00]
+```
+
+**Percentages against the fixtures.** Each window's `(a→b)` pair must be
+`(baseline, after_5h)` for that window:
+
+| Window | printed prev | fixture `baseline_snapshot()` | printed curr | fixture `snapshot_after_5h()` | match |
+| --- | --- | --- | --- | --- | --- |
+| `5h` | 12.50% | `five_hour_pct: 12.5` | 18.20% | `five_hour_pct: 18.2` | yes |
+| `7d` | 45.20% | `seven_day_pct: 45.2` | 46.80% | `seven_day_pct: 46.8` | yes |
+| `7ds` | 38.70% | `weekly_scoped_pct: 38.7` | 40.30% | `weekly_scoped_pct: 40.3` | yes |
+
+So `7ds` is fed by `weekly_scoped_pct`, not by any separate Sonnet field — the
+label is a legacy name for the weekly-scoped window. Confirmed independently by
+the `polled usage:` line of cycle 2, which reports the same value as
+`weekly_scoped=40.3%`.
+
+**Each signed delta = current − previous, for its own window.** Arithmetic done
+by hand from the table above:
+
+| Window | subtraction | exact result | printed (`{:+.2}`) | match |
+| --- | --- | --- | --- | --- |
+| `5h` | 18.2 − 12.5 | 5.7 | `+5.70%` | yes |
+| `7d` | 46.8 − 45.2 | 1.6 | `+1.60%` | yes |
+| `7ds` | 40.3 − 38.7 | 1.6 | `+1.60%` | yes |
+
+No cross-wiring: the `5h` delta uses only the `5h` pair, and each of `7d` / `7ds`
+likewise — visible from the fact that `7d` and `7ds` both print `+1.60%` while
+their operand pairs differ (45.20→46.80 vs 38.70→40.30), so neither is a copy of
+the other. Sign is `+` in all three, matching current > previous everywhere.
+
+Float note: none of these subtractions is exact in binary f64 (e.g. 18.2 − 12.5
+evaluates to 5.699999999999999), but `{:+.2}` rounds to the same two decimals as
+the exact decimal arithmetic, so the printed values agree with the hand
+computation. This is why the check is stated to two decimals and not more.
+
+**Both snapshot timestamps appear.** The line ends with two RFC 3339 instants,
+`prev.taken_at → curr.taken_at`. Cross-checking them against the rest of the
+capture:
+
+- the second, `…06:45:42.350087396+00:00`, is byte-identical to cycle 2's
+  `=== cycle start at … ===` line;
+- the first, `…06:45:40.917196817+00:00`, is byte-identical to **cycle 1's**
+  `cycle start` line *and* to the single timestamp in cycle 1's no-baseline
+  line.
+
+That is the rotation working end to end: the instant cycle 1 stamped onto
+`current_api_snapshot` is exactly the instant cycle 2 reports as `previous`.
+
+### Findings for the next bead
+
+**F1 — the fixtures' `taken_at` values never reach the line, so the printed
+interval is meaningless as elapsed time.** The bracketed pair is 1.43 s apart
+(the gap between the two `run_governor_cycle` calls), not the 5 h the fixture
+pair models. This is not a bug in the formatter: `run_governor_cycle` stamps
+`taken_at: now` from `Utc::now()` (`src/governor.rs:4328`, `now` bound at
+`:4237`) and `UsageData` carries no snapshot time for it to use instead, so the
+fixture's own `taken_at` is discarded on the way in. The consequence for any
+future test is that **the timestamps in this line cannot be asserted against a
+fixture** — only against each other and against the cycle-start lines, as done
+above. If a test ever needs a realistic elapsed interval in the rendered line,
+that requires a production change (threading a poll timestamp through
+`UsageData`), which is out of scope for this bead and should be its own decision.
+
+**F2 — nanosecond precision makes the timestamp pair hard to read and hides the
+one number a reader wants.** `to_rfc3339()` emits 9 fractional digits, so the
+bracket alone is 76 characters of a ~200-character line, and the interval
+(1.43 s here) has to be computed mentally from two 30-character strings.
+Candidate fix for a follow-up: render seconds precision
+(`to_rfc3339_opts(SecondsFormat::Secs, true)`) and/or append the elapsed
+duration, e.g. `[… → …, Δt=1.4s]`. Worth noting this is exactly the interval a
+reader needs to judge whether `+5.70%` is alarming — a delta without its
+duration is not a rate.
+
+**F3 — the surrounding lines are not reproducible between runs; the two delta
+lines are.** An earlier run of the same command in the same working tree
+produced a different cycle 1 tail — `5h: 77.5% remaining, resets in 4.0h —
+exhausts in 15.2h at 3 workers`, `7d: … CUTOFF_RISK`, `→ safe_worker_count: 0
+workers from binding window weekly_scoped` — where the run transcribed above
+prints `exhausts in infh` and `insufficient burn rate data`. The state file is a
+fresh `TempDir` each run, so this variance comes from host state the cycle reads
+outside it (the collector pass over `~/.claude` — note `collector pass: 1 lines`
+in cycle 1 above versus `0 lines` in cycle 2 — and the fleet-aggregate SQLite
+read). The `window deltas:` and `no previous snapshot` lines were identical
+across both runs apart from the wall-clock timestamps, which is the property this
+verification depends on. Anything asserting on *other* lines of this capture
+would be flaky.
+
+**F4 — no mismatch found in the numbers themselves.** Every delta, every
+percentage pair, and both timestamps check out as shown above. The formatting
+observations F1–F3 are the only defects, and none of them is a wrong value.
+
+### Test status
+
+`~/.cargo/bin/cargo test`: exit 0 — 740 lib tests plus every integration binary,
+0 failed. The `dump_cycle` addition is print-only and changes no assertion;
+`two_cycles_emit_the_delta_log_lines` still passes. No production code changed by
+this bead.
