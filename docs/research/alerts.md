@@ -182,7 +182,7 @@ Only alerts at or above `min_severity` fire:
 
 The default alert command creates NEEDLE beads:
 ```bash
-br create --type human "[WARNING] sonnet_cutoff_risk: ..."
+bf create --type human "[WARNING] sonnet_cutoff_risk: ..."
 ```
 
 This integrates with the existing task tracking system — alerts appear as HUMAN-type beads requiring attention.
