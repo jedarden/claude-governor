@@ -1475,6 +1475,11 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - `test_previous_snapshot_without_current_no_panic` (current missing)
 /// - `test_first_poll_governor_state_no_panic_deltas_stay_none`
 /// - `test_format_no_previous_snapshot_line` (the rendered line)
+/// - Field-by-field, one test per missing-baseline pairing, each documenting why
+///   `None` and not `0.0` (bead bf-410er):
+///   `test_missing_baseline_first_poll_yields_none_in_every_field`,
+///   `test_missing_both_snapshots_yield_none_in_every_field`,
+///   `test_missing_current_snapshot_yields_none_in_every_field`
 ///
 /// ## 3. Identical values produce 0% deltas — COVERED
 /// - `test_identical_snapshots_zero_deltas`
@@ -1502,7 +1507,10 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 ///   (`test_edge_case_fixture_snapshots_compute_deltas`), plus the
 ///   `mock_poller_tests` suite (saturation, asymmetry, performance).
 /// - `window_deltas_from_snapshots`: all four `Option` combinations — see case 2
-///   above plus `test_consecutive_polls_after_first_poll_computes_deltas`.
+///   above plus `test_consecutive_polls_after_first_poll_computes_deltas` and
+///   `test_both_snapshots_present_match_calculate_window_pct_delta`, which pins
+///   the computing branch to `calculate_window_pct_delta` on the same pair
+///   instead of to copied literals (bead bf-410er).
 /// - `format_window_deltas`: positive, negative, sub-second interval, negative
 ///   interval (`test_format_window_deltas_{positive,negative,
 ///   subsecond_interval_is_readable,negative_interval_keeps_its_sign}`).
@@ -2639,6 +2647,182 @@ mod window_delta_tests {
             (Some(0.0), Some(0.0), Some(0.0)),
             "with a baseline, an unmoved window reports a measured zero"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Missing-baseline cases: every Option pairing, asserted field by field
+    //
+    // The tests above assert on the returned tuple as a whole. These four name
+    // each field (`p5h_delta`, `p7d_delta`, `p7ds_delta`) separately, so a
+    // regression that leaks a fabricated delta into one window — the field
+    // cross-wiring failure a tuple comparison reports only as "the tuple
+    // differs" — is identified by window in the failure message. The fourth
+    // test pins the computing branch to `calculate_window_pct_delta` itself
+    // rather than to literals, so the two cannot drift apart.
+    // ---------------------------------------------------------------------------
+
+    /// First poll: previous `None`, current `Some` — all three fields `None`.
+    ///
+    /// `None` rather than `0.0` because a delta is a statement about an
+    /// interval, and the first poll has not measured one. `Some(0.0)` would
+    /// assert "this window did not move", which is a claim the governor is in
+    /// no position to make: the window may have climbed 40% before the process
+    /// started. Downstream consumers cannot recover the distinction — a
+    /// fabricated zero is byte-identical to a genuine flat window — so it has
+    /// to be preserved here, in the return type.
+    #[test]
+    fn test_missing_baseline_first_poll_yields_none_in_every_field() {
+        // Non-zero in every window, so a zero-baseline fabrication would be
+        // visible as a distinct value per field rather than coinciding with 0.0.
+        let current = make_usage_snapshot(25.0, 45.0, 35.0);
+
+        let (p5h_delta, p7d_delta, p7ds_delta) = window_deltas_from_snapshots(None, Some(&current));
+
+        assert_eq!(
+            p5h_delta, None,
+            "first poll: no baseline for the 5h window, so no delta"
+        );
+        assert_eq!(
+            p7d_delta, None,
+            "first poll: no baseline for the 7d window, so no delta"
+        );
+        assert_eq!(
+            p7ds_delta, None,
+            "first poll: no baseline for the 7ds window, so no delta"
+        );
+
+        // What a fabricated zero baseline would have produced, for contrast:
+        // three Somes carrying the current percentages, indistinguishable
+        // downstream from a real interval that burned that much quota.
+        let fabricated = calculate_window_pct_delta(
+            &make_window_pct_snapshot(0.0, 0.0, 0.0),
+            &make_window_pct_snapshot(
+                current.five_hour_pct,
+                current.seven_day_pct,
+                current.weekly_scoped_pct,
+            ),
+        );
+        assert_eq!(
+            fabricated,
+            (25.0, 45.0, 35.0),
+            "sanity: a zero stand-in baseline would report the current values as deltas"
+        );
+    }
+
+    /// Neither snapshot present — all three fields `None`.
+    ///
+    /// Reachable while the governor is starting up, or after a poll failure has
+    /// cleared `current_api_snapshot` and the next rotation has shifted that
+    /// `None` into `previous_api_snapshot`. `0.0` would be wrong twice over
+    /// here: there is neither an endpoint nor a baseline, so there is not even a
+    /// current reading to claim the window is flat *at*.
+    #[test]
+    fn test_missing_both_snapshots_yield_none_in_every_field() {
+        let previous: Option<crate::state::PrevUsageSnapshot> = None;
+        let current: Option<crate::state::PrevUsageSnapshot> = None;
+
+        let (p5h_delta, p7d_delta, p7ds_delta) =
+            window_deltas_from_snapshots(previous.as_ref(), current.as_ref());
+
+        assert_eq!(p5h_delta, None, "no snapshots at all: no 5h delta");
+        assert_eq!(p7d_delta, None, "no snapshots at all: no 7d delta");
+        assert_eq!(p7ds_delta, None, "no snapshots at all: no 7ds delta");
+    }
+
+    /// Baseline present, current poll produced nothing — all three fields `None`.
+    ///
+    /// The API call errored or timed out, so the interval has a start but no
+    /// end. `Some(0.0)` here would be the most misleading of the three cases:
+    /// it would read as "we polled and usage held steady" at exactly the moment
+    /// the governor lost visibility, and a stalled-looking-but-flat window is
+    /// what a throttling decision is least entitled to assume. Carrying the
+    /// previous cycle's `Some(..)` forward would be just as wrong — it
+    /// describes an interval that has already scrolled past.
+    #[test]
+    fn test_missing_current_snapshot_yields_none_in_every_field() {
+        let previous = Some(make_usage_snapshot_with_time(
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+            25.0,
+            45.0,
+            35.0,
+        ));
+        let current: Option<crate::state::PrevUsageSnapshot> = None;
+
+        let (p5h_delta, p7d_delta, p7ds_delta) =
+            window_deltas_from_snapshots(previous.as_ref(), current.as_ref());
+
+        assert_eq!(p5h_delta, None, "failed current poll: no 5h delta");
+        assert_eq!(p7d_delta, None, "failed current poll: no 7d delta");
+        assert_eq!(p7ds_delta, None, "failed current poll: no 7ds delta");
+    }
+
+    /// Both snapshots present — all three fields `Some`, and each equals what
+    /// `calculate_window_pct_delta` returns for the same pair.
+    ///
+    /// This is the complement of the three cases above: it is the only pairing
+    /// where a number is warranted, and it shows the `None`s are a property of
+    /// the missing baseline rather than of the inputs, which are otherwise
+    /// unremarkable. The expectation is derived by calling
+    /// `calculate_window_pct_delta` on the same pair rather than by copying
+    /// literals, so `window_deltas_from_snapshots` is pinned to the arithmetic
+    /// it delegates to and the two cannot drift apart.
+    #[test]
+    fn test_both_snapshots_present_match_calculate_window_pct_delta() {
+        let previous = make_usage_snapshot_with_time(
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+            25.0,
+            45.0,
+            35.0,
+        );
+        // Mixed directions: 5h up, 7d down (a window reset), 7ds flat. A wrapper
+        // that dropped a sign or reused one window's delta for another would not
+        // survive all three.
+        let current = make_usage_snapshot(27.5, 40.0, 35.0);
+
+        let (p5h_delta, p7d_delta, p7ds_delta) =
+            window_deltas_from_snapshots(Some(&previous), Some(&current));
+
+        let (expected_5h, expected_7d, expected_7ds) = calculate_window_pct_delta(
+            &make_window_pct_snapshot(
+                previous.five_hour_pct,
+                previous.seven_day_pct,
+                previous.weekly_scoped_pct,
+            ),
+            &make_window_pct_snapshot(
+                current.five_hour_pct,
+                current.seven_day_pct,
+                current.weekly_scoped_pct,
+            ),
+        );
+
+        // Same inputs through the same subtraction, so equality is exact.
+        assert_eq!(
+            p5h_delta,
+            Some(expected_5h),
+            "5h delta should match calculate_window_pct_delta on the same pair"
+        );
+        assert_eq!(
+            p7d_delta,
+            Some(expected_7d),
+            "7d delta should match calculate_window_pct_delta on the same pair"
+        );
+        assert_eq!(
+            p7ds_delta,
+            Some(expected_7ds),
+            "7ds delta should match calculate_window_pct_delta on the same pair"
+        );
+
+        // And the delegate itself computed what the fixture describes, so this
+        // test cannot pass by both sides agreeing on a wrong answer.
+        assert!(
+            (expected_5h - 2.5).abs() < f64::EPSILON,
+            "5h rose 25.0 -> 27.5"
+        );
+        assert!(
+            (expected_7d + 5.0).abs() < f64::EPSILON,
+            "7d fell 45.0 -> 40.0"
+        );
+        assert!(expected_7ds.abs() < f64::EPSILON, "7ds held at 35.0");
     }
 
     // ---------------------------------------------------------------------------
