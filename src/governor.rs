@@ -4298,12 +4298,23 @@ pub fn run_governor_cycle(
                 state.previous_api_snapshot.as_ref(),
                 state.current_api_snapshot.as_ref(),
             ) {
-                (Some(delta_5h), Some(delta_7d), Some(delta_7ds), Some(prev), Some(curr)) => {
+                // The deltas are matched only to confirm a baseline exists;
+                // format_window_deltas recomputes them from the same two
+                // snapshots, so both cycle paths render one identical line.
+                (Some(_), Some(_), Some(_), Some(prev), Some(curr)) => {
+                    let prev_pct = crate::db::WindowPctSnapshot {
+                        five_hour: prev.five_hour_pct,
+                        seven_day: prev.seven_day_pct,
+                        weekly_scoped: prev.weekly_scoped_pct,
+                    };
+                    let curr_pct = crate::db::WindowPctSnapshot {
+                        five_hour: curr.five_hour_pct,
+                        seven_day: curr.seven_day_pct,
+                        weekly_scoped: curr.weekly_scoped_pct,
+                    };
                     log::info!(
-                        "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}% (previous: {:.1}/{:.1}/{:.1}%, current: {:.1}/{:.1}/{:.1}%)",
-                        delta_5h, delta_7d, delta_7ds,
-                        prev.five_hour_pct, prev.seven_day_pct, prev.weekly_scoped_pct,
-                        curr.five_hour_pct, curr.seven_day_pct, curr.weekly_scoped_pct,
+                        "[governor] {}",
+                        format_window_deltas(&prev_pct, &curr_pct, prev.taken_at, curr.taken_at)
                     );
                 }
                 _ => {
@@ -6144,8 +6155,8 @@ fn run_observe_cycle_internal(
                     calculate_window_pct_delta(&prev_pct, &curr_pct);
 
                 log::info!(
-                    "[governor] window deltas: 5h={:+.2}%, 7d={:+.2}%, 7ds={:+.2}%",
-                    delta_5h, delta_7d, delta_7ds,
+                    "[governor] {}",
+                    format_window_deltas(&prev_pct, &curr_pct, prev.taken_at, curr.taken_at)
                 );
 
                 // Store computed deltas in governor state
