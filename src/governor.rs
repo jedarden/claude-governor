@@ -1441,6 +1441,95 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
     total_delta * weight
 }
 
+/// Unit tests for snapshot window-delta computation and rendering.
+///
+/// # Coverage map (audited 2026-08-06, bead bf-14u9s)
+///
+/// The four acceptance cases from the parent bead `bf-g9mg9` map onto existing
+/// tests as follows. Every case is COVERED; the audit found no missing case.
+/// Line numbers are omitted deliberately — search by test name.
+///
+/// ## 1. Consecutive snapshots produce correct p5h / p7d / p7ds deltas — COVERED
+/// - `test_consecutive_snapshots_non_zero_deltas` (hand-built pair)
+/// - `test_consecutive_polls_after_first_poll_computes_deltas`
+///   (via `window_deltas_from_snapshots`)
+/// - `test_consecutive_snapshots_fixtures_produce_correct_deltas` (5h fixtures)
+/// - `test_consecutive_snapshots_7d_fixtures_produce_correct_deltas`
+/// - `test_consecutive_snapshots_7ds_fixtures_produce_correct_deltas`
+/// - `test_snapshot_pair_fixtures_compute_correct_deltas` (all three pairs)
+/// - `test_delta_uses_correct_window_fields` (no field cross-wiring)
+/// - `test_consecutive_snapshots_governor_cycle` (state shift + persistence)
+/// - `tests::test_consecutive_snapshot_delta_computation`
+/// - `mock_poller_tests::test_second_cycle_repolls_and_computes_window_deltas`
+///   (end-to-end, two real cycles)
+///
+/// ## 2. First poll with no baseline returns no deltas — COVERED
+/// - `test_first_poll_no_previous_snapshot`
+/// - `test_first_poll_reports_no_deltas`
+/// - `test_first_poll_reports_no_deltas_regardless_of_current_values`
+/// - `test_delta_computation_skipped_on_first_poll`
+/// - `test_no_snapshots_available_no_panic` (neither snapshot present)
+/// - `test_previous_snapshot_without_current_no_panic` (current missing)
+/// - `test_first_poll_governor_state_no_panic_deltas_stay_none`
+/// - `test_format_no_previous_snapshot_line` (the rendered line)
+///
+/// ## 3. Identical values produce 0% deltas — COVERED
+/// - `test_identical_snapshots_zero_deltas`
+/// - `test_identical_fixture_snapshots_produce_zero_deltas`
+/// - `test_zero_delta_reported_only_when_a_baseline_exists`
+///   (distinguishes a real 0% from "no baseline")
+/// - `tests::test_consecutive_snapshot_delta_identical_snapshots`
+///
+/// ## 4. Increased values produce positive deltas — COVERED
+/// - `test_calculate_window_pct_delta_basic`
+/// - `test_increased_fixture_values_produce_positive_deltas`
+/// - `test_format_window_deltas_positive` (the `+` sign in the rendered line)
+///
+/// ## Per-function inventory
+/// - `calculate_window_pct_delta`: basic, negative (`..._negative_deltas`,
+///   `test_negative_deltas_window_reset`), mixed
+///   (`test_mixed_deltas_increase_and_decrease`), zero previous
+///   (`..._zero_previous`), precision (`test_delta_precision_small_changes`,
+///   `test_fixture_delta_computation_with_fp_tolerance`), extremes
+///   (`test_panic_prevention_with_extreme_values`), reset/idle/high fixtures
+///   (`test_edge_case_fixture_snapshots_compute_deltas`), plus the
+///   `mock_poller_tests` suite (saturation, asymmetry, performance).
+/// - `window_deltas_from_snapshots`: all four `Option` combinations — see case 2
+///   above plus `test_consecutive_polls_after_first_poll_computes_deltas`.
+/// - `format_window_deltas`: positive, negative, sub-second interval, negative
+///   interval (`test_format_window_deltas_{positive,negative,
+///   subsecond_interval_is_readable,negative_interval_keeps_its_sign}`).
+/// - `format_no_previous_snapshot`: `test_format_no_previous_snapshot_line` only.
+///
+/// ## Fixture inventory (`src/snapshot_fixtures.rs`)
+/// Used by the delta tests: `make_snapshot`, `baseline_snapshot`,
+/// `snapshot_after_5h`, `snapshot_after_7d`, `snapshot_after_7ds`,
+/// `idle_snapshot`, `high_utilization_snapshot`, `post_reset_snapshot`,
+/// `snapshot_pair_5h`, `snapshot_pair_7d`, `snapshot_pair_7ds`.
+///
+/// Defined but never consumed by a delta test (only by the fixtures module's own
+/// self-checks): `snapshot_pair_reset`, `weekly_scoped_present_snapshot`,
+/// `weekly_scoped_absent_snapshot`,
+/// `snapshot_pair_weekly_scoped_first_absence`,
+/// `weekly_scoped_absent_3_consecutive_polls`,
+/// `weekly_scoped_present_3_consecutive_polls`.
+///
+/// ## Gaps found (work list for the remaining children)
+/// - **G1 — naming.** The parent scope names `format_window_deltas_unavailable`;
+///   no such function exists. The real counterpart to `format_window_deltas` is
+///   `format_no_previous_snapshot`. Follow-up beads should use that name.
+/// - **G2 — thin coverage of `format_no_previous_snapshot`.** One happy-path
+///   test. Not covered: extreme/saturated percentages, and an explicit assertion
+///   that the line never fabricates a `0.00%` delta (the doctest checks this, the
+///   unit test does not).
+/// - **G3 — unused fixtures.** The six fixtures listed above never reach
+///   `calculate_window_pct_delta`. `snapshot_pair_reset` in particular is the
+///   ready-made window-reset pair, yet `test_negative_deltas_window_reset` and
+///   `test_edge_case_fixture_snapshots_compute_deltas` build their own inputs.
+///   The `weekly_scoped_*` fixtures mean the 7ds-absence path has no delta test.
+/// - **G4 — log lines vs. numbers.** `tests/delta_logging_runtime_test.rs`
+///   proves both lines reach the log and in what order, but asserts nothing about
+///   the numbers they carry (self-documented there as a separate bead).
 #[cfg(test)]
 mod window_delta_tests {
     use super::*;
