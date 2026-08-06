@@ -1249,6 +1249,56 @@ pub fn format_window_deltas(
     )
 }
 
+/// Render the line a cycle logs when it has no baseline to subtract from.
+///
+/// The counterpart to [`format_window_deltas`]: on the first poll after
+/// governor start or a state clear there is no previous snapshot, the delta
+/// computation is skipped, and the logs used to go silent with no explanation
+/// of why the usual `window deltas:` line vanished. This says so, and reports
+/// the percentages that *were* just recorded so the poll still leaves a
+/// readable trace.
+///
+/// It deliberately prints no deltas — not even zeros. "No baseline" is not the
+/// same claim as "no change", and a fabricated `0.00%` would read as a real
+/// measurement of an interval that was never observed.
+///
+/// Pure: it builds and returns a `String`. It performs no logging and no I/O;
+/// the caller decides the log level and target.
+///
+/// # Arguments
+/// - `curr`: window percentages recorded by this poll
+/// - `curr_at`: when `curr` was captured
+///
+/// # Returns
+/// A line stating that deltas are unavailable for this poll, naming the current
+/// `5h` / `7d` / `7ds` percentages and the snapshot timestamp.
+///
+/// # Example
+/// ```
+/// use chrono::{DateTime, Utc};
+/// use claude_governor::db::WindowPctSnapshot;
+/// use claude_governor::governor::format_no_previous_snapshot;
+/// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, weekly_scoped: 18.0 };
+/// let curr_at = "2026-08-05T12:05:00Z".parse::<DateTime<Utc>>().unwrap();
+/// let line = format_no_previous_snapshot(&curr, curr_at);
+/// assert!(line.contains("no previous snapshot"));
+/// assert!(line.contains("5h=12.50%"));
+/// assert!(!line.contains("0.00%"));
+/// ```
+pub fn format_no_previous_snapshot(
+    curr: &crate::db::WindowPctSnapshot,
+    curr_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "no previous snapshot yet (first poll or poll following a failure); \
+         window deltas unavailable this poll. current: 5h={:.2}%, 7d={:.2}%, 7ds={:.2}% [{}]",
+        curr.five_hour,
+        curr.seven_day,
+        curr.weekly_scoped,
+        curr_at.to_rfc3339(),
+    )
+}
+
 /// Decide the window delta fields for a poll from the two API snapshots.
 ///
 /// This is the whole first-poll contract in one place: `run_governor_cycle`
@@ -4317,9 +4367,23 @@ pub fn run_governor_cycle(
                         format_window_deltas(&prev_pct, &curr_pct, prev.taken_at, curr.taken_at)
                     );
                 }
+                // No baseline: say so at INFO and report the percentages this
+                // poll just recorded, so the cycle is not silent about why the
+                // delta line is missing. No delta fields are written here.
+                (_, _, _, _, Some(curr)) => {
+                    let curr_pct = crate::db::WindowPctSnapshot {
+                        five_hour: curr.five_hour_pct,
+                        seven_day: curr.seven_day_pct,
+                        weekly_scoped: curr.weekly_scoped_pct,
+                    };
+                    log::info!(
+                        "[governor] {}",
+                        format_no_previous_snapshot(&curr_pct, curr.taken_at)
+                    );
+                }
                 _ => {
                     log::debug!(
-                        "[governor] no previous API snapshot; window deltas cleared (first poll or poll following a failure)"
+                        "[governor] no current API snapshot; window deltas cleared for this poll"
                     );
                 }
             }
@@ -6172,9 +6236,27 @@ fn run_observe_cycle_internal(
                 state.p7d_delta = None;
                 state.p7ds_delta = None;
 
-                log::debug!(
-                    "[governor] no previous API snapshot; window deltas cleared (first poll or poll following a failure)"
-                );
+                // Say so at INFO, naming the percentages this poll recorded,
+                // rather than leaving the cycle silent. Same rendering as
+                // run_governor_cycle so both paths emit one identical line.
+                match state.current_api_snapshot.as_ref() {
+                    Some(curr) => {
+                        let curr_pct = crate::db::WindowPctSnapshot {
+                            five_hour: curr.five_hour_pct,
+                            seven_day: curr.seven_day_pct,
+                            weekly_scoped: curr.weekly_scoped_pct,
+                        };
+                        log::info!(
+                            "[governor] {}",
+                            format_no_previous_snapshot(&curr_pct, curr.taken_at)
+                        );
+                    }
+                    None => {
+                        log::debug!(
+                            "[governor] no current API snapshot; window deltas cleared for this poll"
+                        );
+                    }
+                }
             }
         }
         Err(e) => {
