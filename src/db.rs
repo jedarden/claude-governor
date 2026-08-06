@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -791,77 +791,89 @@ pub fn annotate_window_pct_deltas(
         return Ok(());
     }
 
-    // Apportion and update each instance record
+    // Apportion and update each instance record.
+    //
+    // The UPDATE is prepared once and re-executed per row: an interval can hold
+    // one row per concurrent session, and re-parsing the same SQL for each of
+    // them is pure overhead.
     let tx = conn.unchecked_transaction()?;
-    for (rowid, sess, total_usd) in instances {
-        // Weight for this instance = its total_usd / fleet total_usd
-        let weight = total_usd / total_usd_sum;
+    {
+        let mut update_instance =
+            tx.prepare("UPDATE i SET p5h = ?, p7d = ?, p7ds = ? WHERE rowid = ?")?;
 
-        // Apportioned deltas for this instance
-        let p5h = delta_5h * weight;
-        let p7d = delta_7d * weight;
-        let p7ds = delta_7ds * weight;
+        for (rowid, sess, total_usd) in instances {
+            // Apportioned deltas for this instance: its share of the fleet's
+            // spend for the interval, applied to each window delta.
+            let p5h = crate::governor::apportion_delta(delta_5h, total_usd_sum, total_usd);
+            let p7d = crate::governor::apportion_delta(delta_7d, total_usd_sum, total_usd);
+            let p7ds = crate::governor::apportion_delta(delta_7ds, total_usd_sum, total_usd);
 
-        tx.execute(
-            "UPDATE i SET p5h = ?, p7d = ?, p7ds = ? WHERE rowid = ?",
-            params![p5h, p7d, p7ds, rowid],
-        )?;
+            update_instance.execute(params![p5h, p7d, p7ds, rowid])?;
 
-        log::trace!(
-            "[annotate] i row {}: sess={}, total_usd={:.4}, weight={:.3}, p5h={:.4}, p7d={:.4}, p7ds={:.4}",
-            rowid,
-            sess,
-            total_usd,
-            weight,
-            p5h,
-            p7d,
-            p7ds
-        );
+            log::trace!(
+                "[annotate] i row {}: sess={}, total_usd={:.4}, weight={:.3}, p5h={:.4}, p7d={:.4}, p7ds={:.4}",
+                rowid,
+                sess,
+                total_usd,
+                total_usd / total_usd_sum,
+                p5h,
+                p7d,
+                p7ds
+            );
+        }
     }
 
-    // Update fleet record with full (unapportioned) deltas
-    let fleet_updated = tx.execute(
-        "UPDATE f SET p5h = ?, p7d = ?, p7ds = ?, usd_per_pct_7ds = CASE WHEN ? > 0 THEN total_usd / ? ELSE NULL END WHERE t0 = ? AND t1 = ?",
-        params![delta_5h, delta_7d, delta_7ds, delta_7ds, delta_7ds, &t0_str, &t1_str],
-    )?;
+    // Update the fleet record with full (unapportioned) deltas.
+    //
+    // `usd_per_pct_7ds` needs the row's own `total_usd`, so read it first and
+    // write every annotated column in a single UPDATE rather than updating the
+    // row twice.
+    let fleet_total_usd: Option<f64> = tx
+        .query_row(
+            "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
+            params![&t0_str, &t1_str],
+            |row| row.get(0),
+        )
+        .optional()?;
 
-    if fleet_updated > 0 {
-        // Compute usd_per_pct_7ds for the fleet record
-        let usd_per_pct_7ds = if delta_7ds > 0.0 {
-            // Query total_usd from the fleet record we just updated
-            let fleet_total_usd: f64 = tx
-                .query_row(
-                    "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
-                    params![&t0_str, &t1_str],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0.0);
-            fleet_total_usd / delta_7ds
-        } else {
-            0.0
-        };
+    match fleet_total_usd {
+        Some(fleet_total_usd) => {
+            let usd_per_pct_7ds = if delta_7ds > 0.0 {
+                fleet_total_usd / delta_7ds
+            } else {
+                0.0
+            };
 
-        tx.execute(
-            "UPDATE f SET usd_per_pct_7ds = ? WHERE t0 = ? AND t1 = ?",
-            params![usd_per_pct_7ds, &t0_str, &t1_str],
-        )?;
+            let mut update_fleet = tx.prepare(
+                "UPDATE f SET p5h = ?, p7d = ?, p7ds = ?, usd_per_pct_7ds = ? WHERE t0 = ? AND t1 = ?",
+            )?;
+            update_fleet.execute(params![
+                delta_5h,
+                delta_7d,
+                delta_7ds,
+                usd_per_pct_7ds,
+                &t0_str,
+                &t1_str
+            ])?;
 
-        log::info!(
-            "[annotate] f row: t0={}, t1={}, p5h={:.4}, p7d={:.4}, p7ds={:.4}, usd_per_pct_7ds={:.4}, elapsed={:.1}s",
-            t0_str,
-            t1_str,
-            delta_5h,
-            delta_7d,
-            delta_7ds,
-            usd_per_pct_7ds,
-            elapsed_seconds
-        );
-    } else {
-        log::warn!(
-            "[annotate] no fleet record found for interval {} - {}",
-            t0_str,
-            t1_str
-        );
+            log::info!(
+                "[annotate] f row: t0={}, t1={}, p5h={:.4}, p7d={:.4}, p7ds={:.4}, usd_per_pct_7ds={:.4}, elapsed={:.1}s",
+                t0_str,
+                t1_str,
+                delta_5h,
+                delta_7d,
+                delta_7ds,
+                usd_per_pct_7ds,
+                elapsed_seconds
+            );
+        }
+        None => {
+            log::warn!(
+                "[annotate] no fleet record found for interval {} - {}",
+                t0_str,
+                t1_str
+            );
+        }
     }
 
     tx.commit()?;
@@ -1317,6 +1329,113 @@ mod tests {
             "usd_per_pct_7ds should be 0.5, got {}",
             usd_per_pct
         );
+    }
+
+    #[test]
+    fn annotate_window_pct_deltas_conserves_the_delta_across_many_sessions() {
+        // The apportioned i rows must add back up to the delta the f row carries,
+        // including when a session spent nothing during the interval: an idle
+        // session earns no share, and its share must not vanish from the fleet
+        // total either.
+        let (_temp, conn) = setup_db();
+
+        let t0_parsed: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1_parsed: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+        let t0 = t0_parsed.to_rfc3339();
+        let t1 = t1_parsed.to_rfc3339();
+
+        // Four concurrent sessions, one of them idle.
+        let spends = [("a", 0.05), ("b", 0.15), ("c", 0.30), ("idle", 0.0)];
+        for (sess, usd) in spends {
+            let inst = serde_json::json!({
+                "r": "i", "ts": "2026-03-20T10:00:00Z",
+                "t0": t0, "t1": t1,
+                "sess": sess, "sid": sess, "model": "sonnet",
+                "pk": 1, "hr_et": 10, "dow": 2,
+                "input-n": 0, "input-usd": 0.0,
+                "output-n": 0, "output-usd": 0.0,
+                "r-cache-n": 0, "r-cache-usd": 0.0,
+                "w-cache-n": 0, "w-cache-usd": 0.0,
+                "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                "total-usd": usd, "cache-eff": 0.0,
+            });
+            insert_instance(&conn, &inst).unwrap();
+        }
+
+        let fleet = serde_json::json!({
+            "r": "f", "ts": "2026-03-20T10:00:00Z",
+            "t0": t0, "t1": t1,
+            "pk": 1, "hr_et": 10, "dow": 2, "workers": 4,
+            "total-usd": 0.50, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+            "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+        });
+        insert_fleet(&conn, &fleet).unwrap();
+
+        let old_pct = WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 20.0,
+            weekly_scoped: 30.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 11.0,
+            seven_day: 22.0,
+            weekly_scoped: 34.0,
+        };
+
+        annotate_window_pct_deltas(&conn, t0_parsed, t1_parsed, &old_pct, &new_pct, 4, 4).unwrap();
+
+        // The idle session gets nothing.
+        let idle_p7ds: f64 = conn
+            .query_row("SELECT p7ds FROM i WHERE sess = 'idle'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            idle_p7ds, 0.0,
+            "a session that spent nothing earns no delta"
+        );
+
+        // The spending sessions split the delta by their share of spend:
+        // 0.05/0.50, 0.15/0.50, 0.30/0.50 of a 4.0-point 7ds delta.
+        for (sess, expected) in [("a", 0.4), ("b", 1.2), ("c", 2.4)] {
+            let p7ds: f64 = conn
+                .query_row("SELECT p7ds FROM i WHERE sess = ?", params![sess], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                (p7ds - expected).abs() < 1e-9,
+                "session {} should get p7ds={}, got {}",
+                sess,
+                expected,
+                p7ds
+            );
+        }
+
+        // Every window's apportioned rows sum back to the f row's full delta.
+        for (col, full_delta) in [("p5h", 1.0), ("p7d", 2.0), ("p7ds", 4.0)] {
+            let apportioned_sum: f64 = conn
+                .query_row(&format!("SELECT SUM({}) FROM i", col), [], |row| row.get(0))
+                .unwrap();
+            let fleet_delta: f64 = conn
+                .query_row(&format!("SELECT {} FROM f", col), [], |row| row.get(0))
+                .unwrap();
+
+            assert!(
+                (fleet_delta - full_delta).abs() < 1e-9,
+                "f.{} should carry the full delta {}, got {}",
+                col,
+                full_delta,
+                fleet_delta
+            );
+            assert!(
+                (apportioned_sum - fleet_delta).abs() < 1e-9,
+                "apportioned {} across sessions ({}) should sum to the fleet delta ({})",
+                col,
+                apportioned_sum,
+                fleet_delta
+            );
+        }
     }
 
     #[test]

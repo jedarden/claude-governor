@@ -304,6 +304,31 @@ pub fn check_window_reset(old_pct: &db::WindowPctSnapshot, new_pct: &db::WindowP
     None
 }
 
+/// Decide whether an interval may be annotated, and say why not when it may not.
+///
+/// The three guards ([`check_elapsed_minimum`], [`check_worker_count_stable`],
+/// [`check_window_reset`]) are always applied together and always in this order:
+/// a too-short interval is the cheapest thing to reject, and a window reset is
+/// only meaningful once the interval is otherwise trustworthy. Gathering them
+/// here keeps the governor cycle from restating the same three conditions —
+/// and from drifting away from them.
+///
+/// # Returns
+/// `Some(reason)` for the first guard that trips, `None` when the interval is
+/// safe to annotate.
+pub fn annotation_skip_reason(
+    t0: DateTime<Utc>,
+    t1: DateTime<Utc>,
+    workers_at_start: u32,
+    workers_at_end: u32,
+    old_pct: &db::WindowPctSnapshot,
+    new_pct: &db::WindowPctSnapshot,
+) -> Option<SkipReason> {
+    check_elapsed_minimum(t0, t1)
+        .or_else(|| check_worker_count_stable(workers_at_start, workers_at_end))
+        .or_else(|| check_window_reset(old_pct, new_pct))
+}
+
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSnapshot {
@@ -5510,38 +5535,26 @@ pub fn run_governor_cycle(
                 weekly_scoped: state.usage.weekly_scoped_pct,
             };
 
-            // Guard 1: Elapsed time < 2 minutes - too noisy for reliable annotation
-            let elapsed_seconds = (t1 - t0).num_seconds().abs();
-            if elapsed_seconds < 120 {
-                log::warn!(
-                    "[governor] skipping window delta annotation: interval too short ({}s < 120s)",
-                    elapsed_seconds
-                );
-            } else if workers_at_start != workers_at_end {
-                // Guard 2: Worker count changed mid-interval - sessions not comparable
-                log::warn!(
-                    "[governor] skipping window delta annotation: worker count changed mid-interval ({} -> {})",
-                    workers_at_start,
-                    workers_at_end
-                );
-            } else {
-                // Guard 3: Check if interval spans a window reset
-                // A reset is detected when any window utilization drops > 1%
-                let reset_threshold = 1.0;
-                let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-                let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-                let weekly_scoped_reset =
-                    new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-
-                if five_hour_reset || seven_day_reset || weekly_scoped_reset {
+            match annotation_skip_reason(
+                t0,
+                t1,
+                workers_at_start,
+                workers_at_end,
+                &old_pct,
+                &new_pct,
+            ) {
+                Some(reason) => {
                     log::warn!(
-                        "[governor] skipping window delta annotation: interval spans window reset (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
+                        "[governor] skipping window delta annotation: {} (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
+                        reason.description(),
                         old_pct.five_hour, new_pct.five_hour,
                         old_pct.seven_day, new_pct.seven_day,
                         old_pct.weekly_scoped, new_pct.weekly_scoped
                     );
-                } else {
-                    // All guards passed - proceed with annotation
+                }
+                None => {
+                    // All guards passed - apportion the interval's deltas across
+                    // the concurrent sessions and annotate the SQLite mirror.
                     if let Err(e) = db::annotate_window_pct_deltas(
                         &conn,
                         t0,
@@ -13044,6 +13057,86 @@ mod annotation_guard_tests {
         let result = check_window_reset(&old_pct, &new_pct);
 
         assert!(result.is_none(), "Should proceed when all windows are stable");
+    }
+
+    /// A clean interval: long enough, stable worker count, all windows rising.
+    fn annotatable_interval() -> (
+        DateTime<Utc>,
+        DateTime<Utc>,
+        db::WindowPctSnapshot,
+        db::WindowPctSnapshot,
+    ) {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(300);
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.0,
+            seven_day: 45.5,
+            weekly_scoped: 35.8,
+        };
+        (t0, t1, old_pct, new_pct)
+    }
+
+    /// annotation_skip_reason: a clean interval is annotated.
+    #[test]
+    fn test_annotation_skip_reason_clean_interval_proceeds() {
+        let (t0, t1, old_pct, new_pct) = annotatable_interval();
+
+        assert_eq!(
+            annotation_skip_reason(t0, t1, 4, 4, &old_pct, &new_pct),
+            None,
+            "A 5-minute interval at a stable worker count with rising windows should annotate"
+        );
+    }
+
+    /// annotation_skip_reason: each guard is wired in, and the cheapest check wins.
+    #[test]
+    fn test_annotation_skip_reason_reports_each_guard() {
+        let (t0, t1, old_pct, new_pct) = annotatable_interval();
+
+        // Too short — reported even though the other two guards would pass.
+        assert_eq!(
+            annotation_skip_reason(t0, t0 + Duration::seconds(60), 4, 4, &old_pct, &new_pct),
+            Some(SkipReason::IntervalTooShort {
+                elapsed_seconds: 60
+            })
+        );
+
+        // Worker count changed mid-interval.
+        assert_eq!(
+            annotation_skip_reason(t0, t1, 4, 6, &old_pct, &new_pct),
+            Some(SkipReason::WorkerCountChanged {
+                workers_start: 4,
+                workers_end: 6,
+            })
+        );
+
+        // Window reset: the 5h window rolled over.
+        let reset_pct = db::WindowPctSnapshot {
+            five_hour: 2.0,
+            ..new_pct.clone()
+        };
+        assert_eq!(
+            annotation_skip_reason(t0, t1, 4, 4, &old_pct, &reset_pct),
+            Some(SkipReason::WindowReset {
+                five_hour_reset: true,
+                seven_day_reset: false,
+                weekly_scoped_reset: false,
+            })
+        );
+
+        // Ordering: when several guards trip, the cheapest one is reported.
+        assert_eq!(
+            annotation_skip_reason(t0, t0 + Duration::seconds(60), 4, 6, &old_pct, &reset_pct),
+            Some(SkipReason::IntervalTooShort {
+                elapsed_seconds: 60
+            }),
+            "A too-short interval should be reported before the worker-count and reset guards"
+        );
     }
 
     /// Test SkipReason::description() method
