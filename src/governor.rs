@@ -1513,34 +1513,45 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - `format_no_previous_snapshot`: `test_format_no_previous_snapshot_line` only.
 ///
 /// ## Fixture inventory (`src/snapshot_fixtures.rs`)
-/// Used by the delta tests: `make_snapshot`, `baseline_snapshot`,
-/// `snapshot_after_5h`, `snapshot_after_7d`, `snapshot_after_7ds`,
-/// `idle_snapshot`, `high_utilization_snapshot`, `post_reset_snapshot`,
-/// `snapshot_pair_5h`, `snapshot_pair_7d`, `snapshot_pair_7ds`.
-///
-/// Defined but never consumed by a delta test (only by the fixtures module's own
-/// self-checks): `snapshot_pair_reset`, `weekly_scoped_present_snapshot`,
-/// `weekly_scoped_absent_snapshot`,
+/// Every fixture below is now consumed by a delta test in this module:
+/// `make_snapshot`, `baseline_snapshot`, `snapshot_after_5h`,
+/// `snapshot_after_7d`, `snapshot_after_7ds`, `idle_snapshot`,
+/// `high_utilization_snapshot`, `post_reset_snapshot`, `snapshot_pair_5h`,
+/// `snapshot_pair_7d`, `snapshot_pair_7ds`, `snapshot_pair_reset`,
+/// `weekly_scoped_present_snapshot`, `weekly_scoped_absent_snapshot`,
 /// `snapshot_pair_weekly_scoped_first_absence`,
 /// `weekly_scoped_absent_3_consecutive_polls`,
-/// `weekly_scoped_present_3_consecutive_polls`.
+/// `weekly_scoped_present_3_consecutive_polls`. The last six reach the delta
+/// path via the G3 closures listed below.
 ///
-/// ## Gaps found (work list for the remaining children)
-/// - **G1 — naming.** The parent scope names `format_window_deltas_unavailable`;
-///   no such function exists. The real counterpart to `format_window_deltas` is
-///   `format_no_previous_snapshot`. Follow-up beads should use that name.
-/// - **G2 — thin coverage of `format_no_previous_snapshot`.** One happy-path
-///   test. Not covered: extreme/saturated percentages, and an explicit assertion
-///   that the line never fabricates a `0.00%` delta (the doctest checks this, the
-///   unit test does not).
-/// - **G3 — unused fixtures.** The six fixtures listed above never reach
-///   `calculate_window_pct_delta`. `snapshot_pair_reset` in particular is the
-///   ready-made window-reset pair, yet `test_negative_deltas_window_reset` and
-///   `test_edge_case_fixture_snapshots_compute_deltas` build their own inputs.
-///   The `weekly_scoped_*` fixtures mean the 7ds-absence path has no delta test.
-/// - **G4 — log lines vs. numbers.** `tests/delta_logging_runtime_test.rs`
-///   proves both lines reach the log and in what order, but asserts nothing about
-///   the numbers they carry (self-documented there as a separate bead).
+/// ## Gaps found by the audit, and their disposition
+/// - **G1 — naming. Not a code defect.** The parent scope names
+///   `format_window_deltas_unavailable`; no such function exists. The real
+///   counterpart to `format_window_deltas` is `format_no_previous_snapshot`.
+///   Recorded so a later reader does not go looking for the phantom name.
+/// - **G2 — thin coverage of `format_no_previous_snapshot`. CLOSED (bf-g9mg9)**
+///   by `test_format_no_previous_snapshot_renders_saturated_values` and
+///   `test_format_no_previous_snapshot_zero_reading_is_not_a_delta_claim`. The
+///   latter supersedes the audit's suggested "line never contains `0.00%`"
+///   assertion, which is unsound: an all-zero *reading* legitimately prints
+///   `0.00%` three times. It asserts the durable invariant instead — every
+///   percentage sits behind the `current:` label and no signed delta is rendered.
+/// - **G3 — unused fixtures. CLOSED (bf-g9mg9)** by
+///   `test_reset_pair_fixture_deltas_equal_fixture_field_difference`
+///   (`snapshot_pair_reset`),
+///   `test_weekly_scoped_first_absence_pair_reports_the_full_drop_as_a_delta`,
+///   `test_weekly_scoped_absent_consecutive_polls_flatten_to_zero_7ds_delta`,
+///   and `test_weekly_scoped_present_consecutive_polls_keep_7ds_delta_positive`.
+///   Together these pin the 7ds-absence contract: absence arrives as a drop to
+///   0.0, so the first absent poll carries the whole negative delta and every
+///   later absent-to-absent step is a flat `Some(0.0)`. The delta path cannot
+///   distinguish absence from a genuine reset — that is the structural-inactivity
+///   predicate's job, and these tests make an attempt to special-case it here
+///   fail loudly.
+/// - **G4 — log lines vs. numbers. STILL OPEN.**
+///   `tests/delta_logging_runtime_test.rs` proves both lines reach the log and in
+///   what order, but asserts nothing about the numbers they carry
+///   (self-documented there as a separate bead).
 ///
 /// ## Deduplication (bead bf-laii4)
 /// Five tests were removed as strictly subsumed by another test in this module.
@@ -3925,6 +3936,237 @@ mod window_delta_tests {
             (delta_7ds - 0.075).abs() < TOLERANCE,
             "7ds delta should be 0.075 with tolerance"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap closures for the coverage map above (bead bf-g9mg9)
+    //
+    // G3: fixtures that existed but never reached the delta path, so a change
+    // to them could not fail a delta test.
+    // G2: `format_no_previous_snapshot` had one happy-path test.
+    // -----------------------------------------------------------------------
+
+    /// `snapshot_pair_reset` is the fixtures module's ready-made window-reset
+    /// pair, but the reset tests all built their own inputs, so the fixture was
+    /// never exercised by the real function.
+    ///
+    /// Runs it through `window_deltas_from_snapshots` — the function
+    /// `run_governor_cycle` actually calls — and derives each expectation from
+    /// the fixture fields rather than from literals, so the assertion pins the
+    /// relationship (every window reads its own field) and not one set of
+    /// numbers.
+    #[test]
+    fn test_reset_pair_fixture_deltas_equal_fixture_field_difference() {
+        let (prev, curr) = crate::snapshot_fixtures::snapshot_pair_reset();
+
+        let (d5h, d7d, d7ds) = window_deltas_from_snapshots(Some(&prev), Some(&curr));
+
+        // A reset pair has a baseline on both sides, so every field is Some.
+        let (d5h, d7d, d7ds) = (
+            d5h.expect("5h delta"),
+            d7d.expect("7d delta"),
+            d7ds.expect("7ds delta"),
+        );
+
+        assert!(
+            (d5h - (curr.five_hour_pct - prev.five_hour_pct)).abs() < DELTA_EPSILON,
+            "5h delta {d5h} is not curr - prev for the 5h field"
+        );
+        assert!(
+            (d7d - (curr.seven_day_pct - prev.seven_day_pct)).abs() < DELTA_EPSILON,
+            "7d delta {d7d} is not curr - prev for the 7d field"
+        );
+        assert!(
+            (d7ds - (curr.weekly_scoped_pct - prev.weekly_scoped_pct)).abs() < DELTA_EPSILON,
+            "7ds delta {d7ds} is not curr - prev for the 7ds field"
+        );
+
+        // A reset only ever releases capacity, so every window moves down.
+        // Asserted separately from magnitude: a sign flip is the failure that
+        // would make the governor scale the wrong way.
+        assert!(d5h < 0.0, "5h delta after a reset must be negative, got {d5h}");
+        assert!(d7d < 0.0, "7d delta after a reset must be negative, got {d7d}");
+        assert!(
+            d7ds < 0.0,
+            "7ds delta after a reset must be negative, got {d7ds}"
+        );
+    }
+
+    /// The 7ds window vanishing from the API is reported as a drop to 0.0, so
+    /// the delta layer sees a large negative 7ds delta while the other two
+    /// windows keep climbing.
+    ///
+    /// This test documents the contract deliberately: `calculate_window_pct_delta`
+    /// is pure arithmetic over three numbers and *cannot* tell "the window was
+    /// removed from the response" from "the window genuinely reset to zero".
+    /// Distinguishing those is the structural-inactivity predicate's job, not
+    /// this layer's. Pinning it here means a future attempt to special-case
+    /// absence inside the delta path fails loudly rather than silently changing
+    /// what a 7ds delta means.
+    #[test]
+    fn test_weekly_scoped_first_absence_pair_reports_the_full_drop_as_a_delta() {
+        let (prev, curr) = crate::snapshot_fixtures::snapshot_pair_weekly_scoped_first_absence();
+
+        // Fixture premise: the window really does go from present to absent.
+        assert!(prev.weekly_scoped_pct > 0.0, "previous 7ds should be present");
+        assert_eq!(curr.weekly_scoped_pct, 0.0, "current 7ds should be absent");
+
+        let (d5h, d7d, d7ds) = window_deltas_from_snapshots(Some(&prev), Some(&curr));
+
+        // The whole previously-reported utilization shows up as the delta —
+        // not None, and not a suppressed 0.0.
+        let d7ds = d7ds.expect("7ds delta is still computed when the window is absent");
+        assert!(
+            (d7ds - (0.0 - prev.weekly_scoped_pct)).abs() < DELTA_EPSILON,
+            "7ds delta should be the full drop from {}, got {d7ds}",
+            prev.weekly_scoped_pct
+        );
+
+        // The other two windows are unaffected by the 7ds absence and keep
+        // reporting their own small increases.
+        let d5h = d5h.expect("5h delta");
+        let d7d = d7d.expect("7d delta");
+        assert!(d5h > 0.0, "5h kept accumulating across the pair, got {d5h}");
+        assert!(d7d > 0.0, "7d kept accumulating across the pair, got {d7d}");
+    }
+
+    /// Across a run of consecutive absences, only the *first* poll carries the
+    /// drop; every later absent-to-absent step yields a 7ds delta of exactly
+    /// 0.0, indistinguishable from a genuinely flat window.
+    ///
+    /// That indistinguishability is the reason the absence counter has to live
+    /// outside the delta path — this test is what makes the consequence visible.
+    #[test]
+    fn test_weekly_scoped_absent_consecutive_polls_flatten_to_zero_7ds_delta() {
+        let polls = crate::snapshot_fixtures::weekly_scoped_absent_3_consecutive_polls();
+        assert_eq!(polls.len(), 4, "baseline + 3 absent polls");
+
+        // Poll 0 -> 1: the drop, carried in full by this one step.
+        let (_, _, first) = window_deltas_from_snapshots(Some(&polls[0]), Some(&polls[1]));
+        let first = first.expect("7ds delta on the first absence");
+        assert!(
+            (first - (0.0 - polls[0].weekly_scoped_pct)).abs() < DELTA_EPSILON,
+            "first absence should carry the whole drop, got {first}"
+        );
+
+        // Polls 1 -> 2 and 2 -> 3: 0.0 - 0.0. Exactly zero, and Some(0.0)
+        // rather than None, because a baseline does exist for these steps.
+        for window in polls.windows(2).skip(1) {
+            let (_, _, d7ds) = window_deltas_from_snapshots(Some(&window[0]), Some(&window[1]));
+            let d7ds = d7ds.expect("a baseline exists, so the delta is Some");
+            assert_eq!(
+                d7ds, 0.0,
+                "absent-to-absent step should be a flat 0.0 delta at {}",
+                window[1].taken_at
+            );
+        }
+
+        // 5h and 7d keep climbing throughout, so a zero 7ds delta here is the
+        // window's own behavior and not a stalled poll.
+        for window in polls.windows(2) {
+            let (d5h, d7d, _) = window_deltas_from_snapshots(Some(&window[0]), Some(&window[1]));
+            assert!(d5h.expect("5h delta") > 0.0, "5h should keep accumulating");
+            assert!(d7d.expect("7d delta") > 0.0, "7d should keep accumulating");
+        }
+    }
+
+    /// The contrast case for the test above: when 7ds stays present across the
+    /// same 3-poll run, every step yields a strictly positive 7ds delta.
+    ///
+    /// Without this, a bug that zeroed all 7ds deltas would still pass the
+    /// absence test (which expects zeros for the absent steps).
+    #[test]
+    fn test_weekly_scoped_present_consecutive_polls_keep_7ds_delta_positive() {
+        let polls = crate::snapshot_fixtures::weekly_scoped_present_3_consecutive_polls();
+        assert_eq!(polls.len(), 4, "baseline + 3 present polls");
+
+        for window in polls.windows(2) {
+            let (_, _, d7ds) = window_deltas_from_snapshots(Some(&window[0]), Some(&window[1]));
+            let d7ds = d7ds.expect("7ds delta");
+
+            assert!(
+                d7ds > 0.0,
+                "7ds should keep climbing while present, got {d7ds} at {}",
+                window[1].taken_at
+            );
+            assert!(
+                (d7ds - (window[1].weekly_scoped_pct - window[0].weekly_scoped_pct)).abs()
+                    < DELTA_EPSILON,
+                "7ds delta should be the field difference, got {d7ds}"
+            );
+        }
+    }
+
+    /// Saturated percentages render without truncation or overflow, and the
+    /// line still claims no delta and no interval.
+    #[test]
+    fn test_format_no_previous_snapshot_renders_saturated_values() {
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 100.0,
+            seven_day: 100.0,
+            weekly_scoped: 100.0,
+        };
+        let curr_at = "2026-08-06T06:45:40.917Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        let line = format_no_previous_snapshot(&curr, curr_at);
+
+        assert!(
+            line.contains("current: 5h=100.00%, 7d=100.00%, 7ds=100.00%"),
+            "saturated reading should render in full: {line}"
+        );
+        assert!(!line.contains("Δ"), "no-baseline line must not claim a delta");
+        assert!(!line.contains("Δt"), "no-baseline line must not claim a Δt");
+    }
+
+    /// An all-zero *reading* prints `0.00%` three times — and that is correct,
+    /// because those are current values, not deltas.
+    ///
+    /// The doctest asserts `!line.contains("0.00%")`, which only holds because
+    /// its reading happens to be non-zero; it would be wrong here. The durable
+    /// invariant is the one asserted below: every percentage on this line sits
+    /// behind the `current:` label, and the line never renders a signed delta.
+    /// This is the case where a reader is most likely to misread the line as
+    /// "all three windows were flat".
+    #[test]
+    fn test_format_no_previous_snapshot_zero_reading_is_not_a_delta_claim() {
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 0.0,
+            seven_day: 0.0,
+            weekly_scoped: 0.0,
+        };
+        let curr_at = "2026-08-06T06:45:40.917Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        let line = format_no_previous_snapshot(&curr, curr_at);
+
+        // The zeros are readings, and they are labelled as such.
+        assert!(
+            line.contains("current: 5h=0.00%, 7d=0.00%, 7ds=0.00%"),
+            "zero reading should be labelled `current:`: {line}"
+        );
+        // Every percentage on the line follows the `current:` label — there is
+        // no second, unlabelled group that could be read as deltas.
+        let (before, after) = line
+            .split_once("current:")
+            .expect("line labels its readings `current:`");
+        assert!(
+            !before.contains('%'),
+            "no percentage may precede the `current:` label: {before}"
+        );
+        assert_eq!(
+            after.matches('%').count(),
+            3,
+            "exactly three percentages, one per window: {after}"
+        );
+        // And it states outright that deltas are unavailable.
+        assert!(
+            line.contains("window deltas unavailable this poll"),
+            "line must say deltas are unavailable: {line}"
+        );
+        assert!(!line.contains("Δ"), "no-baseline line must not claim a delta");
     }
 }
 
