@@ -138,10 +138,10 @@ alerts:
   min_severity: warning          # info | warning | critical
   cooldown_minutes: 60           # suppress duplicate alerts
   command:
-    - br
+    - bf
     - create
-    --type
-    human
+    - --type
+    - human
   low_cache_eff_threshold: 0.30  # 30%
   low_cache_eff_intervals: 5     # 5 consecutive polls (~25 min)
 ```
