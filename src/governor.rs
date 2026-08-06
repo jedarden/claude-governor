@@ -1188,6 +1188,67 @@ pub fn calculate_window_pct_delta(
     (delta_5h, delta_7d, delta_7ds)
 }
 
+/// Render one human-readable line describing the window percentage deltas
+/// between two consecutive API poll snapshots.
+///
+/// The governor logs window deltas from more than one cycle path, and those
+/// sites had drifted apart: one printed deltas plus the previous/current
+/// percentages, the other printed deltas alone, and neither said *when* the
+/// two snapshots were taken — which is exactly what makes a delta
+/// interpretable (a +2.5% jump means something different over 30s than over
+/// 30min). This helper is the single rendering of that line so every caller
+/// emits the same thing.
+///
+/// Pure: it builds and returns a `String`. It performs no logging and no I/O;
+/// the caller decides the log level and target.
+///
+/// # Arguments
+/// - `prev`: window percentages from the previous poll cycle
+/// - `curr`: window percentages from the current poll cycle
+/// - `prev_at`: when `prev` was captured
+/// - `curr_at`: when `curr` was captured
+///
+/// # Returns
+/// A line naming all three windows (`5h`, `7d`, `7ds`) with signed deltas, the
+/// previous and current percentages, and both snapshot timestamps.
+///
+/// # Example
+/// ```
+/// use chrono::{DateTime, Utc};
+/// use claude_governor::db::WindowPctSnapshot;
+/// use claude_governor::governor::format_window_deltas;
+/// let prev = WindowPctSnapshot { five_hour: 10.0, seven_day: 20.0, weekly_scoped: 15.0 };
+/// let curr = WindowPctSnapshot { five_hour: 12.5, seven_day: 22.0, weekly_scoped: 18.0 };
+/// let prev_at = "2026-08-05T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+/// let curr_at = "2026-08-05T12:05:00Z".parse::<DateTime<Utc>>().unwrap();
+/// let line = format_window_deltas(&prev, &curr, prev_at, curr_at);
+/// assert!(line.contains("5h=+2.50%"));
+/// assert!(line.contains("2026-08-05T12:05:00+00:00"));
+/// ```
+pub fn format_window_deltas(
+    prev: &crate::db::WindowPctSnapshot,
+    curr: &crate::db::WindowPctSnapshot,
+    prev_at: chrono::DateTime<chrono::Utc>,
+    curr_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(prev, curr);
+    format!(
+        "window deltas: 5h={:+.2}% ({:.2}%→{:.2}%), 7d={:+.2}% ({:.2}%→{:.2}%), \
+         7ds={:+.2}% ({:.2}%→{:.2}%) [{} → {}]",
+        delta_5h,
+        prev.five_hour,
+        curr.five_hour,
+        delta_7d,
+        prev.seven_day,
+        curr.seven_day,
+        delta_7ds,
+        prev.weekly_scoped,
+        curr.weekly_scoped,
+        prev_at.to_rfc3339(),
+        curr_at.to_rfc3339(),
+    )
+}
+
 /// Decide the window delta fields for a poll from the two API snapshots.
 ///
 /// This is the whole first-poll contract in one place: `run_governor_cycle`
@@ -1340,6 +1401,60 @@ mod window_delta_tests {
         assert!((d5h - 5.0).abs() < f64::EPSILON);
         assert!((d7d - 10.0).abs() < f64::EPSILON);
         assert!((d7ds - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_format_window_deltas_positive() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 10.0,
+            seven_day: 20.0,
+            weekly_scoped: 15.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 12.5,
+            seven_day: 22.0,
+            weekly_scoped: 18.0,
+        };
+        let prev_at = "2026-08-05T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let curr_at = "2026-08-05T12:05:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        assert_eq!(
+            format_window_deltas(&prev, &curr, prev_at, curr_at),
+            "window deltas: 5h=+2.50% (10.00%→12.50%), 7d=+2.00% (20.00%→22.00%), \
+             7ds=+3.00% (15.00%→18.00%) \
+             [2026-08-05T12:00:00+00:00 → 2026-08-05T12:05:00+00:00]"
+        );
+    }
+
+    #[test]
+    fn test_format_window_deltas_negative() {
+        let prev = crate::db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 30.0,
+            weekly_scoped: 25.0,
+        };
+        let curr = crate::db::WindowPctSnapshot {
+            five_hour: 15.0,
+            seven_day: 22.0,
+            weekly_scoped: 18.0,
+        };
+        let prev_at = "2026-08-05T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let curr_at = "2026-08-05T17:30:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+
+        assert_eq!(
+            format_window_deltas(&prev, &curr, prev_at, curr_at),
+            "window deltas: 5h=-5.00% (20.00%→15.00%), 7d=-8.00% (30.00%→22.00%), \
+             7ds=-7.00% (25.00%→18.00%) \
+             [2026-08-05T12:00:00+00:00 → 2026-08-05T17:30:00+00:00]"
+        );
     }
 
     #[test]
