@@ -1457,6 +1457,9 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - `test_consecutive_snapshots_7d_fixtures_produce_correct_deltas`
 /// - `test_consecutive_snapshots_7ds_fixtures_produce_correct_deltas`
 /// - `test_snapshot_pair_fixtures_compute_correct_deltas` (all three pairs)
+/// - `test_snapshot_pair_deltas_equal_fixture_field_difference` (all three
+///   pairs, expectation derived from the fixture rather than from literals
+///   copied out of its doc comment — bead bf-1o5pq)
 /// - `test_delta_uses_correct_window_fields` (no field cross-wiring)
 /// - `test_consecutive_snapshots_governor_cycle` (state shift + persistence)
 /// - `tests::test_consecutive_snapshot_delta_computation`
@@ -1479,10 +1482,14 @@ pub fn apportion_delta(total_delta: f64, total_usd: f64, session_total_usd: f64)
 /// - `test_zero_delta_reported_only_when_a_baseline_exists`
 ///   (distinguishes a real 0% from "no baseline")
 /// - `tests::test_consecutive_snapshot_delta_identical_snapshots`
+/// - `test_identical_pair_fixture_snapshots_produce_zero_deltas` (each pair
+///   fixture against itself, not just the baseline — bead bf-1o5pq)
 ///
 /// ## 4. Increased values produce positive deltas — COVERED
 /// - `test_calculate_window_pct_delta_basic`
 /// - `test_increased_fixture_values_produce_positive_deltas`
+/// - `test_pair_fixture_increases_produce_strictly_positive_deltas` (sign
+///   asserted separately from magnitude — bead bf-1o5pq)
 /// - `test_format_window_deltas_positive` (the `+` sign in the rendered line)
 ///
 /// ## Per-function inventory
@@ -3468,6 +3475,133 @@ mod window_delta_tests {
             (delta_7ds_7ds - delta_7ds).abs() < 1e-9,
             "7ds pair should match 7d 7ds delta"
         );
+    }
+
+    /// Tolerance for comparing computed deltas against expected values.
+    ///
+    /// Fixture percentages are decimal literals with no exact binary
+    /// representation, so `18.2 - 12.5` lands a few ULPs away from `5.7`.
+    /// Exact equality would make these tests fail on arithmetic that is
+    /// correct; `1e-9` is far tighter than any percentage difference the
+    /// governor acts on.
+    const DELTA_EPSILON: f64 = 1e-9;
+
+    /// Project a fixture snapshot onto the percentage triple the delta
+    /// function consumes.
+    fn pct_of(snapshot: &crate::state::PrevUsageSnapshot) -> crate::db::WindowPctSnapshot {
+        crate::db::WindowPctSnapshot {
+            five_hour: snapshot.five_hour_pct,
+            seven_day: snapshot.seven_day_pct,
+            weekly_scoped: snapshot.weekly_scoped_pct,
+        }
+    }
+
+    /// Proves each returned delta is the corresponding window's `current -
+    /// previous`, derived from the fixture fields themselves.
+    ///
+    /// The sibling pair tests assert against hardcoded literals copied from the
+    /// fixture doc comments, so they prove the arithmetic only for the numbers
+    /// that were current when they were written. Deriving the expectation from
+    /// the fixture instead pins the *relationship* — every window keeps reading
+    /// its own field, whatever values the fixtures later carry.
+    #[test]
+    fn test_snapshot_pair_deltas_equal_fixture_field_difference() {
+        use crate::snapshot_fixtures::{snapshot_pair_5h, snapshot_pair_7d, snapshot_pair_7ds};
+
+        let pairs = [
+            ("5h", snapshot_pair_5h()),
+            ("7d", snapshot_pair_7d()),
+            ("7ds", snapshot_pair_7ds()),
+        ];
+
+        for (label, (prev, curr)) in pairs {
+            let (delta_5h, delta_7d, delta_7ds) =
+                calculate_window_pct_delta(&pct_of(&prev), &pct_of(&curr));
+
+            assert!(
+                (delta_5h - (curr.five_hour_pct - prev.five_hour_pct)).abs() < DELTA_EPSILON,
+                "{label} pair: 5h delta should be {} - {}",
+                curr.five_hour_pct,
+                prev.five_hour_pct
+            );
+            assert!(
+                (delta_7d - (curr.seven_day_pct - prev.seven_day_pct)).abs() < DELTA_EPSILON,
+                "{label} pair: 7d delta should be {} - {}",
+                curr.seven_day_pct,
+                prev.seven_day_pct
+            );
+            assert!(
+                (delta_7ds - (curr.weekly_scoped_pct - prev.weekly_scoped_pct)).abs()
+                    < DELTA_EPSILON,
+                "{label} pair: 7ds delta should be {} - {}",
+                curr.weekly_scoped_pct,
+                prev.weekly_scoped_pct
+            );
+        }
+    }
+
+    /// Proves a snapshot compared against itself yields 0.0 on all three
+    /// windows, for every snapshot the pair fixtures produce.
+    ///
+    /// A poll that finds unchanged utilization must report a real zero rather
+    /// than drift or a stale carry-over. The existing zero-delta test uses the
+    /// baseline fixture only; this covers each pair's current snapshot too, so
+    /// the property holds at post-reset and mid-window values as well.
+    #[test]
+    fn test_identical_pair_fixture_snapshots_produce_zero_deltas() {
+        use crate::snapshot_fixtures::{snapshot_pair_5h, snapshot_pair_7d, snapshot_pair_7ds};
+
+        let (_, after_5h) = snapshot_pair_5h();
+        let (_, after_7d) = snapshot_pair_7d();
+        let (baseline, after_7ds) = snapshot_pair_7ds();
+
+        for snapshot in [baseline, after_5h, after_7d, after_7ds] {
+            let pct = pct_of(&snapshot);
+            let (delta_5h, delta_7d, delta_7ds) = calculate_window_pct_delta(&pct, &pct);
+
+            assert!(
+                delta_5h.abs() < DELTA_EPSILON,
+                "5h delta should be 0.0 for an unchanged snapshot, got {delta_5h}"
+            );
+            assert!(
+                delta_7d.abs() < DELTA_EPSILON,
+                "7d delta should be 0.0 for an unchanged snapshot, got {delta_7d}"
+            );
+            assert!(
+                delta_7ds.abs() < DELTA_EPSILON,
+                "7ds delta should be 0.0 for an unchanged snapshot, got {delta_7ds}"
+            );
+        }
+    }
+
+    /// Proves every window of every pair fixture moves strictly upward.
+    ///
+    /// Each pair models usage accumulating between two polls, so a delta that
+    /// came back zero or negative would mean the sign was dropped or a window
+    /// read the wrong field. Asserting the sign separately from the magnitude
+    /// keeps that failure legible: the literal-valued sibling tests would
+    /// report only "expected 5.7".
+    #[test]
+    fn test_pair_fixture_increases_produce_strictly_positive_deltas() {
+        use crate::snapshot_fixtures::{snapshot_pair_5h, snapshot_pair_7d, snapshot_pair_7ds};
+
+        let pairs = [
+            ("5h", snapshot_pair_5h()),
+            ("7d", snapshot_pair_7d()),
+            ("7ds", snapshot_pair_7ds()),
+        ];
+
+        for (label, (prev, curr)) in pairs {
+            let (delta_5h, delta_7d, delta_7ds) =
+                calculate_window_pct_delta(&pct_of(&prev), &pct_of(&curr));
+
+            assert!(delta_5h > 0.0, "{label} pair: 5h delta should be positive");
+            assert!(delta_7d > 0.0, "{label} pair: 7d delta should be positive");
+            assert!(
+                delta_7ds > 0.0,
+                "{label} pair: 7ds delta should be positive"
+            );
+        }
     }
 
     /// Test that fixtures with increased utilization produce positive deltas.
