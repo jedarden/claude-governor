@@ -329,6 +329,56 @@ pub fn annotation_skip_reason(
         .or_else(|| check_window_reset(old_pct, new_pct))
 }
 
+/// Render the line the governor logs when a guard rejects an interval.
+///
+/// A reason on its own does not say what was rejected: `interval spans window
+/// reset (5h)` leaves a reader guessing which readings tripped the guard and
+/// how far the windows had actually moved, and the annotated history now has a
+/// hole they cannot account for. Pairing the reason with the interval's own
+/// percentages makes the line self-contained, the same way
+/// [`format_window_deltas`] does for the delta line.
+///
+/// Pure: it builds and returns a `String`. It performs no logging and no I/O;
+/// the caller decides the log level. The governor logs it at WARN, because a
+/// skipped interval is a gap in the data the promotion validator reads.
+///
+/// # Example
+/// ```
+/// use claude_governor::db::WindowPctSnapshot;
+/// use claude_governor::governor::{format_annotation_skip, SkipReason};
+/// let old_pct = WindowPctSnapshot { five_hour: 20.0, seven_day: 45.0, weekly_scoped: 35.0 };
+/// let new_pct = WindowPctSnapshot { five_hour: 2.0, seven_day: 45.5, weekly_scoped: 35.8 };
+/// let line = format_annotation_skip(
+///     &SkipReason::WindowReset {
+///         five_hour_reset: true,
+///         seven_day_reset: false,
+///         weekly_scoped_reset: false,
+///     },
+///     &old_pct,
+///     &new_pct,
+/// );
+/// assert!(line.contains("interval spans window reset (5h)"));
+/// // The readings that tripped the guard are printed alongside it.
+/// assert!(line.contains("5h: 20.0%→2.0%"));
+/// ```
+pub fn format_annotation_skip(
+    reason: &SkipReason,
+    old_pct: &db::WindowPctSnapshot,
+    new_pct: &db::WindowPctSnapshot,
+) -> String {
+    format!(
+        "skipping window delta annotation: {} \
+         (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
+        reason.description(),
+        old_pct.five_hour,
+        new_pct.five_hour,
+        old_pct.seven_day,
+        new_pct.seven_day,
+        old_pct.weekly_scoped,
+        new_pct.weekly_scoped,
+    )
+}
+
 /// Snapshot of usage data for all windows
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSnapshot {
@@ -5545,11 +5595,8 @@ pub fn run_governor_cycle(
             ) {
                 Some(reason) => {
                     log::warn!(
-                        "[governor] skipping window delta annotation: {} (5h: {:.1}%→{:.1}%, 7d: {:.1}%→{:.1}%, 7ds: {:.1}%→{:.1}%)",
-                        reason.description(),
-                        old_pct.five_hour, new_pct.five_hour,
-                        old_pct.seven_day, new_pct.seven_day,
-                        old_pct.weekly_scoped, new_pct.weekly_scoped
+                        "[governor] {}",
+                        format_annotation_skip(&reason, &old_pct, &new_pct)
                     );
                 }
                 None => {
@@ -12275,238 +12322,14 @@ mod annotation_guard_tests {
     use super::*;
     use chrono::{Duration, Utc};
 
-    /// Test Guard 1: Interval too short (< 2 minutes)
-    #[test]
-    fn test_annotation_guard_short_interval_skips() {
-        let t0 = Utc::now();
-        let t1 = t0 + Duration::seconds(90); // Only 90 seconds - should skip
-
-        let elapsed_seconds = (t1 - t0).num_seconds().abs();
-
-        // Guard should trigger
-        assert!(
-            elapsed_seconds < 120,
-            "Test setup: interval should be < 120s"
-        );
-    }
-
-    /// Test Guard 1 passes: Interval >= 2 minutes
-    #[test]
-    fn test_annotation_guard_sufficient_interval_proceeds() {
-        let t0 = Utc::now();
-        let t1 = t0 + Duration::seconds(150); // 150 seconds - should pass
-
-        let elapsed_seconds = (t1 - t0).num_seconds().abs();
-
-        // Guard should not trigger
-        assert!(
-            elapsed_seconds >= 120,
-            "Test setup: interval should be >= 120s"
-        );
-    }
-
-    /// Test Guard 2: Worker count changed mid-interval
-    #[test]
-    fn test_annotation_guard_worker_change_skips() {
-        let workers_at_start = 5;
-        let workers_at_end = 7;
-
-        // Guard should trigger - workers changed
-        assert_ne!(
-            workers_at_start, workers_at_end,
-            "Test setup: workers should differ"
-        );
-    }
-
-    /// Test Guard 2 passes: Worker count stable
-    #[test]
-    fn test_annotation_guard_stable_workers_proceeds() {
-        let workers_at_start = 5;
-        let workers_at_end = 5;
-
-        // Guard should not trigger
-        assert_eq!(
-            workers_at_start, workers_at_end,
-            "Test setup: workers should be equal"
-        );
-    }
-
-    /// Test Guard 3: Window reset detected (utilization drop > 1%)
-    #[test]
-    fn test_annotation_guard_window_reset_skips() {
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 20.0,
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 18.5, // Dropped 1.5% - should trigger
-            seven_day: 46.0,
-            weekly_scoped: 36.0,
-        };
-
-        let reset_threshold = 1.0;
-
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-
-        // At least one guard should trigger (5h dropped > 1%)
-        assert!(
-            five_hour_reset || seven_day_reset || weekly_scoped_reset,
-            "Test setup: at least one window should show reset"
-        );
-    }
-
-    /// Test Guard 3 passes: No window reset (normal utilization increase)
-    #[test]
-    fn test_annotation_guard_no_reset_proceeds() {
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 20.0,
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 21.5, // Increased 1.5% - normal
-            seven_day: 46.0,
-            weekly_scoped: 36.5,
-        };
-
-        let reset_threshold = 1.0;
-
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-
-        // No guard should trigger - all increased or stable
-        assert!(
-            !(five_hour_reset || seven_day_reset || weekly_scoped_reset),
-            "Test setup: no window should show reset"
-        );
-    }
-
-    /// Test Guard 3: Multiple windows reset
-    #[test]
-    fn test_annotation_guard_multiple_window_resets() {
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 25.0,
-            seven_day: 50.0,
-            weekly_scoped: 40.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 22.0,     // Dropped 3%
-            seven_day: 48.0,     // Dropped 2%
-            weekly_scoped: 38.5, // Dropped 1.5%
-        };
-
-        let reset_threshold = 1.0;
-
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-
-        // Multiple guards should trigger
-        assert!(five_hour_reset, "5h window should show reset");
-        assert!(seven_day_reset, "7d window should show reset");
-        assert!(weekly_scoped_reset, "7ds window should show reset");
-    }
-
-    /// Test all guards pass: Ideal conditions for annotation
-    #[test]
-    fn test_annotation_all_guards_pass() {
-        let t0 = Utc::now();
-        let t1 = t0 + Duration::seconds(180); // 3 minutes - passes Guard 1
-
-        let workers_at_start = 6;
-        let workers_at_end = 6; // Stable - passes Guard 2
-
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 20.0,
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 22.0,     // Increased 2% - no reset
-            seven_day: 46.5,     // Increased 1.5%
-            weekly_scoped: 36.5, // Increased 1.5%
-        };
-
-        // Guard 1: Check interval
-        let elapsed_seconds = (t1 - t0).num_seconds().abs();
-        assert!(
-            elapsed_seconds >= 120,
-            "Guard 1: interval should be sufficient"
-        );
-
-        // Guard 2: Check worker stability
-        assert_eq!(
-            workers_at_start, workers_at_end,
-            "Guard 2: workers should be stable"
-        );
-
-        // Guard 3: Check no window reset
-        let reset_threshold = 1.0;
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-        let seven_day_reset = new_pct.seven_day < old_pct.seven_day - reset_threshold;
-        let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - reset_threshold;
-        assert!(
-            !(five_hour_reset || seven_day_reset || weekly_scoped_reset),
-            "Guard 3: no window reset should occur"
-        );
-    }
-
-    /// Test Guard 3 edge case: Exactly at threshold (1% drop = reset)
-    #[test]
-    fn test_annotation_guard_reset_at_threshold() {
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 20.0,
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 18.99, // Dropped 1.01% - just over threshold
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let reset_threshold = 1.0;
-
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-
-        // Guard should trigger (just barely)
-        assert!(five_hour_reset, "Drop of 1.01% should trigger reset guard");
-    }
-
-    /// Test Guard 3 edge case: Just below threshold (0.99% drop = no reset)
-    #[test]
-    fn test_annotation_guard_reset_below_threshold() {
-        let old_pct = db::WindowPctSnapshot {
-            five_hour: 20.0,
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let new_pct = db::WindowPctSnapshot {
-            five_hour: 19.01, // Dropped 0.99% - just under threshold
-            seven_day: 45.0,
-            weekly_scoped: 35.0,
-        };
-
-        let reset_threshold = 1.0;
-
-        let five_hour_reset = new_pct.five_hour < old_pct.five_hour - reset_threshold;
-
-        // Guard should not trigger (just barely)
-        assert!(
-            !five_hour_reset,
-            "Drop of 0.99% should not trigger reset guard"
-        );
-    }
+    // -------------------------------------------------------------------------
+    // Guard helpers: the tests that used to sit here re-derived each guard's
+    // condition inline and then asserted their own arithmetic, so they passed no
+    // matter what the production guards did. The tests below `Tests for guard
+    // helper functions` cover the same cases — including both reset thresholds —
+    // against `check_elapsed_minimum`, `check_worker_count_stable` and
+    // `check_window_reset` themselves.
+    // -------------------------------------------------------------------------
 
     /// Regression test: continuously-calibrated windows are unaffected by cold-start fixes.
     ///
@@ -13185,6 +13008,69 @@ mod annotation_guard_tests {
             weekly_scoped_reset: false,
         };
         assert_eq!(reason.description(), "interval spans window reset ()");
+    }
+
+    /// Every guard that can skip an interval produces a logged line that names
+    /// both the reason and the readings, so an operator reading the WARN can
+    /// tell why the annotated history has a gap without re-deriving the guard.
+    #[test]
+    fn test_format_annotation_skip_names_reason_and_readings() {
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.0,
+            seven_day: 45.5,
+            weekly_scoped: 35.8,
+        };
+
+        // One case per guard, keyed by the reason each one reports.
+        let cases = [
+            (
+                SkipReason::IntervalTooShort {
+                    elapsed_seconds: 60,
+                },
+                "interval too short (60s < 120s)",
+            ),
+            (
+                SkipReason::WorkerCountChanged {
+                    workers_start: 4,
+                    workers_end: 6,
+                },
+                "worker count changed mid-interval (4 -> 6)",
+            ),
+            (
+                SkipReason::WindowReset {
+                    five_hour_reset: true,
+                    seven_day_reset: false,
+                    weekly_scoped_reset: true,
+                },
+                "interval spans window reset (5h, 7ds)",
+            ),
+        ];
+
+        for (reason, expected_reason) in cases {
+            let line = format_annotation_skip(&reason, &old_pct, &new_pct);
+
+            assert!(
+                line.starts_with("skipping window delta annotation: "),
+                "every skip line should say what was skipped, got {line:?}"
+            );
+            assert!(
+                line.contains(expected_reason),
+                "line should carry the guard's own reason {expected_reason:?}, got {line:?}"
+            );
+            // All three windows, so a line that dropped or crossed one fails
+            // here rather than reading plausibly with the wrong numbers.
+            for window in ["5h: 20.0%→21.0%", "7d: 45.0%→45.5%", "7ds: 35.0%→35.8%"] {
+                assert!(
+                    line.contains(window),
+                    "line should report {window:?}, got {line:?}"
+                );
+            }
+        }
     }
 }
 
