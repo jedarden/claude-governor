@@ -1101,6 +1101,120 @@ fn check_model_generation() -> CheckResult {
     }
 }
 
+/// Lookback window for the pricing-coverage check.
+const PRICING_COVERAGE_LOOKBACK_HOURS: i64 = 24;
+
+/// Share of recent usage records on unpriced models at or above which
+/// pricing_coverage fails rather than warns.
+const PRICING_COVERAGE_FAIL_FRACTION: f64 = 0.10;
+
+/// Model names the pricing engine deliberately treats as non-models.
+///
+/// Kept in sync with the skip list in `pricing::get_pricing_for_model`.
+const PRICING_SYNTHETIC_MODELS: [&str; 3] = ["", "unknown", "<synthetic>"];
+
+/// Evaluate pricing coverage from recent per-model record counts.
+///
+/// Split out from [`check_pricing_coverage`] so the threshold logic is testable
+/// without a database.
+fn evaluate_pricing_coverage(counts: &[(String, i64)], priced: &[String]) -> CheckResult {
+    let total: i64 = counts.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return CheckResult::pass(
+            "pricing_coverage",
+            format!("No usage records in last {}h", PRICING_COVERAGE_LOOKBACK_HOURS),
+        );
+    }
+
+    let mut unpriced: Vec<(&str, i64)> = counts
+        .iter()
+        .filter(|(model, _)| {
+            !PRICING_SYNTHETIC_MODELS.contains(&model.as_str())
+                && !priced.iter().any(|p| p == model)
+        })
+        .map(|(model, n)| (model.as_str(), *n))
+        .collect();
+
+    if unpriced.is_empty() {
+        return CheckResult::pass(
+            "pricing_coverage",
+            format!(
+                "All {} model(s) priced ({} records / {}h)",
+                counts.len(),
+                total,
+                PRICING_COVERAGE_LOOKBACK_HOURS
+            ),
+        );
+    }
+
+    // Largest offender first, so the message names the model that matters most.
+    unpriced.sort_by(|a, b| b.1.cmp(&a.1));
+    let unpriced_n: i64 = unpriced.iter().map(|(_, n)| *n).sum();
+    let fraction = unpriced_n as f64 / total as f64;
+    let names: Vec<&str> = unpriced.iter().map(|(m, _)| *m).collect();
+    let message = format!(
+        "{:.0}% of recent records use unpriced model(s): {}",
+        fraction * 100.0,
+        names.join(", ")
+    );
+    let remediation = format!(
+        "Add pricing entries for {} to the pricing.models block in \
+         ~/.config/claude-governor/governor.yaml — dollar figures for these \
+         models are fallback estimates, not exact",
+        names.join(", ")
+    );
+
+    if fraction >= PRICING_COVERAGE_FAIL_FRACTION {
+        CheckResult::fail("pricing_coverage", message, remediation)
+    } else {
+        CheckResult::warn("pricing_coverage", message, remediation)
+    }
+}
+
+/// Check pricing coverage — detect models in recent usage that have no pricing
+/// entry and therefore fall back to a nearest-known-model rate.
+fn check_pricing_coverage() -> CheckResult {
+    let config_path = default_config_path();
+    if !config_path.exists() {
+        return CheckResult::pass("pricing_coverage", "No config file (skipped)");
+    }
+
+    let priced: Vec<String> = match crate::config::GovernorConfig::load_from_path(&config_path) {
+        Ok(config) => config.pricing.models.keys().cloned().collect(),
+        // config_parseable already reports an unreadable config; don't double-fail.
+        Err(_) => return CheckResult::pass("pricing_coverage", "Cannot check (config unreadable)"),
+    };
+
+    let db_path = default_db_path();
+    if !db_path.exists() {
+        return CheckResult::pass("pricing_coverage", "No database yet (skipped)");
+    }
+
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(conn) => conn,
+        // sqlite_integrity already reports an unopenable database.
+        Err(_) => return CheckResult::pass("pricing_coverage", "Cannot open database (skipped)"),
+    };
+
+    let cutoff = (Utc::now() - chrono::Duration::hours(PRICING_COVERAGE_LOOKBACK_HOURS))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+
+    let counts = conn
+        .prepare("SELECT model, COUNT(*) FROM i WHERE ts >= ?1 GROUP BY model")
+        .and_then(|mut stmt| {
+            stmt.query_map([&cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(String, i64)>>>())
+        });
+
+    match counts {
+        Ok(counts) => evaluate_pricing_coverage(&counts, &priced),
+        Err(_) => CheckResult::pass("pricing_coverage", "Cannot query usage records (skipped)"),
+    }
+}
+
 /// Check promotion dates — verify promotions are not expired
 fn check_promotion_dates() -> CheckResult {
     let promo_path = default_promotions_path();
@@ -1633,6 +1747,7 @@ pub fn run_doctor() -> DoctorReport {
         check_burn_rate_samples(),
         check_config_parseable(),
         check_model_generation(),
+        check_pricing_coverage(),
         check_promotion_dates(),
         check_sqlite_integrity(),
         check_jsonl_db_sync(),
@@ -1701,6 +1816,61 @@ pub fn format_doctor_json(report: &DoctorReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn counts(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
+        pairs.iter().map(|(m, n)| (m.to_string(), *n)).collect()
+    }
+
+    fn priced(models: &[&str]) -> Vec<String> {
+        models.iter().map(|m| m.to_string()).collect()
+    }
+
+    #[test]
+    fn test_pricing_coverage_all_priced() {
+        let result = evaluate_pricing_coverage(
+            &counts(&[("claude-sonnet-5", 400), ("claude-opus-5", 100)]),
+            &priced(&["claude-sonnet-5", "claude-opus-5"]),
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_pricing_coverage_no_records() {
+        let result = evaluate_pricing_coverage(&[], &priced(&["claude-sonnet-5"]));
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_pricing_coverage_fails_above_threshold() {
+        // 400/500 = 80% of records on an unpriced model.
+        let result = evaluate_pricing_coverage(
+            &counts(&[("claude-sonnet-5", 400), ("claude-opus-5", 100)]),
+            &priced(&["claude-opus-5"]),
+        );
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("claude-sonnet-5"));
+        assert!(result.message.contains("80%"));
+    }
+
+    #[test]
+    fn test_pricing_coverage_warns_below_threshold() {
+        // 5/1005 ≈ 0.5% — real drift, but not yet distorting fleet figures.
+        let result = evaluate_pricing_coverage(
+            &counts(&[("claude-opus-5", 1000), ("claude-haiku-9", 5)]),
+            &priced(&["claude-opus-5"]),
+        );
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("claude-haiku-9"));
+    }
+
+    #[test]
+    fn test_pricing_coverage_ignores_synthetic_models() {
+        let result = evaluate_pricing_coverage(
+            &counts(&[("claude-opus-5", 10), ("<synthetic>", 90), ("unknown", 50)]),
+            &priced(&["claude-opus-5"]),
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
 
     #[test]
     fn test_check_result_pass() {
