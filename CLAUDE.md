@@ -54,7 +54,7 @@ generation (this loop) and execution (a normal NEEDLE fleet that works the beads
 
 Install by copying to `~/.config/needle/adapters/`, then `needle test-agent claude-print-opus`.
 
-Two rules make these work under NEEDLE dispatch (both learned the hard way):
+Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
 1. **Deliver the prompt with `< {prompt_file}`.** Without it, claude-print launches
    with no prompt, produces nothing, exits instantly, and NEEDLE's re-dispatch loop
@@ -63,6 +63,18 @@ Two rules make these work under NEEDLE dispatch (both learned the hard way):
 2. **Call the binary by absolute path** (`/home/coding/.local/bin/claude-print`).
    NEEDLE's dispatch shell PATH is not the interactive shell's; a bare `claude-print`
    is "command not found" (silent empty output).
+3. **Scrub the IDE environment** — `unset CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_*`
+   before the binary. `CLAUDECODE=1` tells the dispatched agent it is nested inside
+   Claude Code; combined with an inherited `VSCODE_IPC_HOOK_CLI` and a live
+   `~/.claude/ide/<port>.lock`, it connects to the VS Code extension host over
+   loopback **instead of ever reaching the API** and blocks there until
+   `timeout_secs` kills it. Observed at 46% of dispatches (26/57) on a worker
+   launched from an interactive Claude Code shell, including six consecutive
+   20-minute Opus timeouts on one bead. The symptom is a hung dispatch whose only
+   socket is `127.0.0.1 -> 127.0.0.1:<ide-lock-port>` with no outbound connection to
+   the API. The glm adapter has always carried `unset CLAUDECODE`, which is why it
+   was immune. Workers launched by cgov via systemd get a clean environment and never
+   see this — the adapter must be immune either way.
 
 Also: `--output-format stream-json` (what `needle-transform-claude` expects) and
 `--no-inherit-hooks` (isolation; claude-print still installs its own Stop hook).

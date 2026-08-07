@@ -4,7 +4,7 @@ agent_cli: claude-print
 version_command: "claude-print --version"
 input_method:
   method: stdin
-invoke_template: "cd {workspace} && /home/coding/.local/bin/claude-print --model {model} --max-turns 60 --output-format stream-json --dangerously-skip-permissions --no-inherit-hooks < {prompt_file}"
+invoke_template: "cd {workspace} && unset CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD && /home/coding/.local/bin/claude-print --model {model} --max-turns 60 --output-format stream-json --dangerously-skip-permissions --no-inherit-hooks < {prompt_file}"
 timeout_secs: 600
 provider: anthropic
 model: fable
