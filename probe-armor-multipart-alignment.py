@@ -26,7 +26,7 @@ BLOCK_SIZE = 65536  # 64KB alignment requirement
 def create_s3_client():
     """Create an S3 client with standard credential chain."""
     endpoint_url = os.environ.get('ARMOR_ENDPOINT_URL')
-    return boto3.client('s3', endpoint_url_url=endpoint_url if endpoint_url else None)
+    return boto3.client('s3', endpoint_url=endpoint_url if endpoint_url else None)
 
 
 def get_test_bucket():
