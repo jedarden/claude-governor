@@ -329,6 +329,33 @@ pub fn annotation_skip_reason(
         .or_else(|| check_window_reset(old_pct, new_pct))
 }
 
+/// The `(workers_at_start, workers_at_end)` pair to hand the annotation guard
+/// for a collector interval.
+///
+/// Both ends come from the same place — the fleet record's worker count for
+/// `[t0, t1]` — because that is the population being annotated. The collector
+/// writes one `i` row per session it saw in the interval and sets the fleet
+/// record's `workers` field to `instances.len()` (see `collector.rs`), so this
+/// count *is* the count of the `i` rows that
+/// [`db::annotate_window_pct_deltas`] apportions the deltas across.
+///
+/// The governor's own tmux census is the wrong quantity for this guard twice
+/// over: it spans every model class rather than the collector's population, and
+/// it is sampled at cycle time — after `t1` — rather than at the interval's
+/// end. Comparing it against the collector's count made the worker-count guard
+/// fire on every cycle that ran a single non-sonnet worker, which skipped
+/// annotation entirely in any mixed-model fleet.
+///
+/// The collector reports one worker count for the whole interval, so start and
+/// end are the same measurement of the same population and this guard cannot
+/// trip here. It stays in the chain so the call site keeps applying the full
+/// guard set, and so the day a per-end count does exist there is one place to
+/// supply it.
+pub fn annotation_worker_counts(fleet: &state::FleetAggregate) -> (u32, u32) {
+    let interval_workers = fleet.sonnet_workers;
+    (interval_workers, interval_workers)
+}
+
 /// Render the line the governor logs when a guard rejects an interval.
 ///
 /// A reason on its own does not say what was rejected: `interval spans window
@@ -5571,8 +5598,12 @@ pub fn run_governor_cycle(
         if let (Some(ref prev_snap), Ok(conn)) = (&old_snapshot, db::open_db(&db_path)) {
             let t0 = state.last_fleet_aggregate.t0;
             let t1 = state.last_fleet_aggregate.t1;
-            let workers_at_start = state.last_fleet_aggregate.sonnet_workers;
-            let workers_at_end = current_total;
+            // Both ends are the collector's worker count for this interval —
+            // the population of the `i` rows being annotated. See
+            // `annotation_worker_counts` for why the tmux census (`current_total`)
+            // is not the quantity to compare here.
+            let (workers_at_start, workers_at_end) =
+                annotation_worker_counts(&state.last_fleet_aggregate);
 
             let old_pct = db::WindowPctSnapshot {
                 five_hour: prev_snap.five_hour_pct,
@@ -12913,6 +12944,52 @@ mod annotation_guard_tests {
             annotation_skip_reason(t0, t1, 4, 4, &old_pct, &new_pct),
             None,
             "A 5-minute interval at a stable worker count with rising windows should annotate"
+        );
+    }
+
+    /// Regression: a steady fleet that includes non-sonnet workers must still be
+    /// annotated.
+    ///
+    /// The call site used to pass the collector's sonnet-only count as
+    /// `workers_at_start` and the governor's all-model tmux total as
+    /// `workers_at_end`. Those are different quantities, so any fleet running a
+    /// single non-sonnet worker tripped `WorkerCountChanged` every cycle and was
+    /// never annotated. This drives the derivation the call site uses, not
+    /// hand-supplied counts, so a regression there fails here.
+    #[test]
+    fn test_annotation_worker_counts_ignores_non_sonnet_tmux_total() {
+        let (t0, t1, old_pct, new_pct) = annotatable_interval();
+
+        // Steady fleet: the collector saw 4 sonnet sessions for this interval and
+        // wrote 4 `i` rows. The governor's tmux census sees 7 — the same 4 plus 3
+        // opus/haiku workers the collector's fleet record does not count.
+        let fleet = state::FleetAggregate {
+            sonnet_workers: 4,
+            ..Default::default()
+        };
+        let tmux_total_all_models: u32 = 7;
+
+        let (workers_at_start, workers_at_end) = annotation_worker_counts(&fleet);
+
+        assert_eq!(
+            workers_at_start, workers_at_end,
+            "both ends must be the same quantity measured the same way"
+        );
+        assert_ne!(
+            workers_at_end, tmux_total_all_models,
+            "the annotated population is the collector's `i` rows, not the tmux census"
+        );
+        assert_eq!(
+            annotation_skip_reason(
+                t0,
+                t1,
+                workers_at_start,
+                workers_at_end,
+                &old_pct,
+                &new_pct
+            ),
+            None,
+            "a steady fleet with non-sonnet workers must not trip the worker-count guard"
         );
     }
 
