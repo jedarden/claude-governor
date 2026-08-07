@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -698,39 +698,71 @@ pub struct WindowPctSnapshot {
 
 /// Annotate instance and fleet records with window percentage deltas.
 ///
-/// For the interval [t0, t1], computes the per-window percentage deltas from
-/// consecutive API snapshots (old_pct vs new_pct) and annotates:
-/// - Instance records (i): apportioned by total_usd weight
-/// - Fleet record (f): full (unapportioned) deltas
+/// `[span_start, span_end]` is the span the deltas were *measured* over: the
+/// gap between the two consecutive API readings that produced `old_pct` and
+/// `new_pct`. Rows are selected against that same span, so a delta is only
+/// ever written onto the spend that produced it, and every guard below is
+/// evaluated against that span rather than against a collector row's own
+/// `[t0, t1]`.
+///
+/// # Which rows a span claims
+///
+/// A collector row belongs to the span that contains its `t1`
+/// (`span_start < t1 <= span_end`), not to whichever span happens to contain
+/// the whole of `[t0, t1]`. Two facts force this:
+///
+/// - The collector's `t0` is nominal. `run_collection_pass` stamps every row
+///   `t0 = now - 5min`, but the daemon's default cadence is 120 s and a manual
+///   `cgov collect` can fire at any moment. What the row actually covers is
+///   every JSONL line read since the previous pass — cursor-driven, so bounded
+///   by the previous pass, not by the printed `t0`. `t1` is the only end of the
+///   label that is a real measurement.
+/// - Requiring the printed `[t0, t1]` to nest inside the span would drop
+///   almost every row: the nominal 5-minute `t0` reaches back past the start
+///   of a 300 s governor span.
+///
+/// Keying on `t1` also makes the assignment a partition. Governor spans are
+/// contiguous and non-overlapping (each cycle's `span_start` is the previous
+/// cycle's `span_end`), and the half-open `(span_start, span_end]` test puts
+/// each row in exactly one of them — no row annotated twice, none skipped for
+/// straddling a boundary.
+///
+/// # What gets written
+///
+/// - Instance records (`i`): the span's delta apportioned by `total_usd` weight
+/// - Fleet records (`f`): the span's delta apportioned by the row's share of
+///   the span's fleet spend. A span usually claims one or two collector passes
+///   (120 s cadence, 300 s governor cycle); when it claims exactly one, that
+///   share is 1.0 and the row carries the whole delta, as it did when
+///   annotation was keyed to a single collector interval.
 ///
 /// Guard conditions (returns early without error):
-/// - No records found for the interval
-/// - Interval spans a window reset (detected via negative deltas)
-/// - elapsed_seconds < 120 (too short for meaningful delta)
-/// - Worker count changed mid-interval
+/// - No records found in the span
+/// - Span covers a window reset (detected via negative deltas)
+/// - `span_end - span_start` < 120 s (too short for a meaningful delta)
+/// - Worker count changed mid-span
 pub fn annotate_window_pct_deltas(
     conn: &Connection,
-    t0: DateTime<Utc>,
-    t1: DateTime<Utc>,
+    span_start: DateTime<Utc>,
+    span_end: DateTime<Utc>,
     old_pct: &WindowPctSnapshot,
     new_pct: &WindowPctSnapshot,
     workers_at_start: u32,
     workers_at_end: u32,
 ) -> Result<()> {
-    // Compute elapsed time
-    let elapsed_seconds = (t1 - t0).num_seconds().abs() as i64;
-    let _elapsed_hours = elapsed_seconds as f64 / 3600.0;
+    // Elapsed time over the span the delta was measured over.
+    let elapsed_seconds = (span_end - span_start).num_seconds().abs();
 
-    // Guard: interval too short
+    // Guard: span too short
     if elapsed_seconds < 120 {
         log::debug!(
-            "[annotate] skipping annotation: interval too short ({}s < 120s)",
+            "[annotate] skipping annotation: delta span too short ({}s < 120s)",
             elapsed_seconds
         );
         return Ok(());
     }
 
-    // Guard: worker count changed mid-interval
+    // Guard: worker count changed mid-span
     if workers_at_start != workers_at_end {
         log::debug!(
             "[annotate] skipping annotation: worker count changed ({} -> {})",
@@ -756,15 +788,22 @@ pub fn annotate_window_pct_deltas(
         return Ok(());
     }
 
-    // Query all instance records for this interval
-    let t0_str = t0.to_rfc3339();
-    let t1_str = t1.to_rfc3339();
+    // Query the instance records the span claims.
+    //
+    // `julianday()` rather than a string comparison on the RFC 3339 text:
+    // `to_rfc3339()` emits a variable number of fractional-second digits, so
+    // lexicographic ordering is only *usually* chronological. The exact-match
+    // query this replaced never had to care; a range query does.
+    let span_start_str = span_start.to_rfc3339();
+    let span_end_str = span_end.to_rfc3339();
 
-    let mut instance_stmt =
-        conn.prepare("SELECT rowid, sess, total_usd FROM i WHERE t0 = ? AND t1 = ?")?;
+    let mut instance_stmt = conn.prepare(
+        "SELECT rowid, sess, total_usd FROM i \
+         WHERE julianday(t1) > julianday(?) AND julianday(t1) <= julianday(?)",
+    )?;
 
     let instances: Vec<(i64, String, f64)> = instance_stmt
-        .query_map(params![&t0_str, &t1_str], |row| {
+        .query_map(params![&span_start_str, &span_end_str], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -772,9 +811,9 @@ pub fn annotate_window_pct_deltas(
     // Guard: no instance records found
     if instances.is_empty() {
         log::debug!(
-            "[annotate] skipping annotation: no instance records found for interval {} - {}",
-            t0_str,
-            t1_str
+            "[annotate] skipping annotation: no instance records found in delta span {} - {}",
+            span_start_str,
+            span_end_str
         );
         return Ok(());
     }
@@ -823,55 +862,64 @@ pub fn annotate_window_pct_deltas(
         }
     }
 
-    // Update the fleet record with full (unapportioned) deltas.
+    // Update the fleet rows the span claims.
     //
-    // `usd_per_pct_7ds` needs the row's own `total_usd`, so read it first and
-    // write every annotated column in a single UPDATE rather than updating the
-    // row twice.
-    let fleet_total_usd: Option<f64> = tx
-        .query_row(
-            "SELECT total_usd FROM f WHERE t0 = ? AND t1 = ?",
-            params![&t0_str, &t1_str],
-            |row| row.get(0),
-        )
-        .optional()?;
+    // Each row gets its share of the span's delta, weighted by its share of the
+    // span's fleet spend — the same apportionment the `i` rows get, one level
+    // up. A span that claimed a single collector pass gives that row a weight
+    // of 1.0 and therefore the whole delta, which is what annotation wrote back
+    // when it was keyed to one collector interval.
+    //
+    // `usd_per_pct_7ds` needs the row's own `total_usd`, so read the rows first
+    // and write every annotated column in a single UPDATE per row rather than
+    // updating each row twice.
+    let mut fleet_stmt = tx.prepare(
+        "SELECT rowid, total_usd FROM f \
+         WHERE julianday(t1) > julianday(?) AND julianday(t1) <= julianday(?)",
+    )?;
+    let fleet_rows: Vec<(i64, f64)> = fleet_stmt
+        .query_map(params![&span_start_str, &span_end_str], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(fleet_stmt);
 
-    match fleet_total_usd {
-        Some(fleet_total_usd) => {
-            let usd_per_pct_7ds = if delta_7ds > 0.0 {
-                fleet_total_usd / delta_7ds
+    if fleet_rows.is_empty() {
+        log::warn!(
+            "[annotate] no fleet record found in delta span {} - {}",
+            span_start_str,
+            span_end_str
+        );
+    } else {
+        let fleet_usd_sum: f64 = fleet_rows.iter().map(|(_, usd)| *usd).sum();
+
+        let mut update_fleet = tx.prepare(
+            "UPDATE f SET p5h = ?, p7d = ?, p7ds = ?, usd_per_pct_7ds = ? WHERE rowid = ?",
+        )?;
+
+        for (rowid, fleet_total_usd) in fleet_rows {
+            let p5h = crate::governor::apportion_delta(delta_5h, fleet_usd_sum, fleet_total_usd);
+            let p7d = crate::governor::apportion_delta(delta_7d, fleet_usd_sum, fleet_total_usd);
+            let p7ds = crate::governor::apportion_delta(delta_7ds, fleet_usd_sum, fleet_total_usd);
+
+            let usd_per_pct_7ds = if p7ds > 0.0 {
+                fleet_total_usd / p7ds
             } else {
                 0.0
             };
 
-            let mut update_fleet = tx.prepare(
-                "UPDATE f SET p5h = ?, p7d = ?, p7ds = ?, usd_per_pct_7ds = ? WHERE t0 = ? AND t1 = ?",
-            )?;
-            update_fleet.execute(params![
-                delta_5h,
-                delta_7d,
-                delta_7ds,
-                usd_per_pct_7ds,
-                &t0_str,
-                &t1_str
-            ])?;
+            update_fleet.execute(params![p5h, p7d, p7ds, usd_per_pct_7ds, rowid])?;
 
             log::info!(
-                "[annotate] f row: t0={}, t1={}, p5h={:.4}, p7d={:.4}, p7ds={:.4}, usd_per_pct_7ds={:.4}, elapsed={:.1}s",
-                t0_str,
-                t1_str,
-                delta_5h,
-                delta_7d,
-                delta_7ds,
+                "[annotate] f row {}: span={} - {}, p5h={:.4}, p7d={:.4}, p7ds={:.4}, usd_per_pct_7ds={:.4}, elapsed={}s",
+                rowid,
+                span_start_str,
+                span_end_str,
+                p5h,
+                p7d,
+                p7ds,
                 usd_per_pct_7ds,
                 elapsed_seconds
-            );
-        }
-        None => {
-            log::warn!(
-                "[annotate] no fleet record found for interval {} - {}",
-                t0_str,
-                t1_str
             );
         }
     }
@@ -1536,6 +1584,241 @@ mod tests {
         assert!((fleet_p5h - 2.0).abs() < 1e-6, "fleet p5h should be 2.0");
         assert!((fleet_p7d - 3.0).abs() < 1e-6, "fleet p7d should be 3.0");
         assert!((fleet_p7ds - 4.0).abs() < 1e-6, "fleet p7ds should be 4.0");
+    }
+
+    /// Write one collector pass: `n` instance rows plus the fleet row for them.
+    ///
+    /// `t1` is the pass time — the end of the label, and the only end the
+    /// annotator keys on. `t0` is stamped the way `run_collection_pass` stamps
+    /// it, a nominal five minutes back, so these fixtures reproduce the label
+    /// the collector actually writes rather than an idealised one.
+    fn insert_collector_pass(conn: &Connection, t1: DateTime<Utc>, sessions: &[(&str, f64)]) {
+        let t0 = (t1 - chrono::Duration::minutes(5)).to_rfc3339();
+        let t1 = t1.to_rfc3339();
+        let mut fleet_usd = 0.0;
+
+        for (sess, usd) in sessions {
+            fleet_usd += *usd;
+            insert_instance(
+                conn,
+                &serde_json::json!({
+                    "r": "i", "ts": t1,
+                    "t0": t0, "t1": t1,
+                    "sess": sess, "sid": sess, "model": "sonnet",
+                    "pk": 1, "hr_et": 10, "dow": 2,
+                    "input-n": 0, "input-usd": 0.0,
+                    "output-n": 0, "output-usd": 0.0,
+                    "r-cache-n": 0, "r-cache-usd": 0.0,
+                    "w-cache-n": 0, "w-cache-usd": 0.0,
+                    "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                    "total-usd": usd, "cache-eff": 0.0,
+                }),
+            )
+            .unwrap();
+        }
+
+        insert_fleet(
+            conn,
+            &serde_json::json!({
+                "r": "f", "ts": t1,
+                "t0": t0, "t1": t1,
+                "pk": 1, "hr_et": 10, "dow": 2, "workers": sessions.len(),
+                "total-usd": fleet_usd, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+                "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+            }),
+        )
+        .unwrap();
+    }
+
+    fn p7ds_of(conn: &Connection, sess: &str) -> Option<f64> {
+        conn.query_row("SELECT p7ds FROM i WHERE sess = ?", params![sess], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// A delta measured over `[span_start, span_end]` may only be written onto
+    /// rows from that span.
+    ///
+    /// Annotation used to select rows by the collector's own aggregation
+    /// window, which is produced by a different clock at a different cadence
+    /// than the API poll the delta is measured across. A row from before or
+    /// after the span contributed none of the spend that moved the API
+    /// percentages, so it must come away unannotated.
+    #[test]
+    fn annotate_window_pct_deltas_ignores_rows_outside_the_delta_span() {
+        let (_temp, conn) = setup_db();
+
+        let span_start: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+        let span_end: DateTime<Utc> = "2026-03-20T10:05:00Z".parse().unwrap();
+
+        // One pass before the span, one inside it, one after. The in-span pass
+        // is stamped with the collector's nominal five-minute `t0`, which
+        // reaches back past `span_start` — the span claims it on `t1` anyway.
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T09:59:00Z".parse().unwrap(),
+            &[("before", 0.10)],
+        );
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T10:03:00Z".parse().unwrap(),
+            &[("inside", 0.10)],
+        );
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T10:07:00Z".parse().unwrap(),
+            &[("after", 0.10)],
+        );
+
+        let old_pct = WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 70.0,
+            weekly_scoped: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 50.9,
+            seven_day: 70.9,
+            weekly_scoped: 70.9,
+        };
+
+        annotate_window_pct_deltas(&conn, span_start, span_end, &old_pct, &new_pct, 1, 1).unwrap();
+
+        assert_eq!(
+            p7ds_of(&conn, "before"),
+            None,
+            "a pass that ended before the span spent none of what moved the API percentages"
+        );
+        assert_eq!(
+            p7ds_of(&conn, "after"),
+            None,
+            "a pass that ended after the span is not covered by this delta either"
+        );
+        let inside = p7ds_of(&conn, "inside").expect("the in-span row must be annotated");
+        assert!(
+            (inside - 0.9).abs() < 1e-6,
+            "the sole in-span row carries the whole 0.9 delta, got {inside}"
+        );
+
+        // The fleet rows follow the same rule.
+        let annotated_fleets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM f WHERE p7ds IS NOT NULL", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            annotated_fleets, 1,
+            "only the in-span fleet row may be annotated"
+        );
+    }
+
+    /// Every row inside the span is annotated, and the shares add back up to
+    /// the delta.
+    ///
+    /// A governor cycle (300 s) is longer than a collector pass (120 s), so a
+    /// span routinely claims more than one pass. All of their rows spent into
+    /// the same measured delta, so all of them share it — by `total_usd`
+    /// weight across the whole span, not per pass.
+    #[test]
+    fn annotate_window_pct_deltas_apportions_across_every_pass_in_the_span() {
+        let (_temp, conn) = setup_db();
+
+        let span_start: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+        let span_end: DateTime<Utc> = "2026-03-20T10:05:00Z".parse().unwrap();
+
+        // Two collector passes inside one governor span. $1.00 of spend total.
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T10:02:00Z".parse().unwrap(),
+            &[("a", 0.10), ("b", 0.30)],
+        );
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T10:04:00Z".parse().unwrap(),
+            &[("c", 0.20), ("d", 0.40)],
+        );
+
+        let old_pct = WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 70.0,
+            weekly_scoped: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 51.0,
+            seven_day: 71.0,
+            weekly_scoped: 71.0,
+        };
+
+        annotate_window_pct_deltas(&conn, span_start, span_end, &old_pct, &new_pct, 2, 2).unwrap();
+
+        for (sess, expected) in [("a", 0.10), ("b", 0.30), ("c", 0.20), ("d", 0.40)] {
+            let got = p7ds_of(&conn, sess)
+                .unwrap_or_else(|| panic!("{sess} is inside the span and must be annotated"));
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "{sess} should get p7ds={expected} (its share of the $1.00 span), got {got}"
+            );
+        }
+
+        // Conservation: the apportioned instance rows add back up to the delta,
+        // and so do the fleet rows.
+        let instance_sum: f64 = conn
+            .query_row("SELECT SUM(p7ds) FROM i", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            (instance_sum - 1.0).abs() < 1e-6,
+            "apportioned i rows must sum to the 1.0 delta, got {instance_sum}"
+        );
+
+        let fleet_sum: f64 = conn
+            .query_row("SELECT SUM(p7ds) FROM f", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            (fleet_sum - 1.0).abs() < 1e-6,
+            "the two f rows split the delta by spend and must sum to 1.0, got {fleet_sum}"
+        );
+    }
+
+    /// The too-short guard measures the delta span, not the row's label.
+    ///
+    /// The collector stamps every row with a nominal five-minute `t0`, so a
+    /// guard that read the row's label always saw 300 s and always passed —
+    /// even when the two API readings were seconds apart and their difference
+    /// was noise.
+    #[test]
+    fn annotate_window_pct_deltas_measures_elapsed_over_the_span() {
+        let (_temp, conn) = setup_db();
+
+        // A row whose printed label spans five minutes...
+        insert_collector_pass(
+            &conn,
+            "2026-03-20T10:03:00Z".parse().unwrap(),
+            &[("a", 0.10)],
+        );
+
+        // ...claimed by a delta span of thirty seconds.
+        let span_start: DateTime<Utc> = "2026-03-20T10:02:30Z".parse().unwrap();
+        let span_end: DateTime<Utc> = "2026-03-20T10:03:00Z".parse().unwrap();
+
+        let old_pct = WindowPctSnapshot {
+            five_hour: 50.0,
+            seven_day: 70.0,
+            weekly_scoped: 70.0,
+        };
+        let new_pct = WindowPctSnapshot {
+            five_hour: 50.9,
+            seven_day: 70.9,
+            weekly_scoped: 70.9,
+        };
+
+        annotate_window_pct_deltas(&conn, span_start, span_end, &old_pct, &new_pct, 1, 1).unwrap();
+
+        assert_eq!(
+            p7ds_of(&conn, "a"),
+            None,
+            "a 30 s delta span is below the 120 s minimum — the row's 5-minute \
+             label must not be what the guard measures"
+        );
     }
 
     #[test]

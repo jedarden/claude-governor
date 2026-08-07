@@ -313,6 +313,12 @@ pub fn check_window_reset(old_pct: &db::WindowPctSnapshot, new_pct: &db::WindowP
 /// here keeps the governor cycle from restating the same three conditions —
 /// and from drifting away from them.
 ///
+/// `t0` and `t1` are the span the delta was *measured* over — the gap between
+/// the two API readings `old_pct` and `new_pct` came from. That has to be the
+/// same span [`db::annotate_window_pct_deltas`] selects rows over, or the
+/// elapsed guard passes judgement on one interval while the delta describes
+/// another.
+///
 /// # Returns
 /// `Some(reason)` for the first guard that trips, `None` when the interval is
 /// safe to annotate.
@@ -337,9 +343,10 @@ pub fn annotation_skip_reason(
 /// writes one `i` row per `(session, model)` pair it saw in the interval, across
 /// every model class, and sets the fleet record's `workers` field to
 /// `instances.len()` (see `collector.rs`), so this count *is* the count of the
-/// `i` rows that [`db::annotate_window_pct_deltas`] apportions the deltas
-/// across — that function selects them with `WHERE t0 = ? AND t1 = ?`, with no
-/// model filter.
+/// `i` rows [`db::annotate_window_pct_deltas`] apportions the deltas across for
+/// that collector pass — that function selects rows by `t1`, with no model
+/// filter. A delta span claims one or two passes (a 300 s governor cycle over a
+/// 120 s collector cadence), so this is the population of the most recent one.
 ///
 /// Despite its name, `FleetAggregate::sonnet_workers` holds that all-model
 /// count: the governor parses it straight from the fleet record's `workers`
@@ -5600,14 +5607,30 @@ pub fn run_governor_cycle(
 
     // 5-pre-b. Annotate window percentage deltas in the SQLite mirror.
     //
-    // After computing API deltas, annotate the i and f records for the interval
-    // with the per-window percentage deltas, apportioning by total_usd weight.
-    // This unblocks empirical promotion validation and downstream analytics.
+    // After computing API deltas, annotate the i and f records with the
+    // per-window percentage deltas, apportioning by total_usd weight. This
+    // unblocks empirical promotion validation and downstream analytics.
+    //
+    // The span is `[prev_snap.taken_at, now]` — the gap between the two API
+    // readings `old_pct` and `new_pct` are taken from. Rows are selected
+    // against that same span, and the guards are evaluated over it.
+    //
+    // This used to be `state.last_fleet_aggregate.{t0, t1}`, the collector's
+    // most recent aggregation window. That is a different span produced by a
+    // different clock: the collector runs on its own cadence (120 s by
+    // default) and stamps rows with a nominal `t0 = t1 - 5min`, while the
+    // governor polls the API every `loop_interval_secs` (300 s). Apportioning
+    // a delta measured over the poll span onto rows drawn from the collector's
+    // window attributed p5h/p7d/p7ds to the wrong interval, and made the
+    // <2 min guard test the collector's window instead of the span the delta
+    // actually covers. See `db::annotate_window_pct_deltas` for how a span
+    // claims collector rows (by `t1`, so spans partition the rows between
+    // them).
     if !state.usage.stale {
         if let (Some(ref prev_snap), Ok(conn)) = (&old_snapshot, db::open_db(&db_path)) {
-            let t0 = state.last_fleet_aggregate.t0;
-            let t1 = state.last_fleet_aggregate.t1;
-            // Both ends are the collector's worker count for this interval —
+            let span_start = prev_snap.taken_at;
+            let span_end = now;
+            // Both ends are the collector's worker count for the interval —
             // the population of the `i` rows being annotated. See
             // `annotation_worker_counts` for why the tmux census (`current_total`)
             // is not the quantity to compare here.
@@ -5626,8 +5649,8 @@ pub fn run_governor_cycle(
             };
 
             match annotation_skip_reason(
-                t0,
-                t1,
+                span_start,
+                span_end,
                 workers_at_start,
                 workers_at_end,
                 &old_pct,
@@ -5640,12 +5663,12 @@ pub fn run_governor_cycle(
                     );
                 }
                 None => {
-                    // All guards passed - apportion the interval's deltas across
+                    // All guards passed - apportion the span's deltas across
                     // the concurrent sessions and annotate the SQLite mirror.
                     if let Err(e) = db::annotate_window_pct_deltas(
                         &conn,
-                        t0,
-                        t1,
+                        span_start,
+                        span_end,
                         &old_pct,
                         &new_pct,
                         workers_at_start,
@@ -13114,6 +13137,130 @@ mod annotation_guard_tests {
                  — 0.0 means the worker-count guard skipped annotation again"
             );
         }
+    }
+
+    /// Regression, at the call site: annotation follows the delta's own span,
+    /// not the collector's aggregation window.
+    ///
+    /// `run_governor_cycle` measures the delta between two API readings —
+    /// `prev_usage_snapshot.taken_at` and `now` — but used to select rows with
+    /// `state.last_fleet_aggregate.{t0, t1}`. Those come from different clocks
+    /// at different cadences and generally do not coincide, so the delta was
+    /// apportioned onto rows from a span it never covered. This drives the
+    /// same sequence the call site does, with the two spans deliberately
+    /// disjoint, and asserts the rows the delta actually covers are the ones
+    /// annotated.
+    #[test]
+    fn test_annotation_follows_the_delta_span_not_the_collector_window() {
+        // The collector's most recent aggregation window, ending before the
+        // governor's poll span even opens.
+        let agg_t0: DateTime<Utc> = "2026-03-20T09:53:00Z".parse().unwrap();
+        let agg_t1: DateTime<Utc> = "2026-03-20T09:58:00Z".parse().unwrap();
+
+        // The span the delta was measured over: two consecutive API readings.
+        let span_start: DateTime<Utc> = "2026-03-20T09:59:00Z".parse().unwrap();
+        let span_end: DateTime<Utc> = "2026-03-20T10:04:00Z".parse().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = db::open_db(&tmp.path().join("history.db")).unwrap();
+        db::create_schema(&conn).unwrap();
+
+        // One collector pass in each span, same spend, so nothing but the
+        // interval choice can decide which row gets the delta.
+        for (sess, t1) in [("in-agg-window", agg_t1), ("in-delta-span", span_end)] {
+            db::insert_instance(
+                &conn,
+                &serde_json::json!({
+                    "r": "i", "ts": t1.to_rfc3339(),
+                    "t0": (t1 - Duration::minutes(5)).to_rfc3339(), "t1": t1.to_rfc3339(),
+                    "sess": sess, "sid": sess, "model": "sonnet",
+                    "pk": 1, "hr_et": 10, "dow": 2,
+                    "input-n": 0, "input-usd": 0.0,
+                    "output-n": 0, "output-usd": 0.0,
+                    "r-cache-n": 0, "r-cache-usd": 0.0,
+                    "w-cache-n": 0, "w-cache-usd": 0.0,
+                    "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                    "total-usd": 0.50, "cache-eff": 0.0,
+                }),
+            )
+            .unwrap();
+            db::insert_fleet(
+                &conn,
+                &serde_json::json!({
+                    "r": "f", "ts": t1.to_rfc3339(),
+                    "t0": (t1 - Duration::minutes(5)).to_rfc3339(), "t1": t1.to_rfc3339(),
+                    "pk": 1, "hr_et": 10, "dow": 2, "workers": 1,
+                    "total-usd": 0.50, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+                    "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+                }),
+            )
+            .unwrap();
+        }
+
+        let fleet = state::FleetAggregate {
+            t0: agg_t0,
+            t1: agg_t1,
+            sonnet_workers: 1,
+            ..Default::default()
+        };
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.0,
+            seven_day: 45.5,
+            weekly_scoped: 35.8,
+        };
+
+        // The call-site sequence, verbatim: derive the counts, run the guard
+        // chain over the delta span, annotate over the same span.
+        let (workers_at_start, workers_at_end) = annotation_worker_counts(&fleet);
+        assert_eq!(
+            annotation_skip_reason(
+                span_start,
+                span_end,
+                workers_at_start,
+                workers_at_end,
+                &old_pct,
+                &new_pct
+            ),
+            None,
+            "a 5-minute delta span over a steady fleet must clear the guards"
+        );
+        db::annotate_window_pct_deltas(
+            &conn,
+            span_start,
+            span_end,
+            &old_pct,
+            &new_pct,
+            workers_at_start,
+            workers_at_end,
+        )
+        .unwrap();
+
+        let annotated = |sess: &str| -> Option<f64> {
+            conn.query_row(
+                "SELECT p7ds FROM i WHERE sess = ?",
+                rusqlite::params![sess],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let in_span =
+            annotated("in-delta-span").expect("the row inside the delta span must carry the delta");
+        assert!(
+            (in_span - 0.8).abs() < 1e-6,
+            "the in-span row should get the whole 0.8 weekly_scoped delta, got {in_span}"
+        );
+        assert_eq!(
+            annotated("in-agg-window"),
+            None,
+            "the collector's aggregation window is not the span the delta was \
+             measured over — its row must be left alone"
+        );
     }
 
     /// annotation_skip_reason: each guard is wired in, and the cheapest check wins.
