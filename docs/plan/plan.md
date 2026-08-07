@@ -1824,6 +1824,17 @@ cgov start    # start daemon (must already be enabled, or use enable)
 cgov stop     # graceful stop — governor finishes current cycle before exiting
 ```
 
+`claude-governor.service` is the one canonical unit name for the daemon, and
+`ExecStart` is always the hidden `cgov _daemon` subcommand — never the public
+foreground `cgov daemon`, which exists for interactive runs and carries no
+`Restart=always` or ordering against the collector. Early builds also shipped a
+`cgov.service` under that public subcommand; an operator who enabled that one
+instead got `Restart=on-failure` and no dependency on the token collector, with
+nothing marking either as canonical. That name is retired: `cgov init`, `cgov
+enable`, and `cgov disable --purge` stop, disable, and delete any `cgov.service`
+left in `~/.config/systemd/user/` before reloading, so upgrading an old install
+converges on the single unit.
+
 **Mode B: tmux sessions (fallback — no systemd or macOS)**
 
 ```bash

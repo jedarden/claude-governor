@@ -135,9 +135,12 @@ now finally accumulate, because the daemon that grows that counter is running ag
 
 ## Footguns left in place, deliberately
 
-- `cgov.service` still exists as a stale duplicate unit (`ExecStart=cgov daemon`, no `--dry-run`,
+- ~~`cgov.service` still exists as a stale duplicate unit (`ExecStart=cgov daemon`, no `--dry-run`,
   `Restart=on-failure`). It is `disabled`; enabling it would start a second, fully-Act daemon.
-  Not removed here — deleting an operator's unit file is their call, not this bead's.
+  Not removed here — deleting an operator's unit file is their call, not this bead's.~~
+  **Resolved by bf-5l61f (2026-08-07):** `claude-governor.service` is now the sole canonical unit.
+  `cgov init`, `cgov enable`, and `cgov disable --purge` stop, disable, and delete any leftover
+  `cgov.service`, and the file was removed from this host.
 - `cgov enable` / `cgov init` install the unit from `config/claude-governor.service`, which has the
   plain `ExecStart`. They skip existing files unless `--force`, so the normal path is safe, but
   `cgov enable --force` **will** silently revert the observe-only ExecStart.

@@ -1291,6 +1291,69 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
 const GOVERNOR_SERVICE: &str = "claude-governor.service";
 const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
 
+/// Obsolete unit names that older installs shipped for the governor daemon.
+///
+/// `cgov.service` ran the public foreground `cgov daemon` subcommand with
+/// `Restart=on-failure` and no ordering against the collector, so an operator who
+/// enabled it by name got different restart semantics and no dependency on
+/// [`COLLECTOR_SERVICE`]. [`GOVERNOR_SERVICE`] (running the systemd-oriented
+/// `cgov _daemon`) is the only canonical unit; leaving the old file on disk keeps
+/// that ambiguity alive, so installs delete it.
+const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service"];
+
+/// Run a systemctl --user command without letting it write to our stdout/stderr.
+///
+/// Used for probing (`is-active`, `is-enabled`) and best-effort cleanup, where the
+/// expected case is a non-zero exit that should not look like an error to the user.
+fn systemctl_user_quiet(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .args(["--user"])
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Stop, disable, and delete any obsolete governor units left by an older install.
+///
+/// Returns one unprefixed sentence per unit actually removed — empty, and silent,
+/// when there is nothing to clean up. A removal that fails is warned about on
+/// stderr rather than reported as an action taken, since the install itself still
+/// succeeds. The caller is responsible for the `daemon-reload` that makes the
+/// removal take effect.
+fn remove_legacy_governor_units(user_dir: &Path) -> Vec<String> {
+    let mut actions = Vec::new();
+
+    for svc in LEGACY_GOVERNOR_SERVICES {
+        let path = user_dir.join(svc);
+        if !path.exists() {
+            continue;
+        }
+
+        if systemctl_user_quiet(&["is-active", svc]) {
+            systemctl_user_quiet(&["stop", svc]);
+        }
+        if systemctl_user_quiet(&["is-enabled", svc]) {
+            systemctl_user_quiet(&["disable", svc]);
+        }
+
+        match fs::remove_file(&path) {
+            Ok(()) => actions.push(format!(
+                "Removed obsolete unit {} (superseded by {})",
+                path.display(),
+                GOVERNOR_SERVICE
+            )),
+            Err(e) => eprintln!(
+                "warning: could not remove obsolete unit {}: {}",
+                path.display(),
+                e
+            ),
+        }
+    }
+
+    actions
+}
+
 /// Resolve --service arg to a list of unit names
 fn resolve_service_names(service: &str) -> Vec<&'static str> {
     match service {
@@ -1434,6 +1497,13 @@ fn run_enable_command(force: bool) -> Result<()> {
         }
     }
 
+    // Drop obsolete units from older installs before reloading
+    actions.extend(
+        remove_legacy_governor_units(&user_dir)
+            .into_iter()
+            .map(|a| format!("  ✓ {}", a)),
+    );
+
     // Daemon-reload
     systemctl_user(&["daemon-reload"])?;
     actions.push("  ✓ Ran daemon-reload".to_string());
@@ -1521,6 +1591,11 @@ fn run_disable_command(purge: bool) -> Result<()> {
                     actions.push(format!("  ✓ Removed {}", path.display()));
                 }
             }
+            actions.extend(
+                remove_legacy_governor_units(&dir)
+                    .into_iter()
+                    .map(|a| format!("  ✓ {}", a)),
+            );
             systemctl_user(&["daemon-reload"])?;
             actions.push("  ✓ Ran daemon-reload".to_string());
         }
@@ -1813,6 +1888,9 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
                     ));
                 }
             }
+
+            // Drop obsolete units from older installs before reloading
+            actions_taken.extend(remove_legacy_governor_units(&systemd_user_dir));
 
             // Run daemon-reload
             let _ = Command::new("systemctl")
@@ -2386,5 +2464,56 @@ mod tests {
             cargo_version, clap_version,
             "Clap version must match CARGO_PKG_VERSION - do not hardcode #[command(version = \"X.Y.Z\")]"
         );
+    }
+
+    #[test]
+    fn test_remove_legacy_governor_units_deletes_stale_unit() {
+        // An install from before the unit names were consolidated leaves cgov.service
+        // sitting next to the canonical unit. Enabling it by name gives the operator
+        // `cgov daemon` with Restart=on-failure and no dependency on the collector,
+        // so install/enable must delete it rather than leave both as valid choices.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("cgov.service");
+        let canonical = dir.path().join(GOVERNOR_SERVICE);
+        let collector = dir.path().join(COLLECTOR_SERVICE);
+        fs::write(&legacy, "[Service]\nExecStart=cgov daemon\n").expect("write legacy");
+        fs::write(&canonical, "[Service]\nExecStart=cgov _daemon\n").expect("write canonical");
+        fs::write(&collector, "[Service]\n").expect("write collector");
+
+        let actions = remove_legacy_governor_units(dir.path());
+
+        assert!(!legacy.exists(), "stale cgov.service should be removed");
+        assert!(canonical.exists(), "canonical governor unit must survive");
+        assert!(collector.exists(), "collector unit must survive");
+        assert_eq!(
+            actions.len(),
+            1,
+            "one removal should be reported: {actions:?}"
+        );
+        assert!(
+            actions[0].contains("cgov.service") && actions[0].contains(GOVERNOR_SERVICE),
+            "action should name the removed unit and its replacement: {}",
+            actions[0]
+        );
+    }
+
+    #[test]
+    fn test_remove_legacy_governor_units_is_silent_when_clean() {
+        // A fresh install has nothing to clean up and must not report phantom actions.
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join(GOVERNOR_SERVICE), "[Service]\n").expect("write canonical");
+
+        assert!(remove_legacy_governor_units(dir.path()).is_empty());
+        assert!(dir.path().join(GOVERNOR_SERVICE).exists());
+    }
+
+    #[test]
+    fn test_legacy_service_list_excludes_canonical_units() {
+        // Guard against someone adding a name here that would make install/enable
+        // delete the units it just wrote.
+        for svc in LEGACY_GOVERNOR_SERVICES {
+            assert_ne!(*svc, GOVERNOR_SERVICE);
+            assert_ne!(*svc, COLLECTOR_SERVICE);
+        }
     }
 }
