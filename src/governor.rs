@@ -334,10 +334,16 @@ pub fn annotation_skip_reason(
 ///
 /// Both ends come from the same place — the fleet record's worker count for
 /// `[t0, t1]` — because that is the population being annotated. The collector
-/// writes one `i` row per session it saw in the interval and sets the fleet
-/// record's `workers` field to `instances.len()` (see `collector.rs`), so this
-/// count *is* the count of the `i` rows that
-/// [`db::annotate_window_pct_deltas`] apportions the deltas across.
+/// writes one `i` row per `(session, model)` pair it saw in the interval, across
+/// every model class, and sets the fleet record's `workers` field to
+/// `instances.len()` (see `collector.rs`), so this count *is* the count of the
+/// `i` rows that [`db::annotate_window_pct_deltas`] apportions the deltas
+/// across — that function selects them with `WHERE t0 = ? AND t1 = ?`, with no
+/// model filter.
+///
+/// Despite its name, `FleetAggregate::sonnet_workers` holds that all-model
+/// count: the governor parses it straight from the fleet record's `workers`
+/// field. The name is historical, from when the fleet was sonnet-only.
 ///
 /// The governor's own tmux census is the wrong quantity for this guard twice
 /// over: it spans every model class rather than the collector's population, and
@@ -12991,6 +12997,119 @@ mod annotation_guard_tests {
             None,
             "a steady fleet with non-sonnet workers must not trip the worker-count guard"
         );
+    }
+
+    /// Regression, end to end: a steady mixed-model fleet is actually annotated.
+    ///
+    /// The test above stops at the guard verdict. This one drives the whole
+    /// call-site path — derive the counts, run the guard chain, then call
+    /// [`db::annotate_window_pct_deltas`] against a real database holding
+    /// sonnet, opus and haiku `i` rows — and asserts the deltas land in the
+    /// rows. Under the old call site `workers_at_end` was the all-model tmux
+    /// census (5 here) while `workers_at_start` was the collector's count (4),
+    /// so the annotation was skipped and every `p7ds` stayed 0.
+    #[test]
+    fn test_mixed_model_fleet_is_annotated_end_to_end() {
+        let t0: DateTime<Utc> = "2026-03-20T09:55:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2026-03-20T10:00:00Z".parse().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = db::open_db(&tmp.path().join("history.db")).unwrap();
+        db::create_schema(&conn).unwrap();
+
+        // Four `i` rows the collector wrote for this interval: two sonnet, one
+        // opus, one haiku. Equal cost, so each should receive a quarter of the
+        // delta. The governor's tmux census would report 5 (an extra session
+        // that logged no usage this interval), which is exactly the mismatch.
+        let sessions = [
+            ("sess-a", "sonnet"),
+            ("sess-b", "sonnet"),
+            ("sess-c", "opus"),
+            ("sess-d", "haiku"),
+        ];
+        for (sess, model) in sessions {
+            db::insert_instance(
+                &conn,
+                &serde_json::json!({
+                    "r": "i", "ts": t1.to_rfc3339(),
+                    "t0": t0.to_rfc3339(), "t1": t1.to_rfc3339(),
+                    "sess": sess, "sid": sess, "model": model,
+                    "pk": 1, "hr_et": 10, "dow": 2,
+                    "input-n": 0, "input-usd": 0.0,
+                    "output-n": 0, "output-usd": 0.0,
+                    "r-cache-n": 0, "r-cache-usd": 0.0,
+                    "w-cache-n": 0, "w-cache-usd": 0.0,
+                    "w-cache-1h-n": 0, "w-cache-1h-usd": 0.0,
+                    "total-usd": 0.25, "cache-eff": 0.0,
+                }),
+            )
+            .unwrap();
+        }
+        db::insert_fleet(
+            &conn,
+            &serde_json::json!({
+                "r": "f", "ts": t1.to_rfc3339(),
+                "t0": t0.to_rfc3339(), "t1": t1.to_rfc3339(),
+                "pk": 1, "hr_et": 10, "dow": 2, "workers": 4,
+                "total-usd": 1.0, "p75-usd-hr": 5.0, "std-usd-hr": 1.0,
+                "fleet-cache-eff": 0.0, "cache-eff-p25": 0.0,
+            }),
+        )
+        .unwrap();
+
+        // The collector's fleet record for the interval: 4 rows written.
+        let fleet = state::FleetAggregate {
+            t0,
+            t1,
+            sonnet_workers: 4,
+            ..Default::default()
+        };
+
+        let old_pct = db::WindowPctSnapshot {
+            five_hour: 20.0,
+            seven_day: 45.0,
+            weekly_scoped: 35.0,
+        };
+        let new_pct = db::WindowPctSnapshot {
+            five_hour: 21.0,
+            seven_day: 45.5,
+            weekly_scoped: 35.8,
+        };
+
+        let (workers_at_start, workers_at_end) = annotation_worker_counts(&fleet);
+        assert_eq!(
+            annotation_skip_reason(t0, t1, workers_at_start, workers_at_end, &old_pct, &new_pct),
+            None,
+            "the guard chain must clear a steady mixed-model fleet"
+        );
+
+        db::annotate_window_pct_deltas(
+            &conn,
+            t0,
+            t1,
+            &old_pct,
+            &new_pct,
+            workers_at_start,
+            workers_at_end,
+        )
+        .unwrap();
+
+        // Every row — sonnet and non-sonnet alike — carries its share of the
+        // 0.8 weekly_scoped delta, split four ways by equal total_usd weight.
+        for (sess, model) in sessions {
+            let p7ds: f64 = conn
+                .query_row(
+                    "SELECT p7ds FROM i WHERE sess = ? AND t0 = ? AND t1 = ?",
+                    rusqlite::params![sess, t0.to_rfc3339(), t1.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                (p7ds - 0.2).abs() < 1e-6,
+                "{sess} ({model}) should be annotated with p7ds=0.2, got {p7ds} \
+                 — 0.0 means the worker-count guard skipped annotation again"
+            );
+        }
     }
 
     /// annotation_skip_reason: each guard is wired in, and the cheapest check wins.
