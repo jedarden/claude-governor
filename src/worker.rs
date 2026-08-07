@@ -19,6 +19,20 @@ use std::time::Duration as StdDuration;
 /// without cleanup. Stale heartbeats are verified against tmux before being removed.
 const STALE_HEARTBEAT_THRESHOLD: i64 = 60; // seconds
 
+/// Disk usage percentage at or above which `scale_up` refuses to launch workers.
+///
+/// On 2026-08-05 a needle span-nesting leak (NEEDLE bf-3uj6i) drove a single
+/// worker's stderr log to 33.7 GB at ~159 GB/hr. The governor is the spawner, and
+/// each fresh worker restarts such a leak from zero, so an unguarded scale_up turns
+/// a worker-side logging bug into a host-wide outage.
+///
+/// The governor does NOT own the worker stderr file — needle builds the `2>>`
+/// redirect itself (needle `src/cli/mod.rs`, `~/.needle/logs/<session>.stderr.log`),
+/// so the governor cannot rotate or truncate it without racing needle's own writer.
+/// What the governor does own is the decision to add another writer, so that is
+/// where the bound belongs: stop feeding a filling disk.
+const SCALE_UP_MAX_DISK_USE_PCT: u8 = 90;
+
 /// Worker heartbeat JSON structure (written by each worker instance)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
@@ -191,6 +205,32 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
         return 0;
     }
 
+    // Refuse to add workers to a filling disk. Checked before the dry_run branch so
+    // observe-only mode reports the block too — a dry run that claims it "would
+    // launch" while the real path would refuse is a misleading forecast.
+    //
+    // The heartbeat dir lives under ~/.needle, the same filesystem as the
+    // ~/.needle/logs/*.stderr.log files a leaking worker grows, so it is the right
+    // thing to stat. See SCALE_UP_MAX_DISK_USE_PCT.
+    let use_pct = disk_use_percent(&config.heartbeat_dir);
+    if scale_up_blocked_by_disk(use_pct) {
+        log::error!(
+            "[worker] refusing to launch {} worker(s): disk {}% used (>= {}% limit) on the \
+             filesystem holding {}. Each worker adds a log writer; see NEEDLE bf-3uj6i.",
+            n,
+            use_pct.unwrap_or(0),
+            SCALE_UP_MAX_DISK_USE_PCT,
+            config.heartbeat_dir.display(),
+        );
+        return 0;
+    }
+    if use_pct.is_none() {
+        log::warn!(
+            "[worker] could not determine disk usage for {} — proceeding with launch",
+            config.heartbeat_dir.display(),
+        );
+    }
+
     let timestamp = Utc::now().format("%Y%m%d%H%M%S");
     let mut launched = 0;
 
@@ -241,6 +281,40 @@ pub fn scale_up(n: u32, config: &WorkerConfig, dry_run: bool) -> usize {
     }
 
     launched
+}
+
+/// Read the used-percentage of the filesystem holding `path`.
+///
+/// Uses `df -P` (POSIX output format) so the columns stay on one line regardless
+/// of how long the device name is — plain `df` wraps long device names onto a
+/// second line and shifts every field.
+///
+/// Returns `None` if df is unavailable or its output cannot be parsed. Callers
+/// treat `None` as "unknown" and proceed: a df that stops parsing should not be
+/// able to wedge scaling permanently.
+pub fn disk_use_percent(path: &Path) -> Option<u8> {
+    let output = Command::new("df").arg("-P").arg(path).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Line 0 is the header; line 1 holds the values.
+    let fields: Vec<&str> = stdout.lines().nth(1)?.split_whitespace().collect();
+    // Filesystem, 1024-blocks, Used, Available, Capacity, Mounted-on
+    fields.get(4)?.trim_end_matches('%').parse::<u8>().ok()
+}
+
+/// Whether a disk reading should block launching new workers.
+///
+/// `None` means df was unavailable or unparseable. That fails OPEN (returns false):
+/// a df that stops reporting should not be able to wedge scaling permanently, and
+/// unlike a genuinely full disk it is not evidence of a problem. Note that some
+/// pseudo-filesystems (procfs, for one) report capacity as `-`, which lands here.
+fn scale_up_blocked_by_disk(use_pct: Option<u8>) -> bool {
+    match use_pct {
+        Some(pct) => pct >= SCALE_UP_MAX_DISK_USE_PCT,
+        None => false,
+    }
 }
 
 /// Result of executing a shell command.
@@ -843,6 +917,50 @@ mod tests {
         let launched = scale_up(0, &config, false);
 
         assert_eq!(launched, 0);
+    }
+
+    #[test]
+    fn disk_use_percent_reads_a_real_filesystem() {
+        let temp = TempDir::new().unwrap();
+
+        let pct = disk_use_percent(temp.path()).expect("df should report on a real temp dir");
+
+        // The value must be a real percentage, not a mis-indexed column (a device
+        // name or block count would fail to parse into u8 and yield None above).
+        assert!(pct <= 100, "disk use {pct}% is not a percentage");
+    }
+
+    #[test]
+    fn disk_use_percent_is_none_for_a_nonexistent_path() {
+        // df exits non-zero on a missing path; the parse must not panic or invent a
+        // number, because a bogus low reading would silently defeat the scale-up guard.
+        assert_eq!(
+            disk_use_percent(Path::new("/nonexistent-cgov-disk-guard-probe")),
+            None,
+        );
+    }
+
+    #[test]
+    fn disk_guard_blocks_at_and_above_the_limit() {
+        assert!(scale_up_blocked_by_disk(Some(SCALE_UP_MAX_DISK_USE_PCT)));
+        assert!(scale_up_blocked_by_disk(Some(100)));
+    }
+
+    #[test]
+    fn disk_guard_allows_below_the_limit() {
+        assert!(!scale_up_blocked_by_disk(Some(
+            SCALE_UP_MAX_DISK_USE_PCT - 1
+        )));
+        // 73% is roughly where the host sat while this guard was written; a routine
+        // disk must not block routine scaling.
+        assert!(!scale_up_blocked_by_disk(Some(73)));
+    }
+
+    #[test]
+    fn disk_guard_fails_open_on_an_unreadable_disk() {
+        // An unparseable df is "unknown", not "full". Blocking here would wedge
+        // scaling permanently on any host where df output drifts.
+        assert!(!scale_up_blocked_by_disk(None));
     }
 
     #[test]
