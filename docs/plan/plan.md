@@ -799,7 +799,7 @@ Alerts are created as HUMAN-type NEEDLE beads that workers will not claim, surfa
 | `burn_rate_sample > baseline * 2` | `burn_rate_spike` | Log anomaly; increase polling rate to recalibrate faster |
 | All windows `margin_hrs > hrs_left * 0.5` | `underutilization` | Scale up toward max_workers; headroom is ample |
 
-**Deduplication:** Per-type cooldown of 1 hour (configurable via `alerts.cooldown_minutes`). When an alert fires, the same alert type is suppressed for the cooldown period even if the condition persists. If the condition clears and then re-triggers after the cooldown expires, a new alert is created. Cooldown timestamps are stored per-type in the state file under `alerts.last_fired`.
+**Deduplication:** Per-*episode*, not per-cooldown-window. An episode is one continuous stretch during which a condition holds, keyed by alert type plus scope (`cutoff_imminent:five_hour`, `subscription_billing_drift:needle-sonnet`). The first cycle a condition is true creates exactly one bead and records its id in the state file under `open_alert_beads`; while the condition persists no further beads are created (the existing one is refreshed at most once per `alerts.cooldown_minutes`); the first cycle it is no longer detected, the bead is auto-closed and the entry dropped. `alerts.cooldown_minutes` remains only as an anti-flap floor on *opening* a new episode after one resolves, with timestamps stored per episode key under `alert_cooldown.last_fired`. The earlier pure-cooldown scheme minted a fresh bead every hour for as long as a condition held and never closed one on recovery — the source of the 226 `sonnet_cutoff_risk` / 160 `cutoff_imminent` beads in this repo's own workspace. See `docs/research/alerts.md` for the full lifecycle.
 
 ---
 

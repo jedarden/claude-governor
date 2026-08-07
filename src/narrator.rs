@@ -602,6 +602,7 @@ mod tests {
             alerts: Vec::new(),
             safe_mode: Default::default(),
             alert_cooldown: Default::default(),
+            open_alert_beads: Default::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: Default::default(),

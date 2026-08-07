@@ -1,11 +1,29 @@
-//! Alert Condition Checker and Cooldown Deduplication
+//! Alert Condition Checker and Episode Lifecycle
 //!
 //! This module handles:
 //! - Alert condition evaluation from governor state
-//! - Per-type cooldown deduplication to prevent alert spam
+//! - Stateful, episode-based deduplication: one bead per condition episode
 //! - Alert severity classification
 //! - Firing alerts via configured command (default: bf create --type human)
 //! - Logging alerts to governor.log
+//!
+//! # Episode lifecycle
+//!
+//! An *episode* is one continuous stretch during which a given condition (keyed by
+//! alert type plus an optional scope such as the window or agent name) is true. The
+//! lifecycle is:
+//!
+//! 1. **Open** — the first cycle the condition is true, one bead is created and its id
+//!    is recorded in `governor-state.json` under `open_alert_beads`.
+//! 2. **Recur** — while the condition stays true, no new bead is created. The existing
+//!    bead is refreshed with current numbers at most once per `cooldown_minutes`.
+//! 3. **Resolve** — the first cycle the condition is no longer reported, the bead is
+//!    auto-closed and the entry is removed.
+//!
+//! This replaces the previous cooldown-only dedup, under which a condition that stayed
+//! true simply minted a brand-new bead every time the cooldown elapsed. The cooldown is
+//! retained only as an anti-flap floor on *opening* a new episode, so a condition that
+//! rapidly toggles cannot produce a bead per toggle.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,7 +35,7 @@ use std::process::Command;
 
 use crate::burn_rate::MIN_VALIDATION_SAMPLES;
 use crate::config::AlertConfig;
-use crate::state::{AlertCooldown, CapacityForecast, GovernorState};
+use crate::state::{AlertCooldown, CapacityForecast, GovernorState, OpenAlertBead};
 
 /// Alert severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +119,52 @@ pub struct AlertCondition {
     pub severity: AlertSeverity,
     /// Timestamp when this condition was detected
     pub detected_at: DateTime<Utc>,
+    /// What this condition is about, when a single alert type can describe more than one
+    /// subject: the window name for cutoff alerts, the agent name for billing drift.
+    /// Two conditions of the same type but different scope are separate episodes and get
+    /// separate beads; `None` means the type itself is the whole identity.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl AlertCondition {
+    /// Construct a condition whose identity is its alert type alone.
+    pub fn new(
+        alert_type: AlertType,
+        message: String,
+        severity: AlertSeverity,
+        detected_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            alert_type,
+            message,
+            severity,
+            detected_at,
+            scope: None,
+        }
+    }
+
+    /// Attach a scope, making this condition a distinct episode from other conditions of
+    /// the same type with a different scope.
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
+
+    /// The key identifying this condition's episode: `alert_type` or `alert_type:scope`.
+    ///
+    /// This is the key under which the open bead and the anti-flap cooldown are stored.
+    pub fn episode_key(&self) -> String {
+        episode_key(self.alert_type, self.scope.as_deref())
+    }
+}
+
+/// Build an episode key from an alert type and optional scope.
+pub fn episode_key(alert_type: AlertType, scope: Option<&str>) -> String {
+    match scope {
+        Some(s) => format!("{}:{}", alert_type, s),
+        None => alert_type.to_string(),
+    }
 }
 
 /// Default cooldown duration in minutes
@@ -229,19 +293,19 @@ pub fn check_underutilization_sprint_for_worker(
     None
 }
 
-/// Check if an alert should be fired based on cooldown
+/// Check whether a *new* episode may open for the given episode key.
 ///
-/// Returns true if:
-/// - No previous fire for this alert type, OR
-/// - Cooldown period has elapsed since last fire, OR
-/// - Condition had cleared and is now re-triggered (cooldown was cleared)
-pub fn should_fire(
-    alert_type: AlertType,
+/// This is the anti-flap floor, not a repeat interval: it is consulted only when no
+/// episode is currently open for the key. Returns true if:
+/// - No previous episode opened for this key, OR
+/// - The cooldown period has elapsed since the last episode opened
+pub fn should_open_episode(
+    key: &str,
     cooldown: &AlertCooldown,
     now: DateTime<Utc>,
     cooldown_minutes: i64,
 ) -> bool {
-    match cooldown.get_last_fired(&alert_type.to_string()) {
+    match cooldown.get_last_fired(key) {
         None => true, // Never fired before
         Some(last_fired) => {
             let elapsed = (now - last_fired).num_minutes();
@@ -250,7 +314,24 @@ pub fn should_fire(
     }
 }
 
-/// Update cooldown state after firing an alert
+/// Check if an alert should be fired based on cooldown, keyed by alert type alone.
+///
+/// Convenience wrapper over [`should_open_episode`] for unscoped alert types.
+pub fn should_fire(
+    alert_type: AlertType,
+    cooldown: &AlertCooldown,
+    now: DateTime<Utc>,
+    cooldown_minutes: i64,
+) -> bool {
+    should_open_episode(&alert_type.to_string(), cooldown, now, cooldown_minutes)
+}
+
+/// Record that an episode opened for the given key.
+pub fn record_episode_opened(cooldown: &mut AlertCooldown, key: &str, now: DateTime<Utc>) {
+    cooldown.record_fired(key, now);
+}
+
+/// Update cooldown state after firing an alert, keyed by alert type alone.
 pub fn update_cooldown(cooldown: &mut AlertCooldown, alert_type: AlertType, now: DateTime<Utc>) {
     cooldown.record_fired(&alert_type.to_string(), now);
 }
@@ -276,7 +357,13 @@ pub fn default_alert_log_path() -> PathBuf {
 /// 3. Executes the configured command (default: bf create --type human "...")
 /// 4. Logs the alert to governor.log (with log rotation if config provided)
 ///
-/// Returns Ok(()) if the alert was fired successfully, or an error message.
+/// Returns `Ok(Some(bead_id))` when a bead was created and its id could be parsed from
+/// the command's output, `Ok(None)` when no bead was created (alerts disabled, severity
+/// below threshold, `auto_bead` off) or the id could not be determined, and `Err` when
+/// the alert could not be fired at all.
+///
+/// Callers should not invoke this per cycle for a condition that is already open — see
+/// [`process_alert_episodes`], which calls it exactly once per condition episode.
 ///
 /// The optional (log_max_bytes, log_backup_count) tuple enables log rotation.
 /// If None, logs are written without rotation (legacy behavior).
@@ -284,11 +371,11 @@ pub fn fire_alert(
     alert: &AlertCondition,
     config: &AlertConfig,
     log_rotation_config: Option<(u64, u32)>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Check if alerts are enabled
     if !config.enabled {
         log::debug!("[alert] alerts disabled, skipping {}", alert.alert_type);
-        return Ok(());
+        return Ok(None);
     }
 
     // Check severity threshold
@@ -299,7 +386,7 @@ pub fn fire_alert(
             config.min_severity,
             alert.alert_type
         );
-        return Ok(());
+        return Ok(None);
     }
 
     log::info!(
@@ -322,7 +409,7 @@ pub fn fire_alert(
             "[alert] auto_bead disabled — logged but did not execute command for {}",
             alert.alert_type
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // Build the command with the alert message as the final argument
@@ -343,10 +430,18 @@ pub fn fire_alert(
     cmd.arg(&alert_message);
 
     // Execute the command
+    let mut bead_id = None;
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
-                log::info!("[alert] command executed successfully");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                bead_id = parse_bead_id(&stdout);
+                match &bead_id {
+                    Some(id) => log::info!("[alert] created bead {} for {}", id, alert.alert_type),
+                    None => log::warn!(
+                        "[alert] command succeeded but no bead id found in output — this episode's bead cannot be refreshed or auto-closed"
+                    ),
+                }
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 log::warn!("[alert] command failed: {}", stderr.trim());
@@ -362,7 +457,131 @@ pub fn fire_alert(
         log::warn!("[alert] failed to write to governor.log: {}", e);
     }
 
-    Ok(())
+    Ok(bead_id)
+}
+
+/// Extract a bead id from an alert-creation command's stdout.
+///
+/// Handles the two shapes the default `bf create` emits:
+/// - `--json` output, where the id lives at `.data.id` (envelope) or `.id`
+/// - plain output, which is the bare id, possibly prefixed by a human-readable phrase
+///
+/// Returns None when nothing that looks like a bead id is present, in which case the
+/// episode is tracked without a bead to refresh or close.
+fn parse_bead_id(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // JSON output: {"version":1,"kind":"create","data":{"id":"bf-2sf9o",...}} or {"id":"..."}
+    for line in trimmed.lines().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            let id = value
+                .get("data")
+                .and_then(|d| d.get("id"))
+                .or_else(|| value.get("id"))
+                .and_then(|v| v.as_str());
+            if let Some(id) = id {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    // Plain output: scan back-to-front for the last token shaped like a bead id.
+    for line in trimmed.lines().rev() {
+        if let Some(token) = line
+            .split_whitespace()
+            .rev()
+            .find(|t| looks_like_bead_id(t.trim_matches(|c: char| c == '.' || c == ',')))
+        {
+            return Some(
+                token
+                    .trim_matches(|c: char| c == '.' || c == ',')
+                    .to_string(),
+            );
+        }
+    }
+
+    None
+}
+
+/// Whether a token has the shape of a bead id: `<prefix>-<suffix>`, where the prefix is
+/// alphanumeric and the suffix is at least three alphanumeric characters (e.g. `bf-5k6yv`,
+/// `docs-878a`).
+fn looks_like_bead_id(token: &str) -> bool {
+    let Some((prefix, suffix)) = token.split_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric())
+        && suffix.len() >= 3
+        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Close the bead tracking an alert episode whose condition has cleared.
+///
+/// Invokes `<close_command...> <bead_id> --reason <reason>`. Errors are reported to the
+/// caller but are not fatal: a bead that was already closed by hand, or a workspace that
+/// has moved, must not wedge the governor cycle.
+pub fn close_alert_bead(bead_id: &str, config: &AlertConfig, reason: &str) -> Result<(), String> {
+    if config.close_command.is_empty() {
+        return Err("no alert close command configured".to_string());
+    }
+
+    let mut cmd = Command::new(&config.close_command[0]);
+    if config.close_command.len() > 1 {
+        cmd.args(&config.close_command[1..]);
+    }
+    cmd.arg(bead_id).arg("--reason").arg(reason);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            log::info!("[alert] closed bead {}: {}", bead_id, reason);
+            Ok(())
+        }
+        Ok(output) => Err(format!(
+            "close command failed for {}: {}",
+            bead_id,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(e) => Err(format!(
+            "could not run close command for {}: {}",
+            bead_id, e
+        )),
+    }
+}
+
+/// Refresh an open episode's bead with the condition's current numbers.
+///
+/// Invokes `<update_command...> <bead_id> --notes <notes>`. Used instead of creating a
+/// second bead when a condition is still true on a later cycle.
+pub fn refresh_alert_bead(bead_id: &str, config: &AlertConfig, notes: &str) -> Result<(), String> {
+    if config.update_command.is_empty() {
+        return Err("no alert update command configured".to_string());
+    }
+
+    let mut cmd = Command::new(&config.update_command[0]);
+    if config.update_command.len() > 1 {
+        cmd.args(&config.update_command[1..]);
+    }
+    cmd.arg(bead_id).arg("--notes").arg(notes);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            log::debug!("[alert] refreshed bead {}", bead_id);
+            Ok(())
+        }
+        Ok(output) => Err(format!(
+            "update command failed for {}: {}",
+            bead_id,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(e) => Err(format!(
+            "could not run update command for {}: {}",
+            bead_id, e
+        )),
+    }
 }
 
 /// Check if an alert severity meets the minimum threshold.
@@ -472,15 +691,184 @@ fn rotate_log_file(path: &std::path::PathBuf, backup_count: u32) -> std::io::Res
     Ok(())
 }
 
-/// Process all pending alerts: filter by cooldown, fire, and update cooldown state.
+/// An episode that resolved this cycle because its condition is no longer true.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedEpisode {
+    /// The episode key that resolved
+    pub key: String,
+    /// The bead that was tracking it, if one was created
+    pub bead_id: Option<String>,
+    /// How long the condition was continuously true, in hours
+    pub duration_hours: f64,
+    /// How many cycles observed the condition
+    pub observations: u32,
+    /// Whether the close command ran successfully. False when there was no bead to close
+    /// or the close command failed.
+    pub closed: bool,
+}
+
+/// What the episode lifecycle did this cycle.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EpisodeOutcome {
+    /// Episode keys that opened this cycle — one bead each
+    pub opened: Vec<String>,
+    /// Conditions that were still true but already had an open episode, so no bead was created
+    pub suppressed: usize,
+    /// Episodes whose condition cleared this cycle
+    pub resolved: Vec<ResolvedEpisode>,
+}
+
+/// Drive the alert-episode lifecycle for one governor cycle.
 ///
-/// This is a convenience function that combines:
-/// 1. `check_alert_conditions` - find active alerts
-/// 2. `should_fire` - filter by cooldown
-/// 3. `fire_alert` - execute and log
-/// 4. `update_cooldown` - record that we fired
+/// For each condition in `conditions`:
+/// - if no episode is open for its key, open one (subject to the anti-flap cooldown),
+///   firing the alert and recording the created bead id in `state.open_alert_beads`;
+/// - if an episode is already open, do **not** create another bead — record the sighting
+///   and refresh the existing bead's notes at most once per `cooldown_minutes`.
 ///
-/// Returns the number of alerts that were actually fired.
+/// Then, for every open episode whose condition is absent from `conditions`, close its
+/// bead and drop the entry. The cooldown timestamp is deliberately left in place on
+/// resolution so a flapping condition cannot open a new episode immediately.
+///
+/// Returns a summary of what happened; callers use it for logging and telemetry.
+pub fn process_alert_episodes(
+    state: &mut GovernorState,
+    config: &AlertConfig,
+    conditions: &[AlertCondition],
+    now: DateTime<Utc>,
+    log_rotation_config: Option<(u64, u32)>,
+) -> EpisodeOutcome {
+    let mut outcome = EpisodeOutcome::default();
+
+    let active_keys: std::collections::HashSet<String> =
+        conditions.iter().map(|c| c.episode_key()).collect();
+
+    // --- Resolve episodes whose condition is no longer true ---
+    let cleared: Vec<String> = state
+        .open_alert_beads
+        .keys()
+        .filter(|k| !active_keys.contains(*k))
+        .cloned()
+        .collect();
+
+    for key in cleared {
+        let Some(episode) = state.open_alert_beads.remove(&key) else {
+            continue;
+        };
+        let duration_hours = (now - episode.opened_at).num_seconds() as f64 / 3600.0;
+        let mut closed = false;
+
+        if let Some(bead_id) = &episode.bead_id {
+            let reason = format!(
+                "Condition cleared: {} was continuously true for {:.1}h across {} governor cycles, and is no longer detected. Auto-closed by claude-governor.",
+                key, duration_hours, episode.observations
+            );
+            match close_alert_bead(bead_id, config, &reason) {
+                Ok(()) => closed = true,
+                Err(e) => log::warn!("[alert] could not auto-close bead for {}: {}", key, e),
+            }
+        }
+
+        log::info!(
+            "[alert] episode resolved: {} after {:.1}h ({} observations){}",
+            key,
+            duration_hours,
+            episode.observations,
+            match &episode.bead_id {
+                Some(id) if closed => format!(", closed bead {}", id),
+                Some(id) => format!(", bead {} left open", id),
+                None => String::new(),
+            }
+        );
+
+        outcome.resolved.push(ResolvedEpisode {
+            key,
+            bead_id: episode.bead_id,
+            duration_hours,
+            observations: episode.observations,
+            closed,
+        });
+    }
+
+    // --- Open new episodes / record recurrences of open ones ---
+    for alert in conditions {
+        let key = alert.episode_key();
+
+        if let Some(episode) = state.open_alert_beads.get_mut(&key) {
+            // Already tracked: this is the same episode, not a new incident.
+            episode.last_seen = now;
+            episode.observations = episode.observations.saturating_add(1);
+            episode.last_message = alert.message.clone();
+            outcome.suppressed += 1;
+
+            let last_touch = episode.last_refreshed_at.unwrap_or(episode.opened_at);
+            let refresh_due = (now - last_touch).num_minutes() >= config.cooldown_minutes;
+
+            if refresh_due {
+                if let Some(bead_id) = episode.bead_id.clone() {
+                    let notes = format!(
+                        "Still active as of {}. Open for {:.1}h across {} governor cycles.\nLatest: [{}] {}",
+                        now.to_rfc3339(),
+                        (now - episode.opened_at).num_seconds() as f64 / 3600.0,
+                        episode.observations,
+                        alert.severity,
+                        alert.message,
+                    );
+                    if let Err(e) = refresh_alert_bead(&bead_id, config, &notes) {
+                        log::warn!("[alert] could not refresh bead for {}: {}", key, e);
+                    }
+                }
+                episode.last_refreshed_at = Some(now);
+            }
+
+            log::debug!(
+                "[alert] {} still active (episode open since {}, {} observations) — no new bead",
+                key,
+                episode.opened_at.to_rfc3339(),
+                episode.observations
+            );
+            continue;
+        }
+
+        // New episode. The cooldown is an anti-flap floor on opening, not a repeat interval.
+        if !should_open_episode(&key, &state.alert_cooldown, now, config.cooldown_minutes) {
+            log::debug!(
+                "[alert] {} re-triggered within the anti-flap window — not opening a new episode",
+                key
+            );
+            continue;
+        }
+
+        match fire_alert(alert, config, log_rotation_config) {
+            Ok(bead_id) => {
+                record_episode_opened(&mut state.alert_cooldown, &key, now);
+                state.open_alert_beads.insert(
+                    key.clone(),
+                    OpenAlertBead {
+                        bead_id,
+                        alert_type: alert.alert_type.to_string(),
+                        scope: alert.scope.clone(),
+                        opened_at: now,
+                        last_seen: now,
+                        observations: 1,
+                        last_message: alert.message.clone(),
+                        last_refreshed_at: None,
+                    },
+                );
+                outcome.opened.push(key);
+            }
+            Err(e) => log::warn!("[alert] alert fire failed for {}: {}", key, e),
+        }
+    }
+
+    outcome
+}
+
+/// Process all pending alerts through the episode lifecycle.
+///
+/// Convenience wrapper that evaluates conditions and runs [`process_alert_episodes`].
+/// Returns the number of *new episodes* opened — not the number of active conditions,
+/// which may be larger when conditions from earlier cycles are still true.
 pub fn process_alerts(
     state: &mut GovernorState,
     config: &AlertConfig,
@@ -488,22 +876,9 @@ pub fn process_alerts(
     agents: &std::collections::HashMap<String, crate::config::AgentConfig>,
 ) -> usize {
     let conditions = check_alert_conditions(state, now, agents);
-    let mut fired_count = 0;
-
-    for alert in &conditions {
-        if should_fire(
-            alert.alert_type,
-            &state.alert_cooldown,
-            now,
-            config.cooldown_minutes,
-        ) && fire_alert(alert, config, None).is_ok()
-        {
-            update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
-            fired_count += 1;
-        }
-    }
-
-    fired_count
+    process_alert_episodes(state, config, &conditions, now, None)
+        .opened
+        .len()
 }
 
 /// Check for subscription billing drift: subscription agents using sdk-cli instead of cli
@@ -573,12 +948,15 @@ fn check_subscription_billing_drift(
                 agent_name,
                 sdk_cli_sessions.join(", ")
             );
-            alerts.push(AlertCondition {
-                alert_type: AlertType::SubscriptionBillingDrift,
-                message: msg,
-                severity: AlertSeverity::Critical,
-                detected_at: now,
-            });
+            alerts.push(
+                AlertCondition::new(
+                    AlertType::SubscriptionBillingDrift,
+                    msg,
+                    AlertSeverity::Critical,
+                    now,
+                )
+                .with_scope(agent_name.clone()),
+            );
         }
     }
 }
@@ -691,12 +1069,12 @@ pub fn check_alert_conditions(
             "Off-peak promotion not applying: observed ratio {:.2} vs expected {:.2}",
             observed, expected
         );
-        alerts.push(AlertCondition {
-            alert_type: AlertType::PromotionNotApplying,
-            message: msg,
-            severity: AlertSeverity::Warning,
-            detected_at: now,
-        });
+        alerts.push(AlertCondition::new(
+            AlertType::PromotionNotApplying,
+            msg,
+            AlertSeverity::Warning,
+            now,
+        ));
     }
 
     // Check PromotionRatioAnomaly: observed ratio is outside expected range.
@@ -720,12 +1098,12 @@ pub fn check_alert_conditions(
                     observed, state.burn_rate.offpeak_ratio_expected
                 )
             };
-            alerts.push(AlertCondition {
-                alert_type: AlertType::PromotionRatioAnomaly,
-                message: msg,
-                severity: AlertSeverity::Warning,
-                detected_at: now,
-            });
+            alerts.push(AlertCondition::new(
+                AlertType::PromotionRatioAnomaly,
+                msg,
+                AlertSeverity::Warning,
+                now,
+            ));
         }
     }
 
@@ -741,23 +1119,23 @@ pub fn check_alert_conditions(
             "Token collector offline: last update {} minutes ago",
             age_minutes
         );
-        alerts.push(AlertCondition {
-            alert_type: AlertType::CollectorOffline,
-            message: msg,
-            severity: AlertSeverity::Warning,
-            detected_at: now,
-        });
+        alerts.push(AlertCondition::new(
+            AlertType::CollectorOffline,
+            msg,
+            AlertSeverity::Warning,
+            now,
+        ));
     }
 
     // Check TokenRefreshFailing: poller detected auth issues
     if state.token_refresh_failing {
         let msg = "OAuth token refresh failing — Claude Code sessions may be unable to make API calls. Run: claude login".to_string();
-        alerts.push(AlertCondition {
-            alert_type: AlertType::TokenRefreshFailing,
-            message: msg,
-            severity: AlertSeverity::Critical,
-            detected_at: now,
-        });
+        alerts.push(AlertCondition::new(
+            AlertType::TokenRefreshFailing,
+            msg,
+            AlertSeverity::Critical,
+            now,
+        ));
     }
 
     // Check SubscriptionBillingDrift: subscription agents using sdk-cli instead of cli
@@ -839,12 +1217,10 @@ fn check_cutoff_imminent(
                 "Window {} at cutoff risk: hard_limit_margin_hrs={:.1}h, utilization={:.1}%, hrs_left={:.1}h, remaining_to_100={:.1}%",
                 name, win.hard_limit_margin_hrs, win.current_utilization, win.hours_remaining, win.hard_limit_remaining_pct
             );
-            alerts.push(AlertCondition {
-                alert_type: AlertType::CutoffImminent,
-                message: msg,
-                severity: AlertSeverity::Critical,
-                detected_at: now,
-            });
+            alerts.push(
+                AlertCondition::new(AlertType::CutoffImminent, msg, AlertSeverity::Critical, now)
+                    .with_scope(name),
+            );
             return;
         }
     }
@@ -881,12 +1257,15 @@ fn check_sonnet_cutoff_risk(
             "Seven-day Sonnet window at cutoff risk: {:.1}% utilized, {:.1}h remaining, hard_limit_margin_hrs={:.1}h, remaining_to_100={:.1}%",
             win.current_utilization, win.hours_remaining, win.hard_limit_margin_hrs, win.hard_limit_remaining_pct
         );
-        alerts.push(AlertCondition {
-            alert_type: AlertType::SonnetCutoffRisk,
-            message: msg,
-            severity: AlertSeverity::Warning,
-            detected_at: now,
-        });
+        alerts.push(
+            AlertCondition::new(
+                AlertType::SonnetCutoffRisk,
+                msg,
+                AlertSeverity::Warning,
+                now,
+            )
+            .with_scope("weekly_scoped"),
+        );
     }
 }
 
@@ -916,12 +1295,15 @@ fn check_session_cutoff_risk(
             "Five-hour session window at cutoff risk: {:.1}% utilized, {:.1}h remaining, hard_limit_margin_hrs={:.1}h, remaining_to_100={:.1}%",
             win.current_utilization, win.hours_remaining, win.hard_limit_margin_hrs, win.hard_limit_remaining_pct
         );
-        alerts.push(AlertCondition {
-            alert_type: AlertType::SessionCutoffRisk,
-            message: msg,
-            severity: AlertSeverity::Warning,
-            detected_at: now,
-        });
+        alerts.push(
+            AlertCondition::new(
+                AlertType::SessionCutoffRisk,
+                msg,
+                AlertSeverity::Warning,
+                now,
+            )
+            .with_scope("five_hour"),
+        );
     }
 }
 
@@ -947,12 +1329,12 @@ pub fn check_low_cache_efficiency(
             consecutive,
             consecutive * 5,
         );
-        Some(AlertCondition {
-            alert_type: AlertType::LowCacheEfficiency,
-            message: msg,
-            severity: AlertSeverity::Warning,
-            detected_at: now,
-        })
+        Some(AlertCondition::new(
+            AlertType::LowCacheEfficiency,
+            msg,
+            AlertSeverity::Warning,
+            now,
+        ))
     } else {
         None
     }
@@ -976,12 +1358,12 @@ fn check_underutilization(
 
     if all_abundant {
         let msg = "All windows have abundant capacity: safe to increase worker count".to_string();
-        alerts.push(AlertCondition {
-            alert_type: AlertType::Underutilization,
-            message: msg,
-            severity: AlertSeverity::Info,
-            detected_at: now,
-        });
+        alerts.push(AlertCondition::new(
+            AlertType::Underutilization,
+            msg,
+            AlertSeverity::Info,
+            now,
+        ));
     }
 }
 
@@ -1057,6 +1439,7 @@ mod tests {
             alerts: Vec::new(),
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
+            open_alert_beads: Default::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
@@ -2475,12 +2858,12 @@ mod tests {
 
     #[test]
     fn fire_alert_disabled_skips() {
-        let alert = AlertCondition {
-            alert_type: AlertType::CutoffImminent,
-            message: "test".to_string(),
-            severity: AlertSeverity::Critical,
-            detected_at: base_now(),
-        };
+        let alert = AlertCondition::new(
+            AlertType::CutoffImminent,
+            "test".to_string(),
+            AlertSeverity::Critical,
+            base_now(),
+        );
 
         let config = AlertConfig {
             enabled: false,
@@ -2493,12 +2876,12 @@ mod tests {
 
     #[test]
     fn fire_alert_below_severity_skips() {
-        let alert = AlertCondition {
-            alert_type: AlertType::Underutilization,
-            message: "test".to_string(),
-            severity: AlertSeverity::Info,
-            detected_at: base_now(),
-        };
+        let alert = AlertCondition::new(
+            AlertType::Underutilization,
+            "test".to_string(),
+            AlertSeverity::Info,
+            base_now(),
+        );
 
         let config = AlertConfig {
             min_severity: "critical".to_string(),
@@ -2511,12 +2894,12 @@ mod tests {
 
     #[test]
     fn fire_alert_empty_command_returns_error() {
-        let alert = AlertCondition {
-            alert_type: AlertType::CutoffImminent,
-            message: "test".to_string(),
-            severity: AlertSeverity::Critical,
-            detected_at: base_now(),
-        };
+        let alert = AlertCondition::new(
+            AlertType::CutoffImminent,
+            "test".to_string(),
+            AlertSeverity::Critical,
+            base_now(),
+        );
 
         let config = AlertConfig {
             command: vec![],
@@ -2537,12 +2920,12 @@ mod tests {
         // Override the log path by using a temp file directly
         let log_path = temp_dir.path().join("governor.log");
 
-        let alert = AlertCondition {
-            alert_type: AlertType::CutoffImminent,
-            message: "Test alert message".to_string(),
-            severity: AlertSeverity::Critical,
-            detected_at: base_now(),
-        };
+        let alert = AlertCondition::new(
+            AlertType::CutoffImminent,
+            "Test alert message".to_string(),
+            AlertSeverity::Critical,
+            base_now(),
+        );
 
         // Manually write to the temp path
         let mut file = OpenOptions::new()
@@ -2595,17 +2978,21 @@ mod tests {
             base_now(),
             &std::collections::HashMap::new(),
         );
-        assert!(fired >= 1, "Should have fired at least one alert");
+        assert!(fired >= 1, "Should have opened at least one episode");
 
-        // Cooldown should now be set
+        // The anti-flap cooldown is keyed by episode key, not bare alert type
         assert!(state
             .alert_cooldown
-            .get_last_fired("cutoff_imminent")
+            .get_last_fired("cutoff_imminent:five_hour")
             .is_some());
+        // ...and the episode is now tracked so later cycles don't create a second bead
+        assert!(state
+            .open_alert_beads
+            .contains_key("cutoff_imminent:five_hour"));
     }
 
     #[test]
-    fn process_alerts_respects_cooldown() {
+    fn process_alerts_respects_anti_flap_cooldown() {
         let forecast = CapacityForecast {
             five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
             seven_day: make_window(false, 10.0, 30.0),
@@ -2616,13 +3003,14 @@ mod tests {
         };
         let mut state = make_state_with_forecast(forecast);
 
-        // Set cooldown for both expected alert types to have just fired
+        // Both expected episodes resolved moments ago — the anti-flap floor should stop
+        // them re-opening (and minting fresh beads) straight away.
         state
             .alert_cooldown
-            .record_fired("cutoff_imminent", base_now());
+            .record_fired("cutoff_imminent:five_hour", base_now());
         state
             .alert_cooldown
-            .record_fired("session_cutoff_risk", base_now());
+            .record_fired("session_cutoff_risk:five_hour", base_now());
 
         let config = AlertConfig {
             enabled: true,
@@ -2637,8 +3025,325 @@ mod tests {
             base_now(),
             &std::collections::HashMap::new(),
         );
-        // Both CutoffImminent and SessionCutoffRisk should be skipped due to cooldown
-        assert_eq!(fired, 0, "Should have fired zero alerts due to cooldown");
+        assert_eq!(
+            fired, 0,
+            "Should have opened zero episodes within the anti-flap window"
+        );
+        assert!(
+            state.open_alert_beads.is_empty(),
+            "No episodes should be tracked when opening was suppressed"
+        );
+    }
+
+    // --- Episode lifecycle tests ---
+
+    /// Forecast that makes CutoffImminent + SessionCutoffRisk fire on five_hour.
+    fn cutoff_forecast() -> CapacityForecast {
+        CapacityForecast {
+            five_hour: make_window_with_util_and_margin(97.0, true, -2.4, 3.0),
+            seven_day: make_window(false, 10.0, 30.0),
+            weekly_scoped: make_window(false, 5.0, 30.0),
+            binding_window: "five_hour".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        }
+    }
+
+    /// Config whose bead commands are inert but succeed, with a parseable "bead id".
+    fn echoing_config() -> AlertConfig {
+        AlertConfig {
+            enabled: true,
+            auto_bead: true,
+            cooldown_minutes: 60,
+            command: vec!["echo".to_string(), "bf-test1".to_string()],
+            close_command: vec!["true".to_string()],
+            update_command: vec!["true".to_string()],
+            ..AlertConfig::default()
+        }
+    }
+
+    fn cutoff_condition(now: DateTime<Utc>) -> AlertCondition {
+        AlertCondition::new(
+            AlertType::CutoffImminent,
+            "Window five_hour at cutoff risk".to_string(),
+            AlertSeverity::Critical,
+            now,
+        )
+        .with_scope("five_hour")
+    }
+
+    #[test]
+    fn episode_key_includes_scope() {
+        let scoped = cutoff_condition(base_now());
+        assert_eq!(scoped.episode_key(), "cutoff_imminent:five_hour");
+
+        let unscoped = AlertCondition::new(
+            AlertType::CollectorOffline,
+            "offline".to_string(),
+            AlertSeverity::Warning,
+            base_now(),
+        );
+        assert_eq!(unscoped.episode_key(), "collector_offline");
+    }
+
+    #[test]
+    fn persistent_condition_creates_exactly_one_bead() {
+        // The regression this whole design exists for: a condition that stays true for
+        // days used to mint a fresh bead every cooldown window (226 sonnet_cutoff_risk
+        // beads accumulated that way). It must now produce exactly one.
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = echoing_config();
+        let conditions = vec![cutoff_condition(base_now())];
+
+        let first = process_alert_episodes(&mut state, &config, &conditions, base_now(), None);
+        assert_eq!(first.opened, vec!["cutoff_imminent:five_hour".to_string()]);
+        assert_eq!(first.suppressed, 0);
+
+        // Simulate two days of cycles, well past many cooldown windows.
+        let mut opened_after = 0;
+        for hour in 1..48 {
+            let now = base_now() + Duration::hours(hour);
+            let conditions = vec![cutoff_condition(now)];
+            let outcome = process_alert_episodes(&mut state, &config, &conditions, now, None);
+            opened_after += outcome.opened.len();
+            assert_eq!(
+                outcome.suppressed, 1,
+                "condition should be recorded, not re-fired"
+            );
+        }
+
+        assert_eq!(
+            opened_after, 0,
+            "A continuously-true condition must not open a second episode"
+        );
+
+        let episode = state
+            .open_alert_beads
+            .get("cutoff_imminent:five_hour")
+            .expect("episode should still be open");
+        assert_eq!(episode.bead_id.as_deref(), Some("bf-test1"));
+        assert_eq!(episode.observations, 48);
+        assert_eq!(episode.scope.as_deref(), Some("five_hour"));
+    }
+
+    #[test]
+    fn cleared_condition_resolves_and_closes_bead() {
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = echoing_config();
+
+        process_alert_episodes(
+            &mut state,
+            &config,
+            &[cutoff_condition(base_now())],
+            base_now(),
+            None,
+        );
+        assert!(state
+            .open_alert_beads
+            .contains_key("cutoff_imminent:five_hour"));
+
+        // Condition clears three hours later.
+        let later = base_now() + Duration::hours(3);
+        let outcome = process_alert_episodes(&mut state, &config, &[], later, None);
+
+        assert_eq!(outcome.resolved.len(), 1);
+        let resolved = &outcome.resolved[0];
+        assert_eq!(resolved.key, "cutoff_imminent:five_hour");
+        assert_eq!(resolved.bead_id.as_deref(), Some("bf-test1"));
+        assert!(resolved.closed, "close command should have run");
+        assert!((resolved.duration_hours - 3.0).abs() < 0.01);
+        assert!(
+            state.open_alert_beads.is_empty(),
+            "resolved episodes must be dropped from state"
+        );
+    }
+
+    #[test]
+    fn resolved_episode_keeps_cooldown_as_anti_flap_floor() {
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = echoing_config();
+
+        process_alert_episodes(
+            &mut state,
+            &config,
+            &[cutoff_condition(base_now())],
+            base_now(),
+            None,
+        );
+
+        // Clears, then immediately re-triggers — the classic flap.
+        let t1 = base_now() + Duration::minutes(5);
+        process_alert_episodes(&mut state, &config, &[], t1, None);
+
+        let t2 = base_now() + Duration::minutes(10);
+        let outcome =
+            process_alert_episodes(&mut state, &config, &[cutoff_condition(t2)], t2, None);
+        assert!(
+            outcome.opened.is_empty(),
+            "Flapping within the cooldown must not open a new episode"
+        );
+
+        // Well past the cooldown, a genuinely new episode is allowed.
+        let t3 = base_now() + Duration::minutes(90);
+        let outcome =
+            process_alert_episodes(&mut state, &config, &[cutoff_condition(t3)], t3, None);
+        assert_eq!(
+            outcome.opened,
+            vec!["cutoff_imminent:five_hour".to_string()],
+            "A new episode after the cooldown should open normally"
+        );
+    }
+
+    #[test]
+    fn distinct_scopes_are_distinct_episodes() {
+        let mut state = make_state_with_forecast(CapacityForecast::default());
+        let config = echoing_config();
+
+        let a = AlertCondition::new(
+            AlertType::SubscriptionBillingDrift,
+            "agent-a drifting".to_string(),
+            AlertSeverity::Critical,
+            base_now(),
+        )
+        .with_scope("agent-a");
+        let b = AlertCondition::new(
+            AlertType::SubscriptionBillingDrift,
+            "agent-b drifting".to_string(),
+            AlertSeverity::Critical,
+            base_now(),
+        )
+        .with_scope("agent-b");
+
+        let outcome = process_alert_episodes(&mut state, &config, &[a, b], base_now(), None);
+        assert_eq!(
+            outcome.opened.len(),
+            2,
+            "Same alert type on two agents is two incidents, so two beads"
+        );
+        assert_eq!(state.open_alert_beads.len(), 2);
+    }
+
+    #[test]
+    fn episode_refresh_is_throttled_to_cooldown() {
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = echoing_config();
+
+        process_alert_episodes(
+            &mut state,
+            &config,
+            &[cutoff_condition(base_now())],
+            base_now(),
+            None,
+        );
+
+        // 30 minutes in: below the 60-minute throttle, so no refresh recorded.
+        let t1 = base_now() + Duration::minutes(30);
+        process_alert_episodes(&mut state, &config, &[cutoff_condition(t1)], t1, None);
+        assert!(state.open_alert_beads["cutoff_imminent:five_hour"]
+            .last_refreshed_at
+            .is_none());
+
+        // 70 minutes in: throttle elapsed, bead refreshed in place (still no new bead).
+        let t2 = base_now() + Duration::minutes(70);
+        let outcome =
+            process_alert_episodes(&mut state, &config, &[cutoff_condition(t2)], t2, None);
+        assert!(outcome.opened.is_empty());
+        assert_eq!(
+            state.open_alert_beads["cutoff_imminent:five_hour"].last_refreshed_at,
+            Some(t2)
+        );
+    }
+
+    #[test]
+    fn episode_tracked_even_when_auto_bead_disabled() {
+        // auto_bead off means no bead to close, but the episode is still deduplicated so
+        // the governor log gets one line per incident rather than one per cooldown window.
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = AlertConfig {
+            auto_bead: false,
+            ..echoing_config()
+        };
+
+        let outcome = process_alert_episodes(
+            &mut state,
+            &config,
+            &[cutoff_condition(base_now())],
+            base_now(),
+            None,
+        );
+        assert_eq!(outcome.opened.len(), 1);
+        let episode = &state.open_alert_beads["cutoff_imminent:five_hour"];
+        assert!(
+            episode.bead_id.is_none(),
+            "no bead is created when auto_bead is off"
+        );
+
+        let later = base_now() + Duration::hours(5);
+        let outcome =
+            process_alert_episodes(&mut state, &config, &[cutoff_condition(later)], later, None);
+        assert!(outcome.opened.is_empty());
+        assert_eq!(outcome.suppressed, 1);
+    }
+
+    #[test]
+    fn episode_message_is_updated_in_place() {
+        let mut state = make_state_with_forecast(cutoff_forecast());
+        let config = echoing_config();
+
+        process_alert_episodes(
+            &mut state,
+            &config,
+            &[cutoff_condition(base_now())],
+            base_now(),
+            None,
+        );
+
+        let later = base_now() + Duration::hours(2);
+        let evolved = AlertCondition::new(
+            AlertType::CutoffImminent,
+            "Window five_hour at cutoff risk: now 99.2% utilized".to_string(),
+            AlertSeverity::Critical,
+            later,
+        )
+        .with_scope("five_hour");
+        process_alert_episodes(&mut state, &config, &[evolved], later, None);
+
+        let episode = &state.open_alert_beads["cutoff_imminent:five_hour"];
+        assert!(episode.last_message.contains("99.2%"));
+        assert_eq!(episode.last_seen, later);
+        assert_eq!(episode.opened_at, base_now());
+    }
+
+    // --- Bead id parsing ---
+
+    #[test]
+    fn parse_bead_id_from_envelope_json() {
+        let out = r#"{"version":1,"kind":"create","data":{"id":"bf-2sf9o","title":"x"}}"#;
+        assert_eq!(parse_bead_id(out), Some("bf-2sf9o".to_string()));
+    }
+
+    #[test]
+    fn parse_bead_id_from_flat_json() {
+        assert_eq!(
+            parse_bead_id(r#"{"id":"docs-878a"}"#),
+            Some("docs-878a".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_bead_id_from_plain_output() {
+        assert_eq!(parse_bead_id("bf-5k6yv\n"), Some("bf-5k6yv".to_string()));
+        assert_eq!(
+            parse_bead_id("Created bead bf-5k6yv.\n"),
+            Some("bf-5k6yv".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_bead_id_returns_none_without_an_id() {
+        assert_eq!(parse_bead_id(""), None);
+        assert_eq!(parse_bead_id("  \n "), None);
+        assert_eq!(parse_bead_id("something went wrong"), None);
     }
 
     #[test]

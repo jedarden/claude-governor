@@ -275,6 +275,7 @@ mod tests {
             alerts: Default::default(),
             safe_mode: Default::default(),
             alert_cooldown: Default::default(),
+            open_alert_beads: Default::default(),
             updated_at: chrono::Utc::now(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The governor creates HUMAN-type beads via NEEDLE when specific conditions are detected. Alerts are deduplicated via per-type cooldowns to prevent spam while ensuring persistent conditions generate fresh notifications after the cooldown period.
+The governor creates HUMAN-type beads via NEEDLE when specific conditions are detected. Alerts are deduplicated by *episode*: one bead per continuous stretch during which a condition holds, refreshed while it persists and auto-closed when it clears.
 
 ## Alert Types
 
@@ -136,25 +136,64 @@ Alerts are configured in `~/.config/claude-governor/config.yaml`:
 alerts:
   enabled: true
   min_severity: warning          # info | warning | critical
-  cooldown_minutes: 60           # suppress duplicate alerts
-  command:
+  cooldown_minutes: 60           # anti-flap floor + bead refresh throttle
+  command:                       # message is appended as the final argument
     - bf
     - create
+    - --json
     - --type
     - human
+    - --title
+  close_command: [bf, close]     # <close_command> <bead_id> --reason <reason>
+  update_command: [bf, update]   # <update_command> <bead_id> --notes <notes>
   low_cache_eff_threshold: 0.30  # 30%
   low_cache_eff_intervals: 5     # 5 consecutive polls (~25 min)
 ```
 
-## Cooldown Deduplication
+## Episode Deduplication
 
-Each alert type has an independent cooldown timer. When an alert fires:
-1. A bead is created via the configured command
-2. The alert type is recorded with a timestamp
-3. Subsequent detections are suppressed until cooldown expires
-4. If the condition clears and re-triggers after cooldown, a new alert fires
+Dedup is stateful, not timer-based. An **episode** is one continuous stretch during which a
+condition is true, identified by an *episode key* of `alert_type` plus an optional scope —
+the window name for cutoff alerts (`cutoff_imminent:five_hour`), the agent name for
+`subscription_billing_drift`. Two windows at cutoff risk are two incidents and get two beads;
+one window at cutoff risk for a week is one incident and gets one bead.
 
-Cooldown is cleared immediately when a condition is no longer detected.
+| Cycle | Condition | Action |
+|-------|-----------|--------|
+| First true | not tracked | Create one bead, store its id in `open_alert_beads[key]` |
+| Still true | tracked | No new bead. Record the sighting; refresh the bead's notes at most once per `cooldown_minutes` |
+| No longer reported | tracked | Close the bead with an auto-close reason, drop the entry |
+
+State lives in `governor-state.json`:
+
+```json
+"open_alert_beads": {
+  "sonnet_cutoff_risk:weekly_scoped": {
+    "bead_id": "bf-abc12",
+    "alert_type": "sonnet_cutoff_risk",
+    "scope": "weekly_scoped",
+    "opened_at": "2026-08-01T12:00:00Z",
+    "last_seen": "2026-08-03T09:05:00Z",
+    "observations": 573,
+    "last_message": "Seven-day Sonnet window at cutoff risk: 96.2% utilized ...",
+    "last_refreshed_at": "2026-08-03T09:00:00Z"
+  }
+}
+```
+
+`cooldown_minutes` survives only as an **anti-flap floor**: after an episode resolves, the same
+key cannot open a new episode (and so cannot create a new bead) until the cooldown elapses. It is
+not a repeat interval — a condition that stays true never produces a second bead, however long it
+lasts.
+
+### Why this replaced pure-cooldown dedup
+
+The old scheme re-fired the configured command every time the cooldown elapsed while a condition
+held, so a long-lived condition minted a bead per hour indefinitely. This repo's own workspace
+accumulated 226 closed `[WARNING] sonnet_cutoff_risk` beads and 160 `[CRITICAL] cutoff_imminent`
+beads (517 alert beads total) that way — far more beads than distinct incidents. It also meant
+nothing ever closed a bead when the condition recovered, so open alert beads outlived the problem
+they described.
 
 ## Sprint Triggers (Underutilization)
 

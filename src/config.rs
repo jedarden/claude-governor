@@ -529,12 +529,29 @@ impl Default for WindowOverrideConfig {
 /// Alert configuration
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct AlertConfig {
-    /// Command to execute when an alert fires (default: bf create --type human)
-    /// The alert message is appended as the last argument.
+    /// Command to execute when an alert condition episode opens
+    /// (default: `bf create --json --type human --title`).
+    /// The alert message is appended as the last argument, and the command's stdout is
+    /// parsed for the created bead id so the episode can be tracked, refreshed, and
+    /// auto-closed when the condition clears.
     #[serde(default = "default_alert_command")]
     pub command: Vec<String>,
 
-    /// Cooldown period in minutes between repeated alerts of the same type
+    /// Command used to close the bead for an alert episode once its condition clears
+    /// (default: `bf close`). Invoked as `<close_command...> <bead_id> --reason <reason>`.
+    #[serde(default = "default_alert_close_command")]
+    pub close_command: Vec<String>,
+
+    /// Command used to refresh an open episode's bead with current numbers
+    /// (default: `bf update`). Invoked as `<update_command...> <bead_id> --notes <notes>`.
+    /// Refreshes are throttled to at most one per `cooldown_minutes`.
+    #[serde(default = "default_alert_update_command")]
+    pub update_command: Vec<String>,
+
+    /// Anti-flap floor, in minutes. After an episode resolves, a new episode for the same
+    /// condition cannot open a fresh bead until this many minutes have elapsed. Also
+    /// throttles how often an open episode's bead is refreshed. This is *not* a repeat
+    /// interval: a condition that stays true never mints a second bead, however long it lasts.
     #[serde(default = "default_cooldown_minutes")]
     pub cooldown_minutes: i64,
 
@@ -557,22 +574,39 @@ pub struct AlertConfig {
     #[serde(default = "default_low_cache_eff_intervals")]
     pub low_cache_eff_intervals: u32,
 
-    /// Whether to auto-create beads (execute the alert command) when an alert fires.
-    /// When false, alerts are logged but no external command is executed.
+    /// Whether to auto-create beads (execute the alert command) when an alert episode opens.
+    /// When false, episodes are still tracked and logged but no external command is executed.
     /// Default is false — alert predicates must achieve <5% FP rate measured over
     /// a 100-alert rolling window before enabling auto_bead. Until then, alerts are
     /// logged to governor.log for manual review without burning fleet cycles.
+    ///
+    /// Note that bead volume is now bounded by the number of distinct condition *episodes*,
+    /// not by elapsed time: a condition that stays true for a week produces one bead, which
+    /// is auto-closed when it clears. The original "one bead per cooldown window" spam mode
+    /// no longer exists.
     #[serde(default = "default_auto_bead")]
     pub auto_bead: bool,
 }
 
 fn default_alert_command() -> Vec<String> {
+    // `--title` is last so the appended alert message becomes the bead title, and
+    // `--json` makes the created bead id machine-parseable for episode tracking.
     vec![
         "bf".to_string(),
         "create".to_string(),
+        "--json".to_string(),
         "--type".to_string(),
         "human".to_string(),
+        "--title".to_string(),
     ]
+}
+
+fn default_alert_close_command() -> Vec<String> {
+    vec!["bf".to_string(), "close".to_string()]
+}
+
+fn default_alert_update_command() -> Vec<String> {
+    vec!["bf".to_string(), "update".to_string()]
 }
 
 fn default_cooldown_minutes() -> i64 {
@@ -603,6 +637,8 @@ impl Default for AlertConfig {
     fn default() -> Self {
         Self {
             command: default_alert_command(),
+            close_command: default_alert_close_command(),
+            update_command: default_alert_update_command(),
             cooldown_minutes: default_cooldown_minutes(),
             enabled: default_alerts_enabled(),
             min_severity: default_min_severity(),
@@ -1306,12 +1342,32 @@ daemon:
     /// Locks in `bf` as the alert CLI. The deprecated `br` shim must never
     /// reappear here — a silent regression would send every alert to a command
     /// that no longer creates beads.
+    ///
+    /// `--title` must stay last: the alert message is appended as the final argument,
+    /// and `bf create` requires a title. `--json` must stay present so the created
+    /// bead id can be parsed back out and tracked for the episode's lifetime.
     #[test]
     fn test_default_alert_command_uses_bf() {
         let cmd = default_alert_command();
         assert_eq!(cmd[0], "bf");
-        assert_eq!(cmd, vec!["bf", "create", "--type", "human"]);
+        assert_eq!(
+            cmd,
+            vec!["bf", "create", "--json", "--type", "human", "--title"]
+        );
+        assert_eq!(cmd.last().unwrap(), "--title");
 
         assert_eq!(AlertConfig::default().command[0], "bf");
+    }
+
+    /// The close and update commands must target the same CLI as `command`, or episodes
+    /// would open beads that nothing can ever close.
+    #[test]
+    fn test_default_alert_lifecycle_commands_use_bf() {
+        assert_eq!(default_alert_close_command(), vec!["bf", "close"]);
+        assert_eq!(default_alert_update_command(), vec!["bf", "update"]);
+
+        let config = AlertConfig::default();
+        assert_eq!(config.close_command[0], "bf");
+        assert_eq!(config.update_command[0], "bf");
     }
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::alerts::{
-    check_alert_conditions, check_low_cache_efficiency, fire_alert, should_fire, update_cooldown,
+    check_alert_conditions, check_low_cache_efficiency, process_alert_episodes,
     AlertType, SprintTrigger,
 };
 use crate::burn_rate::{
@@ -6701,42 +6701,75 @@ pub fn run_governor_cycle(
         }
     }
 
-    // 8. Check alerts and fire via configured command
+    // 8. Drive the alert episode lifecycle: one bead per condition episode.
+    //
+    // A condition that stays true across many cycles produces exactly one bead, refreshed
+    // in place; the bead is auto-closed when the condition clears. Only newly-opened
+    // episodes count towards FP telemetry, so the rolling window measures distinct
+    // incidents rather than elapsed cooldown windows.
     let mut alert_conditions = check_alert_conditions(&state, now, agents);
     alert_conditions.extend(check_low_cache_efficiency(&state, alert_config, now));
-    for alert in &alert_conditions {
-        if should_fire(
-            alert.alert_type,
-            &state.alert_cooldown,
-            now,
-            alert_config.cooldown_minutes,
-        ) {
-            // Record alert outcome in FP telemetry. A cutoff alert at sub-100% utilization
-            // is classified as a false positive (the consistency guard should suppress these,
-            // but telemetry catches any that slip through).
-            let is_true_positive = is_true_positive_alert(&alert.alert_type, &state);
-            state
-                .alert_fp_telemetry
-                .record(&alert.alert_type.to_string(), is_true_positive);
 
-            // Fire the alert: execute configured command (e.g. bf create --type human)
-            // and log to governor.log
-            let log_rotation_config = Some((
-                pricing_config.daemon.log_max_bytes,
-                pricing_config.daemon.log_backup_count,
-            ));
-            if let Err(e) = fire_alert(alert, alert_config, log_rotation_config) {
-                log::warn!("[governor] alert fire failed: {}", e);
-            }
-            update_cooldown(&mut state.alert_cooldown, alert.alert_type, now);
-            state.alerts.push(serde_json::json!({
-                "type": alert.alert_type.to_string(),
-                "message": alert.message,
-                "severity": format!("{:?}", alert.severity),
-                "detected_at": alert.detected_at.to_rfc3339(),
-                "is_true_positive": is_true_positive,
-            }));
+    // Classify before the lifecycle borrows state mutably. A cutoff alert at sub-100%
+    // utilization is a false positive (the consistency guard should suppress these, but
+    // telemetry catches any that slip through).
+    let classified: Vec<(String, bool)> = alert_conditions
+        .iter()
+        .map(|a| {
+            (
+                a.episode_key(),
+                is_true_positive_alert(&a.alert_type, &state),
+            )
+        })
+        .collect();
+
+    let log_rotation_config = Some((
+        pricing_config.daemon.log_max_bytes,
+        pricing_config.daemon.log_backup_count,
+    ));
+    let outcome = process_alert_episodes(
+        &mut state,
+        alert_config,
+        &alert_conditions,
+        now,
+        log_rotation_config,
+    );
+
+    // Record telemetry once per newly-opened episode. `recorded` guards against two
+    // conditions resolving to the same episode key in one cycle, which would otherwise
+    // double-count a single incident in the FP rolling window.
+    let mut recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for alert in &alert_conditions {
+        let key = alert.episode_key();
+        if !outcome.opened.contains(&key) || !recorded.insert(key.clone()) {
+            continue;
         }
+        let is_true_positive = classified
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, tp)| *tp)
+            .unwrap_or(true);
+        state
+            .alert_fp_telemetry
+            .record(&alert.alert_type.to_string(), is_true_positive);
+        state.alerts.push(serde_json::json!({
+            "type": alert.alert_type.to_string(),
+            "scope": alert.scope,
+            "message": alert.message,
+            "severity": format!("{:?}", alert.severity),
+            "detected_at": alert.detected_at.to_rfc3339(),
+            "is_true_positive": is_true_positive,
+            "bead_id": state.open_alert_beads.get(&key).and_then(|e| e.bead_id.clone()),
+        }));
+    }
+
+    if !outcome.opened.is_empty() || !outcome.resolved.is_empty() || outcome.suppressed > 0 {
+        log::info!(
+            "[governor] alert episodes: {} opened, {} still active (no new beads), {} resolved",
+            outcome.opened.len(),
+            outcome.suppressed,
+            outcome.resolved.len(),
+        );
     }
 
     // Log aggregate FP rate each cycle for observability

@@ -428,6 +428,31 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         ));
     }
 
+    // Open alert episodes — conditions currently true, each holding exactly one bead
+    // that the governor will auto-close when the condition clears.
+    if !state.open_alert_beads.is_empty() {
+        output.push_str("\n");
+        output.push_str("Open Alert Episodes\n");
+        output.push_str("-------------------\n");
+
+        let mut keys: Vec<&String> = state.open_alert_beads.keys().collect();
+        keys.sort();
+        for key in keys {
+            let episode = &state.open_alert_beads[key];
+            let hours = (state.updated_at - episode.opened_at).num_seconds() as f64 / 3600.0;
+            output.push_str(&format!(
+                "  {} — open {:.1}h, {} observations{}\n",
+                key,
+                hours,
+                episode.observations,
+                match &episode.bead_id {
+                    Some(id) => format!(", bead {}", id),
+                    None => ", no bead".to_string(),
+                }
+            ));
+        }
+    }
+
     // Alert FP rate telemetry
     if state.alert_fp_telemetry.total_recorded > 0 {
         output.push_str("\n");
@@ -587,6 +612,16 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 }))
             }).collect::<std::collections::HashMap<String, serde_json::Value>>(),
         },
+        "open_alert_episodes": state.open_alert_beads.iter().map(|(k, e)| {
+            (k.clone(), serde_json::json!({
+                "bead_id": e.bead_id,
+                "alert_type": e.alert_type,
+                "scope": e.scope,
+                "opened_at": e.opened_at.to_rfc3339(),
+                "last_seen": e.last_seen.to_rfc3339(),
+                "observations": e.observations,
+            }))
+        }).collect::<std::collections::HashMap<String, serde_json::Value>>(),
         "updated_at": state.updated_at.to_rfc3339(),
     })
 }
@@ -720,6 +755,7 @@ mod tests {
             alerts: vec![],
             safe_mode: SafeModeState::default(),
             alert_cooldown: Default::default(),
+            open_alert_beads: Default::default(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: Default::default(),
@@ -828,6 +864,39 @@ mod tests {
         assert!(output.contains("Promo:"));
         assert!(output.contains("2.0x multiplier"));
         assert!(output.contains("validated"));
+    }
+
+    #[test]
+    fn format_dashboard_shows_open_alert_episodes() {
+        let mut state = make_test_state();
+        state.open_alert_beads.insert(
+            "sonnet_cutoff_risk:weekly_scoped".to_string(),
+            crate::state::OpenAlertBead {
+                bead_id: Some("bf-abc12".to_string()),
+                alert_type: "sonnet_cutoff_risk".to_string(),
+                scope: Some("weekly_scoped".to_string()),
+                opened_at: state.updated_at - chrono::Duration::hours(6),
+                last_seen: state.updated_at,
+                observations: 72,
+                last_message: "still at risk".to_string(),
+                last_refreshed_at: None,
+            },
+        );
+
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(output.contains("Open Alert Episodes"));
+        assert!(output.contains("sonnet_cutoff_risk:weekly_scoped"));
+        assert!(output.contains("bead bf-abc12"));
+        assert!(output.contains("72 observations"));
+    }
+
+    #[test]
+    fn format_dashboard_omits_episode_section_when_none_open() {
+        let state = make_test_state();
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(!output.contains("Open Alert Episodes"));
     }
 
     #[test]

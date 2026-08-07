@@ -715,6 +715,41 @@ impl AlertCooldown {
     }
 }
 
+/// One open alert bead, tracking a single *episode* of an alert condition.
+///
+/// An episode begins the first cycle a condition becomes true and ends the first cycle
+/// it is no longer reported. Exactly one bead is created per episode: while the condition
+/// stays true, subsequent cycles refresh the existing bead rather than creating a new one,
+/// and when the condition clears the bead is auto-closed.
+///
+/// This replaces the old cooldown-only dedup, where a condition that stayed true for days
+/// minted a fresh bead every `cooldown_minutes` (226 `sonnet_cutoff_risk` and 160
+/// `cutoff_imminent` beads accumulated in this repo's own workspace that way).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OpenAlertBead {
+    /// The bead id created for this episode, if one was created and its id could be
+    /// parsed from the alert command's output. `None` means the episode is tracked for
+    /// dedup purposes but has no bead to update or close (e.g. `auto_bead` disabled,
+    /// alerts disabled, or an alert command whose output we could not parse).
+    pub bead_id: Option<String>,
+    /// Alert type string (e.g. "sonnet_cutoff_risk")
+    pub alert_type: String,
+    /// Scope that distinguishes this episode from other episodes of the same type,
+    /// e.g. the window name for cutoff alerts or the agent name for billing drift.
+    pub scope: Option<String>,
+    /// When the condition first became true
+    pub opened_at: DateTime<Utc>,
+    /// The most recent cycle in which the condition was still true
+    pub last_seen: DateTime<Utc>,
+    /// How many cycles have observed this condition (1 on the opening cycle)
+    pub observations: u32,
+    /// Most recent alert message for this episode (numbers change as the episode evolves)
+    pub last_message: String,
+    /// When the bead was last refreshed with current numbers. `None` until the first refresh.
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+}
+
 /// Alert FP rate telemetry — rolling window tracking for false-positive regression detection.
 ///
 /// Each alert type tracks the last N outcomes (true positive vs false positive).
@@ -799,8 +834,17 @@ pub struct GovernorState {
     pub burn_rate: BurnRateState,
     pub alerts: Vec<serde_json::Value>,
     pub safe_mode: SafeModeState,
-    /// Per-type alert cooldown timestamps for deduplication
+    /// Per-episode alert cooldown timestamps. Keyed by episode key
+    /// (`alert_type` or `alert_type:scope`), not by alert type alone — see
+    /// [`crate::alerts::AlertCondition::episode_key`]. Acts as an anti-flap floor:
+    /// after an episode resolves, a new episode for the same key cannot open a fresh
+    /// bead until `cooldown_minutes` have elapsed.
     pub alert_cooldown: AlertCooldown,
+    /// Currently-open alert beads, one per in-flight condition episode, keyed by
+    /// episode key. Entries are inserted when a condition first becomes true and
+    /// removed (closing the bead) when it clears.
+    #[serde(default)]
+    pub open_alert_beads: HashMap<String, OpenAlertBead>,
     /// Whether OAuth token refresh is failing (set by poller)
     pub token_refresh_failing: bool,
     /// Number of consecutive collection intervals where fleet_cache_eff was below threshold.
@@ -869,6 +913,7 @@ impl Default for GovernorState {
             alerts: Vec::new(),
             safe_mode: SafeModeState::default(),
             alert_cooldown: AlertCooldown::default(),
+            open_alert_beads: HashMap::new(),
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,
             alert_fp_telemetry: AlertFpTelemetry::default(),
@@ -1380,6 +1425,23 @@ mod tests {
                     );
                     m
                 },
+            },
+            open_alert_beads: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "cutoff_imminent:five_hour".to_string(),
+                    OpenAlertBead {
+                        bead_id: Some("bf-abc12".to_string()),
+                        alert_type: "cutoff_imminent".to_string(),
+                        scope: Some("five_hour".to_string()),
+                        opened_at: "2026-03-18T14:00:00Z".parse().unwrap(),
+                        last_seen: "2026-03-20T09:55:00Z".parse().unwrap(),
+                        observations: 42,
+                        last_message: "Window five_hour at cutoff risk".to_string(),
+                        last_refreshed_at: Some("2026-03-20T09:00:00Z".parse().unwrap()),
+                    },
+                );
+                m
             },
             token_refresh_failing: false,
             low_cache_eff_consecutive: 0,

@@ -219,13 +219,35 @@ daemon:
   log_backup_count: 3               # Number of rotated log files to keep (.1, .2, .3)
 
 # Alert configuration
-# Controls alert firing and cooldown behavior
+#
+# Alerts follow an episode lifecycle, tracked in governor-state.json under
+# `open_alert_beads`. An episode is one continuous stretch during which a condition
+# (keyed by alert type + scope, e.g. cutoff_imminent:five_hour) is true:
+#   - first cycle the condition is true  -> create ONE bead, remember its id
+#   - while it stays true                -> no new bead; refresh the existing one
+#   - first cycle it is no longer true   -> auto-close the bead
+# Bead volume is therefore bounded by the number of distinct incidents, not by
+# elapsed time. The previous cooldown-only dedup minted a fresh bead every
+# cooldown window for as long as a condition held, which is how 226
+# `sonnet_cutoff_risk` and 160 `cutoff_imminent` beads accumulated for far fewer
+# real incidents.
 alerts:
   enabled: true                     # Enable/disable alerts
-  cooldown_minutes: 60              # Cooldown period between repeated alerts
+  cooldown_minutes: 60              # Anti-flap floor: minimum gap before a resolved
+                                    # condition may open a NEW episode. Also throttles
+                                    # how often an open episode's bead is refreshed.
+                                    # Not a repeat interval — a condition that stays
+                                    # true never mints a second bead.
   min_severity: warning             # Minimum severity level: info, warning, critical
   low_cache_eff_threshold: 0.30     # Fleet cache efficiency below this fraction triggers alert (30%)
   low_cache_eff_intervals: 5        # Number of consecutive intervals below threshold before alerting
-  auto_bead: false                  # Disabled: alert predicates have 100% FP rate (docs-878a)
+  auto_bead: false                  # Still disabled pending the FP-rate gate (docs-878a).
                                     # Alerts are logged to governor.log but do not spawn beads.
-                                    # Re-enable only after FP rate < 5% over 100-alert window.
+                                    # The bead-spam failure mode is now structurally fixed
+                                    # (one bead per episode, auto-closed on clear), so
+                                    # re-enablement no longer risks reproducing it — but the
+                                    # gate itself is unchanged: FP rate < 5% over a 100-alert
+                                    # window (alert_fp_telemetry in governor-state.json).
+  # command: [bf, create, --json, --type, human, --title]   # message appended as the title
+  # close_command: [bf, close]      # invoked as: <close_command> <bead_id> --reason <reason>
+  # update_command: [bf, update]    # invoked as: <update_command> <bead_id> --notes <notes>
