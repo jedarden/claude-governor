@@ -345,12 +345,15 @@ pub fn annotation_skip_reason(
 /// count: the governor parses it straight from the fleet record's `workers`
 /// field. The name is historical, from when the fleet was sonnet-only.
 ///
-/// The governor's own tmux census is the wrong quantity for this guard twice
-/// over: it spans every model class rather than the collector's population, and
-/// it is sampled at cycle time — after `t1` — rather than at the interval's
-/// end. Comparing it against the collector's count made the worker-count guard
-/// fire on every cycle that ran a single non-sonnet worker, which skipped
-/// annotation entirely in any mixed-model fleet.
+/// The governor's own tmux census (`current_total`) is a different quantity
+/// three ways over, and none of them are the annotated population: it counts
+/// one entry per tmux *session* rather than per `(session, model)` pair, so a
+/// session that used two model classes in the interval is one there and two
+/// here; it counts sessions that are alive now rather than sessions that
+/// actually logged usage in `[t0, t1]`; and it is sampled at cycle time, after
+/// `t1`, rather than at the interval's end. Comparing it against the
+/// collector's count made the worker-count guard fire on essentially every
+/// cycle of a mixed-model fleet, which skipped annotation entirely.
 ///
 /// The collector reports one worker count for the whole interval, so start and
 /// end are the same measurement of the same population and this guard cannot
@@ -12956,19 +12959,20 @@ mod annotation_guard_tests {
     /// Regression: a steady fleet that includes non-sonnet workers must still be
     /// annotated.
     ///
-    /// The call site used to pass the collector's sonnet-only count as
-    /// `workers_at_start` and the governor's all-model tmux total as
-    /// `workers_at_end`. Those are different quantities, so any fleet running a
-    /// single non-sonnet worker tripped `WorkerCountChanged` every cycle and was
-    /// never annotated. This drives the derivation the call site uses, not
-    /// hand-supplied counts, so a regression there fails here.
+    /// The call site used to pass the collector's per-interval count as
+    /// `workers_at_start` and the governor's tmux census as `workers_at_end`.
+    /// Those are different quantities, so a mixed-model fleet tripped
+    /// `WorkerCountChanged` every cycle and was never annotated. This drives the
+    /// derivation the call site uses, not hand-supplied counts, so a regression
+    /// there fails here.
     #[test]
     fn test_annotation_worker_counts_ignores_non_sonnet_tmux_total() {
         let (t0, t1, old_pct, new_pct) = annotatable_interval();
 
-        // Steady fleet: the collector saw 4 sonnet sessions for this interval and
-        // wrote 4 `i` rows. The governor's tmux census sees 7 — the same 4 plus 3
-        // opus/haiku workers the collector's fleet record does not count.
+        // Steady fleet: the collector wrote 4 `i` rows for this interval, one per
+        // (session, model) pair that logged usage. The governor's tmux census
+        // sees 7 live sessions — a different population, counted per session and
+        // sampled after `t1`.
         let fleet = state::FleetAggregate {
             sonnet_workers: 4,
             ..Default::default()
