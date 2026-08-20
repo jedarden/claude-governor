@@ -122,8 +122,9 @@ fn test_database_connection(
         }
     };
 
-    // Test 3: Verify schema has expected tables (bead store uses 'issues', not 'beads')
-    let expected_tables = vec!["issues", "labels", "events", "metadata"];
+    // Test 3: Verify schema has expected tables (bead store uses 'issues', not 'beads').
+    // bead-rs schema: 'metadata' no longer exists; status lives in 'base_status'.
+    let expected_tables = vec!["issues", "labels", "events", "dependencies"];
     let mut tables_query = match conn.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ) {
@@ -160,7 +161,7 @@ fn test_database_connection(
 
     // Test 5: Count open issues (Pluck's primary query)
     match conn.query_row(
-        "SELECT COUNT(*) FROM issues WHERE status = 'open'",
+        "SELECT COUNT(*) FROM issues WHERE base_status = 'open'",
         [],
         |row| row.get(0)
     ) {
@@ -218,6 +219,7 @@ fn test_database_connection(
     println!("✓ Exclude labels: {:?} ({} labels)", exclude_labels_filter, exclude_labels_filter.len());
     println!("✓ Include labels: {:?} ({} labels)", labels_filter, labels_filter.len());
     println!("✓ Assignee filter: always applied (IS NULL)");
+    println!("✓ Manual blocked filter: always applied (= 0)");
     println!("========================\n");
 
     // Verify query structure
@@ -225,8 +227,9 @@ fn test_database_connection(
     assert!(query_string.contains("SELECT COUNT(DISTINCT i.id)"), "Query must select distinct issue IDs");
     assert!(query_string.contains("FROM issues i"), "Query must use issues table");
     assert!(query_string.contains("LEFT JOIN labels"), "Query must join labels table");
-    assert!(query_string.contains(&format!("WHERE i.status = '{}'", state_filter)), "Query must filter by state");
+    assert!(query_string.contains(&format!("WHERE i.base_status = '{}'", state_filter)), "Query must filter by state");
     assert!(query_string.contains("AND i.assignee IS NULL"), "Query must filter unassigned issues");
+    assert!(query_string.contains("AND i.manual_blocked = 0"), "Query must filter manually blocked issues");
     if !exclude_labels_filter.is_empty() {
         assert!(query_string.contains("AND NOT EXISTS"), "Query must exclude specified labels");
     }
@@ -249,6 +252,7 @@ fn test_database_connection(
             println!("✓ Filters applied:");
             println!("    - State: '{}'", state_filter);
             println!("    - Assignee: IS NULL");
+            println!("    - Manual blocked: = 0");
             if !exclude_labels_filter.is_empty() {
                 println!("    - Excluded labels: {:?}", exclude_labels_filter);
             }
@@ -314,7 +318,8 @@ fn construct_pluck_query(
     construction_log.push(format!("✓ Added LEFT JOIN for labels table"));
 
     // Step 2: State filter (WHERE clause)
-    let where_clause = format!("WHERE i.status = '{}'", state_filter);
+    // bead-rs stores status in the 'base_status' column ('open', 'in_progress', 'deferred', 'closed')
+    let where_clause = format!("WHERE i.base_status = '{}'", state_filter);
     query_parts.push(where_clause);
     params.push(format!("state:{}", state_filter));
     construction_log.push(format!("✓ Added WHERE clause with state filter: '{}'", state_filter));
@@ -323,6 +328,11 @@ fn construct_pluck_query(
     query_parts.push("AND i.assignee IS NULL".to_string());
     params.push("assignee:NULL".to_string());
     construction_log.push(format!("✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)"));
+
+    // Step 3b: Manual-blocked filter (bead-rs ready frontier excludes manually blocked issues)
+    query_parts.push("AND i.manual_blocked = 0".to_string());
+    params.push("manual_blocked:0".to_string());
+    construction_log.push(format!("✓ Added manual_blocked filter: = 0 (bead-rs ready frontier excludes manually blocked issues)"));
 
     // Step 4: Exclude labels filter (NOT EXISTS clause)
     if !exclude_labels_filter.is_empty() {
