@@ -1,6 +1,7 @@
 #!/bin/bash
 # Basic Pluck query without filters
-# This script demonstrates querying the Pluck database directly without label filters
+# This script demonstrates querying the bead-rs Pluck database directly
+# without label filters.
 
 set -e
 
@@ -24,17 +25,17 @@ echo "1. Total issues (no filter):"
 sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM issues;"
 echo ""
 
-# Query 2: All open issues (no label filter)
-echo "2. Open issues (no label filter):"
-sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM issues WHERE status = 'open';"
+# Query 2: All open issues (no label or assignment filter)
+echo "2. Open issues (no label or assignment filter):"
+sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM issues WHERE base_status = 'open';"
 echo ""
 
 # Query 3: Sample of 5 open issues with basic info
 echo "3. Sample of 5 open issues (no filter):"
 sqlite3 -column -header "$DB_PATH" <<EOF
-SELECT id, title, status, priority, issue_type
+SELECT id, title, base_status AS status, priority, issue_type
 FROM issues
-WHERE status = 'open'
+WHERE base_status = 'open'
 LIMIT 5;
 EOF
 echo ""
@@ -42,9 +43,9 @@ echo ""
 # Query 4: Issues by status
 echo "4. Issues by status:"
 sqlite3 -column "$DB_PATH" <<EOF
-SELECT status, COUNT(*) as count
+SELECT base_status AS status, COUNT(*) as count
 FROM issues
-GROUP BY status;
+GROUP BY base_status;
 EOF
 echo ""
 
