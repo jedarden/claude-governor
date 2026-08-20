@@ -4962,8 +4962,11 @@ pub fn compute_pre_scale_target(
 /// Update safe mode state based on current calibration accuracy statistics.
 ///
 /// Entry: if median absolute error > SAFE_MODE_ENTRY_ERROR_THRESHOLD and enough samples.
-/// Exit: if median absolute error < SAFE_MODE_EXIT_ERROR_THRESHOLD (hysteresis) AND
-///       at least SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT new predictions since entry.
+/// Exit: for calibration-triggered safe mode, if median absolute error drops below
+///       SAFE_MODE_EXIT_ERROR_THRESHOLD (hysteresis) AND at least
+///       SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT new predictions have been scored since entry.
+///       Emergency-brake safe mode is released separately when utilization drops below
+///       EMERGENCY_BRAKE_THRESHOLD.
 ///
 /// Also updates calibration.predictions_scored and calibration.median_error_7ds
 /// from the latest stats.
@@ -4988,7 +4991,8 @@ pub fn update_safe_mode_from_calibration(
             .saturating_sub(safe_mode.scored_at_entry);
 
         // Check exit: accuracy recovered past exit threshold and enough new predictions observed
-        if median_error_abs < SAFE_MODE_EXIT_ERROR_THRESHOLD
+        if safe_mode.trigger.as_deref() != Some(state::EMERGENCY_BRAKE_TRIGGER)
+            && median_error_abs < SAFE_MODE_EXIT_ERROR_THRESHOLD
             && safe_mode.predictions_since_entry >= SAFE_MODE_MIN_PREDICTIONS_FOR_EXIT
             && stats.total_samples >= SAFE_MODE_MIN_SAMPLES
         {
@@ -8178,6 +8182,41 @@ mod tests {
 
         assert!(changed, "should return true when exiting safe mode");
         assert!(!safe_mode.active, "safe mode should be inactive after exit");
+    }
+
+    #[test]
+    fn safe_mode_does_not_exit_when_triggered_by_emergency_brake() {
+        let now = Utc::now();
+        let mut safe_mode = state::SafeModeState {
+            active: true,
+            entered_at: Some(now - chrono::Duration::hours(1)),
+            trigger: Some(state::EMERGENCY_BRAKE_TRIGGER.to_string()),
+            median_error_at_entry: None,
+            predictions_since_entry: 0,
+            scored_at_entry: 5,
+        };
+        let mut calibration = state::CalibrationState::default();
+        // Accuracy recovered and enough predictions were scored, but utilization is
+        // checked by the emergency-brake release path rather than calibration.
+        let stats = make_cal_stats(7.0, 8, 6.0);
+
+        let changed =
+            update_safe_mode_from_calibration(&mut safe_mode, &mut calibration, &stats, now);
+
+        assert!(
+            !changed,
+            "calibration must not release emergency-brake safe mode"
+        );
+        assert!(
+            safe_mode.active,
+            "emergency-brake safe mode should remain active"
+        );
+        assert_eq!(
+            safe_mode.trigger.as_deref(),
+            Some(state::EMERGENCY_BRAKE_TRIGGER),
+            "the emergency-brake trigger must be preserved"
+        );
+        assert_eq!(safe_mode.predictions_since_entry, 3);
     }
 
     #[test]
