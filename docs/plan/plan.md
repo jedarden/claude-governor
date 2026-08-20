@@ -1780,28 +1780,21 @@ Two modes, selected at install time based on what's available:
 **Mode A: systemd user service (Linux default)**
 
 ```ini
-# ~/.config/systemd/user/claude-governor.service
-[Unit]
-Description=Claude Governor — quota-aware worker scaler
-After=default.target
-
+# ~/.config/systemd/user/claude-governor-observe.service
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/cgov _daemon
+ExecStart=%h/.local/bin/cgov _observe
 Restart=always
 RestartSec=10
-Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+```
 
-# Logging
-StandardOutput=journal
-StandardError=journal
-
-# Resource limits
-MemoryMax=512M
-CPUQuota=50%
-
-[Install]
-WantedBy=default.target
+```ini
+# ~/.config/systemd/user/claude-governor-act.service
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cgov _act
+Restart=always
+RestartSec=10
 ```
 
 ```ini
@@ -1818,28 +1811,23 @@ RestartSec=30
 ```
 
 ```bash
-cgov enable   # installs units → daemon-reload → enable + start both
-cgov disable  # stop + disable both units
-cgov start    # start daemon (must already be enabled, or use enable)
-cgov stop     # graceful stop — governor finishes current cycle before exiting
+cgov enable         # installs units → daemon-reload → enable + start all
+cgov disable       # stop + disable all units
+cgov start observe # start telemetry without enabling act
+cgov stop act      # pause scaling and alerting, keep telemetry running
+cgov restart       # restart all units
 ```
 
-`claude-governor.service` is the one canonical unit name for the daemon, and
-`ExecStart` is always the hidden `cgov _daemon` subcommand — never the public
-foreground `cgov daemon`, which exists for interactive runs and carries no
-`Restart=always` or ordering against the collector. Early builds also shipped a
-`cgov.service` under that public subcommand; an operator who enabled that one
-instead got `Restart=on-failure` and no dependency on the token collector, with
-nothing marking either as canonical. That name is retired: `cgov init`, `cgov
-enable`, and `cgov disable --purge` stop, disable, and delete any `cgov.service`
-left in `~/.config/systemd/user/` before reloading, so upgrading an old install
-converges on the single unit.
+`claude-governor-observe.service` and `claude-governor-act.service` are
+independently supervised. `cgov init`/`enable` remove the pre-ADR combined
+`claude-governor.service` and `cgov.service` units from an existing install.
 
 **Mode B: tmux sessions (fallback — no systemd or macOS)**
 
 ```bash
-# cgov start (tmux fallback path)
-tmux new-session -d -s "claude-governor" "cgov _daemon"
+# cgov enable (tmux fallback path)
+tmux new-session -d -s "cgov-observe" "cgov _observe"
+tmux new-session -d -s "cgov-act" "cgov _act"
 tmux new-session -d -s "claude-token-collector" "cgov _token-collector"
 ```
 
@@ -2009,7 +1997,8 @@ claude-governor/
 ├── config/
 │   ├── governor.yaml          # Main configuration (incl. pricing table)
 │   ├── promotions.json        # Promotion window definitions (empty by default when no active promotion)
-│   ├── claude-governor.service # Systemd user service — governor daemon
+│   ├── claude-governor-observe.service # Systemd user service — observe loop
+│   ├── claude-governor-act.service # Systemd user service — act loop
 │   └── claude-token-collector.service # Systemd user service — token collector
 ├── docs/
 │   ├── research/
@@ -2088,7 +2077,7 @@ claude-governor/
 
 ## ADR-001: 2026-07-20 — Split the governor daemon into an always-on Observe loop and a separately-gated Act loop
 
-**Status:** Proposed
+**Status:** Implemented
 
 ### Context
 
@@ -2114,10 +2103,10 @@ Because these three are one process, the only way to stop *acting* on distrusted
 
 Split `cgov _daemon` into two independently-supervised processes:
 
-- **`cgov _observe`** (new hidden subcommand, replaces the observation portion of `_daemon`): runs the poll → burn-rate EMA → capacity-forecast → confidence-cone → calibrator → safe-mode pipeline every `loop_interval` seconds and writes `governor-state.json` / `governor-state.prev.json` / `prediction-accuracy.jsonl`. It **never** shells out to `launch_cmd`, never sends SIGINT/kill to a worker session, and never executes the alert command. It is installed as its own systemd unit (`claude-governor-observe.service`), `enabled` and `Restart=always` by default at `cgov init` time — exactly like `claude-token-collector.service` already is.
+- **`cgov _observe`** (new hidden subcommand, replaces the observation portion of `_daemon`): runs the poll → burn-rate EMA → capacity-forecast → confidence-cone → calibrator → safe-mode pipeline every `loop_interval` seconds and writes `governor-state.json` / `governor-state.prev.json` / `prediction-accuracy.jsonl`. It **never** shells out to `launch_cmd`, never sends SIGINT/kill to a worker session, and never executes the alert command. It is installed as its own systemd unit (`claude-governor-observe.service`) with `Restart=always`; `cgov enable` enables and starts it alongside the act and collector units.
 - **`cgov _act`** (new hidden subcommand, replaces the scaling+alerting portion of `_daemon`): reads the state that `_observe` last wrote, and *only* performs `apply_scaling()` (Component 6/7/9/13/14/17) and `check_alerts()` / `fire_alert()` (Component 8). It is installed as a separate systemd unit (`claude-governor-act.service`) that an operator can `cgov stop act` / `cgov disable act` independently, without losing forecasting, calibration, or `cgov status` freshness.
 
-`governor-state.json` gains an explicit ownership split so the two processes don't race on the same file: `_observe` owns `usage`, `capacity_forecast`, `burn_rate`, `schedule`, `calibration`, `safe_mode`, `alert_fp_telemetry`; `_act` owns `workers.*.target`, `alert_cooldown`, and appends to `alerts`. `_act` reads the file, computes its decision, and writes back only its own subtree (last-writer-wins on the rest is acceptable since `_observe` is the sole writer of everything else).
+`governor-state.json` gains an explicit ownership split so the two processes don't race on the same file: `_observe` owns `usage`, `capacity_forecast`, `burn_rate`, `schedule`, `calibration`, and `safe_mode`; `_act` owns `workers.*.target`, `alert_cooldown`, `open_alert_beads`, `alert_fp_telemetry`, and appends to `alerts`. `_act` reads the file, computes its decision, and writes back only its own subtree; both halves serialize their merge transaction so a concurrent write cannot revert the other half.
 
 `cgov status`, `cgov doctor`, `cgov explain`, and `cgov simulate` are unaffected — they already read state from disk and don't care which process wrote it. `cgov enable` installs and starts both units; `cgov disable`/`cgov stop` gain a target argument (`observe`, `act`, or `all`, default `all`) so `cgov stop act` becomes the documented, single command for "pause automated scaling and alerting without losing telemetry," replacing the undocumented `systemctl --user disable claude-governor.service` that appears to be what actually happened here.
 
@@ -2143,9 +2132,22 @@ Split `cgov _daemon` into two independently-supervised processes:
 - `governor-state.json` needs a documented ownership split (above) to avoid a torn-write race between two processes; this is a small but real increase in state-management complexity versus the current single-writer model.
 - Slightly higher baseline resource usage (a second always-on process, though `_observe`'s workload — HTTP poll + arithmetic — is lighter than `_act`'s tmux/process-exec work).
 
-### Follow-up
+### Implementation
 
-Implementing this ADR is out of scope for this pass (this pass files it as a decision, not an implementation). The concrete first steps — extracting `_observe`/`_act` from `governor.rs`, writing the new unit files, and updating `cgov enable`/`disable`/`stop` — should be filed as their own beads once someone picks this ADR up; the beads filed alongside this ADR (see bf beads labeled `artifact-improvement` in this repo) cover the narrower, immediately-actionable problems found during this same investigation (stale pricing table, wrong default alert-bead command, duplicate systemd units, alert-bead spam) that don't require the full split to fix.
+The split is implemented in `src/governor.rs`: `run_observe_cycle` owns polling,
+collection, forecasting, calibration, and observe-owned state; `run_act_cycle`
+owns worker lifecycle and alert episodes. The hidden `_observe` and `_act`
+commands run those halves as independently supervised loops. `cgov init` installs
+`claude-governor-observe.service`, `claude-governor-act.service`, and the token
+collector; `cgov enable` enables and starts them. Lifecycle commands accept
+`observe`, `act`, `collector`, `governor`, or `all` targets, so `cgov stop act`
+pauses scaling and alerting while observation continues.
+
+State subtree merges are serialized with a scoped lock and use process-specific
+temporary files for atomic writes, so observe and act cannot overwrite each
+other's owned fields or splice partial JSON. `cgov doctor` reports
+`observe_running` as the required telemetry loop and `act_running` as a warning
+when acting is intentionally paused.
 
 ---
 

@@ -135,9 +135,12 @@ cgov enable
 
 # Start services
 cgov start
+cgov start observe
+cgov start act
 
-# Stop services
+# Stop all services, or pause only automated scaling and alerting
 cgov stop
+cgov stop act
 
 # Restart services
 cgov restart
@@ -146,6 +149,13 @@ cgov restart
 cgov disable
 cgov disable --purge
 ```
+
+The governor runs as two independently supervised loops. `_observe` polls usage,
+updates burn rates and forecasts, and keeps state fresh without launching or
+killing workers. `_act` reads that state and performs scaling and alerting. Stop
+`act` when actions need to be paused while telemetry should continue; `doctor`
+reports this as a warning rather than treating the intentional pause as a
+telemetry failure.
 
 ## Usage Windows
 

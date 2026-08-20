@@ -34,7 +34,7 @@ impl std::fmt::Display for CheckStatus {
 /// Result of a single health check
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
-    /// Check identifier (e.g., "daemon_running")
+    /// Check identifier (e.g., "observe_running")
     pub check: String,
     /// Status: pass, warn, or fail
     pub status: CheckStatus,
@@ -198,9 +198,11 @@ fn default_promotions_path() -> PathBuf {
 // Service detection helpers
 // ---------------------------------------------------------------------------
 
-const GOVERNOR_SERVICE: &str = "claude-governor.service";
+const OBSERVE_SERVICE: &str = "claude-governor-observe.service";
+const ACT_SERVICE: &str = "claude-governor-act.service";
 const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
-const GOVERNOR_SESSION: &str = "cgov-governor";
+const OBSERVE_SESSION: &str = "cgov-observe";
+const ACT_SESSION: &str = "cgov-act";
 const COLLECTOR_SESSION: &str = "cgov-collector";
 
 /// Check if systemd user sessions are available
@@ -248,14 +250,14 @@ enum DaemonStatus {
 }
 
 /// Detect if the governor daemon is running
-fn detect_daemon_status() -> DaemonStatus {
+fn detect_observe_status() -> DaemonStatus {
     // Priority 1: systemd
-    if systemd_user_available() && systemd_service_is_active(GOVERNOR_SERVICE) {
+    if systemd_user_available() && systemd_service_is_active(OBSERVE_SERVICE) {
         return DaemonStatus::RunningSystemd;
     }
 
     // Priority 2: tmux
-    if tmux_available_check() && tmux_session_exists(GOVERNOR_SESSION) {
+    if tmux_available_check() && tmux_session_exists(OBSERVE_SESSION) {
         return DaemonStatus::RunningTmux;
     }
 
@@ -268,6 +270,18 @@ fn detect_daemon_status() -> DaemonStatus {
         }
     }
 
+    DaemonStatus::Stopped
+}
+
+/// Detect if the act half is running. State freshness cannot be used as a
+/// fallback because act deliberately never updates `updated_at`.
+fn detect_act_status() -> DaemonStatus {
+    if systemd_user_available() && systemd_service_is_active(ACT_SERVICE) {
+        return DaemonStatus::RunningSystemd;
+    }
+    if tmux_available_check() && tmux_session_exists(ACT_SESSION) {
+        return DaemonStatus::RunningTmux;
+    }
     DaemonStatus::Stopped
 }
 
@@ -309,34 +323,34 @@ fn detect_collector_status() -> CollectorStatus {
 // Individual health checks
 // ---------------------------------------------------------------------------
 
-/// Check if the governor daemon is running (via systemd, tmux, or state file)
-fn check_daemon_running() -> CheckResult {
-    match detect_daemon_status() {
+/// Check if the observe daemon is running. Observe is the telemetry source,
+/// so a stopped observe process remains a hard failure.
+fn check_observe_running() -> CheckResult {
+    match detect_observe_status() {
         DaemonStatus::RunningSystemd => {
-            // Also verify state freshness as a sanity check
             let state_path = default_state_path();
             match crate::state::load_state(&state_path) {
                 Ok(state) => {
                     let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
                     if age_secs < 300 {
                         CheckResult::pass(
-                            "daemon_running",
+                            "observe_running",
                             format!("running (systemd), state {}s old", age_secs),
                         )
                     } else {
                         CheckResult::warn(
-                            "daemon_running",
+                            "observe_running",
                             format!("systemd active but state {}s old", age_secs),
-                            "Daemon may be stuck; check logs: journalctl --user -u claude-governor",
+                            "Observe may be stuck; check logs: journalctl --user -u claude-governor-observe",
                         )
                     }
                 }
-                Err(_) => CheckResult::pass("daemon_running", "running (systemd)"),
+                Err(_) => CheckResult::pass("observe_running", "running (systemd)"),
             }
         }
-        DaemonStatus::RunningTmux => CheckResult::pass("daemon_running", "running (tmux)"),
+        DaemonStatus::RunningTmux => CheckResult::pass("observe_running", "running (tmux)"),
         DaemonStatus::ActiveState(age_secs) => CheckResult::pass(
-            "daemon_running",
+            "observe_running",
             format!("active (state {}s old)", age_secs),
         ),
         DaemonStatus::Stopped => {
@@ -345,25 +359,42 @@ fn check_daemon_running() -> CheckResult {
                 if let Ok(state) = crate::state::load_state(&state_path) {
                     let age_secs = (Utc::now() - state.updated_at).num_seconds().abs();
                     CheckResult::fail(
-                        "daemon_running",
+                        "observe_running",
                         format!("stopped (state {}s old)", age_secs),
-                        "Start the governor: cgov start governor",
+                        "Start the observation loop: cgov start observe",
                     )
                 } else {
                     CheckResult::fail(
-                        "daemon_running",
+                        "observe_running",
                         "stopped (state unreadable)",
                         "Check state file permissions or run 'cgov init'",
                     )
                 }
             } else {
                 CheckResult::warn(
-                    "daemon_running",
+                    "observe_running",
                     "not initialized",
-                    "Run 'cgov enable' to start the governor daemon",
+                    "Run 'cgov enable' to start the observation loop",
                 )
             }
         }
+    }
+}
+
+/// Check if the act daemon is running. Pausing act is a supported safety
+/// posture, so it is a warning rather than a failure.
+fn check_act_running() -> CheckResult {
+    match detect_act_status() {
+        DaemonStatus::RunningSystemd => CheckResult::pass("act_running", "running (systemd)"),
+        DaemonStatus::RunningTmux => CheckResult::pass("act_running", "running (tmux)"),
+        DaemonStatus::ActiveState(age_secs) => {
+            CheckResult::pass("act_running", format!("active (state {}s old)", age_secs))
+        }
+        DaemonStatus::Stopped => CheckResult::warn(
+            "act_running",
+            "paused (scaling and alerting are disabled)",
+            "Run 'cgov start act' when automated scaling and alerting are trusted",
+        ),
     }
 }
 
@@ -1122,7 +1153,10 @@ fn evaluate_pricing_coverage(counts: &[(String, i64)], priced: &[String]) -> Che
     if total == 0 {
         return CheckResult::pass(
             "pricing_coverage",
-            format!("No usage records in last {}h", PRICING_COVERAGE_LOOKBACK_HOURS),
+            format!(
+                "No usage records in last {}h",
+                PRICING_COVERAGE_LOOKBACK_HOURS
+            ),
         );
     }
 
@@ -1751,7 +1785,8 @@ pub fn run_doctor() -> DoctorReport {
         check_promotion_dates(),
         check_sqlite_integrity(),
         check_jsonl_db_sync(),
-        check_daemon_running(),
+        check_observe_running(),
+        check_act_running(),
         check_log_file(),
         check_prediction_accuracy(),
         // Additional operational checks

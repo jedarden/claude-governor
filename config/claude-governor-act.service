@@ -1,12 +1,12 @@
 [Unit]
-Description=Claude Governor - automated capacity governor for Claude Code
+Description=Claude Governor - scale workers and manage alerts
 Documentation=https://github.com/jedarden/claude-governor
-After=network-online.target
-Wants=network-online.target claude-token-collector.service
+After=network-online.target claude-governor-observe.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/cgov _daemon
+ExecStart=%h/.local/bin/cgov _act
 Restart=always
 RestartSec=10
 Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -15,7 +15,8 @@ Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 StandardOutput=journal
 StandardError=journal
 
-# Resource limits
+# Acting shells out to worker/session commands and alert commands, but does
+# not poll the usage API or run the token collector.
 MemoryMax=512M
 CPUQuota=50%
 

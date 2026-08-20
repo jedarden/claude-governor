@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use log::LevelFilter;
 use std::env;
 use std::fs;
@@ -359,6 +359,9 @@ enum Commands {
 
     /// Disable claude-governor services (stop and remove systemd units)
     Disable {
+        #[command(flatten)]
+        target: ServiceTarget,
+
         /// Also remove service files
         #[arg(long)]
         purge: bool,
@@ -366,23 +369,20 @@ enum Commands {
 
     /// Start claude-governor daemon services
     Start {
-        /// Service to start: governor, collector, or all (default: all)
-        #[arg(long, default_value = "all")]
-        service: String,
+        #[command(flatten)]
+        target: ServiceTarget,
     },
 
     /// Stop claude-governor daemon services
     Stop {
-        /// Service to stop: governor, collector, or all (default: all)
-        #[arg(long, default_value = "all")]
-        service: String,
+        #[command(flatten)]
+        target: ServiceTarget,
     },
 
     /// Restart claude-governor daemon services
     Restart {
-        /// Service to restart: governor, collector, or all (default: all)
-        #[arg(long, default_value = "all")]
-        service: String,
+        #[command(flatten)]
+        target: ServiceTarget,
     },
 
     /// Show recent governor scaling decisions from the audit log
@@ -433,7 +433,55 @@ enum Commands {
 
     /// Internal: Run a single observation cycle (poll, forecast, calibrate, write state)
     #[command(hide = true, name = "_observe")]
-    _Observe {},
+    _Observe {
+        /// Loop interval in seconds (overrides config)
+        #[arg(short = 'i', long)]
+        interval: Option<u64>,
+    },
+
+    /// Internal: Run the scaling and alerting daemon (called by systemd)
+    #[command(hide = true, name = "_act")]
+    _Act {
+        /// Show what would happen without actually scaling workers
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Loop interval in seconds (overrides config)
+        #[arg(short = 'i', long)]
+        interval: Option<u64>,
+
+        /// Hysteresis band for scaling decisions (overrides config)
+        #[arg(long)]
+        hysteresis: Option<f64>,
+
+        /// Target utilization ceiling percentage (overrides config)
+        #[arg(short = 'c', long)]
+        ceiling: Option<f64>,
+    },
+}
+
+/// Target for lifecycle commands. Both `cgov stop act` and the older
+/// `cgov stop --service act` spelling are accepted so the split remains easy
+/// to adopt from existing scripts.
+#[derive(Args, Debug, Clone)]
+struct ServiceTarget {
+    /// Service to manage: observe, act, collector, governor, or all (default: all)
+    #[arg(
+        value_name = "SERVICE",
+        default_value = "all",
+        value_parser = ["observe", "act", "collector", "governor", "all"]
+    )]
+    positional: String,
+
+    /// Service to manage (alternative to the positional form)
+    #[arg(long = "service", value_name = "SERVICE", value_parser = ["observe", "act", "collector", "governor", "all"])]
+    flag: Option<String>,
+}
+
+impl ServiceTarget {
+    fn value(&self) -> &str {
+        self.flag.as_deref().unwrap_or(&self.positional)
+    }
 }
 
 /// Format usage data for human consumption
@@ -808,20 +856,33 @@ fn systemd_service_is_active(service: &str) -> bool {
 
 /// Get daemon status as a string with detection method
 fn daemon_status_string() -> String {
-    if systemd_user_available() && systemd_service_is_active(GOVERNOR_SERVICE) {
-        return "✓ running (systemd)".to_string();
-    }
-    if tmux_available() && tmux_session_exists(GOVERNOR_SESSION) {
-        return "✓ running (tmux)".to_string();
-    }
     let state_path = default_state_path();
-    if let Ok(state) = state::load_state(&state_path) {
-        let age = (Utc::now() - state.updated_at).num_seconds();
-        if age < 300 {
-            return format!("✓ active (state {}s old)", age);
+    let observe_running = (systemd_user_available() && systemd_service_is_active(OBSERVE_SERVICE))
+        || (tmux_available() && tmux_session_exists(OBSERVE_SESSION));
+    let act_running = (systemd_user_available() && systemd_service_is_active(ACT_SERVICE))
+        || (tmux_available() && tmux_session_exists(ACT_SESSION));
+
+    let freshness = state::load_state(&state_path)
+        .ok()
+        .map(|state| (Utc::now() - state.updated_at).num_seconds())
+        .filter(|age| *age < 300)
+        .map(|age| format!(", state {}s old", age))
+        .unwrap_or_default();
+
+    format!(
+        "observe {}{}, act {}",
+        if observe_running {
+            "✓ running"
+        } else {
+            "✗ stopped"
+        },
+        freshness,
+        if act_running {
+            "✓ running"
+        } else {
+            "⚠ paused"
         }
-    }
-    "✗ stopped".to_string()
+    )
 }
 
 /// Get collector status as a string with detection method
@@ -1170,17 +1231,17 @@ fn main() -> Result<()> {
         Commands::Enable { force } => {
             run_enable_command(force)?;
         }
-        Commands::Disable { purge } => {
-            run_disable_command(purge)?;
+        Commands::Disable { target, purge } => {
+            run_disable_command(target.value(), purge)?;
         }
-        Commands::Start { service } => {
-            run_start_command(&service)?;
+        Commands::Start { target } => {
+            run_start_command(target.value())?;
         }
-        Commands::Stop { service } => {
-            run_stop_command(&service)?;
+        Commands::Stop { target } => {
+            run_stop_command(target.value())?;
         }
-        Commands::Restart { service } => {
-            run_restart_command(&service)?;
+        Commands::Restart { target } => {
+            run_restart_command(target.value())?;
         }
         Commands::Explain { last, json } => {
             run_explain_command(last, json)?;
@@ -1199,8 +1260,16 @@ fn main() -> Result<()> {
         Commands::_TokenCollector { interval } => {
             run_internal_token_collector_command(interval)?;
         }
-        Commands::_Observe {} => {
-            run_internal_observe_command()?;
+        Commands::_Observe { interval } => {
+            run_internal_observe_command(interval)?;
+        }
+        Commands::_Act {
+            dry_run,
+            interval,
+            hysteresis,
+            ceiling,
+        } => {
+            run_internal_act_command(dry_run, interval, hysteresis, ceiling)?;
         }
     }
 
@@ -1287,19 +1356,18 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
     }
 }
 
-/// Service names for the two-unit split
-const GOVERNOR_SERVICE: &str = "claude-governor.service";
+/// Service names for the observe/act split.
+const OBSERVE_SERVICE: &str = "claude-governor-observe.service";
+const ACT_SERVICE: &str = "claude-governor-act.service";
 const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
 
 /// Obsolete unit names that older installs shipped for the governor daemon.
 ///
-/// `cgov.service` ran the public foreground `cgov daemon` subcommand with
-/// `Restart=on-failure` and no ordering against the collector, so an operator who
-/// enabled it by name got different restart semantics and no dependency on
-/// [`COLLECTOR_SERVICE`]. [`GOVERNOR_SERVICE`] (running the systemd-oriented
-/// `cgov _daemon`) is the only canonical unit; leaving the old file on disk keeps
-/// that ambiguity alive, so installs delete it.
-const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service"];
+/// `cgov.service` and `claude-governor.service` were the pre-ADR combined
+/// daemon units. Leaving either installed would let an old process continue to
+/// scale and alert outside the independently manageable `act` target, so new
+/// installs remove both.
+const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service", "claude-governor.service"];
 
 /// Run a systemctl --user command without letting it write to our stdout/stderr.
 ///
@@ -1341,7 +1409,7 @@ fn remove_legacy_governor_units(user_dir: &Path) -> Vec<String> {
             Ok(()) => actions.push(format!(
                 "Removed obsolete unit {} (superseded by {})",
                 path.display(),
-                GOVERNOR_SERVICE
+                OBSERVE_SERVICE
             )),
             Err(e) => eprintln!(
                 "warning: could not remove obsolete unit {}: {}",
@@ -1354,12 +1422,16 @@ fn remove_legacy_governor_units(user_dir: &Path) -> Vec<String> {
     actions
 }
 
-/// Resolve --service arg to a list of unit names
+/// Resolve a lifecycle target to unit names.
 fn resolve_service_names(service: &str) -> Vec<&'static str> {
     match service {
-        "governor" => vec![GOVERNOR_SERVICE],
+        "observe" => vec![OBSERVE_SERVICE],
+        "act" => vec![ACT_SERVICE],
+        // `governor` is retained as a compatibility alias for the two
+        // governor halves; it no longer refers to a combined process.
+        "governor" => vec![OBSERVE_SERVICE, ACT_SERVICE],
         "collector" => vec![COLLECTOR_SERVICE],
-        _ => vec![GOVERNOR_SERVICE, COLLECTOR_SERVICE],
+        _ => vec![OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE],
     }
 }
 
@@ -1384,7 +1456,8 @@ fn resolve_daemon_mode(config: &GovernorConfig) -> &'static str {
 
 // --- tmux session management ---
 
-const GOVERNOR_SESSION: &str = "cgov-governor";
+const OBSERVE_SESSION: &str = "cgov-observe";
+const ACT_SESSION: &str = "cgov-act";
 const COLLECTOR_SESSION: &str = "cgov-collector";
 
 fn tmux_session_exists(session: &str) -> bool {
@@ -1427,9 +1500,11 @@ fn tmux_start_session(session: &str, command: &str) -> Result<()> {
 
 fn resolve_tmux_sessions(service: &str) -> Vec<&'static str> {
     match service {
-        "governor" => vec![GOVERNOR_SESSION],
+        "observe" => vec![OBSERVE_SESSION],
+        "act" => vec![ACT_SESSION],
+        "governor" => vec![OBSERVE_SESSION, ACT_SESSION],
         "collector" => vec![COLLECTOR_SESSION],
-        _ => vec![GOVERNOR_SESSION, COLLECTOR_SESSION],
+        _ => vec![OBSERVE_SESSION, ACT_SESSION, COLLECTOR_SESSION],
     }
 }
 
@@ -1443,10 +1518,12 @@ fn run_enable_command(force: bool) -> Result<()> {
         // tmux mode: just start the sessions
         println!("Detected tmux mode — starting daemon sessions");
         println!("=============================================\n");
-        tmux_start_session(GOVERNOR_SESSION, "cgov _daemon")?;
+        tmux_start_session(OBSERVE_SESSION, "cgov _observe")?;
+        tmux_start_session(ACT_SESSION, "cgov _act")?;
         tmux_start_session(COLLECTOR_SESSION, "cgov _token-collector")?;
         println!("\nAttach to sessions:");
-        println!("  tmux attach -t {}", GOVERNOR_SESSION);
+        println!("  tmux attach -t {}", OBSERVE_SESSION);
+        println!("  tmux attach -t {}", ACT_SESSION);
         println!("  tmux attach -t {}", COLLECTOR_SESSION);
         return Ok(());
     }
@@ -1471,11 +1548,15 @@ fn run_enable_command(force: bool) -> Result<()> {
 
     let mut actions = Vec::new();
 
-    // Install both unit files
+    // Install both governor halves and the independent token collector.
     for (name, content) in [
         (
-            GOVERNOR_SERVICE,
-            include_str!("../config/claude-governor.service"),
+            OBSERVE_SERVICE,
+            include_str!("../config/claude-governor-observe.service"),
+        ),
+        (
+            ACT_SERVICE,
+            include_str!("../config/claude-governor-act.service"),
         ),
         (
             COLLECTOR_SERVICE,
@@ -1508,19 +1589,16 @@ fn run_enable_command(force: bool) -> Result<()> {
     systemctl_user(&["daemon-reload"])?;
     actions.push("  ✓ Ran daemon-reload".to_string());
 
-    // Enable both services
-    systemctl_user(&["enable", GOVERNOR_SERVICE])?;
-    actions.push(format!("  ✓ Enabled {}", GOVERNOR_SERVICE));
+    // Enable and start all selected-by-default services.
+    for svc in [OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE] {
+        systemctl_user(&["enable", svc])?;
+        actions.push(format!("  ✓ Enabled {}", svc));
+    }
 
-    systemctl_user(&["enable", COLLECTOR_SERVICE])?;
-    actions.push(format!("  ✓ Enabled {}", COLLECTOR_SERVICE));
-
-    // Start both services
-    systemctl_user(&["start", GOVERNOR_SERVICE])?;
-    actions.push(format!("  ✓ Started {}", GOVERNOR_SERVICE));
-
-    systemctl_user(&["start", COLLECTOR_SERVICE])?;
-    actions.push(format!("  ✓ Started {}", COLLECTOR_SERVICE));
+    for svc in [OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE] {
+        systemctl_user(&["start", svc])?;
+        actions.push(format!("  ✓ Started {}", svc));
+    }
 
     println!("Claude Governor services enabled and started (systemd)");
     println!("======================================================\n");
@@ -1528,20 +1606,21 @@ fn run_enable_command(force: bool) -> Result<()> {
         println!("{}", action);
     }
     println!("\nView logs:");
-    println!("  journalctl --user -u {} -f", GOVERNOR_SERVICE);
+    println!("  journalctl --user -u {} -f", OBSERVE_SERVICE);
+    println!("  journalctl --user -u {} -f", ACT_SERVICE);
     println!("  journalctl --user -u {} -f", COLLECTOR_SERVICE);
 
     Ok(())
 }
 
-fn run_disable_command(purge: bool) -> Result<()> {
+fn run_disable_command(service: &str, purge: bool) -> Result<()> {
     let config = GovernorConfig::load()?;
     let mode = resolve_daemon_mode(&config);
 
     if mode == "tmux" || mode == "none" {
         // Kill tmux sessions if they exist
         let mut actions = Vec::new();
-        for session in [GOVERNOR_SESSION, COLLECTOR_SESSION] {
+        for session in resolve_tmux_sessions(service) {
             if tmux_session_exists(session) {
                 tmux_kill_session(session)?;
                 actions.push(format!("  ✓ Killed tmux session {}", session));
@@ -1563,18 +1642,20 @@ fn run_disable_command(purge: bool) -> Result<()> {
 
     let mut actions = Vec::new();
 
-    // Stop both services (ignore errors if not running)
-    for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
-        if systemctl_user(&["is-active", svc]).is_ok() {
-            systemctl_user(&["stop", svc])?;
+    let services = resolve_service_names(service);
+
+    // Stop selected services (ignore errors if not running)
+    for svc in &services {
+        if systemctl_user(&["is-active", *svc]).is_ok() {
+            systemctl_user(&["stop", *svc])?;
             actions.push(format!("  ✓ Stopped {}", svc));
         }
     }
 
-    // Disable both services
-    for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
-        if systemctl_user(&["is-enabled", svc]).is_ok() {
-            systemctl_user(&["disable", svc])?;
+    // Disable selected services
+    for svc in &services {
+        if systemctl_user(&["is-enabled", *svc]).is_ok() {
+            systemctl_user(&["disable", *svc])?;
             actions.push(format!("  ✓ Disabled {}", svc));
         }
     }
@@ -1583,8 +1664,8 @@ fn run_disable_command(purge: bool) -> Result<()> {
     if purge {
         let user_dir = systemd_user_dir();
         if let Some(dir) = user_dir {
-            for svc in [GOVERNOR_SERVICE, COLLECTOR_SERVICE] {
-                let path = dir.join(svc);
+            for svc in &services {
+                let path = dir.join(*svc);
                 if path.exists() {
                     fs::remove_file(&path)
                         .with_context(|| format!("Failed to remove {}", path.display()))?;
@@ -1620,7 +1701,8 @@ fn run_start_command(service: &str) -> Result<()> {
         let sessions = resolve_tmux_sessions(service);
         for session in &sessions {
             let cmd = match *session {
-                GOVERNOR_SESSION => "cgov _daemon",
+                OBSERVE_SESSION => "cgov _observe",
+                ACT_SESSION => "cgov _act",
                 COLLECTOR_SESSION => "cgov _token-collector",
                 _ => unreachable!(),
             };
@@ -1690,7 +1772,8 @@ fn run_restart_command(service: &str) -> Result<()> {
                 tmux_kill_session(session)?;
             }
             let cmd = match *session {
-                GOVERNOR_SESSION => "cgov _daemon",
+                OBSERVE_SESSION => "cgov _observe",
+                ACT_SESSION => "cgov _act",
                 COLLECTOR_SESSION => "cgov _token-collector",
                 _ => unreachable!(),
             };
@@ -1727,7 +1810,7 @@ fn run_internal_token_collector_command(interval: u64) -> Result<()> {
     collector::run_daemon(interval)
 }
 
-fn run_internal_observe_command() -> Result<()> {
+fn run_internal_observe_command(interval: Option<u64>) -> Result<()> {
     let config = GovernorConfig::load()?;
     let state_path = default_state_path();
 
@@ -1735,31 +1818,45 @@ fn run_internal_observe_command() -> Result<()> {
     let promo_path = default_promotions_path();
     let promotions = schedule::load_promotions(&promo_path);
 
-    // Run the observe cycle (poll, forecast, calibrate, write state)
-    let output = governor::run_observe(
+    // Run the observe half continuously. It never scales workers or fires alerts.
+    governor::run_observe_daemon(
         &state_path,
+        interval.unwrap_or(config.daemon.loop_interval_secs),
         &config.alerts,
         &config.agents,
+        &promotions,
+        &config,
+    )?;
+
+    Ok(())
+}
+
+fn run_internal_act_command(
+    dry_run: bool,
+    interval: Option<u64>,
+    hysteresis: Option<f64>,
+    ceiling: Option<f64>,
+) -> Result<()> {
+    let config = GovernorConfig::load()?;
+    let daemon = &config.daemon;
+    let promotions = schedule::load_promotions(&default_promotions_path());
+
+    governor::run_act_daemon(
+        &default_state_path(),
+        dry_run,
+        interval.unwrap_or(daemon.loop_interval_secs),
+        hysteresis.unwrap_or(daemon.hysteresis_band),
+        daemon.max_scale_up_per_cycle,
+        daemon.max_scale_down_per_cycle,
+        ceiling.unwrap_or(daemon.target_ceiling),
+        &config.alerts,
+        &config.agents,
+        daemon.pre_scale_minutes,
         &promotions,
         &config.composite_risk,
         &config.cone_scaling,
         &config,
     )?;
-
-    // Print observation results
-    println!("Observation Cycle Results");
-    println!("========================");
-    println!("Timestamp: {}", output.timestamp);
-    println!("Status: {}", if output.success { "✓ SUCCESS" } else { "✗ FAILED" });
-    println!("Message: {}", output.message);
-    println!();
-    println!("Window Summaries:");
-    for window in &output.windows {
-        println!(
-            "  {}: {:.1}% utilization, {:.1} hours remaining",
-            window.name, window.utilization, window.remaining_hours
-        );
-    }
 
     Ok(())
 }
@@ -1856,11 +1953,15 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
                 })?;
             }
 
-            // Install both unit files (governor + token-collector)
+            // Install both governor halves and the independent token collector.
             for (name, content) in [
                 (
-                    GOVERNOR_SERVICE,
-                    include_str!("../config/claude-governor.service"),
+                    OBSERVE_SERVICE,
+                    include_str!("../config/claude-governor-observe.service"),
+                ),
+                (
+                    ACT_SERVICE,
+                    include_str!("../config/claude-governor-act.service"),
                 ),
                 (
                     COLLECTOR_SERVICE,
@@ -1946,7 +2047,8 @@ fn run_init_command(force: bool, no_systemd: bool) -> Result<()> {
     println!("  3. View forecasts:     cgov forecast");
     if systemd_installed {
         println!("  4. Enable services:    cgov enable");
-        println!("  5. View logs:          journalctl --user -u claude-governor -f");
+        println!("  5. View observe logs:  journalctl --user -u claude-governor-observe -f");
+        println!("     View act logs:      journalctl --user -u claude-governor-act -f");
     } else {
         println!("  4. Run daemon:         cgov daemon");
     }
@@ -2468,32 +2570,41 @@ mod tests {
 
     #[test]
     fn test_remove_legacy_governor_units_deletes_stale_unit() {
-        // An install from before the unit names were consolidated leaves cgov.service
-        // sitting next to the canonical unit. Enabling it by name gives the operator
-        // `cgov daemon` with Restart=on-failure and no dependency on the collector,
-        // so install/enable must delete it rather than leave both as valid choices.
+        // An install from before ADR-001 leaves the combined daemon units next to
+        // the split units. Install/enable must remove those stale entry points.
         let dir = tempfile::tempdir().expect("tempdir");
         let legacy = dir.path().join("cgov.service");
-        let canonical = dir.path().join(GOVERNOR_SERVICE);
+        let old_combined = dir.path().join("claude-governor.service");
+        let observe = dir.path().join(OBSERVE_SERVICE);
+        let act = dir.path().join(ACT_SERVICE);
         let collector = dir.path().join(COLLECTOR_SERVICE);
         fs::write(&legacy, "[Service]\nExecStart=cgov daemon\n").expect("write legacy");
-        fs::write(&canonical, "[Service]\nExecStart=cgov _daemon\n").expect("write canonical");
+        fs::write(&old_combined, "[Service]\nExecStart=cgov _daemon\n")
+            .expect("write old combined");
+        fs::write(&observe, "[Service]\nExecStart=cgov _observe\n").expect("write observe");
+        fs::write(&act, "[Service]\nExecStart=cgov _act\n").expect("write act");
         fs::write(&collector, "[Service]\n").expect("write collector");
 
         let actions = remove_legacy_governor_units(dir.path());
 
         assert!(!legacy.exists(), "stale cgov.service should be removed");
-        assert!(canonical.exists(), "canonical governor unit must survive");
+        assert!(
+            !old_combined.exists(),
+            "old combined unit should be removed"
+        );
+        assert!(observe.exists(), "observe unit must survive");
+        assert!(act.exists(), "act unit must survive");
         assert!(collector.exists(), "collector unit must survive");
         assert_eq!(
             actions.len(),
-            1,
-            "one removal should be reported: {actions:?}"
+            2,
+            "two old units should be removed: {actions:?}"
         );
         assert!(
-            actions[0].contains("cgov.service") && actions[0].contains(GOVERNOR_SERVICE),
-            "action should name the removed unit and its replacement: {}",
-            actions[0]
+            actions
+                .iter()
+                .any(|action| action.contains("cgov.service") && action.contains(OBSERVE_SERVICE)),
+            "action should name the removed unit and its replacement: {actions:?}"
         );
     }
 
@@ -2501,10 +2612,12 @@ mod tests {
     fn test_remove_legacy_governor_units_is_silent_when_clean() {
         // A fresh install has nothing to clean up and must not report phantom actions.
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join(GOVERNOR_SERVICE), "[Service]\n").expect("write canonical");
+        fs::write(dir.path().join(OBSERVE_SERVICE), "[Service]\n").expect("write observe");
+        fs::write(dir.path().join(ACT_SERVICE), "[Service]\n").expect("write act");
 
         assert!(remove_legacy_governor_units(dir.path()).is_empty());
-        assert!(dir.path().join(GOVERNOR_SERVICE).exists());
+        assert!(dir.path().join(OBSERVE_SERVICE).exists());
+        assert!(dir.path().join(ACT_SERVICE).exists());
     }
 
     #[test]
@@ -2512,7 +2625,8 @@ mod tests {
         // Guard against someone adding a name here that would make install/enable
         // delete the units it just wrote.
         for svc in LEGACY_GOVERNOR_SERVICES {
-            assert_ne!(*svc, GOVERNOR_SERVICE);
+            assert_ne!(*svc, OBSERVE_SERVICE);
+            assert_ne!(*svc, ACT_SERVICE);
             assert_ne!(*svc, COLLECTOR_SERVICE);
         }
     }

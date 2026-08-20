@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Window name keys for consecutive-absent tracking
@@ -1177,7 +1178,12 @@ pub fn save_state(state: &GovernorState, path: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("json.tmp");
+    // Observe and act are separate processes and may finish a cycle at the
+    // same time. A shared `<state>.tmp` lets their writes splice together
+    // before either rename; a process-specific temporary path keeps each
+    // atomic rename whole. The merge callers below additionally serialize
+    // their load/merge/save transaction with `with_state_lock`.
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
 
     {
         let file = fs::File::create(&tmp_path)?;
@@ -1188,6 +1194,208 @@ pub fn save_state(state: &GovernorState, path: &Path) -> Result<()> {
     fs::rename(&tmp_path, path)?;
 
     Ok(())
+}
+
+/// Serialize a state load/merge/save transaction across the observe and act
+/// processes. `save_state` remains usable on its own for callers that only
+/// need a single atomic snapshot; the split daemons use this helper whenever
+/// they merge one ownership subtree onto the other process's latest state.
+pub fn with_state_lock<T, F>(path: &Path, update: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let lock_path = path.with_extension("json.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let started = Instant::now();
+    let lock = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                // Record the owner so a hard-killed daemon cannot strand both
+                // loops behind an otherwise indistinguishable lock file.
+                if let Err(error) = writeln!(file, "{}", std::process::id()) {
+                    drop(file);
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(StateError::Io(error));
+                }
+                if let Err(error) = file.flush() {
+                    drop(file);
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(StateError::Io(error));
+                }
+                break file;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if state_lock_is_stale(&lock_path) {
+                    // Another process may remove the lock between the check
+                    // and this call; either outcome simply returns us to the
+                    // create_new loop.
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                if started.elapsed() >= Duration::from_secs(10) {
+                    return Err(StateError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("timed out waiting for state lock {}", lock_path.display()),
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(StateError::Io(error)),
+        }
+    };
+
+    // Keep the file descriptor alive for the complete transaction. The lock
+    // is represented by create_new rather than file contents so no secret or
+    // state data is ever written to the lock path.
+    let result = update();
+    drop(lock);
+    let remove_result = fs::remove_file(&lock_path);
+
+    match (result, remove_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(StateError::Io(error)),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+/// Return whether a state lock's recorded owner is no longer alive.
+///
+/// The lock is intentionally a tiny PID file rather than state data. Linux
+/// provides an authoritative process-presence check through `/proc`; on other
+/// platforms, an old lock with no readable owner is conservatively considered
+/// stale after one minute, longer than a normal merge transaction.
+fn state_lock_is_stale(path: &Path) -> bool {
+    let age = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
+
+    let owner = fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok());
+
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = owner {
+        return !Path::new("/proc").join(pid.to_string()).exists();
+    }
+
+    owner.is_none() && age.is_some_and(|duration| duration >= Duration::from_secs(60))
+}
+
+// ---------------------------------------------------------------------------
+// ADR-001 state ownership split
+// ---------------------------------------------------------------------------
+
+/// Emergency-brake safe-mode trigger string (mirrors the value the governor's
+/// emergency-brake path writes). Duplicated here so the merge helpers in this
+/// module don't need to import governor internals.
+pub const EMERGENCY_BRAKE_TRIGGER: &str = "emergency_brake";
+
+/// Copy the observe-owned subtrees from `src` onto `dst` (ADR-001).
+///
+/// `dst` is the freshest on-disk state; `src` is the observe cycle's finished
+/// in-memory copy; `safe_mode_at_load` is what `src` was loaded from at the
+/// start of the cycle (see below). Everything the observe process owns is
+/// copied wholesale. Everything the act process owns (`workers.*.target`,
+/// `alert_cooldown`, `open_alert_beads`, `alerts`, `alert_fp_telemetry`) is
+/// left at `dst`'s value so a concurrent `_act` write is never reverted.
+///
+/// `workers` is merged per-key: observe owns `current`/`min`/`max` (it performs
+/// the census), act owns `target`.
+///
+/// `safe_mode` is observe-owned (calibration-driven transitions, and clearing a
+/// brake once utilization drops) with one exception: a brake that `_act`
+/// engaged *while this observe cycle was in flight* — active on disk with the
+/// emergency-brake trigger, but not active in `safe_mode_at_load` — must
+/// survive this save. `run_act_cycle` is the only other writer of safe_mode,
+/// so this rule cannot mask a legitimate observe transition.
+pub fn merge_observe_owned(
+    dst: &mut GovernorState,
+    src: &GovernorState,
+    safe_mode_at_load: &SafeModeState,
+) {
+    dst.usage = src.usage.clone();
+    dst.last_fleet_aggregate = src.last_fleet_aggregate.clone();
+    dst.capacity_forecast = src.capacity_forecast.clone();
+    dst.schedule = src.schedule.clone();
+    dst.burn_rate = src.burn_rate.clone();
+
+    let brake_engaged_since_load = dst.safe_mode.active
+        && dst.safe_mode.trigger.as_deref() == Some(EMERGENCY_BRAKE_TRIGGER)
+        && !(safe_mode_at_load.active
+            && safe_mode_at_load.trigger.as_deref() == Some(EMERGENCY_BRAKE_TRIGGER));
+    if !brake_engaged_since_load {
+        dst.safe_mode = src.safe_mode.clone();
+    }
+
+    for (name, src_ws) in &src.workers {
+        let dst_ws = dst
+            .workers
+            .entry(name.clone())
+            .or_insert_with(|| src_ws.clone());
+        dst_ws.current = src_ws.current;
+        dst_ws.min = src_ws.min;
+        dst_ws.max = src_ws.max;
+    }
+
+    dst.token_refresh_failing = src.token_refresh_failing;
+    dst.low_cache_eff_consecutive = src.low_cache_eff_consecutive;
+    dst.pending_predictions = src.pending_predictions.clone();
+    dst.previous_api_snapshot = src.previous_api_snapshot.clone();
+    dst.current_api_snapshot = src.current_api_snapshot.clone();
+    dst.p5h_delta = src.p5h_delta;
+    dst.p7d_delta = src.p7d_delta;
+    dst.p7ds_delta = src.p7ds_delta;
+    dst.baseline_burn_rates = src.baseline_burn_rates.clone();
+    dst.consecutive_absent_polls = src.consecutive_absent_polls.clone();
+    dst.updated_at = src.updated_at;
+}
+
+/// Copy the act-owned subtrees from `src` onto `dst` (ADR-001).
+///
+/// `dst` is the freshest on-disk state; `src` is the act cycle's finished
+/// in-memory copy; `safe_mode_at_load` is what `src` was loaded from at the
+/// start of the cycle. Act owns the worker targets, its own census of worker
+/// counts (taken moments before the write, so at least as fresh as any
+/// concurrent observe census), and the whole alert-episode bookkeeping
+/// (`alert_cooldown`, `open_alert_beads`, `alert_fp_telemetry`, `alerts`).
+///
+/// `safe_mode` is written only when this cycle engaged the emergency brake
+/// (`src` is braking and `safe_mode_at_load` was not) — the one deliberate
+/// exception to safe_mode being observe-owned, because the brake must leave a
+/// durable mark even though it is an action. Observe owns releasing it once
+/// utilization drops below the threshold. Every other safe_mode transition on
+/// disk survives untouched.
+///
+/// `updated_at` is deliberately NOT copied: it tracks when the observe
+/// pipeline last ran (what `cgov doctor`'s state-freshness checks measure),
+/// and an act write must not make stale observations look fresh.
+pub fn merge_act_owned(
+    dst: &mut GovernorState,
+    src: &GovernorState,
+    safe_mode_at_load: &SafeModeState,
+) {
+    dst.workers = src.workers.clone();
+    dst.alert_cooldown = src.alert_cooldown.clone();
+    dst.open_alert_beads = src.open_alert_beads.clone();
+    dst.alert_fp_telemetry = src.alert_fp_telemetry.clone();
+    dst.alerts = src.alerts.clone();
+
+    let brake_engaged_this_cycle = src.safe_mode.active
+        && src.safe_mode.trigger.as_deref() == Some(EMERGENCY_BRAKE_TRIGGER)
+        && !(safe_mode_at_load.active
+            && safe_mode_at_load.trigger.as_deref() == Some(EMERGENCY_BRAKE_TRIGGER));
+    if brake_engaged_this_cycle {
+        dst.safe_mode = src.safe_mode.clone();
+    }
 }
 
 /// Save current state as the previous state (before an update)
@@ -1201,7 +1409,7 @@ pub fn save_previous_state(state: &GovernorState, path: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = prev_path.with_extension("prev.json.tmp");
+    let tmp_path = prev_path.with_extension(format!("json.tmp.{}", std::process::id()));
 
     {
         let file = fs::File::create(&tmp_path)?;
@@ -2765,5 +2973,102 @@ mod null_roundtrip_test {
 
         // Empty string (poller populated nothing meaningful) -> fallback, not "".
         assert_eq!(weekly_scoped_display_label(Some("")), "weekly_scoped");
+    }
+}
+
+#[cfg(test)]
+mod ownership_merge_test {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    #[test]
+    fn observe_merge_preserves_act_owned_fields() {
+        let mut disk = GovernorState::default();
+        disk.updated_at = Utc::now() - ChronoDuration::hours(1);
+        disk.workers.insert(
+            "agent".to_string(),
+            WorkerState {
+                current: 1,
+                target: 7,
+                min: 0,
+                max: 8,
+            },
+        );
+        disk.alert_cooldown
+            .record_fired("cutoff", Utc::now() - ChronoDuration::minutes(2));
+        disk.alerts.push(serde_json::json!({"source": "act"}));
+        disk.alert_fp_telemetry.record("cutoff", true);
+
+        let mut observed = disk.clone();
+        observed.updated_at = Utc::now();
+        observed.usage.five_hour_pct = 42.0;
+        observed.capacity_forecast.binding_window = "five_hour".to_string();
+        observed.workers.get_mut("agent").unwrap().current = 3;
+        observed.workers.get_mut("agent").unwrap().target = 99;
+        observed.alert_cooldown = AlertCooldown::default();
+        observed.alerts.clear();
+        observed.alert_fp_telemetry = AlertFpTelemetry::default();
+
+        merge_observe_owned(&mut disk, &observed, &SafeModeState::default());
+
+        assert_eq!(disk.usage.five_hour_pct, 42.0);
+        assert_eq!(disk.capacity_forecast.binding_window, "five_hour");
+        assert_eq!(disk.workers["agent"].current, 3);
+        assert_eq!(disk.workers["agent"].target, 7);
+        assert!(disk.alert_cooldown.get_last_fired("cutoff").is_some());
+        assert_eq!(disk.alerts.len(), 1);
+        assert_eq!(disk.alert_fp_telemetry.total_recorded, 1);
+        assert_eq!(disk.updated_at, observed.updated_at);
+    }
+
+    #[test]
+    fn act_merge_preserves_observe_owned_fields_and_freshness() {
+        let mut disk = GovernorState::default();
+        disk.updated_at = Utc::now();
+        disk.usage.five_hour_pct = 42.0;
+        disk.capacity_forecast.binding_window = "five_hour".to_string();
+        disk.workers
+            .insert("agent".to_string(), WorkerState::default());
+
+        let mut acting = disk.clone();
+        acting.updated_at = Utc::now() + ChronoDuration::hours(1);
+        acting.workers.get_mut("agent").unwrap().current = 4;
+        acting.workers.get_mut("agent").unwrap().target = 5;
+        acting.alerts.push(serde_json::json!({"source": "act"}));
+
+        let observed_updated_at = disk.updated_at;
+        merge_act_owned(&mut disk, &acting, &SafeModeState::default());
+
+        assert_eq!(disk.usage.five_hour_pct, 42.0);
+        assert_eq!(disk.capacity_forecast.binding_window, "five_hour");
+        assert_eq!(disk.workers["agent"].current, 4);
+        assert_eq!(disk.workers["agent"].target, 5);
+        assert_eq!(disk.alerts.len(), 1);
+        assert_eq!(disk.updated_at, observed_updated_at);
+    }
+
+    #[test]
+    fn emergency_brake_survives_a_concurrent_observe_save() {
+        let mut disk = GovernorState::default();
+        let safe_mode_at_load = SafeModeState::default();
+        let mut acting = disk.clone();
+        acting.safe_mode.active = true;
+        acting.safe_mode.trigger = Some(EMERGENCY_BRAKE_TRIGGER.to_string());
+        acting.safe_mode.entered_at = Some(Utc::now());
+
+        merge_act_owned(&mut disk, &acting, &safe_mode_at_load);
+        assert!(disk.safe_mode.active);
+        assert_eq!(
+            disk.safe_mode.trigger.as_deref(),
+            Some(EMERGENCY_BRAKE_TRIGGER)
+        );
+
+        let observed = GovernorState::default();
+        merge_observe_owned(&mut disk, &observed, &safe_mode_at_load);
+        assert!(disk.safe_mode.active);
+        assert_eq!(
+            disk.safe_mode.trigger.as_deref(),
+            Some(EMERGENCY_BRAKE_TRIGGER)
+        );
     }
 }
