@@ -10,14 +10,14 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::alerts::{
-    check_alert_conditions, check_low_cache_efficiency, process_alert_episodes,
-    AlertType, SprintTrigger,
+    check_alert_conditions, check_low_cache_efficiency, process_alert_episodes, AlertType,
+    SprintTrigger,
 };
 use crate::burn_rate::{
     compute_composite_safe_workers, effective_multiplier, generate_window_forecast,
@@ -155,7 +155,10 @@ pub enum SkipReason {
     IntervalTooShort { elapsed_seconds: i64 },
 
     /// Worker count changed mid-interval, violating the concurrent session assumption
-    WorkerCountChanged { workers_start: u32, workers_end: u32 },
+    WorkerCountChanged {
+        workers_start: u32,
+        workers_end: u32,
+    },
 
     /// Interval spans a window reset (utilization dropped significantly)
     WindowReset {
@@ -172,10 +175,20 @@ impl SkipReason {
             SkipReason::IntervalTooShort { elapsed_seconds } => {
                 format!("interval too short ({}s < 120s)", elapsed_seconds)
             }
-            SkipReason::WorkerCountChanged { workers_start, workers_end } => {
-                format!("worker count changed mid-interval ({} -> {})", workers_start, workers_end)
+            SkipReason::WorkerCountChanged {
+                workers_start,
+                workers_end,
+            } => {
+                format!(
+                    "worker count changed mid-interval ({} -> {})",
+                    workers_start, workers_end
+                )
             }
-            SkipReason::WindowReset { five_hour_reset, seven_day_reset, weekly_scoped_reset } => {
+            SkipReason::WindowReset {
+                five_hour_reset,
+                seven_day_reset,
+                weekly_scoped_reset,
+            } => {
                 let resets: Vec<&str> = [
                     (*five_hour_reset).then_some("5h"),
                     (*seven_day_reset).then_some("7d"),
@@ -288,10 +301,14 @@ pub fn check_worker_count_stable(workers_start: u32, workers_end: u32) -> Option
 /// // All increased or stable - should proceed
 /// assert!(check_window_reset(&old_pct, &new_pct2).is_none());
 /// ```
-pub fn check_window_reset(old_pct: &db::WindowPctSnapshot, new_pct: &db::WindowPctSnapshot) -> Option<SkipReason> {
+pub fn check_window_reset(
+    old_pct: &db::WindowPctSnapshot,
+    new_pct: &db::WindowPctSnapshot,
+) -> Option<SkipReason> {
     let five_hour_reset = new_pct.five_hour < old_pct.five_hour - WINDOW_RESET_THRESHOLD_PCT;
     let seven_day_reset = new_pct.seven_day < old_pct.seven_day - WINDOW_RESET_THRESHOLD_PCT;
-    let weekly_scoped_reset = new_pct.weekly_scoped < old_pct.weekly_scoped - WINDOW_RESET_THRESHOLD_PCT;
+    let weekly_scoped_reset =
+        new_pct.weekly_scoped < old_pct.weekly_scoped - WINDOW_RESET_THRESHOLD_PCT;
 
     if five_hour_reset || seven_day_reset || weekly_scoped_reset {
         return Some(SkipReason::WindowReset {
@@ -4259,8 +4276,14 @@ mod window_delta_tests {
         // A reset only ever releases capacity, so every window moves down.
         // Asserted separately from magnitude: a sign flip is the failure that
         // would make the governor scale the wrong way.
-        assert!(d5h < 0.0, "5h delta after a reset must be negative, got {d5h}");
-        assert!(d7d < 0.0, "7d delta after a reset must be negative, got {d7d}");
+        assert!(
+            d5h < 0.0,
+            "5h delta after a reset must be negative, got {d5h}"
+        );
+        assert!(
+            d7d < 0.0,
+            "7d delta after a reset must be negative, got {d7d}"
+        );
         assert!(
             d7ds < 0.0,
             "7ds delta after a reset must be negative, got {d7ds}"
@@ -4283,7 +4306,10 @@ mod window_delta_tests {
         let (prev, curr) = crate::snapshot_fixtures::snapshot_pair_weekly_scoped_first_absence();
 
         // Fixture premise: the window really does go from present to absent.
-        assert!(prev.weekly_scoped_pct > 0.0, "previous 7ds should be present");
+        assert!(
+            prev.weekly_scoped_pct > 0.0,
+            "previous 7ds should be present"
+        );
         assert_eq!(curr.weekly_scoped_pct, 0.0, "current 7ds should be absent");
 
         let (d5h, d7d, d7ds) = window_deltas_from_snapshots(Some(&prev), Some(&curr));
@@ -4391,7 +4417,10 @@ mod window_delta_tests {
             line.contains("current: 5h=100.00%, 7d=100.00%, 7ds=100.00%"),
             "saturated reading should render in full: {line}"
         );
-        assert!(!line.contains("Δ"), "no-baseline line must not claim a delta");
+        assert!(
+            !line.contains("Δ"),
+            "no-baseline line must not claim a delta"
+        );
         assert!(!line.contains("Δt"), "no-baseline line must not claim a Δt");
     }
 
@@ -4441,7 +4470,10 @@ mod window_delta_tests {
             line.contains("window deltas unavailable this poll"),
             "line must say deltas are unavailable: {line}"
         );
-        assert!(!line.contains("Δ"), "no-baseline line must not claim a delta");
+        assert!(
+            !line.contains("Δ"),
+            "no-baseline line must not claim a delta"
+        );
     }
 }
 
@@ -5044,12 +5076,59 @@ fn is_true_positive_alert(alert_type: &AlertType, state: &state::GovernorState) 
 // Governor daemon loop
 // ---------------------------------------------------------------------------
 
-/// Run one governor cycle: poll -> schedule -> burn_rate -> target -> scale -> alert -> write_state
+/// Host filesystem locations a governor cycle touches outside its state file.
+///
+/// `Default` is the real `~/.needle` / `~/.claude` layout. A cycle reads the
+/// collector's SQLite mirror and the calibrator's prediction-accuracy log — and
+/// writes to both (newly scored predictions, collector history/cursor/SQLite
+/// state) — so tests inject [`CyclePaths::under`] to point all of it at a temp
+/// directory instead of the machine's live governor data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CyclePaths {
+    /// Collector layout: session base, JSONL history, SQLite mirror, cursors
+    pub collector: collector::CollectionPaths,
+    /// prediction-accuracy.jsonl — scored for calibration stats, appended on
+    /// window resets
+    pub accuracy: PathBuf,
+}
+
+impl Default for CyclePaths {
+    fn default() -> Self {
+        Self {
+            collector: collector::CollectionPaths::default(),
+            accuracy: calibrator::default_accuracy_path(),
+        }
+    }
+}
+
+impl CyclePaths {
+    /// The host layout rooted at `root` instead of `~`.
+    ///
+    /// Treats `root` as the home directory: collector state lands under
+    /// `root/.needle/state/`, the collector scans `root/.claude/projects`
+    /// (absent → the pass finds nothing and writes nothing), and calibration
+    /// scores land in `root/.needle/state/prediction-accuracy.jsonl`.
+    pub fn under(root: &Path) -> Self {
+        Self {
+            collector: collector::CollectionPaths::under(root),
+            accuracy: root
+                .join(".needle")
+                .join("state")
+                .join("prediction-accuracy.jsonl"),
+        }
+    }
+}
+
+/// Run one governor cycle: poll → collect → forecast → (maybe) scale.
 ///
 /// This is the core loop body executed every `loop_interval` seconds.
+/// `paths` names every host location the cycle reads or writes besides
+/// `state_path`; production passes [`CyclePaths::default`], tests pass a
+/// temp-rooted layout so they cannot disturb (or depend on) live state.
 pub fn run_governor_cycle(
     poller: &mut impl UsagePoller,
     state_path: &Path,
+    paths: &CyclePaths,
     dry_run: bool,
     loop_interval: u64,
     hysteresis_band: f64,
@@ -5225,7 +5304,7 @@ pub fn run_governor_cycle(
     }
 
     // 2. Run token collector pass to gather usage data from JSONL files
-    match collector::run_collection_pass() {
+    match collector::run_collection_pass_at(&paths.collector) {
         Ok(result) => {
             log::info!(
                 "[governor] collector pass: {} lines, {} instances, ${:.4} total",
@@ -5240,7 +5319,7 @@ pub fn run_governor_cycle(
     }
 
     // 3. Read latest fleet record from database and update last_fleet_aggregate
-    let db_path = collector::default_db_path();
+    let db_path = paths.collector.db_path.clone();
     // Snapshot whether collector was offline before this update, so we can detect recovery.
     let collector_was_offline = (now - state.last_fleet_aggregate.t1).num_seconds() > 300;
     if let Ok(conn) = db::open_db(&db_path) {
@@ -5744,7 +5823,7 @@ pub fn run_governor_cycle(
                     );
 
                     // Append score to accuracy log
-                    if let Err(e) = calibrator::append_score(&score) {
+                    if let Err(e) = calibrator::append_score_to_path(&score, &paths.accuracy) {
                         log::warn!(
                             "[governor] failed to append prediction score for {}: {}",
                             window_name,
@@ -5918,7 +5997,7 @@ pub fn run_governor_cycle(
     //
     // This must run before the capacity forecast is built so the effective
     // target ceiling (reduced when safe mode is active) is used in forecasts.
-    if let Ok(scores) = calibrator::read_all_scores() {
+    if let Ok(scores) = calibrator::read_all_scores_from_path(&paths.accuracy) {
         if !scores.is_empty() {
             let cal_stats = calibrator::compute_stats(&scores);
             update_safe_mode_from_calibration(
@@ -6189,7 +6268,7 @@ pub fn run_governor_cycle(
 
     // Empirically validate promotion multiplier from token-history DB.
     // If validation fails (insufficient data or ratio out of range), fall back to 1x.
-    let db_path = collector::default_db_path();
+    let db_path = paths.collector.db_path.clone();
     let promo_validation: PromotionValidationResult = if let Some(promo) = promotions.first() {
         // Only validate if there's an active promotion with offpeak_multiplier > 1.0
         if promo.offpeak_multiplier > 1.0 && schedule::is_promo_active_at(now, promo) {
@@ -6836,7 +6915,10 @@ pub fn run_observe(
     pricing_config: &crate::config::GovernorConfig,
 ) -> anyhow::Result<ObserveOutput> {
     let now = Utc::now();
-    log::info!("[governor] === observe cycle start at {} ===", now.to_rfc3339());
+    log::info!(
+        "[governor] === observe cycle start at {} ===",
+        now.to_rfc3339()
+    );
 
     // Create poller for live usage data
     let credentials_path = pricing_config.credentials_path.clone();
@@ -6851,6 +6933,7 @@ pub fn run_observe(
     run_observe_cycle_internal(
         &mut poller,
         state_path,
+        &CyclePaths::default(),
         alert_config,
         agents,
         promotions,
@@ -6912,6 +6995,7 @@ pub fn run_observe(
 fn run_observe_cycle_internal(
     poller: &mut Poller,
     state_path: &Path,
+    paths: &CyclePaths,
     _alert_config: &AlertConfig,
     agents: &std::collections::HashMap<String, AgentConfig>,
     _promotions: &[Promotion],
@@ -7078,7 +7162,7 @@ fn run_observe_cycle_internal(
     }
 
     // 4. Run token collector pass
-    match collector::run_collection_pass() {
+    match collector::run_collection_pass_at(&paths.collector) {
         Ok(result) => {
             log::info!(
                 "[governor] collector pass: {} lines, {} instances, ${:.4} total",
@@ -7093,7 +7177,7 @@ fn run_observe_cycle_internal(
     }
 
     // 5. Read latest fleet record from database
-    let db_path = collector::default_db_path();
+    let db_path = paths.collector.db_path.clone();
     if let Ok(conn) = db::open_db(&db_path) {
         if let Ok(fleet_records) = db::query_last_fleets(&conn, 1) {
             if let Some(fleet_json) = fleet_records.first() {
@@ -7119,9 +7203,18 @@ fn run_observe_cycle_internal(
                         .get("std-usd-hr")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
-                    let p5h = fleet_json.get("p5h").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p7d = fleet_json.get("p7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p7ds = fleet_json.get("p7ds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p5h = fleet_json
+                        .get("p5h")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p7d = fleet_json
+                        .get("p7d")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let p7ds = fleet_json
+                        .get("p7ds")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
                     let fleet_cache_eff = fleet_json
                         .get("fleet-cache-eff")
                         .and_then(|v| v.as_f64())
@@ -7149,7 +7242,8 @@ fn run_observe_cycle_internal(
 
                     log::debug!(
                         "[governor] fleet aggregate: {} workers, ${:.2}/hr p75",
-                        workers, p75_usd_hr
+                        workers,
+                        p75_usd_hr
                     );
                 }
             }
@@ -7240,7 +7334,8 @@ fn run_observe_cycle_internal(
                     &state.last_fleet_aggregate,
                     &baseline,
                 );
-                let fleet_usd_hr = usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
+                let fleet_usd_hr =
+                    usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
 
                 let samples = state.burn_rate.fleet_pct_ema_samples;
 
@@ -7249,16 +7344,16 @@ fn run_observe_cycle_internal(
                     if samples == 0 {
                         state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
                     } else {
-                        state.burn_rate.fleet_pct_hr_ema.five_hour =
-                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
+                        state.burn_rate.fleet_pct_hr_ema.five_hour = EMA_ALPHA * rate
+                            + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
                     }
                     if fleet_usd_hr > 0.0 {
                         let ratio = fleet_usd_hr / rate;
                         if samples == 0 {
                             state.burn_rate.usd_per_pct_ema_five_hour = ratio;
                         } else {
-                            state.burn_rate.usd_per_pct_ema_five_hour =
-                                EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
+                            state.burn_rate.usd_per_pct_ema_five_hour = EMA_ALPHA * ratio
+                                + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
                         }
                     }
                     state.burn_rate.fleet_pct_ema_samples += 1;
@@ -7269,8 +7364,8 @@ fn run_observe_cycle_internal(
                     if samples == 0 {
                         state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
                     } else {
-                        state.burn_rate.fleet_pct_hr_ema.seven_day =
-                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
+                        state.burn_rate.fleet_pct_hr_ema.seven_day = EMA_ALPHA * rate
+                            + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
                     }
                 }
 
@@ -7279,8 +7374,8 @@ fn run_observe_cycle_internal(
                     if samples == 0 {
                         state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
                     } else {
-                        state.burn_rate.fleet_pct_hr_ema.weekly_scoped =
-                            EMA_ALPHA * rate + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
+                        state.burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate
+                            + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
                     }
                 }
             }
@@ -7300,19 +7395,28 @@ fn run_observe_cycle_internal(
     let mut hours_remaining = std::collections::HashMap::new();
     hours_remaining.insert(
         "five_hour".to_string(),
-        (state.usage.five_hour_resets_at.parse::<DateTime<Utc>>()
+        (state
+            .usage
+            .five_hour_resets_at
+            .parse::<DateTime<Utc>>()
             .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
             .unwrap_or(0.0)),
     );
     hours_remaining.insert(
         "seven_day".to_string(),
-        (state.usage.seven_day_resets_at.parse::<DateTime<Utc>>()
+        (state
+            .usage
+            .seven_day_resets_at
+            .parse::<DateTime<Utc>>()
             .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
             .unwrap_or(0.0)),
     );
     hours_remaining.insert(
         "weekly_scoped".to_string(),
-        (state.usage.sonnet_resets_at.parse::<DateTime<Utc>>()
+        (state
+            .usage
+            .sonnet_resets_at
+            .parse::<DateTime<Utc>>()
             .map(|rt| (rt - now).num_seconds().max(0) as f64 / 3600.0)
             .unwrap_or(0.0)),
     );
@@ -7325,9 +7429,18 @@ fn run_observe_cycle_internal(
 
     // Build fleet_pct_per_hour map from burn_rate EMA
     let mut fleet_pct_per_hour = std::collections::HashMap::new();
-    fleet_pct_per_hour.insert("five_hour".to_string(), state.burn_rate.fleet_pct_hr_ema.five_hour);
-    fleet_pct_per_hour.insert("seven_day".to_string(), state.burn_rate.fleet_pct_hr_ema.seven_day);
-    fleet_pct_per_hour.insert("weekly_scoped".to_string(), state.burn_rate.fleet_pct_hr_ema.weekly_scoped);
+    fleet_pct_per_hour.insert(
+        "five_hour".to_string(),
+        state.burn_rate.fleet_pct_hr_ema.five_hour,
+    );
+    fleet_pct_per_hour.insert(
+        "seven_day".to_string(),
+        state.burn_rate.fleet_pct_hr_ema.seven_day,
+    );
+    fleet_pct_per_hour.insert(
+        "weekly_scoped".to_string(),
+        state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+    );
 
     // Build capacity forecast for each window using burn_rate module
     let mut five_hour_forecast = state::WindowForecast::default();
@@ -7503,7 +7616,7 @@ fn run_observe_cycle_internal(
                         score.error,
                     );
 
-                    if let Err(e) = calibrator::append_score(&score) {
+                    if let Err(e) = calibrator::append_score_to_path(&score, &paths.accuracy) {
                         log::warn!("[governor] failed to append prediction score: {}", e);
                     }
 
@@ -7568,10 +7681,15 @@ pub fn run_daemon(
         }
     };
 
+    // Host filesystem layout every cycle reads and writes (collector state,
+    // calibration accuracy log) — resolved once, shared by all cycles.
+    let cycle_paths = CyclePaths::default();
+
     // Initial cycle
     if let Err(e) = run_governor_cycle(
         &mut poller,
         state_path,
+        &cycle_paths,
         dry_run,
         loop_interval,
         hysteresis_band,
@@ -7605,6 +7723,7 @@ pub fn run_daemon(
         if let Err(e) = run_governor_cycle(
             &mut poller,
             state_path,
+            &cycle_paths,
             dry_run,
             loop_interval,
             hysteresis_band,
@@ -10789,10 +10908,14 @@ mod mock_poller_tests {
         let agents: HashMap<String, crate::config::AgentConfig> = HashMap::new();
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
-        // 5. Run the governor cycle with dry_run=true
+        // 5. Run the governor cycle with dry_run=true, with every `~`-rooted
+        //    path (collector state, calibration log) under the temp dir so the
+        //    cycle cannot touch the host's live `~/.needle` data.
+        let cycle_paths = CyclePaths::under(temp_dir.path());
         let result = run_governor_cycle(
             &mut poller,
             &state_path,
+            &cycle_paths,
             true, // dry_run = true
             60,   // loop_interval
             2.0,  // hysteresis_band
@@ -10870,10 +10993,14 @@ mod mock_poller_tests {
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
         // Runs one cycle in dry-run mode and hands back the persisted state.
+        // Cycle paths root in the temp dir so the four cycles below never
+        // touch the host's `~/.needle` state.
+        let cycle_paths = CyclePaths::under(temp_dir.path());
         let run_cycle = |poller: &mut MockPoller| -> state::GovernorState {
             run_governor_cycle(
                 poller,
                 &state_path,
+                &cycle_paths,
                 true, // dry_run — no agent scaling side effects
                 60,   // loop_interval
                 2.0,  // hysteresis_band
@@ -10929,8 +11056,12 @@ mod mock_poller_tests {
             "previous snapshot = cycle 1's 7ds"
         );
 
-        let d5h = after_second.p5h_delta.expect("second poll: 5h delta computed");
-        let d7d = after_second.p7d_delta.expect("second poll: 7d delta computed");
+        let d5h = after_second
+            .p5h_delta
+            .expect("second poll: 5h delta computed");
+        let d7d = after_second
+            .p7d_delta
+            .expect("second poll: 7d delta computed");
         let d7ds = after_second
             .p7ds_delta
             .expect("second poll: 7ds delta computed");
@@ -11042,17 +11173,20 @@ mod mock_poller_tests {
         // 6. Create empty promotions list
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
-        // 7. Run the governor cycle with dry_run=true (first poll with None prev_snapshot)
+        // 7. Run the governor cycle with dry_run=true (first poll with None prev_snapshot),
+        //    with every `~`-rooted cycle path under the temp dir.
         //
         // This is the critical test: run_governor_cycle should handle the None prev_snapshot
         // gracefully without panicking. On first poll:
         // - previous_api_snapshot is None (no prior data)
         // - After poll, current_api_snapshot becomes Some (first successful poll data)
         // - Delta computation should yield Some(0.0) for all windows
+        let cycle_paths = CyclePaths::under(temp_dir.path());
         let result = if let Ok(mut poller) = poller_result {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
+                &cycle_paths,
                 true, // dry_run = true
                 60,   // loop_interval
                 2.0,  // hysteresis_band
@@ -11073,6 +11207,7 @@ mod mock_poller_tests {
             run_governor_cycle(
                 &mut poller,
                 &state_path,
+                &cycle_paths,
                 true, // dry_run = true
                 60,   // loop_interval
                 2.0,  // hysteresis_band
@@ -11174,6 +11309,10 @@ mod mock_poller_tests {
         // 5. Create empty promotions list
         let promotions: Vec<crate::schedule::Promotion> = Vec::new();
 
+        // Both cycles below share temp-rooted paths so the test cannot touch
+        // the host's `~/.needle` state.
+        let cycle_paths = CyclePaths::under(temp_dir.path());
+
         // ========================================================================
         // FIRST POLL: Verify None prev_snapshot is handled gracefully
         // ========================================================================
@@ -11195,6 +11334,7 @@ mod mock_poller_tests {
         let first_poll_result = run_governor_cycle(
             &mut poller1,
             &state_path,
+            &cycle_paths,
             true, // dry_run = true
             60,   // loop_interval
             2.0,  // hysteresis_band
@@ -11249,6 +11389,7 @@ mod mock_poller_tests {
         let second_poll_result = run_governor_cycle(
             &mut poller2,
             &state_path,
+            &cycle_paths,
             true, // dry_run = true
             60,   // loop_interval
             2.0,  // hysteresis_band
@@ -11782,10 +11923,23 @@ mod mock_poller_tests {
 
     /// Run one governor cycle in dry-run mode with the smoke fixtures.
     ///
-    /// Keeps the 15-argument call in one place so each test below reads as
+    /// Keeps the 16-argument call in one place so each test below reads as
     /// "arrange state → run cycle → assert on persisted state".
+    ///
+    /// The cycle's `~`-rooted paths (collector state, calibration accuracy
+    /// log) are rooted at `state_path`'s directory — every caller puts the
+    /// state file in its own `TempDir`, so each cycle reads and writes that
+    /// test's temp tree, never the host's live `~/.needle` data. The temp root
+    /// has no `.claude/projects`, so the collector pass finds no transcripts
+    /// and returns without writing anything, and no accuracy log exists, so
+    /// step 5a's calibration check is a no-op.
     fn run_cycle(poller: &mut MockPoller, state_path: &std::path::Path) -> anyhow::Result<()> {
         use std::collections::HashMap;
+
+        let root = state_path
+            .parent()
+            .expect("state_path must live in a directory");
+        let cycle_paths = CyclePaths::under(root);
 
         let alert_config = smoke_alert_config();
         let composite_risk_config = crate::config::CompositeRiskConfig::default();
@@ -11797,6 +11951,7 @@ mod mock_poller_tests {
         run_governor_cycle(
             poller,
             state_path,
+            &cycle_paths,
             true, // dry_run — never touches tmux
             60,   // loop_interval
             2.0,  // hysteresis_band
@@ -12195,22 +12350,16 @@ mod mock_poller_tests {
     /// loaded from disk, which is what a real governor sees at the top of the
     /// cycle following the brake.
     ///
-    /// `scored_at_entry` is pinned to `u32::MAX` to keep the *other* safe_mode
-    /// exit out of the picture. Step 5a calls `update_safe_mode_from_calibration`
-    /// against `calibrator::read_all_scores()`, which reads the machine's real
-    /// `~/.needle/state/prediction-accuracy.jsonl` — the cycle is not hermetic, so
-    /// whatever the host governor has logged would otherwise decide this test. That
-    /// path exits only when `predictions_since_entry >= 3`, and
-    /// `predictions_since_entry` is `total_samples.saturating_sub(scored_at_entry)`,
-    /// so `u32::MAX` holds it at 0 for any ambient score count. What survives the
-    /// cycle is then the emergency-brake decision alone, which is what these two
-    /// tests are about.
+    /// The *other* safe_mode exit (step 5a, `update_safe_mode_from_calibration`)
+    /// cannot interfere: `run_cycle` roots the cycle's paths at the state file's
+    /// temp directory, so `read_all_scores` finds no accuracy log and the
+    /// calibration check is skipped entirely. What survives the cycle is the
+    /// emergency-brake decision alone, which is what these two tests are about.
     fn seed_braked_state(state_path: &std::path::Path, utilization: f64) {
         let mut state = state::GovernorState::new();
         state.safe_mode.active = true;
         state.safe_mode.trigger = Some("emergency_brake".to_string());
         state.safe_mode.entered_at = Some(Utc::now());
-        state.safe_mode.scored_at_entry = u32::MAX;
         state.capacity_forecast.five_hour.current_utilization = utilization;
         state.capacity_forecast.seven_day.current_utilization = utilization;
         state.capacity_forecast.weekly_scoped.current_utilization = utilization;
@@ -12760,10 +12909,7 @@ mod annotation_guard_tests {
     fn test_check_worker_count_stable_changed_skips() {
         let result = check_worker_count_stable(5, 7);
 
-        assert!(
-            result.is_some(),
-            "Should skip when worker count changes"
-        );
+        assert!(result.is_some(), "Should skip when worker count changes");
         match result {
             Some(SkipReason::WorkerCountChanged {
                 workers_start,
@@ -12803,10 +12949,7 @@ mod annotation_guard_tests {
     fn test_check_worker_count_stable_decrease_skips() {
         let result = check_worker_count_stable(10, 3);
 
-        assert!(
-            result.is_some(),
-            "Should skip when worker count decreases"
-        );
+        assert!(result.is_some(), "Should skip when worker count decreases");
         match result {
             Some(SkipReason::WorkerCountChanged {
                 workers_start,
@@ -12836,10 +12979,7 @@ mod annotation_guard_tests {
 
         let result = check_window_reset(&old_pct, &new_pct);
 
-        assert!(
-            result.is_some(),
-            "Should skip when any window drops > 1%"
-        );
+        assert!(result.is_some(), "Should skip when any window drops > 1%");
         match result {
             Some(SkipReason::WindowReset {
                 five_hour_reset,
@@ -12871,10 +13011,7 @@ mod annotation_guard_tests {
 
         let result = check_window_reset(&old_pct, &new_pct);
 
-        assert!(
-            result.is_none(),
-            "Should proceed when no window drops > 1%"
-        );
+        assert!(result.is_none(), "Should proceed when no window drops > 1%");
     }
 
     /// Test check_window_reset: multiple windows reset
@@ -12894,10 +13031,7 @@ mod annotation_guard_tests {
 
         let result = check_window_reset(&old_pct, &new_pct);
 
-        assert!(
-            result.is_some(),
-            "Should skip when multiple windows reset"
-        );
+        assert!(result.is_some(), "Should skip when multiple windows reset");
         match result {
             Some(SkipReason::WindowReset {
                 five_hour_reset,
@@ -12975,7 +13109,10 @@ mod annotation_guard_tests {
 
         let result = check_window_reset(&old_pct, &new_pct);
 
-        assert!(result.is_none(), "Should proceed when all windows are stable");
+        assert!(
+            result.is_none(),
+            "Should proceed when all windows are stable"
+        );
     }
 
     /// A clean interval: long enough, stable worker count, all windows rising.
@@ -13046,14 +13183,7 @@ mod annotation_guard_tests {
             "the annotated population is the collector's `i` rows, not the tmux census"
         );
         assert_eq!(
-            annotation_skip_reason(
-                t0,
-                t1,
-                workers_at_start,
-                workers_at_end,
-                &old_pct,
-                &new_pct
-            ),
+            annotation_skip_reason(t0, t1, workers_at_start, workers_at_end, &old_pct, &new_pct),
             None,
             "a steady fleet with non-sonnet workers must not trip the worker-count guard"
         );
@@ -13345,7 +13475,9 @@ mod annotation_guard_tests {
     /// Test SkipReason::description() method
     #[test]
     fn test_skip_reason_description() {
-        let reason = SkipReason::IntervalTooShort { elapsed_seconds: 90 };
+        let reason = SkipReason::IntervalTooShort {
+            elapsed_seconds: 90,
+        };
         assert_eq!(reason.description(), "interval too short (90s < 120s)");
 
         let reason = SkipReason::WorkerCountChanged {
@@ -13362,7 +13494,10 @@ mod annotation_guard_tests {
             seven_day_reset: false,
             weekly_scoped_reset: true,
         };
-        assert_eq!(reason.description(), "interval spans window reset (5h, 7ds)");
+        assert_eq!(
+            reason.description(),
+            "interval spans window reset (5h, 7ds)"
+        );
     }
 
     /// Test SkipReason::description() with all windows reset

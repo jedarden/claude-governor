@@ -30,7 +30,7 @@ use claude_governor::config::{
     AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig, GovernorConfig,
     PricingConfig, SprintConfig,
 };
-use claude_governor::governor::run_governor_cycle;
+use claude_governor::governor::{run_governor_cycle, CyclePaths};
 use claude_governor::poller::{UsageData, UsagePoller};
 use claude_governor::schedule::Promotion;
 use claude_governor::snapshot_fixtures::snapshot_pair_5h;
@@ -196,8 +196,16 @@ fn minimal_pricing_config() -> GovernorConfig {
 ///
 /// `dry_run = true` keeps the cycle off the tmux scaling path; the delta log
 /// sites run before the collector pass, the fleet-aggregate read and the worker
-/// count, so a host with no `~/.claude` data still reaches them.
+/// count, so a host with no `~/.claude` data still reaches them. The cycle's
+/// `~`-rooted paths (collector state, calibration log) are rooted at
+/// `state_path`'s directory — the test's `TempDir` — so the cycle never reads
+/// or writes the host's live `~/.needle` state.
 fn drive_cycle(poller: &mut FakePoller, state_path: &std::path::Path) -> anyhow::Result<()> {
+    let cycle_paths = CyclePaths::under(
+        state_path
+            .parent()
+            .expect("state_path must live in a directory"),
+    );
     let alert_config = AlertConfig::default();
     let composite_risk_config = CompositeRiskConfig::default();
     let cone_scaling_config = ConeScalingConfig::default();
@@ -208,6 +216,7 @@ fn drive_cycle(poller: &mut FakePoller, state_path: &std::path::Path) -> anyhow:
     run_governor_cycle(
         poller,
         state_path,
+        &cycle_paths,
         true, // dry_run
         60,   // loop_interval
         2.0,  // hysteresis_band

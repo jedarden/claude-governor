@@ -23,13 +23,13 @@
 //! nothing here asserts on "no error returned": the assertions are on annotated
 //! values, and a captured log supplies the skip reason when they are missing.
 //!
-//! It lives in its own integration-test binary because it overwrites the
-//! process-global `HOME` (to redirect `collector::default_db_path()` into a
-//! temp dir) and owns the process-global `log` logger — neither is safe to
-//! share with tests running concurrently in the same process.
+//! It lives in its own integration-test binary because it owns the
+//! process-global `log` logger (the captured-log assertions below depend on
+//! it), which is not safe to share with tests running concurrently in the same
+//! process. The cycle's `~`-rooted paths are redirected per-test through
+//! `CyclePaths::under(&home)` — no process-global `HOME` overwrite.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -38,7 +38,7 @@ use claude_governor::config::{
     PricingConfig, SprintConfig,
 };
 use claude_governor::db;
-use claude_governor::governor::run_governor_cycle;
+use claude_governor::governor::{run_governor_cycle, CyclePaths};
 use claude_governor::poller::{UsageData, UsagePoller};
 use claude_governor::schedule::Promotion;
 use claude_governor::state::{self, PrevUsageSnapshot};
@@ -315,14 +315,22 @@ fn minimal_pricing_config() -> GovernorConfig {
 ///
 /// `dry_run = true` keeps the cycle off the tmux scaling path. The annotation
 /// block runs regardless: it sits before scaling and reads only the mirror and
-/// the snapshot.
+/// the snapshot. The cycle's `~`-rooted paths are rooted at `state_path`'s
+/// directory — the test's `TempDir` — so the cycle reads and writes the seeded
+/// mirror there, never the host's live `~/.needle` state.
 fn drive_cycle(poller: &mut FakePoller, state_path: &std::path::Path) -> anyhow::Result<()> {
+    let cycle_paths = CyclePaths::under(
+        state_path
+            .parent()
+            .expect("state_path must live in a directory"),
+    );
     let agents: HashMap<String, AgentConfig> = HashMap::new();
     let promotions: Vec<Promotion> = Vec::new();
 
     run_governor_cycle(
         poller,
         state_path,
+        &cycle_paths,
         true, // dry_run
         300,  // loop_interval
         2.0,  // hysteresis_band
@@ -337,23 +345,6 @@ fn drive_cycle(poller: &mut FakePoller, state_path: &std::path::Path) -> anyhow:
         &ConeScalingConfig::default(),
         &minimal_pricing_config(),
     )
-}
-
-/// Point `collector::default_db_path()` (and every other `~`-rooted path the
-/// cycle touches) at a temp dir.
-///
-/// Also guarantees `~/.claude/projects` is absent, so `run_collection_pass`
-/// finds no JSONL files and returns before writing anything — the seeded rows
-/// below are the only rows in the mirror.
-fn redirect_home(home: &TempDir) -> PathBuf {
-    std::env::set_var("HOME", home.path());
-    let db_path = claude_governor::collector::default_db_path();
-    assert!(
-        db_path.starts_with(home.path()),
-        "HOME redirect did not take: db path is {}",
-        db_path.display()
-    );
-    db_path
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +374,8 @@ fn a_real_cycle_annotates_a_mixed_model_fleet() {
     init_logger();
 
     let home = TempDir::new().expect("failed to create temp HOME");
-    let db_path = redirect_home(&home);
+    let cycle_paths = CyclePaths::under(home.path());
+    let db_path = cycle_paths.collector.db_path.clone();
     let state_path = home.path().join("governor-state.json");
 
     let base = Utc::now();

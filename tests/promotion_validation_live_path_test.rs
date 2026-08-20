@@ -37,13 +37,13 @@
 //! validator reports `no data found` — the exact string the parent bead exists
 //! to eliminate. Cycle two supplies the off-peak side and the string goes away.
 //!
-//! It lives in its own integration-test binary because it overwrites the
-//! process-global `HOME` (to redirect `collector::default_db_path()` into a
-//! temp dir); the tests inside it serialise on `HOME_LOCK` for the same reason.
+//! Every test here roots its cycle's `~`-rooted paths (collector mirror,
+//! accuracy log) in its own `TempDir` via `CyclePaths::under`, so the binary
+//! no longer overwrites the process-global `HOME` and its tests no longer
+//! need to serialise on a lock.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use claude_governor::burn_rate::{
@@ -54,7 +54,7 @@ use claude_governor::config::{
     PricingConfig, SprintConfig,
 };
 use claude_governor::db;
-use claude_governor::governor::run_governor_cycle;
+use claude_governor::governor::{run_governor_cycle, CyclePaths};
 use claude_governor::poller::{UsageData, UsagePoller};
 use claude_governor::schedule::Promotion;
 use claude_governor::state::{self, GovernorState, PrevUsageSnapshot};
@@ -104,39 +104,6 @@ const RATIO_EPS: f64 = 1e-6;
 
 /// The sentinel this whole bead exists to eliminate.
 const NO_DATA_REASON: &str = "no data found in token-history DB";
-
-// ---------------------------------------------------------------------------
-// HOME serialisation
-// ---------------------------------------------------------------------------
-
-/// `std::env::set_var("HOME", ...)` is process-global and every test here needs
-/// its own `HOME`, so they take turns. Poisoning is recovered rather than
-/// propagated: a panic in one test should report that test's failure, not turn
-/// every later test into an unrelated poison error.
-fn home_lock() -> MutexGuard<'static, ()> {
-    static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    HOME_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Point `collector::default_db_path()` — and every other `~`-rooted path the
-/// cycle touches — at a temp dir.
-///
-/// Also guarantees `~/.claude/projects` is absent, so `run_collection_pass`
-/// finds no transcripts and returns before writing anything: the seeded rows
-/// are the only rows in the mirror.
-fn redirect_home(home: &TempDir) -> PathBuf {
-    std::env::set_var("HOME", home.path());
-    let db_path = claude_governor::collector::default_db_path();
-    assert!(
-        db_path.starts_with(home.path()),
-        "HOME redirect did not take: db path is {}",
-        db_path.display()
-    );
-    db_path
-}
 
 // ---------------------------------------------------------------------------
 // Credential-free poller
@@ -314,8 +281,15 @@ fn minimal_pricing_config() -> GovernorConfig {
 ///
 /// `dry_run = true` keeps the cycle off the tmux scaling path. Neither the
 /// annotation block nor the promotion validation is affected by it: both read
-/// the mirror and the state file and write back to them.
-fn drive_cycle(pct: (f64, f64, f64), state_path: &Path, promotions: &[Promotion]) {
+/// the mirror and the state file and write back to them. `paths` names the
+/// temp-rooted collector/calibration layout the cycle runs against — the same
+/// `CyclePaths::under(home)` the caller seeded the mirror through.
+fn drive_cycle(
+    pct: (f64, f64, f64),
+    state_path: &Path,
+    paths: &CyclePaths,
+    promotions: &[Promotion],
+) {
     let mut poller = FakePoller {
         reading: usage_data(pct, Utc::now()),
     };
@@ -324,6 +298,7 @@ fn drive_cycle(pct: (f64, f64, f64), state_path: &Path, promotions: &[Promotion]
     run_governor_cycle(
         &mut poller,
         state_path,
+        paths,
         true, // dry_run
         300,  // loop_interval
         2.0,  // hysteresis_band
@@ -395,10 +370,9 @@ fn view_rows_with_usd_per_pct(conn: &Connection, view: &str) -> i64 {
 /// `BATCH` rows, which is what makes the observed ratio interpretable.
 #[test]
 fn two_real_cycles_unblock_empirical_promotion_validation() {
-    let _guard = home_lock();
-
     let home = TempDir::new().expect("failed to create temp HOME");
-    let db_path = redirect_home(&home);
+    let cycle_paths = CyclePaths::under(home.path());
+    let db_path = cycle_paths.collector.db_path.clone();
     let state_path = home.path().join("governor-state.json");
 
     let base = Utc::now();
@@ -417,7 +391,7 @@ fn two_real_cycles_unblock_empirical_promotion_validation() {
         );
     }
     seed_snapshot(&state_path, PCT_0, base - ChronoDuration::seconds(600));
-    drive_cycle(PCT_1, &state_path, &promotions);
+    drive_cycle(PCT_1, &state_path, &cycle_paths, &promotions);
 
     // With peak rows annotated but no off-peak rows, the validator still has
     // nothing to compare against — `compute_empirical_promo_ratio` needs both
@@ -447,7 +421,7 @@ fn two_real_cycles_unblock_empirical_promotion_validation() {
         );
     }
     seed_snapshot(&state_path, PCT_1, base - ChronoDuration::seconds(300));
-    drive_cycle(PCT_2, &state_path, &promotions);
+    drive_cycle(PCT_2, &state_path, &cycle_paths, &promotions);
 
     let conn = db::open_db(&db_path).expect("failed to reopen the mirror");
 
@@ -574,7 +548,8 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
 
     for annotated in [None, Some(DELTA_7DS / BATCH as f64)] {
         let home = TempDir::new().expect("failed to create temp HOME");
-        let db_path = redirect_home(&home);
+        let cycle_paths = CyclePaths::under(home.path());
+        let db_path = cycle_paths.collector.db_path.clone();
         let state_path = home.path().join("governor-state.json");
         let base = Utc::now();
 
@@ -598,7 +573,7 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
             );
         }
         seed_snapshot(&state_path, PCT_0, base - ChronoDuration::seconds(300));
-        drive_cycle(PCT_1, &state_path, &[active_promotion(base)]);
+        drive_cycle(PCT_1, &state_path, &cycle_paths, &[active_promotion(base)]);
 
         states.push(state::load_state(&state_path).expect("failed to read the cycle's state"));
     }
@@ -606,6 +581,26 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
     let annotated = states.pop().expect("two runs");
     let bare = states.pop().expect("two runs");
     (bare, annotated)
+}
+
+/// Relative tolerance for comparing time-normalized EMAs across the two runs
+/// of `cycle_with_and_without_annotation`.
+///
+/// Each run seeds its previous snapshot at `base - 300s` and the cycle polls
+/// at the real current instant, so every pct/hr (and usd/pct) EMA divides by
+/// a span that includes the wall-clock time between that run's `base` and its
+/// poll — fsync and scheduling jitter of a second or two on a loaded host.
+/// That jitter moves both runs equally (~0.3% per second on the 300s span)
+/// and is not what this test is about; a divergence beyond 1% would be.
+const SPAN_JITTER_TOLERANCE: f64 = 0.01;
+
+/// Assert two time-normalized EMA readings agree within wall-clock span
+/// jitter (see [`SPAN_JITTER_TOLERANCE`]).
+fn assert_ema_close(label: &str, bare: f64, annotated: f64) {
+    assert!(
+        ((bare - annotated) / annotated).abs() < SPAN_JITTER_TOLERANCE,
+        "{label}: bare {bare} vs annotated {annotated} diverged beyond span jitter"
+    );
 }
 
 /// The burn-rate EMA that scaling reads is derived from consecutive API
@@ -618,36 +613,39 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
 /// the same API deltas, apportioned; feeding them back would close a loop.)
 #[test]
 fn the_api_delta_ema_is_unaffected_by_annotation_data() {
-    let _guard = home_lock();
     let (bare, annotated) = cycle_with_and_without_annotation();
 
     // `WindowPctDeltas` is not `PartialEq`, so compare it field by field —
     // spelling the windows out also names which one drifted on failure.
-    assert_eq!(
-        (
-            bare.burn_rate.fleet_pct_hr_ema.five_hour,
-            bare.burn_rate.fleet_pct_hr_ema.seven_day,
-            bare.burn_rate.fleet_pct_hr_ema.weekly_scoped,
-        ),
-        (
-            annotated.burn_rate.fleet_pct_hr_ema.five_hour,
-            annotated.burn_rate.fleet_pct_hr_ema.seven_day,
-            annotated.burn_rate.fleet_pct_hr_ema.weekly_scoped,
-        ),
-        "the fleet pct/hr EMA should not depend on annotation data"
+    assert_ema_close(
+        "five_hour pct/hr EMA",
+        bare.burn_rate.fleet_pct_hr_ema.five_hour,
+        annotated.burn_rate.fleet_pct_hr_ema.five_hour,
     );
-    assert_eq!(
-        (
-            bare.burn_rate.usd_per_pct_ema_five_hour,
-            bare.burn_rate.usd_per_pct_ema_seven_day,
-            bare.burn_rate.usd_per_pct_ema_weekly_scoped,
-        ),
-        (
-            annotated.burn_rate.usd_per_pct_ema_five_hour,
-            annotated.burn_rate.usd_per_pct_ema_seven_day,
-            annotated.burn_rate.usd_per_pct_ema_weekly_scoped,
-        ),
-        "the usd-per-pct EMA fallback should not depend on annotation data"
+    assert_ema_close(
+        "seven_day pct/hr EMA",
+        bare.burn_rate.fleet_pct_hr_ema.seven_day,
+        annotated.burn_rate.fleet_pct_hr_ema.seven_day,
+    );
+    assert_ema_close(
+        "weekly_scoped pct/hr EMA",
+        bare.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+        annotated.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+    );
+    assert_ema_close(
+        "five_hour usd/pct EMA",
+        bare.burn_rate.usd_per_pct_ema_five_hour,
+        annotated.burn_rate.usd_per_pct_ema_five_hour,
+    );
+    assert_ema_close(
+        "seven_day usd/pct EMA",
+        bare.burn_rate.usd_per_pct_ema_seven_day,
+        annotated.burn_rate.usd_per_pct_ema_seven_day,
+    );
+    assert_ema_close(
+        "weekly_scoped usd/pct EMA",
+        bare.burn_rate.usd_per_pct_ema_weekly_scoped,
+        annotated.burn_rate.usd_per_pct_ema_weekly_scoped,
     );
     assert_eq!(
         bare.burn_rate.fleet_pct_ema_samples, annotated.burn_rate.fleet_pct_ema_samples,
@@ -658,6 +656,12 @@ fn the_api_delta_ema_is_unaffected_by_annotation_data() {
     assert!(
         bare.burn_rate.fleet_pct_ema_samples > 0,
         "the cycle should have fed the EMA a sample"
+    );
+    // And the jitter allowance must not be masking a real signal: the seeded
+    // span is 300s, so both EMAs should be far from zero.
+    assert!(
+        bare.burn_rate.fleet_pct_hr_ema.five_hour > 0.0,
+        "the bare run's pct/hr EMA should carry the seeded delta"
     );
 }
 
@@ -670,10 +674,9 @@ fn the_api_delta_ema_is_unaffected_by_annotation_data() {
 /// half-populated ratio.
 #[test]
 fn an_unannotated_mirror_still_falls_back_to_one_x() {
-    let _guard = home_lock();
-
     let home = TempDir::new().expect("failed to create temp HOME");
-    let db_path = redirect_home(&home);
+    let cycle_paths = CyclePaths::under(home.path());
+    let db_path = cycle_paths.collector.db_path.clone();
     let state_path = home.path().join("governor-state.json");
     let base = Utc::now();
 
@@ -692,7 +695,7 @@ fn an_unannotated_mirror_still_falls_back_to_one_x() {
     }
     // No snapshot at all, so the annotation block has no span to work over and
     // the mirror stays unannotated through the cycle.
-    drive_cycle(PCT_1, &state_path, &[active_promotion(base)]);
+    drive_cycle(PCT_1, &state_path, &cycle_paths, &[active_promotion(base)]);
 
     assert_eq!(
         annotated_rows(
@@ -739,10 +742,9 @@ fn an_unannotated_mirror_still_falls_back_to_one_x() {
 /// holds, driven through the same cycle that annotates the mirror.
 #[test]
 fn annotation_does_not_rewrite_the_jsonl_log() {
-    let _guard = home_lock();
-
     let home = TempDir::new().expect("failed to create temp HOME");
-    let db_path = redirect_home(&home);
+    let cycle_paths = CyclePaths::under(home.path());
+    let db_path = cycle_paths.collector.db_path.clone();
     let state_path = home.path().join("governor-state.json");
     let base = Utc::now();
     let t1 = base - ChronoDuration::seconds(100);
@@ -754,7 +756,7 @@ fn annotation_does_not_rewrite_the_jsonl_log() {
 
     // The same records the mirror holds, in the collector's own file, with the
     // annotated fields explicitly null.
-    let history_path = claude_governor::collector::default_history_path();
+    let history_path = cycle_paths.collector.history_path.clone();
     let jsonl: String = (0..BATCH)
         .map(|i| {
             format!(
@@ -775,7 +777,7 @@ fn annotation_does_not_rewrite_the_jsonl_log() {
     std::fs::write(&history_path, &jsonl).expect("failed to seed the JSONL log");
 
     seed_snapshot(&state_path, PCT_0, base - ChronoDuration::seconds(300));
-    drive_cycle(PCT_1, &state_path, &[active_promotion(base)]);
+    drive_cycle(PCT_1, &state_path, &cycle_paths, &[active_promotion(base)]);
 
     // The cycle annotated the mirror...
     assert_eq!(

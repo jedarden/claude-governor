@@ -1159,6 +1159,52 @@ pub fn default_session_base() -> PathBuf {
         .join("projects")
 }
 
+/// Every filesystem location a collection pass reads and writes.
+///
+/// `Default` is the real host layout (`~/.needle/state/*`, `~/.claude/projects`).
+/// Tests inject [`CollectionPaths::under`] so a pass never reads the host's
+/// session JSONL or appends to the live history/cursor/SQLite state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionPaths {
+    /// token-history.jsonl — JSONL record output
+    pub history_path: PathBuf,
+    /// token-history.db — SQLite mirror the governor reads fleet records from
+    pub db_path: PathBuf,
+    /// collector-cursors.json — per-file read offsets
+    pub cursor_path: PathBuf,
+    /// Base directory scanned for Claude Code session JSONL files
+    pub session_base: PathBuf,
+}
+
+impl Default for CollectionPaths {
+    fn default() -> Self {
+        Self {
+            history_path: default_history_path(),
+            db_path: default_db_path(),
+            cursor_path: default_cursor_path(),
+            session_base: default_session_base(),
+        }
+    }
+}
+
+impl CollectionPaths {
+    /// The host layout rooted at `root` instead of `~`.
+    ///
+    /// Mirrors the production relative paths (`root/.needle/state/...`,
+    /// `root/.claude/projects`) so a temp directory can stand in for the home
+    /// directory. An absent session base simply means the pass finds no JSONL
+    /// files and returns without writing anything.
+    pub fn under(root: &Path) -> Self {
+        let state_dir = root.join(".needle").join("state");
+        Self {
+            history_path: state_dir.join("token-history.jsonl"),
+            db_path: state_dir.join("token-history.db"),
+            cursor_path: state_dir.join("collector-cursors.json"),
+            session_base: root.join(".claude").join("projects"),
+        }
+    }
+}
+
 /// Result of a single collection pass.
 pub struct CollectionResult {
     /// Number of new lines processed
@@ -1183,12 +1229,21 @@ pub struct CollectionResult {
 /// 6. Mirrors to SQLite
 /// 7. Saves cursor state
 pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
+    run_collection_pass_at(&CollectionPaths::default())
+}
+
+/// [`run_collection_pass`] against an explicit path set.
+///
+/// The governor cycle passes its injected [`CollectionPaths`] through here so
+/// cycle tests can point the collector at a temp directory instead of the
+/// machine's real `~/.needle` state.
+pub fn run_collection_pass_at(paths: &CollectionPaths) -> anyhow::Result<CollectionResult> {
     use crate::pricing::PricingEngine;
 
-    let history_path = default_history_path();
-    let db_path = default_db_path();
-    let cursor_path = default_cursor_path();
-    let session_base = default_session_base();
+    let history_path = &paths.history_path;
+    let db_path = &paths.db_path;
+    let cursor_path = &paths.cursor_path;
+    let session_base = &paths.session_base;
 
     let pricing_engine = PricingEngine::new()?;
     let config = pricing_engine.config();
@@ -1197,11 +1252,11 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
     let all_models: Vec<String> = config.pricing.models.keys().cloned().collect();
 
     // Load cursors
-    let mut cursors = CursorStore::load(&cursor_path)
+    let mut cursors = CursorStore::load(cursor_path)
         .map_err(|e| anyhow::anyhow!("Failed to load cursors: {}", e))?;
 
     // Discover JSONL files
-    let files = discover_jsonl_files(&session_base);
+    let files = discover_jsonl_files(session_base);
     if files.is_empty() {
         log::info!(
             "[collector] no JSONL files found under {}",
@@ -1259,7 +1314,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
 
         // Critical: heartbeat must succeed to avoid false collector_offline alerts
         // Return error if write fails so governor can detect the issue
-        append_jsonl(&history_path, &[fleet_json.clone()]).map_err(|e| {
+        append_jsonl(history_path, &[fleet_json.clone()]).map_err(|e| {
             log::error!(
                 "[collector] CRITICAL: failed to write heartbeat fleet record: {}",
                 e
@@ -1268,7 +1323,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
         })?;
 
         // Try to write to SQLite, but don't fail if it fails (JSONL is the primary source)
-        match crate::db::open_db(&db_path) {
+        match crate::db::open_db(db_path) {
             Ok(conn) => {
                 if let Err(e) = crate::db::create_schema(&conn) {
                     log::warn!("[collector] failed to create SQLite schema: {}", e);
@@ -1282,7 +1337,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
         }
 
         cursors
-            .save(&cursor_path)
+            .save(cursor_path)
             .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
         return Ok(CollectionResult {
             lines_processed: total_lines,
@@ -1325,11 +1380,11 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
     jsonl_records.push(fleet_json);
 
     // Write to JSONL
-    append_jsonl(&history_path, &jsonl_records)
+    append_jsonl(history_path, &jsonl_records)
         .map_err(|e| anyhow::anyhow!("Failed to write JSONL: {}", e))?;
 
     // Mirror to SQLite
-    match crate::db::open_db(&db_path) {
+    match crate::db::open_db(db_path) {
         Ok(conn) => {
             if let Err(e) = crate::db::create_schema(&conn) {
                 log::warn!("[collector] failed to create SQLite schema: {}", e);
@@ -1348,7 +1403,7 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
 
     // Save cursors
     cursors
-        .save(&cursor_path)
+        .save(cursor_path)
         .map_err(|e| anyhow::anyhow!("Failed to save cursors: {}", e))?;
 
     let result = CollectionResult {
