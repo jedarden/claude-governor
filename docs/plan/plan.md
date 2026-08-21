@@ -1185,7 +1185,7 @@ The governor does not automatically act on cache efficiency (causes are too vari
 | Burn rate samples | ≥5 per window | 3–4 samples | <3 (using baseline fallback) |
 | Pricing config | All detected models have entries | — | Unknown model in token records |
 | Model generation | Rates match known generation | — | Opus 4.6 priced at $15/$75 (legacy) |
-| Promotion dates | Active or future promo configured | Expires in <48h | Expired, still in config |
+| Promotion dates | Active or future promo configured, or no promotion configured | Expires in <48h | Expired, still in config |
 | SQLite integrity | `PRAGMA integrity_check` passes | — | Corruption detected |
 | JSONL/DB sync | Row counts within 1% | Diverge >1% | DB missing or empty |
 | Config parseable | Valid YAML, all required fields present | — | Syntax error or missing required fields |
@@ -1343,6 +1343,11 @@ The range `2.0–3.8h` replaces the single `2.9h`, immediately communicating unc
 ---
 
 ## Configuration File
+
+The canonical default is `~/.config/claude-governor/governor.yaml`. When
+`XDG_CONFIG_HOME` is set, the implementation checks
+`$XDG_CONFIG_HOME/claude-governor/governor.yaml` first, then falls back to the
+canonical default path below.
 
 `~/.config/claude-governor/governor.yaml`:
 
@@ -1588,7 +1593,7 @@ safe_mode:
    - `effective_hours_remaining(reset_time)` → float
    - Reads from `promotions.json`
 
-2. Create `promotions.json` with an entry defining the promotion window when a promotion is active (see Component 4 for format and a historical example of the March 2026 Off-Peak 2x promotion). When no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier — this is the default shipped configuration and the correct normal operating state).
+2. Create `promotions.json` with an entry defining the promotion window when a promotion is active (see Component 4 for the format and the historical March 2026 Off-Peak 2x example). The historical example is not a current configuration: when no promotion is running, `promotions.json` should contain an empty array `[]` (flat 1.0 multiplier — this is the default shipped configuration and the correct normal operating state).
 
 3. Unit tests:
    - Peak hour boundaries (7:59 AM ET → 1x, 8:00 AM ET → 1x peak, 2:01 PM ET → 2x)
@@ -1598,7 +1603,7 @@ safe_mode:
 
 4. **Promotion validation against measured consumption:**
 
-   The `offpeak_multiplier: 2.0` in `promotions.json` is taken from the official announcement — it needs to be confirmed against observed data before the governor trusts it for scheduling.
+   The `offpeak_multiplier: 2.0` in the historical promotion example came from the official announcement — an active future promotion must be confirmed against observed data before the governor trusts it for scheduling. With the shipped empty `promotions.json`, there is no declared multiplier to validate and scheduling remains at the flat 1.0 default.
 
    **Validation approach:** Once the poller has accumulated ≥5 peak-hour samples and ≥5 off-peak samples with the same worker count, compute:
    ```
@@ -1990,7 +1995,8 @@ claude-governor/
 │   ├── doctor.rs              # Health diagnostic (Phase 7)
 │   ├── state.rs               # State store — JSON read/write + rusqlite
 │   ├── capacity_summary.rs    # Capacity forecast aggregation
-│   └── status_display.rs      # Human-readable status output
+│   ├── status_display.rs      # Human-readable status output
+│   └── snapshot_fixtures.rs   # Shared snapshot-test fixtures
 ├── tests/
 │   ├── fixtures.rs            # Test fixtures and helpers
 │   └── governor_cycle_snapshot_test.rs  # Integration test fixtures
@@ -2009,6 +2015,12 @@ claude-governor/
 │       └── plan.md           # This document
 └── README.md
 ```
+
+Service unit source files live in `config/`, not in a repository `systemd/`
+directory. The current implementation ships separate observe, act, and token
+collector units. The former combined `claude-governor.service` and
+`cgov.service` names are legacy installed-unit names that `cgov init`/`enable`
+remove when encountered; they are not current source artifacts.
 
 **Build output:** `cargo build --release` produces a single statically-linked binary `target/release/cgov` (~5–10 MB). This is the only artifact that needs to be deployed.
 
@@ -2061,7 +2073,7 @@ claude-governor/
 
 4. **Bead state after forced kill:** If a worker is killed mid-task, the bead remains `IN_PROGRESS` until the stale claim threshold fires. Prefer graceful shutdown to avoid this.
 
-5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. The March 2026 Off-Peak 2x promotion ended on 2026-03-28; after that date `promotions.json` was reverted to an empty array `[]`. That is the current shipped state — `config/promotions.json` in this repository contains `[]` — and it is the correct default whenever no promotion is running (flat 1.0 multiplier). An expired promotion left in the file is a configuration error the `promotion_dates` doctor check flags.
+5. **Promotion end date:** When a promotion period ends, the governor must correctly revert to 1x flat model. Test the `promotions.json` cutoff logic explicitly. The March 2026 Off-Peak 2x promotion is a historical example that ended on 2026-03-28; after that date `promotions.json` was reverted to an empty array `[]`. That is the current shipped state — `config/promotions.json` in this repository contains `[]` — and it is the correct default whenever no promotion is running (flat 1.0 multiplier). An expired promotion left in the file is a configuration error the `promotion_dates` doctor check flags.
 
 6. **Multiple accounts / credential rotation:** The poller assumes a single `~/.claude/.credentials.json`. If multiple accounts are used, parameterize the credentials path.
 
