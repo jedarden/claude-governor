@@ -1,8 +1,8 @@
 # Pluck workspace path settings
 
 This document describes how NEEDLE's Pluck and Explore strands select bead
-workspaces. The values below are a snapshot of the host configuration checked
-on 2026-08-20.
+workspaces. The values below reflect the host configuration after the runtime
+fix applied on 2026-08-21.
 
 ## Current settings
 
@@ -11,7 +11,7 @@ The authoritative global configuration is
 
 ```yaml
 workspace:
-  default: /home/coding/aide-de-camp
+  default: /home/coding/claude-governor
   home: /home/coding/.needle
 
 strands:
@@ -25,7 +25,7 @@ These values mean:
 
 | Setting | Current value | Meaning |
 | --- | --- | --- |
-| `workspace.default` | `/home/coding/aide-de-camp` | Pluck's home workspace when a worker is started without `--workspace`. Pluck queries this directory's `.beads` store. |
+| `workspace.default` | `/home/coding/claude-governor` | Pluck's home workspace when a worker is started without `--workspace`. Pluck queries this directory's `.beads` store. |
 | `workspace.home` | `/home/coding/.needle` | NEEDLE's own state, logs, heartbeats, and optional starvation records. It is not a bead workspace and is not the Explore scan root. |
 | `strands.explore.enabled` | `true` | Allows the later Explore strand to look for work outside Pluck's home workspace. |
 | `strands.explore.workspaces` | `[]` | No explicit Explore workspace paths are configured. Empty means auto-discovery mode. |
@@ -44,11 +44,10 @@ bead_cli:
   backend: bead-rs
 ```
 
-It does not override any workspace paths. In particular,
-`/home/coding/claude-governor` is not the current default Pluck home. A worker
-started without an explicit workspace queries `/home/coding/aide-de-camp`; a
-worker started with `--workspace /home/coding/claude-governor` queries this
-repository instead.
+It does not override any workspace paths. `/home/coding/claude-governor` is
+now the default Pluck home. A worker started with
+`--workspace /home/coding/claude-governor` remains explicit and selects the
+same repository.
 
 ## Where path settings are stored and resolved
 
@@ -81,12 +80,10 @@ needle config --get strands.explore.workspace_root
 needle config --get strands.explore.workspaces
 ```
 
-At the time of this snapshot, those commands fail before printing resolved
-values because the installed `needle` rejects
-`telemetry.otlp_sink.tls: "none"` at line 139 of the global file. The path
-values in this document are the values read directly from that file; they are
-configured there but cannot become runtime-effective until the unrelated YAML
-type error is corrected or the binary/config versions are aligned.
+After the runtime fix, `needle config --get workspace.default` resolves to
+`/home/coding/claude-governor` and `needle doctor` reports valid configuration.
+The OTLP TLS setting is now a structured mapping, so the global file is
+loadable by the installed NEEDLE versions.
 
 ## How paths affect bead discovery
 
@@ -108,10 +105,10 @@ for ready, unassigned beads. If the home directory has no valid `.beads`
 directory, Pluck skips with `no_home_store`; it does not search other
 repositories to find a replacement home store.
 
-This makes an incorrect `workspace.default` a complete visibility boundary. For
-example, an open bead in
-`/home/coding/claude-governor/.beads` is invisible to Pluck when the worker's
-resolved home remains `/home/coding/aide-de-camp`.
+An incorrect `workspace.default` is a complete visibility boundary. Before the
+fix, an open bead in `/home/coding/claude-governor/.beads` was invisible when
+the worker's resolved home remained `/home/coding/aide-de-camp`; the corrected
+default now opens the target store.
 
 ### Explore: optional cross-workspace discovery
 

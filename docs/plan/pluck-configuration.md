@@ -38,11 +38,11 @@ bead_cli:
 
 ### Runtime loadability
 
-The filter values above are present in the global file, but the installed
-`needle 0.3.0 config` command currently fails before Pluck initializes because
-it rejects the unrelated `telemetry.otlp_sink.tls: none` value at line 133.
-The configuration must be schema-fixed or version-aligned before a worker can
-use these values at runtime; this does not change the filter inventory below.
+The runtime configuration is loadable. The previous
+`telemetry.otlp_sink.tls: none` value was replaced with the structured form
+`{ insecure: true, ca_file: '' }`, which is accepted by both the installed
+`needle 0.3.0` and active `needle 0.4.2` binaries. `needle doctor` reports the
+configuration valid and the target bead store healthy.
 
 There are exactly three configurable Pluck keys in NEEDLE's
 `PluckConfig`:
@@ -62,13 +62,16 @@ NEEDLE loads built-in defaults, the global config, workspace-supported
 overrides, environment overrides, and CLI overrides. Pluck is constructed from
 the resolved `strands.pluck` values when the worker starts.
 
-The global `workspace.default` currently points to
-`/home/coding/aide-de-camp`, while this repository is
-`/home/coding/claude-governor`. That path selects the bead store that Pluck
-opens; it is not itself a label filter. A worker serving this repository must
-use an explicit workspace override or an aligned default. The NEEDLE home path
-(`/home/coding/.needle`) stores worker state and diagnostics; it is not the
-target `.beads` database.
+The global `workspace.default` now points to
+`/home/coding/claude-governor`, selecting this repository's bead store. The
+NEEDLE home path (`/home/coding/.needle`) stores worker state and diagnostics;
+it is not the target `.beads` database. Dedicated launch commands should retain
+an explicit `--workspace /home/coding/claude-governor` override when possible.
+
+At verification time, `bead list --status open --json --limit 999999` returned
+21 open issues and `bead list --ready --json --limit 999999` returned 7 ready
+candidates. The difference is expected: bead-rs removes assigned, manually
+blocked, and unfinished dependency-blocked issues before Pluck receives them.
 
 ## Complete `exclude_labels` inventory
 

@@ -16,17 +16,16 @@ metadata:
 ## Executive summary
 
 The target bead store is healthy and readable. The primary confirmed cause of
-the historical “open beads exist but Pluck finds no work” incident is workspace
+the historical “open beads but Pluck finds no work” incident was workspace
 selection: the worker queried a different home store than the target repository.
-The current global default is /home/coding/aide-de-camp, not
-/home/coding/claude-governor, so a worker for this repository must receive an
-explicit workspace override or use an aligned default.
+The runtime fix aligned the global default with
+/home/coding/claude-governor, so workers without an explicit workspace now
+select the target store.
 
-There is a second operational blocker: the installed NEEDLE 0.3.0 cannot load
-the global config because telemetry.otlp_sink.tls: "none" is rejected as a
-string where the binary expects an OtlpTlsConfig mapping. The Pluck values
-below are the values present in the file, but they cannot become runtime-
-effective until that unrelated config-version/type mismatch is corrected.
+The same fix also replaced the incompatible
+telemetry.otlp_sink.tls: "none" string with the structured
+`{ insecure: true, ca_file: '' }` form. Both the installed NEEDLE 0.3.0 and
+active 0.4.2 binaries now load the global configuration successfully.
 
 The child-investigation snapshot found 48 open issues and 11 in bead-rs’s
 actual ready frontier. A later read-only check at 2026-08-21T11:37:09Z found
@@ -35,11 +34,18 @@ beads. The database has one `deferred` label row, attached to a closed issue,
 so no open issue is currently removed by `exclude_labels`. In that follow-up,
 19 open issues were held by unfinished `blocks` dependencies, not labels.
 
+The implementation-phase verification found 21 open issues and 7 ready
+candidates. The repository Pluck integration test passed 2/2, and
+`needle doctor --workspace /home/coding/claude-governor` passed all required
+configuration, backend, and SQLite checks (with one unrelated stale-heartbeat
+warning).
+
 ## Workspace path findings
 
-### Configured paths
+### Pre-fix configured paths (investigation snapshot)
 
-The global file is /home/coding/.config/needle/config.yaml:
+The following values record the state observed before the implementation fix in
+/home/coding/.config/needle/config.yaml:
 
     workspace:
       default: /home/coding/aide-de-camp
@@ -226,7 +232,7 @@ non-failing diagnostics:
 These tests should be migrated to base_status, current dependency columns,
 and bead list --ready semantics before being used as regression gates.
 
-### Global config resolution
+### Global config resolution before the fix
 
 needle --version reports needle 0.3.0. Both needle config --get
 workspace.default and needle config --dump --show-source fail before
@@ -235,10 +241,11 @@ resolution with:
     telemetry.otlp_sink.tls: invalid type: string "none",
     expected struct OtlpTlsConfig
 
-This means the workspace/filter values were inspected directly from the global
-YAML, but runtime config loading is currently blocked. Fix or align the OTLP
-TLS representation and restart workers before treating the path settings as
-effective.
+This was the pre-fix state: workspace/filter values were inspected directly
+from the global YAML, but runtime config loading was blocked. After the fix,
+`needle config --get workspace.default` resolves to
+`/home/coding/claude-governor`; the structured OTLP TLS mapping is accepted by
+both installed NEEDLE versions.
 
 ## Historical investigation findings
 
@@ -279,16 +286,16 @@ labels table is empty and current readiness is dependency-driven.
 
 ## Issues and recommendations
 
-1. Restore runtime config loading. Correct the OTLP TLS value for NEEDLE 0.3.0,
-   or align the binary and configuration versions, then restart workers.
-2. Align Pluck’s home workspace. Set the service’s default to
-   /home/coding/claude-governor, or always launch target workers with the
-   explicit absolute --workspace /home/coding/claude-governor. Do not rely on
-   . or on Explore to compensate for a wrong home store.
+1. Completed: restore runtime config loading by using the structured OTLP TLS
+   value accepted by NEEDLE 0.3.0 and 0.4.2.
+2. Completed: align Pluck’s default home workspace with
+   /home/coding/claude-governor. Dedicated launch commands should still use the
+   explicit absolute --workspace /home/coding/claude-governor.
 3. Use the ready frontier for health checks. Report open, assigned, manual
    blocked, unfinished dependency-blocked, label-excluded, and ready counts
-   separately. For the current target the key values are 48 open, 0 label
-   exclusions, 37 dependency-blocked, and 11 ready.
+   separately. The pre-fix snapshot was 48 open, 0 label exclusions, 37
+   dependency-blocked, and 11 ready; implementation verification later found
+   21 open and 7 ready.
 4. Refresh investigation tests and historical docs. Replace status with
    base_status, use bead-rs dependency columns, include all four configured
    labels, and assert query failures instead of printing them and passing.

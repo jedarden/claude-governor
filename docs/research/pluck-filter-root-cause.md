@@ -4,6 +4,23 @@
 **Target workspace:** `/home/coding/claude-governor`
 **Backend:** `bead-rs`
 
+## Applied runtime fix
+
+The live NEEDLE configuration at `/home/coding/.config/needle/config.yaml` was
+updated on 2026-08-21:
+
+- `workspace.default` now points to `/home/coding/claude-governor` instead of
+  the unrelated `/home/coding/aide-de-camp` store.
+- `telemetry.otlp_sink.tls: none` is now the structured
+  `{ insecure: true, ca_file: '' }` form accepted by the installed NEEDLE
+  binaries.
+
+Both `needle 0.3.0` and the active `needle 0.4.2` resolve the target workspace
+after the change. `needle doctor --workspace /home/coding/claude-governor`
+passes configuration, bead-store, and SQLite checks. The repository Pluck
+integration test passes 2/2 and the bead-rs ready query returns 7 candidates at
+verification time.
+
 ## Verdict
 
 The historical “open beads, zero Pluck candidates” incident was caused by a
@@ -14,15 +31,15 @@ the work being counted was in
 reported `workspace=.` and `open_count=0`, with zero beads attributed to label
 or status/assignee exclusion.
 
-The current global NEEDLE configuration has the same class of risk: its
-`workspace.default` is `/home/coding/aide-de-camp`, not this repository. A
-worker for this repository must receive an explicit absolute workspace or use
-a target-specific default.
+Before the runtime fix, the global NEEDLE configuration had the same class of
+risk: its `workspace.default` was `/home/coding/aide-de-camp`, not this
+repository. The default is now aligned, and dedicated workers should still
+prefer an explicit absolute workspace in their launch command.
 
 The configured labels are not too broad. Matching is exact and case-sensitive;
 a bead is removed only when one of its labels is exactly one of the configured
-values. The current target database contains no labels, so the four configured
-labels remove zero of its ready candidates.
+values. The current target database has one label row, attached to a closed
+issue, so the four configured labels remove zero of its ready candidates.
 
 ## Evidence from the filter tests
 
@@ -34,7 +51,7 @@ included to show the filter transition, not as a current backlog promise.
 | Historical label isolation (`bf-1y51s`) | No exclusions: 45; exclude `deferred`: 28; exclude `human`, `blocked`, or `starvation-alert` individually: 45 | Only `deferred` matched open beads in that snapshot; the configured list was not broad enough to explain zero. |
 | Historical filter combinations (`pluck_filter_combinations_test`) | On the correct store: base 1,262; `open` 41; unassigned 373; labels only 1,179; `open + unassigned` 40; `open + labels` 36; unassigned + labels 369; full query 36 | All eight combinations returned candidates. No filter combination was blocking. |
 | Historical workspace mismatch (`pluck_workspace_mismatch_test`) | Target store: 36 ready; parent store: 0 open and 0 ready | Selecting the parent store explains the zero result. |
-| Current `pluck_db_test` | 2 tests passed; target path and `bead list --ready --json --limit 999999` verified; backend returned 10 ready candidates; label table has 0 rows | The current bead-rs path and filter configuration work. Its separate SQL simulation reports 32 because it does not model dependency readiness. |
+| Current `pluck_db_test` | 2 tests passed; target path and `bead list --ready --json --limit 999999` verified; backend returned 7 ready candidates; one label row belongs to a closed issue | The current bead-rs path and filter configuration work. Its separate SQL simulation reports 21 because it does not model dependency readiness. |
 | Current `pluck_filter_combinations_test` | Test process passed, but only 4 of 8 scenarios ran; four legacy queries failed with `no such column: status` | This test is stale for bead-rs (`base_status` replaced `status`). Its exit code does not validate the old SQL filter matrix. |
 | Current `test_workspace_path_formats` | Test process passed, but no format was reported successful because its readiness query uses the removed `status` column | Absolute target, `.`, trailing-slash, and double-slash paths opened the target file; the readiness assertion is stale. |
 | Current `tests/test_exclude_labels.sh` | Failed immediately with `no such column: i.status` | The shell test is also legacy `bf`/`br` SQL and cannot measure current label behavior. |
@@ -81,10 +98,8 @@ needle run --workspace /home/coding/claude-governor --agent <agent-name>
 ```
 
 Restart NEEDLE after changing configuration; workers load it at startup. The
-installed `needle 0.3.0` on this host currently rejects the unrelated
-`telemetry.otlp_sink.tls: none` schema value before loading Pluck settings, so
-the global file must also be schema-aligned with the installed NEEDLE version
-before a live worker can consume it.
+global file is now schema-aligned with both the installed `needle 0.3.0` and
+the active `needle 0.4.2`, so the Pluck settings are runtime-effective.
 
 An empty `exclude_labels` list does not disable filtering: NEEDLE falls back to
 `deferred`, `human`, and `blocked`. A non-empty list replaces that fallback,
@@ -113,13 +128,13 @@ bead list --ready --json --limit 999999 \
     '
 ```
 
-On the verification run above, this returned `10`. The important diagnostic
+On the verification run above, this returned `7`. The important diagnostic
 comparison is:
 
 ```bash
 cd /home/coding/claude-governor
-bead list --status open --json --limit 999999 | jq -s 'length'   # 32
-bead list --ready --json --limit 999999 | jq -s 'length'         # 10
+bead list --status open --json --limit 999999 | jq -s 'length'   # 21
+bead list --ready --json --limit 999999 | jq -s 'length'         # 7
 ```
 
 If the first command reports open work but the second reports zero, inspect
