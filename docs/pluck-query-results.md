@@ -1,19 +1,98 @@
-# Pluck Query Results — Historical Query Reference
+# Pluck Query Results
+
+**Status:** current `bead-rs` result reference with historical SQL notes
+**Verified:** 2026-08-21
+**Scope:** NEEDLE Pluck in this workspace
 
 > For the current NEEDLE/`bead-rs` implementation, use
 > [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). This page
-> preserves older `bf`/`br`-era SQL and query examples for investigation only;
-> its generic `issues` fields are not the authoritative Pluck filter contract.
+> documents the result contract first. The older `bf`/`br`-era SQL and query
+> examples below are retained for investigation only; their generic `issues`
+> fields are not the authoritative current Pluck filter contract.
+
+## Current bead-rs result contract
+
+Pluck asks the configured workspace's bead-rs backend for the ready frontier:
+
+```bash
+bead list --ready --json --limit 999999
+```
+
+The command runs with the target workspace as its current directory. With
+`--json`, bead-rs emits compact JSONL: each non-empty stdout line is one
+independent issue object. There is no top-level `beads` array or `total` field,
+so consumers must parse the output line by line. The `--limit` value is the
+maximum number of records, not a page number.
+
+A representative result is:
+
+```json
+{"id":"claudego-example","title":"Example task","description":"Task body","status":"open","assignee":null,"priority":2,"labels":["documentation"],"dependencies":[],"created_at":"2026-08-21T12:00:00Z","updated_at":"2026-08-21T12:00:00Z","revision":1,"comments":[]}
+```
+
+The field contract is:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `id` | string | Stable bead identifier. |
+| `title` | string | Bead title. |
+| `description` | string | Bead body; usually present even when empty. |
+| `status` | string | Base status (`open`, `in_progress`, `deferred`, or `closed`). Ready results are `open`. |
+| `assignee` | string or `null` | Current assignee. Ready results are unassigned. |
+| `priority` | integer | Priority value from 0 through 4; lower values sort first. |
+| `labels` | array of strings | Labels attached to the bead. Pluck applies `exclude_labels` to this array after the backend response. |
+| `dependencies` | array of objects | Dependency references, including the blocker ID and dependency kind. An unfinished `blocks` dependency keeps an issue out of the ready frontier. |
+| `created_at`, `updated_at` | ISO-8601 strings | Creation and last-update timestamps. |
+| `revision` | integer | Bead revision returned by bead-rs. |
+| `comments` | array | Comment projection; the default `--comments none` projection does not include comment bodies. |
+
+The `--ready` predicate is evaluated by bead-rs before Pluck receives any
+records. It requires an open, unassigned, non-manually-blocked issue with no
+unfinished `blocks` dependency. Results are ordered deterministically by
+`priority ASC`, `created_at ASC`, and `id ASC`. Labels are not an inclusion
+filter: Pluck configures no required labels, and a label such as `polish` or
+`documentation` does not make a bead ready by itself.
+
+After parsing the JSONL, Pluck removes records with an excluded label and
+defensively removes an `in_progress` record or an assigned `open` record if a
+backend ever returns one. The active exclusion list for this deployment is
+`deferred`, `human`, `blocked`, and `starvation-alert`; matching is exact and
+case-sensitive. See [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md)
+for the complete filter pipeline and ordering behavior.
+
+### Inspecting and consuming results
+
+Use `jq -s` when an array is convenient, because the backend output is JSONL:
+
+```bash
+# Count ready records.
+bead list --ready --json --limit 999999 | jq -s 'length'
+
+# Print ready bead IDs.
+bead list --ready --json --limit 999999 | jq -r '.id'
+
+# Compare the broad open set with the ready frontier.
+bead list --status open --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -s 'length'
+```
+
+An empty stream means that the backend returned no records for the requested
+frontier; it is not a JSON document containing an empty array. Pluck reports
+this as `NoWork` after its label and defensive filters also produce no
+candidates.
 
 ## Overview
 
-Pluck (the `br` CLI / bead-forge) queries beads from SQLite databases located in `.beads/beads.db` within each workspace. Query results are the foundation of NEEDLE's bead claiming system, cgov's capacity calculations, and the polish loop's generation pipeline.
+Pluck query results are the foundation of NEEDLE's bead claiming system, cgov's
+capacity calculations, and the polish loop's generation pipeline. The
+historical material that follows describes the older `br`/bead-forge model;
+use the current contract above for bead-rs output.
 
 **All Pluck queries share the same core pattern**: filter the `issues` table (beads are stored as "issues" for br compatibility) by status, assignee, and label constraints, then return matching bead IDs and their metadata for claiming, listing, or analysis.
 
 ---
 
-## Database Schema
+## Historical SQL reference (bf/br era)
 
 ### The `issues` Table (Beads)
 
@@ -189,11 +268,11 @@ Filters are applied in this logical order (SQL WHERE clause construction):
 
 ---
 
-## Query Result Formats
+## Historical query result formats
 
-### CLI Output Formats
+### Legacy CLI output formats
 
-Pluck (`br` CLI) supports multiple output formats:
+The historical Pluck (`br` CLI) supported multiple output formats:
 
 #### 1. Human-Readable (default)
 
