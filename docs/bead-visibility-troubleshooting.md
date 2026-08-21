@@ -1,6 +1,10 @@
-# Bead Visibility Troubleshooting Guide
+# Bead Visibility Troubleshooting Guide — Historical
 
-**Last Updated:** 2026-08-03  
+> For the current NEEDLE/`bead-rs` implementation and active four-label list,
+> use [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md).
+> Commands and SQL on this page are retained for older `bf`/`br` investigations.
+
+**Last Updated:** 2026-08-20
 **Purpose:** Quick reference for diagnosing and fixing bead visibility issues
 
 ---
@@ -43,18 +47,18 @@ Step 5: Check database integrity
 ### 1. Exclude Labels Pitfalls
 
 #### Pitfall 1.1: Empty exclude_labels Expects Defaults
-**Problem:** You set `strands.pluck.exclude_labels: []` expecting it to use defaults, but it excludes NOTHING.
+**Problem:** You set `strands.pluck.exclude_labels: []` expecting to disable exclusions.
 
-**Why:** Empty array = "exclude nothing", not "use defaults"
+**Why:** The current Pluck implementation replaces an empty list with its compiled defaults.
 
 **Fix:**
 ```yaml
-# WRONG - excludes nothing
+# Uses compiled defaults: deferred, human, blocked
 strands:
   pluck:
     exclude_labels: []
 
-# CORRECT - uses defaults (deferred, human, blocked)
+# Explicit equivalent of the compiled defaults
 strands:
   pluck:
     exclude_labels:
@@ -62,7 +66,7 @@ strands:
       - human
       - blocked
 
-# OR - omit the key entirely (defaults are compiled in)
+# Omitting the key also uses the compiled defaults
 strands:
   pluck:
     split_after_failures: 3

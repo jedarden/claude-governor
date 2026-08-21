@@ -1,97 +1,18 @@
-# Pluck Configuration Investigation Report
+# Pluck filter and label settings
 
-**Status:** consolidated findings
-**Updated:** 2026-08-20
-**Target workspace:** `/home/coding/claude-governor`
+**Status:** authoritative current-state reference
+**Verified:** 2026-08-20
+**Scope:** NEEDLE Pluck using this workspace's `bead-rs` backend
 
-## Executive summary
+This document records the complete Pluck configuration and candidate-filter
+inventory. It supersedes the older `bf`/`br`-era SQL examples in this
+repository. The target workspace's `.needle.yaml` selects `bead-rs`; it does
+not define a second Pluck configuration.
 
-Pluck does not select from every bead in a workspace. It asks the configured bead
-backend for the ready frontier, removes excluded labels and non-claimable records,
-then sorts the remaining candidates. The configuration has several legitimate
-ways to make a bead invisible:
+## Effective configuration
 
-- Pluck can be pointed at a different workspace and therefore a different
-  `.beads` database.
-- The ready query excludes non-open, assigned, manually blocked, or dependency-
-  blocked beads.
-- `exclude_labels` removes beads carrying any configured label.
-- A stale open assignee can keep a bead out of the ready frontier until it is
-  cleared.
-
-The original “open beads are not visible” incident was a workspace-selection
-failure, not an over-broad label filter. Historical tests returned candidates
-from `/home/coding/claude-governor/.beads` but zero candidates from the wrong
-`/home/coding/.beads` database. The old default was subsequently changed, but
-the currently authoritative global config now points at `/home/coding/aide-de-camp`,
-which is again not this workspace. A worker started without an explicit workspace
-can therefore reproduce the same class of failure.
-
-There is also a separate configuration-load failure in the installed `needle`
-CLI: `needle config` currently rejects
-`/home/coding/.config/needle/config.yaml:139` (`telemetry.otlp_sink.tls: "none"`)
-because that binary expects the structured TLS form. A worker using that same
-binary may fail before Pluck initializes; this must be fixed or version-aligned
-before runtime findings can be trusted.
-
-## Evidence from the three child investigations
-
-The supplied `bf-*` IDs are historical bead-forge IDs. They are not present as
-live IDs after this workspace's 2026-08-14 bead-rs migration, so their findings
-were recovered from the committed investigation history:
-
-| Child bead | Finding | Historical artifact |
-|---|---|---|
-| `bf-6b65h` | Documented `exclude_labels`, the empty-list fallback, custom override behavior, and the distinction between labels and status. | Commit `00c870e` (`notes/bf-6b65h.md`) |
-| `bf-22ks5` | Verified that configured workspace paths and databases were accessible, while also documenting multi-workspace discovery and the then-current default `/home/coding`. | Commit `9aa1888` (`notes/bf-22ks5.md`) |
-| `bf-2ur41` | Documented the filter pipeline, stale-assignee risk, label lifecycle risk, and historical filter impact. | Commit `d69b78a` (`notes/bf-2ur41.md`) |
-
-Later root-cause testing is also relevant: commit `3a70f2f` demonstrated that
-the full filter combination returned ready beads from the correct database and
-zero from the wrong database. The historical counts below are retained with
-their dates because the workspace has since migrated to bead-rs and its live
-queue has changed.
-
-## Configuration sources and precedence
-
-The current NEEDLE source resolves configuration in this order:
-
-1. built-in defaults;
-2. `/home/coding/.config/needle/config.yaml` (global file);
-3. `<workspace>/.needle.yaml` (limited workspace overrides);
-4. `NEEDLE_*` environment overrides;
-5. CLI overrides, including `needle run --workspace`.
-
-The loader is implemented in `/home/coding/NEEDLE/src/config/mod.rs` and reads
-the global file from `.config/needle/config.yaml`. The current source does not
-allow a workspace `.needle.yaml` to override `strands.pluck`; its workspace
-override type supports agent settings, selected auxiliary strands, prompts,
-verification/gates, workspace labels, and bead backend binding.
-
-### Files observed
-
-| File or setting | Current value | Visibility effect |
-|---|---|---|
-| `/home/coding/.config/needle/config.yaml` → `workspace.default` | `/home/coding/aide-de-camp` | **High risk:** the home Pluck store is not `claude-governor` unless the worker is launched with an explicit workspace. |
-| `/home/coding/.config/needle/config.yaml` → `telemetry.otlp_sink.tls` | String `"none"` | **Configuration-load failure in installed CLI:** `needle config` rejects this value as the wrong type at line 139. |
-| `/home/coding/.config/needle/config.yaml` → `workspace.home` | `/home/coding/.needle` | Stores NEEDLE state/heartbeats and optional starvation records; it is not the target bead database. |
-| `/home/coding/.config/needle/config.yaml` → `strands.explore` | enabled; `workspaces: []`; `workspace_root: /home/coding/` | Allows recursive discovery of `.beads` workspaces. The exclusion file still controls which discovered roots are skipped. |
-| `/home/coding/.config/needle/explore-excluded` | Does not list `claude-governor` as observed on 2026-08-20 | If `claude-governor` is added here, Explore cannot find it. |
-| `/home/coding/claude-governor/.needle.yaml` | `bead_cli.backend: bead-rs` | Selects the backend; no Pluck override is present. |
-| `/home/coding/claude-governor/.beads/config.json` | bead-rs workspace metadata (`prefix: claudego`) | Identifies the live bead-rs store; it does not define Pluck label filters. |
-| `/home/coding/.needle/config.yaml` | `workspace.default: /home/coding/claude-governor`, older schema/content | **Not read by the current loader.** It is a stale duplicate and can create false confidence during troubleshooting. |
-
-The global config's `workspace.default` is a home-store selection, not a
-restriction on Explore. Explore can still discover other repositories when it
-is enabled, but this does not make an incorrectly selected home database
-correct. Workers load configuration at startup, so a change requires a worker
-restart.
-
-## Configured Pluck settings
-
-The authoritative global config declares the following Pluck values. They become
-runtime-effective only after the configuration-load error described above is
-resolved:
+The active global configuration is `/home/coding/.config/needle/config.yaml`.
+Its complete `strands.pluck` section is:
 
 ```yaml
 strands:
@@ -105,217 +26,231 @@ strands:
     persistent_starvation_records: false
 ```
 
-### `exclude_labels`
+The target workspace contains only this backend binding:
 
-The configured list has four exact, case-sensitive labels:
+```yaml
+bead_cli:
+  backend: bead-rs
+```
 
-| Label | Effect |
+There are exactly three configurable Pluck keys in NEEDLE's
+`PluckConfig`:
+
+| Key | Effective value | Candidate visibility? | Meaning |
+|---|---:|---:|---|
+| `strands.pluck.exclude_labels` | `deferred`, `human`, `blocked`, `starvation-alert` | Yes | Excludes a bead when any exact label matches. |
+| `strands.pluck.split_after_failures` | `3` | No | Changes the result for the first sorted candidate when its `failure-count:N` label reaches the threshold. `0` disables splitting. |
+| `strands.pluck.persistent_starvation_records` | `false` | No | Controls whether no-candidate diagnostics are also appended to NEEDLE's starvation-record file. |
+
+No other `strands.pluck` keys, status selectors, required-label selectors, or
+metadata selectors are configured for this workspace.
+
+### Configuration precedence and workspace selection
+
+NEEDLE loads built-in defaults, the global config, workspace-supported
+overrides, environment overrides, and CLI overrides. Pluck is constructed from
+the resolved `strands.pluck` values when the worker starts.
+
+The global `workspace.default` currently points to
+`/home/coding/aide-de-camp`, while this repository is
+`/home/coding/claude-governor`. That path selects the bead store that Pluck
+opens; it is not itself a label filter. A worker serving this repository must
+use an explicit workspace override or an aligned default. The NEEDLE home path
+(`/home/coding/.needle`) stores worker state and diagnostics; it is not the
+target `.beads` database.
+
+## Complete `exclude_labels` inventory
+
+### Active target configuration
+
+These are the four labels currently passed into Pluck from the active global
+config:
+
+| Exact label | Effect |
 |---|---|
-| `deferred` | Removes postponed work from Pluck candidates. |
-| `human` | Removes work reserved for human intervention. |
-| `blocked` | Removes work marked as blocked; dependencies are also checked by the ready query. |
-| `starvation-alert` | Removes alert beads from normal work selection. This is an explicit deployment setting, not the current source default. |
+| `deferred` | Excludes postponed work. |
+| `human` | Excludes work reserved for human handling. |
+| `blocked` | Excludes beads carrying the blocked marker. This is a label match, separate from bead-rs manual blocking and effective status. |
+| `starvation-alert` | Excludes starvation-alert beads from normal work selection. This is an explicit deployment label, not a built-in Pluck default. |
 
-The source fallback in `/home/coding/NEEDLE/src/strand/pluck.rs:21` is:
+Matching is exact and case-sensitive. The implementation uses string
+membership (`contains`); there is no wildcard, prefix, regular-expression, or
+case-folded matching. A bead with multiple labels is excluded if it has at
+least one matching label.
+
+### Built-in fallback
+
+NEEDLE defines this fallback in
+`/home/coding/NEEDLE/src/strand/pluck.rs`:
 
 ```rust
 const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
 ```
 
-An empty `exclude_labels` vector activates that fallback. A non-empty configured
-vector replaces the fallback; it is not merged with it. Consequently, an empty
-list is not a way to disable all exclusions. The current global file is
-non-empty, so its four labels will be effective once the file parses.
+An omitted or empty `exclude_labels` vector is replaced by those three labels.
+A non-empty configured list replaces the fallback; it is not merged with it.
+Therefore:
 
-The list applies to the `labels` field only. `open`, `in_progress`, and `closed`
-are status values, not labels; status filtering comes from the ready query and
-the defensive Pluck filter.
+- `exclude_labels: []` does **not** disable label filtering;
+- a custom non-empty list must repeat `deferred`, `human`, or `blocked` if
+  those defaults should remain excluded;
+- the active four-label list is the effective list for this deployment.
 
-### `split_after_failures`
+Labels such as `failure-count:N`, `cycling`, `polish`, or `documentation` are
+not excluded by Pluck unless an operator adds their exact names to
+`exclude_labels`. `failure-count:N` has separate split and ordering behavior,
+described below.
 
-The current value is `3`. When the first sorted candidate carries a
-`failure-count:N` label at or above the threshold, Pluck returns a split
-instruction instead of the normal bead-found result. This can delay processing
-of that bead, but it is not a database visibility filter. A value of `0`
-disables the split trigger.
+## Complete candidate-filter inventory
 
-Candidates are sorted by priority, failure count, creation time, and ID. The
-failure-count tie-breaker prevents a repeatedly failing bead from monopolizing
-the first position.
+Pluck selection has multiple layers. The backend's ready query is the primary
+visibility gate; Pluck then applies label and defensive guards.
 
-### `persistent_starvation_records`
+### 1. Workspace and store
 
-The current value is `false`, matching the source default. Pluck still emits
-starvation telemetry when it has no candidates. When enabled, it additionally
-writes records under the NEEDLE home state directory
-(`/home/coding/.needle/state/starvation-records.jsonl`); this setting affects
-diagnostics, not candidate visibility.
-
-## Candidate filter pipeline
-
-The effective pipeline is:
+Pluck queries the resolved workspace's configured bead store. For this target,
+NEEDLE opens the `.beads` store selected by `bead-rs` and runs:
 
 ```text
-configured home workspace
-  → configured bead backend's ready frontier
-  → backend label/ID filters
-  → Pluck defensive label filter
-  → Pluck status and assignee guard
-  → deterministic sort
-  → split check or BeadFound
+bead list --ready --json --limit 999999
 ```
 
-### 1. Workspace and backend
+If the resolved workspace has no valid `.beads` store, Pluck returns
+`Skipped(no_home_store)`. It does not search upward for this repository's
+database.
 
-Pluck opens the `.beads` store for the worker's resolved home workspace. The
-CLI workspace is canonicalized when supplied. If the selected workspace has no
-valid `.beads` directory, Pluck returns `Skipped(no_home_store)` rather than
-searching this repository by accident.
+### 2. Bead-rs `--ready` frontier
 
-The current target binds `bead-rs` in `.needle.yaml`. The post-migration live
-store is `.beads/beads.db`, with the durable checkpoint under
-`.beads/checkpoint/`; older `bf`/`br` commands and their old schema should not be
-used to diagnose this store.
+The current bead-rs implementation defines a ready issue as all of the
+following:
 
-### 2. Ready-frontier constraints
+| Criterion | Required value | Notes |
+|---|---|---|
+| Base status | `open` | `in_progress`, `deferred`, and `closed` do not enter the ready frontier. |
+| Assignee | `NULL` / absent | Assigned open beads are not ready. |
+| Manual block | `false`, `0`, or `NULL` | A manual block is an effective `blocked` state. |
+| Blocking dependencies | None unfinished | A dependency of kind `blocks` hides the bead while its blocker has any base status other than `closed`. `relates_to` is not a blocking dependency. |
 
-The bead-rs `ready` operation is the main visibility gate. It returns work that
-is ready to claim, which means, at minimum:
+The ready query orders its result by `priority ASC`, `created_at ASC`, and
+`id ASC`. Pluck requests a limit of `999999`, so the limit is effectively an
+implementation ceiling rather than a normal queue filter.
 
-- base status is `open`;
-- the bead is unassigned;
-- it is not manually blocked;
-- it has no unresolved blocking dependency.
+The ready frontier has no filter for labels, pinned state, ephemeral state,
+templates, due dates, `defer_until`, or required labels. Labels are included in
+the JSON projection and filtered by NEEDLE after the backend returns them.
 
-The Pluck `Filters` object supplies `assignee: None`, the configured
-`exclude_labels`, and an empty `exclude_ids` set. The backend also removes any
-configured excluded IDs, although Pluck currently supplies none.
+### 3. NEEDLE `Filters` passed to the store
 
-### 3. Defensive label filter
+Pluck constructs the complete runtime filter object as follows:
 
-Pluck repeats the label exclusion after the backend returns candidates. This
-protects against backend output that omits or mishandles label data and prevents
-a select/claim/retry loop. Any returned bead carrying one of the four effective
-labels is removed again.
+```rust
+Filters {
+    assignee: None,
+    exclude_labels: self.exclude_labels.clone(),
+    exclude_ids: HashSet::new(),
+}
+```
 
-### 4. Status and stale-assignee guard
+| Runtime field | Current value | Effect |
+|---|---|---|
+| `Filters.assignee` | `None` | Pluck does not add an assignee equality filter in the store adapter. The bead-rs `--ready` query already requires no assignee. |
+| `Filters.exclude_labels` | The four active labels above | The CLI store adapter removes any returned bead carrying one of these exact labels. |
+| `Filters.exclude_ids` | Empty set | Pluck supplies no configured ID exclusions. |
 
-Pluck removes an `in_progress` bead and removes an `open` bead with any assignee.
-The latter is intentionally conservative: an open bead with a dead worker's
-assignee is still invisible until the assignment is cleared. This is the main
-filter-level starvation risk identified by `bf-2ur41`.
+The store adapter applies `exclude_labels` and `exclude_ids` after parsing the
+backend output. This is followed by Pluck's own defensive label pass, so label
+exclusion is intentionally performed twice: once in the store adapter and once
+in `PluckStrand` to protect against a backend that omits or mishandles labels.
 
-### 5. Metadata and time fields
+### 4. Pluck status and stale-assignee guard
 
-The old bead-forge investigation notes discussed `ephemeral`, `pinned`,
-`is_template`, `defer_until`, and `due_at` as possible or historical query
-criteria. They are not active Pluck settings in the current bead-rs path shown
-above. In particular, Pluck does not implement a time-based reactivation of a
-`deferred` label; label lifecycle remains an operational responsibility.
+After the store returns candidates, Pluck removes:
 
-## Which settings can make beads invisible?
+- a bead whose status is `in_progress`;
+- an `open` bead that still has an assignee.
 
-| Setting or state | Can hide a bead? | Assessment |
-|---|---:|---|
-| Wrong `workspace.default` or missing `--workspace` | Yes, potentially all beads in the intended repository | **Primary incident cause.** The worker queries another valid but empty/smaller `.beads` store. |
-| `explore.workspace_root` / `explore-excluded` | Yes for discovered workspaces | Current root includes `/home/coding`; `claude-governor` is not currently excluded. |
-| `exclude_labels` | Yes for matching labels | Intended behavior. `starvation-alert` is an extra explicit exclusion in the current global config. |
-| Empty `exclude_labels` | Yes, by activating the three-label source fallback | Common configuration misunderstanding. |
-| `status != open` | Yes | Ready-frontier behavior, not a Pluck bug. |
-| Assigned open bead or `in_progress` status | Yes | Stale assignees can cause durable invisibility. |
-| Manual block or unresolved dependency | Yes | Ready-frontier behavior. |
-| `exclude_ids` | Yes in principle | Currently empty, so it is not contributing. |
-| `split_after_failures` | Delays normal processing, not query visibility | Only applies after candidates have been found and sorted. |
-| `persistent_starvation_records` | No | Changes diagnostics only. |
-| `.beads/config.json` lifecycle metadata | Not directly | Backend selection is relevant; bead-rs metadata itself is not an exclude-label setting. |
+Normally the ready frontier has already removed both cases. The second pass is
+a defensive guard against stale or inconsistent backend output. It also means
+that an open bead assigned to a dead worker remains invisible until its
+assignee is cleared.
 
-## Root cause of the historical invisibility
+Pluck does not independently filter `closed` or `deferred` candidates after
+the ready query; those statuses should never be returned by `--ready`.
 
-The decisive evidence was a database comparison from the later investigation:
+### 5. Worker-local ID exclusions
 
-| Database queried | Historical result |
-|---|---:|
-| `/home/coding/claude-governor/.beads/beads.db` | 36 ready candidates under the full filter combination |
-| `/home/coding/.beads/beads.db` | 0 open beads and 0 candidates |
+The worker maintains a transient exclusion set outside `strands.pluck`. The
+`StrandRunner` removes IDs from selected candidates when they are currently
+excluded, including IDs that recently lost a claim race or produced a claim
+error. Race-lost IDs have a 30-second TTL; other retry exclusions are cleared
+as the worker's retry state resets. This set is not persisted configuration and
+is not part of `exclude_labels`.
 
-The failure sequence was:
+## Labels versus statuses
 
-1. NEEDLE/Pluck resolved a relative or incorrect default workspace to a parent
-   or other workspace.
-2. The worker opened that workspace's valid `.beads` database.
-3. The ready query correctly found no open/claimable records there.
-4. Pluck reported no candidates, making the beads in
-   `/home/coding/claude-governor/.beads` appear invisible.
+Labels and statuses are separate fields:
 
-This explains why debug output showed “no beads excluded”: there were no beads
-from the wrong database on which the label filter could operate. Systematic
-filter tests on the correct database did not produce a zero-candidate result.
+| Concept | Current behavior |
+|---|---|
+| `deferred` label | Excluded by the active `exclude_labels` list. |
+| `deferred` base status | Not eligible for `--ready`, even without the label. |
+| `blocked` label | Excluded by the active `exclude_labels` list. |
+| Manual block | Not a label; `manual_blocked` prevents `--ready` and is shown as effective status `blocked`. |
+| Unfinished `blocks` dependency | Not a label; prevents `--ready`. |
+| `in_progress` base status | Not eligible for `--ready`; also removed by Pluck's defensive status guard. |
+| `closed` base status | Not eligible for `--ready`; a closed blocker is considered finished. |
+| `failure-count:N` label | Not an exclusion label. It affects Pluck ordering and may trigger splitting. |
 
-The `bf-22ks5` finding that `/home/coding` was accessible was therefore not
-evidence that it was the right workspace. Accessibility and correctness are
-different checks. A later historical change set the old global default to
-`/home/coding/claude-governor`, but the current authoritative file has drifted
-to `/home/coding/aide-de-camp`; that live mismatch must be treated as an
-unresolved configuration risk.
+There is no active Pluck filter that requires a bead to have a positive label
+such as `polish`, `rust`, or `documentation`.
 
-## Recommendations
+## Ordering and failure-count behavior
 
-1. **Make the active config parse with the installed worker.** Resolve the
-   `telemetry.otlp_sink.tls` schema mismatch at line 139 (use the format
-   supported by the installed `needle`, or deploy a matching binary/config
-   pair), then verify with `needle config`. This is a prerequisite for
-   trusting any Pluck runtime behavior.
+After filtering, Pluck sorts candidates deterministically by:
 
-2. **Align the active default with the intended worker home.** For workers
-   serving this repository, set `workspace.default` in
-   `/home/coding/.config/needle/config.yaml` to
-   `/home/coding/claude-governor`, or always launch with
-   `needle run --workspace /home/coding/claude-governor`. Restart workers after
-   changing it.
+```text
+priority ASC → failure count ASC → created_at ASC → id ASC
+```
 
-3. **Remove configuration ambiguity.** Treat `/home/coding/.config/needle/` as
-   the active configuration location and archive or clearly mark
-   `/home/coding/.needle/config.yaml` as legacy. Verify the resolved value with
-   `needle config`/the running worker rather than reading the duplicate file.
+The failure count is the maximum valid integer in any `failure-count:N` label;
+missing or malformed values count as zero. This ordering prevents a repeatedly
+failing bead from monopolizing the first slot at the same priority.
 
-4. **Keep label policy intentional.** Retain `deferred`, `human`, and `blocked`
-   if those labels mean “do not dispatch automatically.” Review whether
-   `starvation-alert` should remain hidden; remove it from the explicit global
-   list only if alert beads are meant to be ordinary worker tasks. Do not use an
-   empty list expecting no exclusions.
+With `split_after_failures: 3`, if the first sorted candidate has a failure
+count of at least three, Pluck returns a `Split` result instead of a normal
+bead-found result. This changes dispatch behavior after filtering; it does not
+make the bead disappear from the ready query. Setting the threshold to `0`
+disables this check.
 
-5. **Recover stale assignments.** Monitor open beads with assignees, clear
-   assignments left by dead workers, and ensure the mend/heartbeat recovery
-   path is operating. A label audit should also remove `deferred` or `blocked`
-   labels when their reason no longer applies.
+If a threshold-reaching candidate's title or body matches NEEDLE-internal
+configuration patterns (including Pluck or `exclude_labels` investigation),
+NEEDLE skips that split candidate and evaluates the queue again. This is a
+content-based safety guard, not a configurable label filter.
 
-6. **Protect discovery.** Keep `explore.workspace_root` broad enough to include
-   the target, keep `claude-governor` out of `explore-excluded`, and use an
-   explicit `explore.workspaces` list when strict repository scope is required.
+## Diagnostics setting
 
-7. **Use the current backend for verification.** From the target workspace,
-   compare `bead list --status open` with `bead list --ready`, then inspect the
-   worker's resolved workspace and Pluck telemetry. Do not validate a bead-rs
-   store with old `bf`/`br` commands.
+When the filtered candidate list is empty, Pluck emits starvation telemetry with
+the store-returned count, exclusion count, and exclusion reasons. With the
+current `persistent_starvation_records: false`, it does not write a persistent
+record. If enabled, records are written to NEEDLE's own
+`<workspace.home>/state/starvation-records.jsonl`, never to the target
+repository's `.beads` store.
 
-## Verification snapshot
+## Troubleshooting checklist
 
-On 2026-08-20, the live bead-rs store in this repository reported 75 open beads
-and 16 beads on the ready frontier. These are queue-state counts, not a claim
-that all 16 survive the active four-label Pluck filter. The database and backend
-were readable, the target `.needle.yaml` selected bead-rs, and the target was
-not listed in the current Explore exclusion file.
+To distinguish a filter result from a wrong workspace or empty ready frontier:
 
-The historical child counts (1,208 total beads, 21 open, 20 claimable, and 81
-filtered in one bf-era analysis) should be used only as dated investigation
-evidence, not as current operational metrics.
+```bash
+# Confirm the target backend binding.
+sed -n '1,40p' /home/coding/claude-governor/.needle.yaml
 
-## Conclusion
+# Inspect the active Pluck values.
+sed -n '/^strands:/,/^[^[:space:]]/p' /home/coding/.config/needle/config.yaml
 
-The Pluck filter settings are restrictive by design but function correctly on
-the intended database. Labels, readiness, dependencies, manual blocks, and
-stale assignees can hide individual beads; a workspace mismatch can hide the
-entire queue. The root cause of the investigated “open beads are not visible”
-incident was the latter: Pluck queried the wrong workspace database. The active
-configuration still has a workspace-default mismatch, so aligning that path and
-removing the duplicate-config ambiguity are the required configuration fixes.
+# Compare all open issues with the ready frontier in the target workspace.
+bead list --status open --json --limit 999999
+bead list --ready --json --limit 999999
+```
+
+Use the current `bead` CLI for the bead-rs store. Do not use historical `bf`
+or `br` SQL/schema examples as evidence about the current ready predicate.

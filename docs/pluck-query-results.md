@@ -1,4 +1,9 @@
-# Pluck Query Results — Complete Reference
+# Pluck Query Results — Historical Query Reference
+
+> For the current NEEDLE/`bead-rs` implementation, use
+> [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). This page
+> preserves older `bf`/`br`-era SQL and query examples for investigation only;
+> its generic `issues` fields are not the authoritative Pluck filter contract.
 
 ## Overview
 

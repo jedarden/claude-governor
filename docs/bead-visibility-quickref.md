@@ -1,6 +1,10 @@
-# Bead Visibility Quick Reference
+# Bead Visibility Quick Reference — Historical
 
-**Last Updated:** 2026-08-03
+> The current target-specific Pluck inventory is
+> [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). This page
+> retains older `bf`/`br` operational examples.
+
+**Last Updated:** 2026-08-20
 
 ## Six-Layer Priority (Highest → Lowest)
 
@@ -23,7 +27,7 @@ const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
 
 | Pitfall | Symptom | Fix |
 |---------|---------|-----|
-| `exclude_labels: []` | Excludes nothing (not defaults) | Omit key or include all three defaults |
+| `exclude_labels: []` | Uses compiled defaults (`deferred`, `human`, `blocked`) | Omit key or provide the complete intended list |
 | Custom labels without defaults | Loses default exclusions | Always include `deferred`, `human`, `blocked` |
 | Wrong working directory | Queries wrong database | `cd` to workspace or use `--workspace` |
 | Config not reloaded | Edits ignored | Restart cgov/NEEDLE |

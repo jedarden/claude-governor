@@ -1,4 +1,9 @@
-# Filter Patterns Reference
+# Filter Patterns Reference — Historical
+
+> For the current NEEDLE/`bead-rs` filter contract, use
+> [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). The
+> examples on this page describe the older `bf`/`br` query model and are kept
+> for historical investigation.
 
 **Last Updated:** 2026-08-03
 **Purpose:** Complete reference for Pluck filter patterns and common query examples

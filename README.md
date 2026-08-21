@@ -196,10 +196,11 @@ src/
 - `docs/research/` — Research on API pricing, usage tracking, off-peak promotions
 - `docs/bead-visibility-troubleshooting.md` — Comprehensive troubleshooting guide for bead visibility issues, common pitfalls, and configuration best practices
 - `docs/bead-visibility-quickref.md` — Quick reference for bead visibility configuration and common pitfalls
-- `docs/filter-patterns-reference.md` — Complete reference for Pluck filter patterns and query examples
+- `docs/filter-patterns-reference.md` — Historical Pluck filter patterns and query examples
+- `docs/plan/pluck-configuration.md` — Authoritative current Pluck filter and label settings
 - `docs/pluck-workspace-paths.md` — Workspace path configuration and discovery
-- `docs/pluck-query-results.md` — Query patterns and filter syntax reference
-- `docs/research/bead-visibility-configuration.md` — Complete six-layer configuration system map for bead visibility
+- `docs/pluck-query-results.md` — Historical query patterns and filter syntax examples
+- `docs/research/bead-visibility-configuration.md` — Historical six-layer configuration map for bead visibility
 
 ## License
 
