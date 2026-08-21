@@ -3,8 +3,8 @@ name: pluck-config-investigation
 description: Current and historical Pluck workspace, filter, and connectivity findings
 metadata:
   type: project
-  bead_id: claudego-69cbffe4
-  verified: 2026-08-21
+  bead_id: claudego-a4646171
+  verified: 2026-08-21T11:37:09Z
 ---
 
 # Pluck Configuration Investigation Summary
@@ -28,10 +28,12 @@ string where the binary expects an OtlpTlsConfig mapping. The Pluck values
 below are the values present in the file, but they cannot become runtime-
 effective until that unrelated config-version/type mismatch is corrected.
 
-The current target store has 48 open issues but only 11 in bead-rs’s actual
-ready frontier. Labels currently exclude nothing: the labels table is empty.
-The main current visibility reduction is 37 open issues held by unfinished
-blocks dependencies, not exclude_labels.
+The child-investigation snapshot found 48 open issues and 11 in bead-rs’s
+actual ready frontier. A later read-only check at 2026-08-21T11:37:09Z found
+26 open and 7 ready; counts are expected to change as workers claim and close
+beads. The database has one `deferred` label row, attached to a closed issue,
+so no open issue is currently removed by `exclude_labels`. In that follow-up,
+19 open issues were held by unfinished `blocks` dependencies, not labels.
 
 ## Workspace path findings
 
@@ -77,7 +79,7 @@ workspace overrides, environment overrides, then CLI overrides. The CLI
 --workspace is the normal explicit selection mechanism; configuration is read
 when a worker starts.
 
-### Store comparison at verification time
+### Store comparison at child-investigation verification time
 
 | Store | Database size | Total issues | Open issues | Ready issues |
 |---|---:|---:|---:|---:|
@@ -153,6 +155,22 @@ Read-only checks on 2026-08-21 found:
 The 11 ready issues are the authoritative current candidate count. A simple
 status/assignee/label SQL query returns 48 because it omits dependency
 readiness; that simplified result must not be called the bead-rs ready count.
+
+### Follow-up live sanity check
+
+At 2026-08-21T11:37:09Z, read-only checks of the same target store found:
+
+- 26 open issues, all unassigned.
+- 0 open manually-blocked issues.
+- 1 label row overall (`deferred` on a closed issue), and 0 open labeled
+  issues; therefore no open issue was excluded by the four configured labels.
+- 19 open issues with unfinished `blocks` dependencies.
+- 7 issues returned by `bead list --ready --json --limit 999999`.
+- SQLite `PRAGMA integrity_check` still returned `ok`.
+
+This follow-up confirms that the earlier 48/11 values are a valid point-in-time
+snapshot, not a fixed invariant. Use the ready-frontier command for the live
+candidate count.
 
 ## Connectivity and verification results
 
