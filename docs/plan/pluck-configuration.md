@@ -1,7 +1,7 @@
 # Pluck filter and label settings
 
 **Status:** authoritative current-state reference
-**Verified:** 2026-08-20
+**Verified:** 2026-08-21
 **Scope:** NEEDLE Pluck using this workspace's `bead-rs` backend
 
 This document records the complete Pluck configuration and candidate-filter
@@ -11,7 +11,7 @@ not define a second Pluck configuration.
 
 ## Effective configuration
 
-The active global configuration is `/home/coding/.config/needle/config.yaml`.
+The configured global configuration is `/home/coding/.config/needle/config.yaml`.
 Its complete `strands.pluck` section is:
 
 ```yaml
@@ -32,6 +32,14 @@ The target workspace contains only this backend binding:
 bead_cli:
   backend: bead-rs
 ```
+
+### Runtime loadability
+
+The filter values above are present in the global file, but the installed
+`needle 0.3.0 config` command currently fails before Pluck initializes because
+it rejects the unrelated `telemetry.otlp_sink.tls: none` value at line 133.
+The configuration must be schema-fixed or version-aligned before a worker can
+use these values at runtime; this does not change the filter inventory below.
 
 There are exactly three configurable Pluck keys in NEEDLE's
 `PluckConfig`:
