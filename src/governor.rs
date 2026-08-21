@@ -5245,6 +5245,12 @@ pub fn run_observe_cycle(
     // 1a. Poll Anthropic API for live usage data
     match poller.poll_usage() {
         Ok(usage_data) => {
+            // Keep the instant belonging to the reading separate from `now`,
+            // which is the start of the surrounding governor cycle. A cached
+            // stale reading carries its original timestamp through UsageData,
+            // so the delta interval remains the age of the data being compared.
+            let reading_at = usage_data.timestamp;
+
             // Extract weekly_scoped utilization from model-agnostic limits[] array
             // This ensures the rotated model's REAL pct feeds the EMA calculation
             let weekly_scoped_util = usage_data
@@ -5320,7 +5326,7 @@ pub fn run_observe_cycle(
 
             // Update current_api_snapshot with the new snapshot data
             state.current_api_snapshot = Some(state::PrevUsageSnapshot {
-                taken_at: now,
+                taken_at: reading_at,
                 five_hour_pct: usage_data.five_hour_utilization,
                 seven_day_pct: usage_data.seven_day_utilization,
                 weekly_scoped_pct: weekly_scoped_util,
@@ -5591,6 +5597,14 @@ pub fn run_observe_cycle(
     //
     // Save the old snapshot BEFORE updating it — we need it for reset detection later.
     let old_snapshot = state.burn_rate.prev_usage_snapshot.clone();
+    // Successful polls carry the reading's own timestamp through the API
+    // snapshot. Keep `now` only as the compatibility fallback for a cycle that
+    // did not produce a current snapshot.
+    let current_reading_at = state
+        .current_api_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.taken_at)
+        .unwrap_or(now);
     {
         const EMA_ALPHA: f64 = 0.2;
         // Require at least 60 s between delta samples to avoid noise from very short windows
@@ -5614,7 +5628,7 @@ pub fn run_observe_cycle(
                 new_weekly_scoped
             );
             if let Some(snap) = old_snapshot.clone() {
-                let elapsed_secs = (now - snap.taken_at).num_seconds() as f64;
+                let elapsed_secs = (current_reading_at - snap.taken_at).num_seconds() as f64;
                 let elapsed_hours_snap = elapsed_secs / 3600.0;
 
                 if elapsed_secs >= MIN_ELAPSED_SECS && elapsed_secs <= MAX_ELAPSED_SECS {
@@ -5722,7 +5736,7 @@ pub fn run_observe_cycle(
                     log::info!(
                         "[governor] {} computed window deltas (in {:.0}s): 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
                          → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
-                        now.to_rfc3339(),
+                        current_reading_at.to_rfc3339(),
                         elapsed_secs,
                         delta_5h,
                         delta_7d,
@@ -5737,7 +5751,7 @@ pub fn run_observe_cycle(
 
             // Update the snapshot for use in the next cycle
             state.burn_rate.prev_usage_snapshot = Some(state::PrevUsageSnapshot {
-                taken_at: now,
+                taken_at: current_reading_at,
                 five_hour_pct: new_five_hour,
                 seven_day_pct: new_seven_day,
                 weekly_scoped_pct: new_weekly_scoped,
@@ -5758,7 +5772,7 @@ pub fn run_observe_cycle(
     // per-window percentage deltas, apportioning by total_usd weight. This
     // unblocks empirical promotion validation and downstream analytics.
     //
-    // The span is `[prev_snap.taken_at, now]` — the gap between the two API
+    // The span is `[prev_snap.taken_at, current_reading_at]` — the gap between the two API
     // readings `old_pct` and `new_pct` are taken from. Rows are selected
     // against that same span, and the guards are evaluated over it.
     //
@@ -5776,7 +5790,7 @@ pub fn run_observe_cycle(
     if !state.usage.stale {
         if let (Some(ref prev_snap), Ok(conn)) = (&old_snapshot, db::open_db(&db_path)) {
             let span_start = prev_snap.taken_at;
-            let span_end = now;
+            let span_end = current_reading_at;
             // Both ends are the collector's worker count for the interval —
             // the population of the `i` rows being annotated. See
             // `annotation_worker_counts` for why the tmux census (`current_total`)

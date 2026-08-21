@@ -144,9 +144,9 @@ impl UsagePoller for FakePoller {
 ///
 /// Only the three window percentages carry over; `resets_at` is set to a real
 /// future instant because the cycle parses those strings downstream. The
-/// snapshot's own `taken_at` is deliberately not used — the cycle stamps its
-/// snapshots with `Utc::now()`, so the fixture timestamps could not survive
-/// anyway.
+/// snapshot's own `taken_at` is also carried through as the poll timestamp, so
+/// the rendered delta interval describes the fixture readings rather than the
+/// time spent running this test.
 fn usage_data_from(snapshot: &PrevUsageSnapshot) -> UsageData {
     let now = Utc::now();
     let five_hour_reset = now + ChronoDuration::hours(4);
@@ -168,7 +168,7 @@ fn usage_data_from(snapshot: &PrevUsageSnapshot) -> UsageData {
         // Empty, so `scoped_weekly()` is None and the cycle falls back to
         // `weekly_scoped_utilization` above.
         limits: vec![],
-        timestamp: now,
+        timestamp: snapshot.taken_at,
         stale: false,
     }
 }
@@ -295,6 +295,18 @@ fn two_cycles_emit_the_delta_log_lines() {
         deltas[0].0,
         log::Level::Info,
         "the window-deltas line must be INFO, not a lower level an operator would not see by default"
+    );
+    assert!(
+        deltas[0].1.contains("Δt=5h0m"),
+        "Delta-t must use the five-hour fixture interval, not the cycle wall-clock gap: {}",
+        deltas[0].1
+    );
+    assert!(
+        deltas[0]
+            .1
+            .contains("2026-03-18T10:00:00.000Z → 2026-03-18T15:00:00.000Z"),
+        "delta timestamps must come from the fixture readings: {}",
+        deltas[0].1
     );
     assert!(
         logs_containing_since(cycle1_end, "no previous snapshot").is_empty(),

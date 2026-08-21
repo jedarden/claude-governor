@@ -255,6 +255,11 @@ pub struct UsageData {
     /// omits the array). Enables model-scoped lookups such as
     /// [`UsageData::scoped_weekly`].
     pub limits: Vec<UsageLimit>,
+    /// Instant at which this usage reading was received from the API.
+    ///
+    /// A stale fallback clones this value from the last successful reading,
+    /// so consumers can distinguish the age of the data from the time of the
+    /// cycle that happens to report it.
     pub timestamp: DateTime<Utc>,
     pub stale: bool,
 }
@@ -642,6 +647,10 @@ impl Poller {
         };
 
         let usage = self.fetch_usage(&access_token)?;
+        // Capture the reading's timestamp at the poll boundary. This value is
+        // deliberately retained when the reading is later served from the
+        // stale cache; it is not the timestamp of a governor cycle.
+        let reading_at = Utc::now();
 
         // Extract per-window fields, tolerating windows the API returns as null
         // (a null window is treated as non-binding rather than failing the poll).
@@ -663,7 +672,7 @@ impl Poller {
             five_hour_resets_at,
             five_hour_hours_remaining: five_hour_hours,
             limits: usage.limits.unwrap_or_default(),
-            timestamp: Utc::now(),
+            timestamp: reading_at,
             stale: false,
         };
 
