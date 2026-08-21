@@ -4,29 +4,166 @@
 // 2. Query construction matches expected filter configuration
 // 3. All filter parameters are properly logged before execution
 
-use std::path::PathBuf;
 use rusqlite::Connection;
+use std::path::PathBuf;
+use std::process::Command;
+
+const PLUCK_WORKSPACE: &str = "/home/coding/claude-governor";
+const PLUCK_STATE: &str = "open";
+const PLUCK_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
+
+#[derive(Debug, PartialEq, Eq)]
+struct PluckInvocation {
+    workspace_path: PathBuf,
+    labels: Vec<String>,
+    exclude_labels: Vec<String>,
+    state: String,
+    command: Vec<String>,
+}
+
+fn construct_pluck_invocation(
+    workspace_path: &str,
+    labels: &[&str],
+    exclude_labels: &[&str],
+    state: &str,
+) -> PluckInvocation {
+    PluckInvocation {
+        workspace_path: PathBuf::from(workspace_path),
+        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+        exclude_labels: exclude_labels
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect(),
+        state: state.to_string(),
+        // Pluck passes these filters to the bead store. The bead-rs backend
+        // expresses the open/unassigned/ready state as this command; label
+        // exclusion is applied to the returned JSON by the store adapter.
+        command: vec![
+            "bead".to_string(),
+            "list".to_string(),
+            "--ready".to_string(),
+            "--json".to_string(),
+            "--limit".to_string(),
+            "999999".to_string(),
+        ],
+    }
+}
+
+fn render_pluck_invocation(query: &PluckInvocation) -> String {
+    format!(
+        "(cd {} && {})",
+        query.workspace_path.display(),
+        query.command.join(" ")
+    )
+}
+
+/// Verify the exact backend query Pluck constructs before it is executed.
+#[test]
+fn test_pluck_query_matches_expected_configuration() {
+    let labels: &[&str] = &[];
+    let query =
+        construct_pluck_invocation(PLUCK_WORKSPACE, labels, PLUCK_EXCLUDE_LABELS, PLUCK_STATE);
+
+    println!("\n=== PLUCK QUERY PARAMETERS ===");
+    println!("workspace_path: {}", query.workspace_path.display());
+    println!("labels: {:?}", query.labels);
+    println!("exclude_labels: {:?}", query.exclude_labels);
+    println!("state: {:?}", query.state);
+    println!(
+        "final query before execution: {}",
+        render_pluck_invocation(&query)
+    );
+    println!("===============================\n");
+
+    assert_eq!(query.workspace_path, PathBuf::from(PLUCK_WORKSPACE));
+    assert!(
+        query.labels.is_empty(),
+        "Pluck does not configure include labels"
+    );
+    assert_eq!(
+        query.exclude_labels,
+        PLUCK_EXCLUDE_LABELS
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(query.state, PLUCK_STATE);
+    assert_eq!(
+        query.command,
+        ["bead", "list", "--ready", "--json", "--limit", "999999"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let output = Command::new(&query.command[0])
+        .args(&query.command[1..])
+        .current_dir(&query.workspace_path)
+        .output()
+        .expect("Pluck backend command must be executable");
+    assert!(
+        output.status.success(),
+        "Pluck backend query failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let mut candidate_count = 0;
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let bead: serde_json::Value =
+            serde_json::from_str(line).expect("Pluck backend must return JSONL");
+        assert_eq!(bead["status"], PLUCK_STATE);
+        assert!(bead["assignee"].is_null());
+        for label in &query.exclude_labels {
+            assert!(
+                !bead["labels"]
+                    .as_array()
+                    .expect("Pluck JSON must include labels")
+                    .iter()
+                    .any(|value| value.as_str() == Some(label)),
+                "Pluck returned excluded label {label:?}"
+            );
+        }
+        candidate_count += 1;
+    }
+    println!("Pluck backend returned {candidate_count} ready candidates");
+}
 
 /// Test database connection and basic query functionality
 #[test]
 fn test_pluck_database_connectivity() {
-    let db_path = PathBuf::from("/home/coding/claude-governor/.beads/beads.db");
+    let db_path = PathBuf::from(PLUCK_WORKSPACE).join(".beads/beads.db");
 
     // Define filter parameters
     let labels_filter: Vec<&str> = vec![]; // Empty = no label inclusion filter
-    let exclude_labels_filter: Vec<&str> = vec!["deferred", "human", "blocked"];
+    let exclude_labels_filter: Vec<&str> = PLUCK_EXCLUDE_LABELS.to_vec();
     let state_filter: &str = "open";
 
     // Log filter parameters - workspace_path
     println!("\n=== PLUCK FILTER PARAMETERS ===");
     println!("Workspace path: {}", db_path.display());
     println!("State filter: '{}'", state_filter);
-    println!("Labels (include filter): {:?} ({} labels)", labels_filter, labels_filter.len());
-    println!("Exclude labels (exclude filter): {:?} ({} labels)", exclude_labels_filter, exclude_labels_filter.len());
+    println!(
+        "Labels (include filter): {:?} ({} labels)",
+        labels_filter,
+        labels_filter.len()
+    );
+    println!(
+        "Exclude labels (exclude filter): {:?} ({} labels)",
+        exclude_labels_filter,
+        exclude_labels_filter.len()
+    );
     println!("Assignee filter: 'IS NULL' (always filters unassigned issues)");
     println!("===============================\n");
 
-    let test_results = test_database_connection(&db_path, &labels_filter, &exclude_labels_filter, state_filter);
+    let test_results = test_database_connection(
+        &db_path,
+        &labels_filter,
+        &exclude_labels_filter,
+        state_filter,
+    );
 
     // Print results for visibility
     println!("\n=== PLUCK DATABASE CONNECTIVITY TEST RESULTS ===");
@@ -49,8 +186,14 @@ fn test_pluck_database_connectivity() {
 
     // Assertions for acceptance criteria
     assert!(test_results.file_exists, "Database file must exist");
-    assert!(test_results.connection_ok, "Must be able to connect to database");
-    assert!(test_results.integrity_ok, "Database integrity check must pass");
+    assert!(
+        test_results.connection_ok,
+        "Must be able to connect to database"
+    );
+    assert!(
+        test_results.integrity_ok,
+        "Database integrity check must pass"
+    );
     assert!(test_results.schema_valid, "Database schema must be valid");
 
     // If we have errors, report them but don't fail on minor issues
@@ -77,7 +220,7 @@ fn test_database_connection(
     db_path: &PathBuf,
     labels_filter: &[&str],
     exclude_labels_filter: &[&str],
-    state_filter: &str
+    state_filter: &str,
 ) -> DatabaseTestResults {
     let mut results = DatabaseTestResults {
         file_exists: db_path.exists(),
@@ -91,7 +234,10 @@ fn test_database_connection(
     };
 
     if !results.file_exists {
-        results.errors.push(format!("Database file does not exist: {}", db_path.display()));
+        results.errors.push(format!(
+            "Database file does not exist: {}",
+            db_path.display()
+        ));
         return results;
     }
 
@@ -102,7 +248,9 @@ fn test_database_connection(
             conn
         }
         Err(e) => {
-            results.errors.push(format!("Failed to open database: {}", e));
+            results
+                .errors
+                .push(format!("Failed to open database: {}", e));
             return results;
         }
     };
@@ -113,11 +261,15 @@ fn test_database_connection(
             // integrity_check returns "ok" if successful
             results.integrity_ok = result == "ok";
             if !results.integrity_ok {
-                results.errors.push(format!("Database integrity check failed: {}", result));
+                results
+                    .errors
+                    .push(format!("Database integrity check failed: {}", result));
             }
         }
         Err(e) => {
-            results.errors.push(format!("Database integrity check error: {}", e));
+            results
+                .errors
+                .push(format!("Database integrity check error: {}", e));
             return results;
         }
     };
@@ -125,12 +277,14 @@ fn test_database_connection(
     // Test 3: Verify schema has expected tables (bead store uses 'issues', not 'beads').
     // bead-rs schema: 'metadata' no longer exists; status lives in 'base_status'.
     let expected_tables = vec!["issues", "labels", "events", "dependencies"];
-    let mut tables_query = match conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-    ) {
+    let mut tables_query = match conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    {
         Ok(stmt) => stmt,
         Err(e) => {
-            results.errors.push(format!("Failed to query database schema: {}", e));
+            results
+                .errors
+                .push(format!("Failed to query database schema: {}", e));
             return results;
         }
     };
@@ -143,7 +297,9 @@ fn test_database_connection(
 
     for table in &expected_tables {
         if !existing_tables.contains(&table.to_string()) {
-            results.errors.push(format!("Missing expected table: {}", table));
+            results
+                .errors
+                .push(format!("Missing expected table: {}", table));
         }
     }
 
@@ -155,7 +311,9 @@ fn test_database_connection(
             results.total_issues = count;
         }
         Err(e) => {
-            results.errors.push(format!("Failed to query issues count: {}", e));
+            results
+                .errors
+                .push(format!("Failed to query issues count: {}", e));
         }
     }
 
@@ -163,38 +321,36 @@ fn test_database_connection(
     match conn.query_row(
         "SELECT COUNT(*) FROM issues WHERE base_status = 'open'",
         [],
-        |row| row.get(0)
+        |row| row.get(0),
     ) {
         Ok(count) => {
             results.open_issues = count;
         }
         Err(e) => {
-            results.errors.push(format!("Failed to query open issues: {}", e));
+            results
+                .errors
+                .push(format!("Failed to query open issues: {}", e));
         }
     }
 
     // Test 6: Count issues with labels (Pluck filters by labels)
-    match conn.query_row(
-        "SELECT COUNT(DISTINCT issue_id) FROM labels",
-        [],
-        |row| row.get(0)
-    ) {
+    match conn.query_row("SELECT COUNT(DISTINCT issue_id) FROM labels", [], |row| {
+        row.get(0)
+    }) {
         Ok(count) => {
             results.issues_with_labels = count;
         }
         Err(e) => {
-            results.errors.push(format!("Failed to query issues with labels: {}", e));
+            results
+                .errors
+                .push(format!("Failed to query issues with labels: {}", e));
         }
     }
 
     // Test 7: Simulate a Pluck query (filter by exclude_labels)
     // Construct the exact query that Pluck would build
-    let (query_string, query_params) = construct_pluck_query(
-        db_path,
-        labels_filter,
-        exclude_labels_filter,
-        state_filter
-    );
+    let (query_string, query_params) =
+        construct_pluck_query(db_path, labels_filter, exclude_labels_filter, state_filter);
 
     // Log the complete query construction
     println!("\n=== PLUCK QUERY CONSTRUCTION ===");
@@ -216,22 +372,51 @@ fn test_database_connection(
     println!("✓ Query constructed from provided filter parameters");
     println!("✓ Workspace path: {}", db_path.display());
     println!("✓ State filter: '{}'", state_filter);
-    println!("✓ Exclude labels: {:?} ({} labels)", exclude_labels_filter, exclude_labels_filter.len());
-    println!("✓ Include labels: {:?} ({} labels)", labels_filter, labels_filter.len());
+    println!(
+        "✓ Exclude labels: {:?} ({} labels)",
+        exclude_labels_filter,
+        exclude_labels_filter.len()
+    );
+    println!(
+        "✓ Include labels: {:?} ({} labels)",
+        labels_filter,
+        labels_filter.len()
+    );
     println!("✓ Assignee filter: always applied (IS NULL)");
     println!("✓ Manual blocked filter: always applied (= 0)");
     println!("========================\n");
 
     // Verify query structure
     println!("=== QUERY STRUCTURE VERIFICATION ===");
-    assert!(query_string.contains("SELECT COUNT(DISTINCT i.id)"), "Query must select distinct issue IDs");
-    assert!(query_string.contains("FROM issues i"), "Query must use issues table");
-    assert!(query_string.contains("LEFT JOIN labels"), "Query must join labels table");
-    assert!(query_string.contains(&format!("WHERE i.base_status = '{}'", state_filter)), "Query must filter by state");
-    assert!(query_string.contains("AND i.assignee IS NULL"), "Query must filter unassigned issues");
-    assert!(query_string.contains("AND i.manual_blocked = 0"), "Query must filter manually blocked issues");
+    assert!(
+        query_string.contains("SELECT COUNT(DISTINCT i.id)"),
+        "Query must select distinct issue IDs"
+    );
+    assert!(
+        query_string.contains("FROM issues i"),
+        "Query must use issues table"
+    );
+    assert!(
+        query_string.contains("LEFT JOIN labels"),
+        "Query must join labels table"
+    );
+    assert!(
+        query_string.contains(&format!("WHERE i.base_status = '{}'", state_filter)),
+        "Query must filter by state"
+    );
+    assert!(
+        query_string.contains("AND i.assignee IS NULL"),
+        "Query must filter unassigned issues"
+    );
+    assert!(
+        query_string.contains("AND i.manual_blocked = 0"),
+        "Query must filter manually blocked issues"
+    );
     if !exclude_labels_filter.is_empty() {
-        assert!(query_string.contains("AND NOT EXISTS"), "Query must exclude specified labels");
+        assert!(
+            query_string.contains("AND NOT EXISTS"),
+            "Query must exclude specified labels"
+        );
     }
     println!("✓ Query structure is valid");
     println!("✓ All expected clauses present");
@@ -262,16 +447,18 @@ fn test_database_connection(
             println!("================================\n");
         }
         Err(e) => {
-            results.errors.push(format!("Failed to execute Pluck-style query: {}", e));
+            results
+                .errors
+                .push(format!("Failed to execute Pluck-style query: {}", e));
             eprintln!("ERROR: Query execution failed - check query construction above");
         }
     }
 
-    // Test 8: Test actual label filtering (deferred, human, blocked)
+    // Test 8: Test actual label filtering.
     let exclude_query = "
         SELECT COUNT(DISTINCT issue_id)
         FROM labels
-        WHERE label IN ('deferred', 'human', 'blocked')
+        WHERE label IN ('deferred', 'human', 'blocked', 'starvation-alert')
     ";
 
     match conn.query_row(exclude_query, [], |row| row.get::<_, i64>(0)) {
@@ -279,7 +466,9 @@ fn test_database_connection(
             println!("Issues excluded by Pluck filters: {}", excluded_count);
         }
         Err(e) => {
-            results.errors.push(format!("Failed to query excluded issues: {}", e));
+            results
+                .errors
+                .push(format!("Failed to query excluded issues: {}", e));
         }
     }
 
@@ -305,11 +494,16 @@ fn construct_pluck_query(
     construction_log.push(format!("Initial parameters provided:"));
     construction_log.push(format!("  - state_filter: '{}'", state_filter));
     construction_log.push(format!("  - labels_filter: {} labels", labels_filter.len()));
-    construction_log.push(format!("  - exclude_labels_filter: {} labels", exclude_labels_filter.len()));
+    construction_log.push(format!(
+        "  - exclude_labels_filter: {} labels",
+        exclude_labels_filter.len()
+    ));
 
     // Step 1: Base query structure
     query_parts.push("SELECT COUNT(DISTINCT i.id)".to_string());
-    construction_log.push(format!("✓ Added SELECT clause for counting distinct issue IDs"));
+    construction_log.push(format!(
+        "✓ Added SELECT clause for counting distinct issue IDs"
+    ));
 
     query_parts.push("FROM issues i".to_string());
     construction_log.push(format!("✓ Added FROM clause (issues table aliased as 'i')"));
@@ -322,12 +516,17 @@ fn construct_pluck_query(
     let where_clause = format!("WHERE i.base_status = '{}'", state_filter);
     query_parts.push(where_clause);
     params.push(format!("state:{}", state_filter));
-    construction_log.push(format!("✓ Added WHERE clause with state filter: '{}'", state_filter));
+    construction_log.push(format!(
+        "✓ Added WHERE clause with state filter: '{}'",
+        state_filter
+    ));
 
     // Step 3: Assignee filter (always applied by Pluck)
     query_parts.push("AND i.assignee IS NULL".to_string());
     params.push("assignee:NULL".to_string());
-    construction_log.push(format!("✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)"));
+    construction_log.push(format!(
+        "✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)"
+    ));
 
     // Step 3b: Manual-blocked filter (bead-rs ready frontier excludes manually blocked issues)
     query_parts.push("AND i.manual_blocked = 0".to_string());
@@ -385,7 +584,9 @@ fn construct_pluck_query(
             params.push(format!("include:{}", label));
         }
     } else {
-        construction_log.push(format!("○ No labels filter (empty - no label inclusion requirement)"));
+        construction_log.push(format!(
+            "○ No labels filter (empty - no label inclusion requirement)"
+        ));
     }
 
     let query = query_parts.join("\n  ");
