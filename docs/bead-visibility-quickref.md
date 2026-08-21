@@ -1,86 +1,90 @@
-# Bead Visibility Quick Reference — Historical
+# Bead visibility quick reference
 
-> The current target-specific Pluck inventory is
-> [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). This page
-> retains older `bf`/`br` operational examples.
+This page is the short operational companion to
+[`docs/bead-visibility-troubleshooting.md`](bead-visibility-troubleshooting.md).
+The current workspace uses NEEDLE Pluck with the `bead-rs` backend.
 
-**Last Updated:** 2026-08-20
+## Current configuration
 
-## Six-Layer Priority (Highest → Lowest)
+```yaml
+workspace:
+  default: /home/coding/claude-governor
+  home: /home/coding/.needle        # NEEDLE state, not a bead store
 
-1. **Database filters** (SQL WHERE) - Immutable at runtime
-2. **Workspace .needle.yaml** - Per-workspace overrides
-3. **Global config.yaml** - System-wide settings
-4. **Hardcoded defaults** - Fallback: `["deferred", "human", "blocked"]`
-5. **Workspace exclusions** - Affects discovery only
-6. **.beads/config.yaml** - Does NOT affect visibility
-
-## Default Exclude Labels
-
-```rust
-const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
+strands:
+  pluck:
+    exclude_labels:
+      - deferred
+      - human
+      - blocked
+      - starvation-alert
 ```
 
-**Location:** `/home/coding/NEEDLE/src/strand/pluck.rs:21`
+`exclude_labels` entries are exact, case-sensitive strings. They do not support
+globs, `%`, regular expressions, or prefix matching. An omitted or empty list
+uses the built-in fallback `deferred`, `human`, `blocked`; a non-empty list
+replaces that fallback, so repeat the defaults when adding a custom label.
 
-## Common Pitfalls
+## Workspace rule
 
-| Pitfall | Symptom | Fix |
-|---------|---------|-----|
-| `exclude_labels: []` | Uses compiled defaults (`deferred`, `human`, `blocked`) | Omit key or provide the complete intended list |
-| Custom labels without defaults | Loses default exclusions | Always include `deferred`, `human`, `blocked` |
-| Wrong working directory | Queries wrong database | `cd` to workspace or use `--workspace` |
-| Config not reloaded | Edits ignored | Restart cgov/NEEDLE |
-| Case-sensitive labels | `Deferred` ≠ `deferred` | Use consistent lowercase |
-
-## Filter Syntax
+Always launch workers with an absolute path:
 
 ```bash
-# CLI
-bf ready --limit 0
-bf list --state open --priority 3
-bf list --labels polish,rust
-bf claim --any-workspace
-
-# SQL
-SELECT id FROM issues WHERE status='open' AND assignee IS NULL;
+needle run --agent AGENT --workspace /home/coding/claude-governor
 ```
 
-## Health Check
+Without `--workspace`, NEEDLE uses `workspace.default`. Pluck opens only
+`<resolved-workspace>/.beads`; it does not search sibling or parent stores.
+
+## Current ready query
 
 ```bash
-# Quick diagnostic
-sqlite3 .beads/beads.db "PRAGMA integrity_check;"        # Should return "ok"
-bf ready --limit 0 | wc -l                                # Should be > 0 if open beads exist
+cd /home/coding/claude-governor
+bead list --ready --json --limit 999999
 ```
 
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `~/.config/needle/config.yaml` | Global NEEDLE config |
-| `<workspace>/.needle.yaml` | Workspace overrides (optional) |
-| `<workspace>/.beads/config.yaml` | Lifecycle config (NOT visibility) |
-| `~/.config/needle/explore-excluded` | Workspace discovery exclusions |
-
-## Emergency Commands
+The ready frontier requires an open, unassigned, manually unblocked bead with
+no unfinished `blocks` dependency. Pluck then removes exact excluded labels
+and stale assigned/`in_progress` records. `bead --json` output is JSONL, so
+count it with:
 
 ```bash
-# Find where a bead actually is
-find ~/ -name "beads.db" -exec sqlite3 {} "SELECT 'found' FROM issues WHERE id='bf-xxx';" \; 2>/dev/null
-
-# Database corruption
-br doctor --repair
-
-# Check all open beads
-sqlite3 .beads/beads.db "SELECT id, title FROM issues WHERE status='open';"
-
-# Check excluded labels
-sqlite3 .beads/beads.db "SELECT DISTINCT label FROM labels WHERE label IN ('deferred', 'human', 'blocked');"
+bead list --ready --json --limit 999999 | jq -s 'length'
+bead list --status open --json --limit 999999 | jq -s 'length'
 ```
 
-## Related Documentation
+There is no positive label requirement: `polish` or `documentation` does not
+make a bead ready.
 
-- **Full troubleshooting guide:** `docs/bead-visibility-troubleshooting.md`
-- **Complete visibility map:** `docs/research/bead-visibility-configuration.md`
-- **Query patterns:** `docs/pluck-query-results.md`
+## Five-minute starvation check
+
+```bash
+WORKSPACE=/home/coding/claude-governor
+needle doctor --workspace "$WORKSPACE"
+needle config --dump --show-source
+(cd "$WORKSPACE" && bead list --status open --json --limit 999999 | jq -s 'length')
+(cd "$WORKSPACE" && bead list --ready --json --limit 999999 | jq -s 'length')
+(cd "$WORKSPACE" && bead list --status open --json --limit 999999 |
+  jq -r '[.id, (.assignee // "<unassigned>"), (.labels | join(",")), .title] | @tsv')
+needle logs --since 2h --filter 'event_type~strand\.pluck\.starvation_detected' --format json
+```
+
+If open > 0 and ready = 0, inspect `bead show ID --json` for an assignee,
+`manual_blocked`, unfinished `blocks` dependencies, or an exact excluded
+label. If ready > 0 but no worker progresses, inspect claim and dispatch
+telemetry instead of changing labels.
+
+## Avoid these traps
+
+| Trap | Use instead |
+| --- | --- |
+| A legacy bead-forge command or SQL | `bead list --ready --json` |
+| `exclude_labels: []` to disable filtering | Configure the complete intended label list |
+| `deferred*`, `deferred%`, or `failure-count:*` | The exact label value |
+| Relative `--workspace .` in a service | An absolute workspace path |
+| Treating open count as claimable count | Compare open and ready frontiers |
+| Assuming Explore searches recursively | Use direct-child auto-discovery or a pinned path list |
+| Editing config without restarting workers | Restart and verify the startup configuration |
+
+For the full repair procedure and evidence checklist, see the troubleshooting
+guide linked above.

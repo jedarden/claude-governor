@@ -1,487 +1,308 @@
-# Bead Visibility Troubleshooting Guide — Historical
+# Bead visibility and starvation troubleshooting
 
-> For the current NEEDLE/`bead-rs` implementation and active four-label list,
-> use [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md).
-> Commands and SQL on this page are retained for older `bf`/`br` investigations.
+This is the operational guide for NEEDLE Pluck in this repository. It assumes
+the workspace is bound to the `bead-rs` backend in [`.needle.yaml`](../.needle.yaml).
+For the complete filter inventory, see
+[`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). The older
+bead-forge pages in this repository are historical investigation notes; do not
+use their SQL or commands to infer the current ready predicate.
 
-**Last Updated:** 2026-08-20
-**Purpose:** Quick reference for diagnosing and fixing bead visibility issues
+## The visibility contract
 
----
+Bead visibility is a pipeline, not one filter:
 
-## Quick Diagnosis Flow
-
-When beads aren't being discovered or processed, follow this flow:
-
-```
-Step 1: Verify beads exist in database
-├─ sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"
-├─ If 0: No open beads (not a visibility issue)
-└─ If >0: Continue to Step 2
-
-Step 2: Check ready candidates
-├─ bf ready --limit 0 | wc -l
-├─ If >0: Visibility is working (beads are being found)
-└─ If 0: Continue to Step 3
-
-Step 3: Check excluded labels
-├─ sqlite3 .beads/beads.db "SELECT COUNT(DISTINCT issue_id) FROM labels WHERE label IN ('deferred', 'human', 'blocked');"
-├─ If count matches open count: All beads are excluded (add/remove labels)
-└─ If < open count: Continue to Step 4
-
-Step 4: Check workspace path
-├─ pwd  # Verify you're in the correct workspace
-├─ ls -la .beads/beads.db  # Verify database exists
-└─ If database missing: Run bf init
-
-Step 5: Check database integrity
-├─ sqlite3 .beads/beads.db "PRAGMA integrity_check;"
-├─ If not "ok": Database corruption → run br doctor --repair
-└─ If "ok": Configuration issue → check config files
+```text
+resolved workspace
+    -> <workspace>/.beads store
+    -> bead list --ready
+    -> exact exclude_labels match
+    -> Pluck defensive status/assignee checks
+    -> transient worker-local exclusions
+    -> ordering and claim
 ```
 
----
-
-## Common Pitfalls (by Category)
-
-### 1. Exclude Labels Pitfalls
-
-#### Pitfall 1.1: Empty exclude_labels Expects Defaults
-**Problem:** You set `strands.pluck.exclude_labels: []` expecting to disable exclusions.
-
-**Why:** The current Pluck implementation replaces an empty list with its compiled defaults.
-
-**Fix:**
-```yaml
-# Uses compiled defaults: deferred, human, blocked
-strands:
-  pluck:
-    exclude_labels: []
-
-# Explicit equivalent of the compiled defaults
-strands:
-  pluck:
-    exclude_labels:
-      - deferred
-      - human
-      - blocked
-
-# Omitting the key also uses the compiled defaults
-strands:
-  pluck:
-    split_after_failures: 3
-```
-
-#### Pitfall 1.2: Custom Labels Override Defaults Completely
-**Problem:** You add a custom label expecting it to be merged with defaults, but defaults are lost.
-
-**Why:** Custom exclude_labels REPLACE defaults, not merge
-
-**Fix:** Always include all three defaults when customizing:
-```yaml
-strands:
-  pluck:
-    exclude_labels:
-      - deferred    # Required
-      - human       # Required
-      - blocked     # Required
-      - my-custom-label  # Your addition
-```
-
-#### Pitfall 1.3: Case Sensitivity in Labels
-**Problem:** Beads with label `Deferred` (capital D) are not excluded by `deferred` filter.
-
-**Why:** Label matching is case-sensitive
-
-**Fix:** Use consistent lowercase labeling:
-```bash
-# Check what labels actually exist
-sqlite3 .beads/beads.db "SELECT DISTINCT label FROM labels;"
-
-# Fix inconsistent labels
-bf update bf-123abc --remove-label Deferred --add-label deferred
-```
-
-### 2. Workspace Path Pitfalls
-
-#### Pitfall 2.1: Wrong Working Directory
-**Problem:** Running commands from parent directory instead of workspace.
-
-**Symptom:** `bf: No .beads directory found` or queries wrong database
-
-**Fix:**
-```bash
-# WRONG - from parent directory
-cd /home/coding
-bf ready  # Looks in /home/coding/.beads/ (may not exist)
-
-# CORRECT - from workspace
-cd /home/coding/claude-governor
-bf ready  # Looks in /home/coding/claude-governor/.beads/
-```
-
-#### Pitfall 2.2: Workspace in explore-excluded but Specified Directly
-**Problem:** Workspace is in `~/.config/needle/explore-excluded` but you're using `--workspace` flag, so it should work...but it doesn't.
-
-**Why:** explore-excluded only affects auto-discovery, NOT direct `--workspace` specification
-
-**Fix:** Either remove from excluded or use direct specification:
-```bash
-# Option 1: Remove from excluded
-sed -i '/\/home\/coding\/myproject/d' ~/.config/needle/explore-excluded
-
-# Option 2: Use direct workspace specification (always works)
-needle run --agent claude-print-opus --workspace /home/coding/myproject
-```
-
-#### Pitfall 2.3: Multiple .beads/ Directories in Path
-**Problem:** Workspace discovery finds wrong `.beads/` directory when multiple exist in parent path.
-
-**Example:** Both `/home/coding/.beads/` and `/home/coding/claude-governor/.beads/` exist
-
-**Fix:** Always specify workspace explicitly:
-```bash
-# Explicit workspace (always correct)
-bf --workspace /home/coding/claude-governor ready
-
-# Or cd into workspace first
-cd /home/coding/claude-governor
-bf ready  # Uses nearest .beads/ directory
-```
-
-### 3. Database Filter Pitfalls
-
-#### Pitfall 3.1: Beads Blocked by Dependencies
-**Problem:** Open beads with no excluded labels still don't appear in `bf ready`.
-
-**Why:** Database-level filter excludes beads with unresolved blocking dependencies
-
-**Diagnosis:**
-```bash
-# Find blocked beads
-sqlite3 .beads/beads.db <<'EOF'
-SELECT i.id, i.title 
-FROM issues i
-INNER JOIN dependencies d ON i.id = d.issue_id
-WHERE i.status='open' 
-AND d.type IN ('blocks', 'parent-child')
-AND d.depends_on_id IN (SELECT id FROM issues WHERE status NOT IN ('closed', 'done', 'completed'));
-EOF
-```
-
-**Fix:** Either:
-1. Complete the blocking bead first
-2. Remove invalid blocking dependencies: `bf dep remove bf-child bf-blocker`
-3. Add the `blocked` label: `bf update bf-child --add-label blocked`
-
-#### Pitfall 3.2: Ephemeral or Template Beads
-**Problem:** Beads you just created don't appear in `bf ready`.
-
-**Why:** Beads may be marked `ephemeral=1` or `is_template=1`
-
-**Diagnosis:**
-```bash
-# Check ephemeral/template status
-sqlite3 .beads/beads.db "SELECT id, title, ephemeral, is_template FROM issues WHERE status='open';"
-```
-
-**Fix:** If creating meta-beads or tracking beads that should persist:
-```bash
-# Convert ephemeral to regular bead
-bf update bf-xxx --ephemeral false
-
-# Templates should stay is_template=1 (they're not meant to be claimed)
-```
-
-### 4. Configuration Pitfalls
-
-#### Pitfall 4.1: Config Not Reloaded After Changes
-**Problem:** You edited `~/.config/needle/config.yaml` but changes don't take effect.
-
-**Why:** NEEDLE/cgov only reads config on startup
-
-**Fix:** Restart the daemon/service:
-```bash
-# For cgov
-cgov restart
-
-# For NEEDLE fleet
-pkill needle && needle run --agent ...
-```
-
-#### Pitfall 4.2: Workspace .needle.yaml Conflicts with Global
-**Problem:** Workspace has `.needle.yaml` that overrides global config unexpectedly.
-
-**Why:** Workspace-level config takes precedence over global config
-
-**Diagnosis:**
-```bash
-# Check for workspace override
-cat .needle.yaml
-
-# Or check what's actually in use
-needle config show
-```
-
-**Fix:** Either:
-1. Remove `.needle.yaml` to use global config
-2. Edit `.needle.yaml` to match desired behavior
-
-### 5. Multi-Workspace Pitfalls
-
-#### Pitfall 5.1: Bead in Wrong Workspace
-**Problem:** Bead exists but isn't found by multi-workspace query.
-
-**Why:** Worker is pointing to different workspace than where bead was created
-
-**Fix:** Check bead location and worker workspace:
-```bash
-# Find where the bead actually is
-find ~/ -name "beads.db" -exec sqlite3 {} "SELECT 'found' FROM issues WHERE id='bf-xxx';" \; 2>/dev/null
-
-# Check where worker is pointing
-ps aux | grep needle | grep -o -- '--workspace [^ ]*'
-
-# Point worker to correct workspace
-needle run --agent claude-print-opus --workspace /path/to/correct/workspace
-```
-
-#### Pitfall 5.2: Cross-Workspace Dependencies
-**Problem:** Bead A in workspace 1 blocks bead B in workspace 2, but the blocking isn't detected.
-
-**Why:** Dependencies only work within the same workspace database
-
-**Fix:** Keep related beads in same workspace, or use meta-beads to coordinate cross-workspace work
-
----
-
-## Filter Syntax Reference
-
-### CLI Filter Examples
-
-```bash
-# Basic filters
-bf list --state open                    # Only open beads
-bf list --assignee worker-1            # Beads claimed by worker-1
-bf list --labels polish,rust           # Beads with BOTH labels
-bf list --exclude-labels ''            # Don't exclude any labels
-
-# Combined filters
-bf ready --limit 10                     # First 10 ready beads
-bf list --state open --priority 3      # Open priority 3 beads
-bf list --labels polish --exclude-labels ''  # Polish beads (no default exclusions)
-
-# Multi-workspace
-bf claim --any-workspace               # Claim from any workspace
-bf list --workspace /path/to/ws        # List from specific workspace
-```
-
-### SQL Filter Patterns
-
-```sql
--- The exact query bf ready uses
-SELECT DISTINCT i.id
-FROM issues i
-WHERE i.status = 'open'
-  AND i.assignee IS NULL
-  AND i.ephemeral = 0
-  AND i.pinned = 0
-  AND i.is_template = 0
-  AND NOT EXISTS (
-    SELECT 1 FROM labels 
-    WHERE issue_id = i.id 
-    AND label IN ('deferred', 'human', 'blocked')
-  );
-
--- Beads with specific labels
-SELECT i.id, i.title
-FROM issues i
-INNER JOIN labels l ON i.id = l.issue_id
-WHERE l.label = 'polish' AND i.status = 'open';
-
--- Beads WITHOUT specific labels
-SELECT i.id, i.title
-FROM issues i
-WHERE i.status = 'open'
-  AND NOT EXISTS (
-    SELECT 1 FROM labels 
-    WHERE issue_id = i.id 
-    AND label = 'deferred'
-  );
-```
-
----
-
-## Configuration File Best Practices
-
-### ~/.config/needle/config.yaml
+The current target workspace is `/home/coding/claude-governor`. The active
+global Pluck configuration is `/home/coding/.config/needle/config.yaml`:
 
 ```yaml
-# GOOD: Minimal, rely on compiled defaults
 workspace:
-  default: /home/coding
+  default: /home/coding/claude-governor
   home: /home/coding/.needle
 
 strands:
-  explore:
-    enabled: true
-    workspaces: []          # Empty = auto-discover
-    workspace_root: /home/coding/
+  pluck:
+    exclude_labels:
+      - deferred
+      - human
+      - blocked
+      - starvation-alert
+```
 
-# Pluck uses compiled defaults: ["deferred", "human", "blocked"]
+`workspace.default` selects the bead workspace. `workspace.home` is NEEDLE's
+state directory for logs, heartbeats, and optional diagnostics; it is not a
+bead store.
 
-# GOOD: Explicit custom labels (includes defaults)
+## Correct `exclude_labels` patterns
+
+`exclude_labels` is a YAML sequence of exact label strings:
+
+```yaml
 strands:
   pluck:
     exclude_labels:
       - deferred
       - human
       - blocked
-      - experimental        # Your custom label
-
-# BAD: Empty array (excludes nothing)
-strands:
-  pluck:
-    exclude_labels: []     # WRONG!
+      - starvation-alert
 ```
 
-### Workspace .needle.yaml (Optional)
+A bead is excluded when any one of its labels exactly matches an entry. The
+matching is case-sensitive and uses string membership. These are not glob,
+prefix, regular-expression, or case-insensitive patterns:
 
 ```yaml
-# Only use if you need workspace-specific overrides
-strands:
-  pluck:
-    enabled: true
-    exclude_labels:
-      - deferred
-      - human
-      - blocked
-      - workspace-specific-label
+# These do not exclude every label beginning with the prefix.
+- deferred*
+- deferred%
+- "failure-count:*"
 ```
 
-### .beads/config.yaml (Optional)
+Those values would only match a literal label containing `*` or `%` (and the
+literal string `failure-count:*`). To exclude a label, write the complete
+label, including punctuation and case. A generated label such as
+`failure-count:3` is not covered by `failure-count:*`; it is handled by Pluck's
+failure-count ordering and split logic instead.
+
+The built-in fallback is only:
+
+```text
+deferred, human, blocked
+```
+
+An omitted or empty `exclude_labels` list uses that fallback; it does not mean
+"exclude nothing." A non-empty configured list replaces the fallback rather
+than merging with it. Therefore, a custom list must repeat the three built-in
+labels when they should remain excluded:
 
 ```yaml
-# This does NOT affect visibility (only lifecycle/scoring)
-issue_prefixes:
-  - bf
-default_priority: 2
-default_type: task
-claim_ttl_minutes: 30
-scoring:
-  priority_weight: 0.4
-  blockers_weight: 0.3
-  age_weight: 0.2
-  labels_weight: 0.1
+# Correct: retain the defaults and add a deployment-specific label.
+exclude_labels:
+  - deferred
+  - human
+  - blocked
+  - starvation-alert
 ```
 
----
+Labels such as `polish`, `documentation`, and `failure-count:3` are not
+excluded unless their exact values are added. Pluck has no configured required
+label list, so adding a positive label does not make a bead visible or ready.
 
-## Health Check Commands
+## Workspace path best practices
 
-Run these to verify system health:
+Use an absolute repository path in every worker launch command:
+
+```yaml
+agents:
+  worker:
+    launch_cmd: "needle run --agent <agent> --workspace /home/coding/claude-governor"
+```
+
+The resolution rule is:
+
+```text
+needle run --workspace PATH  -> PATH
+no --workspace               -> workspace.default
+```
+
+Pluck opens only `<resolved workspace>/.beads`; it does not search upward,
+search sibling repositories, or substitute another store when the path is
+wrong. A relative path such as `.` is therefore unsafe for a service or a
+launcher whose current directory is not known.
+
+Explore is separate from Pluck:
+
+- `strands.explore.workspaces: []` enables auto-discovery of direct children
+  under `strands.explore.workspace_root` that contain `.beads`.
+- A non-empty `workspaces` list is a pin list and restricts Explore to those
+  paths; new repositories must be added explicitly.
+- Explore skips Pluck's resolved home workspace because Pluck already checked
+  it.
+- `strands.weave.exclude_workspaces` and old `explore-excluded` files do not
+  configure the current Pluck home path.
+
+When changing the global config, start a new worker or restart the service.
+Workers load their resolved configuration at startup. For cgov-managed worker
+commands, restart cgov after changing the governor configuration as well.
+
+## Filter syntax and common mistakes
+
+The current read-only query is:
 
 ```bash
-# 1. Database integrity
-sqlite3 .beads/beads.db "PRAGMA integrity_check;"
-# Expected: "ok"
-
-# 2. Schema validity
-sqlite3 .beads/beads.db ".schema issues" | grep -q "CREATE TABLE issues"
-# Expected: (no error)
-
-# 3. Label table exists
-sqlite3 .beads/beads.db "SELECT COUNT(*) FROM labels;"
-# Expected: (number, not error)
-
-# 4. Open beads count
-sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"
-# Expected: (number >= 0)
-
-# 5. Ready beads (after all filters)
-bf ready --limit 0 | wc -l
-# Expected: (number, should be <= open count)
-
-# 6. Excluded by labels
-sqlite3 .beads/beads.db "SELECT COUNT(DISTINCT issue_id) FROM labels WHERE label IN ('deferred', 'human', 'blocked');"
-# Expected: (number of beads with excluded labels)
-
-# 7. Blocked by dependencies
-sqlite3 .beads/beads.db "SELECT COUNT(DISTINCT i.id) FROM issues i INNER JOIN dependencies d ON i.id = d.issue_id WHERE i.status='open' AND d.depends_on_id IN (SELECT id FROM issues WHERE status NOT IN ('closed', 'done'));"
-# Expected: (number of beads with unresolved blockers)
+cd /home/coding/claude-governor
+bead list --ready --json --limit 999999
 ```
 
----
-
-## Starvation Prevention
-
-### Monitoring Script
+With `--json`, bead-rs emits compact JSONL: one JSON object per line, not one
+JSON array. Use `jq -s` when an array is useful:
 
 ```bash
-#!/bin/bash
-# pluck-health-check.sh - Run periodically to detect starvation
-
-WORKSPACE="/home/coding/claude-governor"
-cd "$WORKSPACE" || exit 1
-
-OPEN_COUNT=$(sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';")
-READY_COUNT=$(bf ready --limit 0 | grep -c "^\[bf-" || echo 0)
-
-if [ "$OPEN_COUNT" -gt 0 ] && [ "$READY_COUNT" -eq 0 ]; then
-    echo "WARNING: Pluck starvation detected in $WORKSPACE"
-    echo "  Open beads: $OPEN_COUNT"
-    echo "  Ready beads: $READY_COUNT"
-    echo "  All open beads are excluded or blocked"
-    
-    # Create alert bead
-    bf create --type human \
-        --title "Pluck starvation in $WORKSPACE" \
-        --description "$OPEN_COUNT open beads, $READY_COUNT ready. Investigate filter configuration." \
-        --labels "alert,pluck-starvation" || true
-fi
+bead list --ready --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -r '.id'
+bead list --status open --json --limit 999999 | jq -s 'length'
 ```
 
-### Regular Maintenance
+`--limit` is a maximum record count, not a page number. The large value above
+is the value Pluck uses; it is an implementation ceiling, not a visibility
+override.
+
+The `--ready` frontier requires all of the following before Pluck sees a bead:
+
+- base status `open`;
+- no assignee;
+- no manual block;
+- no unfinished dependency of kind `blocks`.
+
+`relates_to` dependencies do not block readiness. A `blocked` label and a
+manual block are different mechanisms, but both can make a bead unavailable.
+Pluck then applies `exclude_labels` and defensive checks for stale assigned or
+`in_progress` records.
+
+Common mistakes:
+
+| Mistake | Result | Correct check |
+| --- | --- | --- |
+| Counting open beads as ready beads | Assigned, manually blocked, and dependency-blocked beads are included in the count | Compare `--status open` with `--ready` |
+| Using a legacy bead-forge command or SQL as current evidence | The command may use a different backend or schema | Use `bead list --ready --json` |
+| Supplying `exclude_labels: []` to disable filtering | The built-in three-label fallback remains active | Configure the complete intended list; do not rely on an empty list as an escape hatch |
+| Writing `deferred*` or `failure-count:*` | No wildcard matching occurs | Use the exact label value |
+| Adding `polish` to a bead and expecting it to become ready | Pluck does not require positive labels | Check status, assignee, block, dependencies, and exclusions |
+| Running from a parent or sibling directory | A different `.beads` store is queried | Use an absolute `--workspace` and verify the resolved store |
+| Looking for an array in JSON output | JSONL has no top-level array | Pipe through `jq -s` |
+| Editing config while workers keep running | Existing workers continue using their startup config | Restart workers and verify the resolved configuration |
+
+## Starvation response procedure
+
+Treat starvation as an evidence-gathering problem. Do not immediately remove
+labels or delete dependencies; those changes can make intentionally deferred
+or blocked work claimable.
+
+### 1. Confirm the worker and configuration
 
 ```bash
-#!/bin/bash
-# Weekly maintenance
-
-# 1. Optimize database
-sqlite3 .beads/beads.db "PRAGMA optimize;"
-
-# 2. Check integrity
-sqlite3 .beads/beads.db "PRAGMA integrity_check;" | grep -v "^ok"
-
-# 3. Vacuum if needed
-DB_SIZE=$(du -m .beads/beads.db | cut -f1)
-if [ "$DB_SIZE" -gt 100 ]; then
-    sqlite3 .beads/beads.db "VACUUM;"
-fi
+needle status
+needle doctor --workspace /home/coding/claude-governor
+needle config --dump --show-source
+sed -n '/^workspace:/,/^strands:/p' /home/coding/.config/needle/config.yaml
+sed -n '/^strands:/,/^telemetry:/p' /home/coding/.config/needle/config.yaml
 ```
 
----
+Confirm that the worker has the intended absolute workspace and that the
+effective Pluck list contains the expected exact labels. If configuration is
+invalid, fix the source file and restart the worker before investigating bead
+data.
 
-## Related Documentation
+### 2. Compare open and ready frontiers
 
-- **Complete Visibility Map:** `docs/research/bead-visibility-configuration.md` - Six-layer configuration system
-- **Workspace Paths:** `docs/pluck-workspace-paths.md` - Workspace discovery and configuration
-- **Query Results:** `docs/pluck-query-results.md` - Query patterns and SQL examples
-- **Starvation Reproduction:** `docs/research/pluck-starvation-reproduction.md` - Historical bug analysis
+```bash
+WORKSPACE=/home/coding/claude-governor
+cd "$WORKSPACE"
 
----
+bead list --status open --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -r '[.id, .priority, (.labels | join(",")), .title] | @tsv'
+```
 
-## Quick Reference Summary
+Interpret the result before changing anything:
 
-| Issue | Symptom | Check | Fix |
-|-------|---------|-------|-----|
-| No open beads | `bf ready` returns 0, DB shows 0 open | `sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"` | Create beads or check status |
-| All excluded | `bf ready` returns 0, DB shows N open | Check excluded labels count | Remove/adjust labels or fix filter config |
-| Wrong workspace | Beads exist but not found | `pwd` and `ls .beads/beads.db` | `cd` to correct workspace or use `--workspace` |
-| Database corruption | Integrity check fails | `PRAGMA integrity_check;` | `br doctor --repair` |
-| Config not applied | Edits don't take effect | Check if NEEDLE restarted | `cgov restart` or restart NEEDLE |
-| Blocked beads | Open beads don't appear | Check dependencies table | Complete blockers or remove deps |
+- Open `0`, ready `0`: there is no backlog in this store.
+- Open `N`, ready `N` (or close): the ready frontier is working; investigate
+  worker dispatch, claim races, or worker-local retry exclusions.
+- Open `N`, ready `0`: inspect the causes below. This is the useful definition
+  of a candidate starvation condition.
 
----
+### 3. Identify why open beads are not ready
 
-**End of Troubleshooting Guide**
+List labels on the open set without assuming that a label explains every
+missing bead:
+
+```bash
+bead list --status open --json --limit 999999 |
+  jq -r '[.id, (.assignee // "<unassigned>"), (.status // "<unknown>"), (.labels | join(",")), .title] | @tsv'
+```
+
+For a suspicious ID, inspect its complete bead-rs record:
+
+```bash
+bead show BEAD_ID --json | jq '.[0]'
+```
+
+Check, in order:
+
+1. Is the bead assigned to a live or stale worker?
+2. Is `manual_blocked` true?
+3. Does `blocked_by` contain an unfinished blocker of kind `blocks`?
+4. Does `labels` contain one of the exact active exclusion labels?
+5. Is the command querying the intended `.beads` store?
+
+Clear a stale assignee or resolve a dependency only when the ownership and
+dependency are confirmed. Remove an exclusion label only when the work is
+actually eligible for automated handling. Preserve evidence in the bead
+comment or incident record when changing a shared queue.
+
+### 4. Check Pluck diagnostics and claim behavior
+
+Pluck emits starvation telemetry with the store-returned count, filtered count,
+and exclusion reasons. Query recent events with the current filter syntax:
+
+```bash
+needle logs --since 2h --filter 'event_type~strand\.pluck\.starvation_detected' --format json
+needle logs --since 2h --filter 'event_type~bead\.claim\..*'
+```
+
+If the ready list is non-empty but no work is being claimed, look for claim
+races, repeated claim failures, or a worker that is stuck after dispatch. A
+transient worker-local exclusion can hide an ID briefly even though the bead
+is still ready. Restarting a single unhealthy worker may clear that transient
+state; changing global labels will not.
+
+The current deployment sets `persistent_starvation_records: false`, so the
+absence of a starvation-record file is not evidence that starvation did not
+occur. Use NEEDLE telemetry and worker logs as the durable evidence source.
+
+### 5. Verify the repair
+
+After a deliberate repair:
+
+```bash
+cd /home/coding/claude-governor
+needle doctor --workspace "$PWD"
+bead list --ready --json --limit 999999 | jq -s 'length'
+needle status
+```
+
+Record the before/after open and ready counts, the resolved workspace, the
+configuration change, and the worker restart time. If the ready count is still
+zero, return to step 3 instead of repeatedly changing labels.
+
+## Quick symptom table
+
+| Symptom | Most likely cause | First action |
+| --- | --- | --- |
+| Open count is zero | No backlog in this store | Verify the intended workspace before creating work |
+| Open beads exist, ready count is zero | Assignment, manual block, unfinished blocker, or exact exclusion label | Compare open/ready JSON and inspect `bead show` |
+| Ready count is positive, worker stays idle | Claim race, worker-local exclusion, or dispatch failure | Query Pluck and claim telemetry; inspect worker status |
+| Every bead disappears after adding a custom label list | Custom list replaced the built-in defaults or added an exact label present on all beads | Restore the complete intended list and restart workers |
+| A repository's beads are missing but another repository has work | Wrong `workspace.default` or missing `--workspace` | Use an absolute worker workspace and run `needle doctor` there |
+| A new sibling repository is not found by Explore | Pinned `workspaces` list, non-direct-child path, or Explore disabled | Check Explore mode and `workspace_root` |
+
+## Related references
+
+- [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md) — current
+  filter and candidate inventory.
+- [`docs/pluck-workspace-paths.md`](pluck-workspace-paths.md) — path resolution
+  and Explore behavior.
+- [`docs/pluck-query-results.md`](pluck-query-results.md) — current JSONL
+  result contract, followed by historical query notes.
+- [`docs/research/pluck-filter-root-cause.md`](research/pluck-filter-root-cause.md)
+  — incident evidence and reproduction history.

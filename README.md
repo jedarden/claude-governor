@@ -177,6 +177,19 @@ See `docs/research/alerts.md` for complete alert documentation including:
 - Cooldown deduplication
 - Troubleshooting steps
 
+## Bead visibility
+
+NEEDLE Pluck uses the resolved workspace's `.beads` store, the `bead-rs`
+`--ready` frontier, and exact `exclude_labels` matching. For worker launches,
+use an absolute `--workspace` path; an empty custom label list does not disable
+the built-in exclusions, and wildcard-looking labels are literal strings.
+
+Use [`docs/bead-visibility-quickref.md`](docs/bead-visibility-quickref.md) for
+the commands and common mistakes, or
+[`docs/bead-visibility-troubleshooting.md`](docs/bead-visibility-troubleshooting.md)
+for the full starvation response procedure. The authoritative current filter
+inventory is [`docs/plan/pluck-configuration.md`](docs/plan/pluck-configuration.md).
+
 ## Project Structure
 
 ```
