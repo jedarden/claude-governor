@@ -21,6 +21,7 @@
 //! - `3` = emergency brake engaged
 
 use crate::state::{CapacityForecast, GovernorState, WindowForecast};
+#[cfg(test)]
 use std::collections::HashMap;
 
 /// Capacity pressure level for worker guidance

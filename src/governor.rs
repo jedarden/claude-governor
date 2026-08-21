@@ -31,6 +31,7 @@ use crate::config::{
 use crate::db;
 use crate::poller::Poller;
 use crate::poller::UsagePoller;
+#[cfg(test)]
 use crate::poller::UsageWindow;
 use crate::schedule::{self, Promotion};
 use crate::state;
@@ -125,6 +126,7 @@ pub const MIN_CONSECUTIVE_ABSENT: u32 = 3;
 /// The is_active field is optional in UsageWindow. When absent/null in the API
 /// response, the window is treated as active (not inactive). Only an explicit
 /// `false` value marks the window as structurally inactive.
+#[cfg(test)]
 fn is_structurally_inactive(window: &UsageWindow, state: &state::GovernorState) -> bool {
     // Condition 1: Consecutive absence threshold reached
     // Check if the window has been absent (null) from API responses across
@@ -6246,7 +6248,7 @@ pub fn run_observe_cycle(
             estimate_quality,
         );
 
-        let mut forecast = forecast;
+        let forecast = forecast;
 
         match *window {
             "five_hour" => five_hour_forecast = forecast,
@@ -8442,7 +8444,7 @@ mod tests {
             dollars_per_worker_per_hour: 5.0,
         };
 
-        let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(
+        let (fleet_pct_hr_seeded, pct_per_worker_seeded, _) = if matches!(
             estimate_quality,
             EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
         ) && util > 0.0
@@ -8479,11 +8481,6 @@ mod tests {
         let util = 15.0;
         let fleet_pct_hr = 4.2; // has observed burn rate
         let current_total = 2;
-        let baseline = crate::state::BaselineBurnRates {
-            pct_per_worker_per_hour: 1.5,
-            dollars_per_worker_per_hour: 5.0,
-        };
-
         let (fleet_pct_hr_seeded, _, _) = if matches!(
             estimate_quality,
             EstimateQuality::ColdStart | EstimateQuality::InsufficientSamples
@@ -8732,6 +8729,16 @@ mod tests {
         // First poll returns weekly_scoped scoped to a model (e.g., "Fable")
         let first_poll_model = Some("Fable".to_string());
         let first_poll_util = 50.0; // Window has real utilization
+
+        assert!(
+            weekly_scoped_model_at_startup.is_none(),
+            "first startup should have no persisted weekly_scoped model"
+        );
+        assert_eq!(
+            first_poll_model.as_deref(),
+            Some("Fable"),
+            "the first poll should identify the scoped model"
+        );
 
         // Governor detects this as initialization (None -> Some), not rotation
         // Since model went from None to Some, reset_weekly_scoped_on_model_change()

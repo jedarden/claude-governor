@@ -31,9 +31,7 @@
 //! in `estimate_burn_rates()` (src/burn_rate.rs:1313-1322) that prevents
 //! cold-start seeding logic from running on first startup.
 
-use chrono::Utc;
-use claude_governor::burn_rate::{estimate_burn_rates, BaselineBurnRates};
-use claude_governor::state::{BurnRateState, EstimateQuality};
+use claude_governor::state::BurnRateState;
 
 /// Create a brand-new burn rate state (no persisted model, no samples)
 ///
@@ -67,18 +65,6 @@ fn create_brand_new_state() -> BurnRateState {
         usd_per_pct_ema_weekly_scoped: 0.0,
         fleet_pct_ema_samples: 0, // Zero samples = cold-start
         prev_usage_snapshot: None,
-    }
-}
-
-/// Create a conservative baseline burn rate configuration
-///
-/// Uses the documented conservative defaults:
-/// - 1.5%/hr per worker (default_baseline_pct)
-/// - $5.0/hr per worker (default_baseline_dollars)
-fn create_baseline() -> BaselineBurnRates {
-    BaselineBurnRates {
-        pct_per_worker_per_hour: claude_governor::config::default_baseline_pct(),
-        dollars_per_worker_per_hour: claude_governor::config::default_baseline_dollars(),
     }
 }
 
@@ -198,7 +184,7 @@ fn test_first_startup_no_weekly_scoped_model_required() {
     //
     // Currently, both cases return default forecasts (Calibrated).
 
-    let mut usage_state = claude_governor::state::UsageState::default();
+    let usage_state = claude_governor::state::UsageState::default();
 
     // Verify weekly_scoped_model is None (no persisted model identity)
     assert!(
@@ -207,6 +193,19 @@ fn test_first_startup_no_weekly_scoped_model_required() {
     );
 
     let burn_rate_state = create_brand_new_state();
+
+    assert!(
+        burn_rate_state.by_model.is_empty(),
+        "brand-new state should have no per-model calibration"
+    );
+    assert_eq!(
+        burn_rate_state.fleet_pct_ema_samples, 0,
+        "brand-new state should have no EMA samples"
+    );
+    assert_eq!(
+        burn_rate_state.fleet_pct_hr_ema.weekly_scoped, 0.0,
+        "brand-new state should have no weekly_scoped burn rate"
+    );
 
     panic!(
         "This test is skipped due to architectural limitation. \

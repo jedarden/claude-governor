@@ -3,8 +3,7 @@
 //! This test verifies that the stdout notification about safe mode reasserting
 //! appears correctly after a manual scale during safe mode.
 
-use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use tempfile::TempDir;
 

@@ -295,7 +295,7 @@ impl UsageData {
                 .unwrap_or_else(|| "Scoped".to_string());
             let window = UsageWindow {
                 name: "weekly_scoped".to_string(),
-                /// **Model-agnostic weekly_scoped pct source: reads from limits[].percent**
+                // **Model-agnostic weekly_scoped pct source: reads from limits[].percent**
                 utilization: limit.percent.unwrap_or(0.0),
                 resets_at: limit.resets_at.clone().unwrap_or_default(),
                 is_active: None,

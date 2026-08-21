@@ -12,10 +12,6 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use std::collections::HashMap;
 
-use claude_governor::config::{
-    AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig, GovernorConfig,
-    ModelPricing, PricingConfig, SprintConfig,
-};
 use claude_governor::poller::UsageData;
 use claude_governor::state::{
     self, BaselineBurnRates, BurnRateState, EstimateQuality, WindowPctDeltas,
@@ -69,32 +65,6 @@ impl ModelRotationPoller {
         } else {
             Err(anyhow::anyhow!("No usage data available"))
         }
-    }
-}
-
-/// Create a minimal governor config
-fn create_minimal_config() -> GovernorConfig {
-    let mut models = HashMap::new();
-    models.insert(
-        "claude-sonnet-4-20250514".to_string(),
-        ModelPricing {
-            input_per_mtok: 3.0,
-            output_per_mtok: 15.0,
-            cache_write_5m_per_mtok: 3.75,
-            cache_write_1h_per_mtok: 6.0,
-            cache_read_per_mtok: 0.30,
-        },
-    );
-
-    GovernorConfig {
-        pricing: PricingConfig { models },
-        sprint: SprintConfig::default(),
-        daemon: DaemonConfig::default(),
-        alerts: AlertConfig::default(),
-        composite_risk: CompositeRiskConfig::default(),
-        cone_scaling: ConeScalingConfig::default(),
-        agents: HashMap::new(),
-        credentials_path: None,
     }
 }
 
@@ -703,7 +673,6 @@ fn test_production_path_identity_change_cold_start_flow() {
 
     // VERIFY 8: Regression - ensure a calibrated (non-rotating) window would be unchanged
     // Simulate five_hour window that was NOT affected by model rotation
-    let five_hour_samples = 15; // Well calibrated
     let five_hour_ema = 1.8; // Established rate
     let five_hour_quality = EstimateQuality::Calibrated;
 
@@ -756,6 +725,16 @@ fn test_first_startup_cold_start_behavior() {
     // First poll returns weekly_scoped scoped to a model (e.g., "Fable")
     let first_poll_model = Some("Fable".to_string());
     let first_poll_util = 50.0; // Window has real utilization
+
+    assert!(
+        weekly_scoped_model_at_startup.is_none(),
+        "first startup should have no persisted weekly_scoped model"
+    );
+    assert_eq!(
+        first_poll_model.as_deref(),
+        Some("Fable"),
+        "the first poll should identify the scoped model"
+    );
 
     // Governor detects this as initialization (None -> Some), not rotation
     // Since model went from None to Some, reset_weekly_scoped_on_model_change()
@@ -1023,6 +1002,11 @@ fn test_full_cycle_model_rotation_resets_calibrated_slot() {
     // Production path state after model change:
     let fleet_pct_hr_after_reset = burn_rate_state.fleet_pct_hr_ema.weekly_scoped; // 0.0
     let ema_samples_after_reset = burn_rate_state.fleet_pct_ema_samples; // 0
+
+    assert_eq!(
+        ema_samples_after_reset, 0,
+        "weekly_scoped EMA samples should be reset after model rotation"
+    );
 
     // Cold-start seeding logic (production path from governor.rs:4761-4786)
     let (fleet_pct_hr_seeded, pct_per_worker_seeded, std_pct_hr_seeded) = if matches!(

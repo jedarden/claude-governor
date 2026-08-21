@@ -1074,6 +1074,7 @@ fn update_ema(ema: &mut ModelWindowEma, pct_hr: f64, usd_hr: f64) {
 ///
 /// Returns the EMA value if enough samples have been accumulated,
 /// otherwise falls back to the baseline.
+#[cfg(test)]
 fn effective_burn_rate(ema: &ModelWindowEma, baseline: &BaselineBurnRates) -> (f64, f64) {
     if ema.samples >= MIN_SAMPLES_FOR_EMA {
         (ema.ema_pct, ema.ema_usd)
@@ -3713,7 +3714,7 @@ mod tests {
 
     #[test]
     fn compute_empirical_promo_ratio_with_sufficient_data() {
-        use crate::db::{create_schema, insert_instance, open_db};
+        use crate::db::{create_schema, insert_instance};
         use tempfile::TempDir;
 
         // Create a temporary database
@@ -3825,7 +3826,7 @@ mod tests {
 
     #[test]
     fn compute_empirical_promo_ratio_insufficient_data_returns_some() {
-        use crate::db::{create_schema, insert_instance, open_db};
+        use crate::db::{create_schema, insert_instance};
         use tempfile::TempDir;
 
         // Create a temporary database
@@ -3900,7 +3901,7 @@ mod tests {
 
     #[test]
     fn compute_empirical_promo_ratio_no_data_returns_none() {
-        use crate::db::{create_schema, open_db};
+        use crate::db::create_schema;
         use tempfile::TempDir;
 
         // Create an empty temporary database
