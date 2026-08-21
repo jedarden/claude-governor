@@ -1,324 +1,198 @@
-# Pluck Starvation Reproduction Report
+# Pluck starvation reproduction report
 
-**Documented:** 2026-08-03  
-**Workspace:** `/home/coding/claude-governor`  
-**Bead ID:** bf-551q7  
-**Issue Type:** Bug Reproduction
+**Bead:** `claudego-f5ec1051`
 
-## Executive Summary
+**Target workspace:** `/home/coding/claude-governor`
 
-The Pluck starvation bug refers to a condition where the NEEDLE Pluck strand fails to discover and process ready beads, even when they exist in the bead store. This manifests as "N open beads, 0 found" where Pluck reports zero candidates despite the database containing ready beads.
+**Incident evidence:** 2026-07-06 and 2026-08-03
 
-**Current Status (2026-08-03):** ✅ **RESOLVED** - System is operating correctly
-- **20 total open issues** in database
-- **5 issues** with excluded labels (`deferred`, `human`, `blocked`)
-- **15 ready beads** correctly discovered by `bf ready`
-- **0 starvation** - Pluck successfully finds all available candidates
+**Report completed:** 2026-08-20
 
-## Bug Description
+## Result
 
-### The Starvation Condition
+The documented failure is the **“37 open, 0 found”** Pluck starvation
+condition: work was expected in the target workspace, but Pluck returned zero
+candidates and emitted starvation telemetry.
 
-Pluck starvation occurs when the Pluck strand's filter configuration excludes all available beads, creating a scenario where:
+The strongest captured 2026-08-03 evidence shows that this was a workspace
+selection failure, not a label-filter failure. Pluck queried `/home/coding`,
+whose `.beads` store had five total issues and zero open issues, while the
+intended `/home/coding/claude-governor` store had 1,208 issues, 21 open issues,
+and 10 ready beads at the time of the capture.
 
-1. **Database contains ready beads** (open status, no excluded labels)
-2. **Pluck strand finds zero candidates** (0 beads returned from query)
-3. **NEEDLE workers idle** despite available work
-4. **System appears stuck** with open work but no processing
+The number 37 is the incident’s expected/precondition count recorded in the
+task and analysis. It is not a durable count of the database: nearby
+verification runs measured 49–52 open beads, and the current bead-rs store is
+different again. The exact bug statement remains: **open work existed in the
+intended workspace, while Pluck found 0 in the workspace it actually queried.**
 
-### Root Cause Categories
+## Environment
 
-1. **Filter Configuration Mismatch**
-   - Custom `exclude_labels` in NEEDLE config conflicts with bead labels
-   - Workspace-specific filters override expected behavior
-   - Label database schema changes break existing queries
+### Incident environment
 
-2. **Database Schema Issues**
-   - `labels` table missing or corrupted
-   - Index failures on `issue_id` or `label` columns
-   - SQLite query planner selects suboptimal execution path
+| Item | Value |
+| --- | --- |
+| Host | Hetzner EX44, Linux 6.12.63 |
+| Pluck | NEEDLE `pluck` strand, compiled into NEEDLE |
+| NEEDLE binary | `~/.needle/bin/needle-stable` |
+| NEEDLE version | `0.2.16` was the deployed stable version documented during this incident; the captured log itself does not print a version |
+| Bead backend | Historical bead-forge (`bf`/`br` compatible) |
+| Intended workspace | `/home/coding/claude-governor` |
+| Workspace used by failing worker | `/home/coding` |
+| Intended database | `/home/coding/claude-governor/.beads/beads.db` |
+| Database actually queried | `/home/coding/.beads/beads.db` |
+| Pluck labels | `deferred`, `human`, `blocked` |
+| Pluck split threshold | `3` |
 
-3. **Workspace Discovery Failures**
-   - Pluck pointing to wrong workspace directory
-   - Multiple `.beads/` directories causing confusion
-   - Path resolution failures in workspace discovery
+### Current verification context
 
-## Environment Context
+The repository has since migrated to bead-rs:
 
-### System Information (2026-08-03)
+```text
+needle 0.3.0
+NEEDLE commit: 9dfbb0058182b978351f7a8953a5a4e2faa264cf
+target commit: dd60860fae6690d373b5fc2031ea97d9f9b88d29
+backend: bead-rs
+current target store: 60 open, 13 ready
+```
+
+The active global config currently defaults to `/home/coding/aide-de-camp`,
+not this repository. A worker serving this repository therefore needs an
+explicit `--workspace /home/coding/claude-governor`; a relative or unrelated
+home path can reproduce the same class of failure.
+
+## Exact commands
+
+The command that exercised the Pluck runtime in the incident was an explicit
+NEEDLE worker launch against the wrong home workspace:
 
 ```bash
-# Host environment
-Hostname: Hetzner EX44 via Tailscale
-Platform: Linux 6.12.63
-Working directory: /home/coding/claude-governor
-
-# Pluck/NEEDLE versions
-br binary: ~/.local/bin/br (bead-forge)
-NEEDLE binary: ~/.needle/bin/needle-stable
-Pluck strand: Compiled into NEEDLE binary
-
-# Database location
-Database: /home/coding/claude-governor/.beads/beads.db
-JSONL checkpoint: /home/coding/claude-governor/.beads/issues.jsonl
-Config: /home/coding/claude-governor/.beads/config.yaml
+RUST_LOG=debug /home/coding/.needle/bin/needle-stable run \
+  --workspace /home/coding \
+  --agent claude-code-glm-4_7 \
+  --identifier lab-roam3
 ```
 
-### Configuration Files
+The original shell wrapper was not retained in the stderr artifact; the
+command above is the explicit reproduction invocation reconstructed from the
+worker identity, workspace, and retained Pluck trace. It is intentionally
+pointed at `/home/coding` to reproduce the wrong-store condition. Do not run it
+against a live production queue without an isolated worker/home and a claim
+safety plan: a real NEEDLE worker can claim beads.
 
-**NEEDLE Config (`~/.config/needle/config.yaml`):**
-```yaml
-workspace:
-  default: /home/coding
-  home: /home/coding/.needle
-  labels: []
-
-strands:
-  explore:
-    enabled: true
-    workspaces: []
-    workspace_root: /home/coding/
-```
-
-**Pluck Strand Configuration (compiled into NEEDLE):**
-```rust
-// From: /home/coding/NEEDLE/src/strand/pluck.rs:13
-const DEFAULT_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked"];
-```
-
-## Reproduction Commands
-
-### 1. Current State Verification (2026-08-03)
+The historical command-level cross-check was:
 
 ```bash
-# Show current working state
+RUST_LOG=debug bf ready --limit 0 --format json > pluck-debug-output.txt 2>&1
+```
+
+The direct database checks used to compare the two stores were:
+
+```bash
+sqlite3 /home/coding/.beads/beads.db \
+  "SELECT COUNT(*) FROM issues WHERE status='open';"
+
+sqlite3 /home/coding/claude-governor/.beads/beads.db \
+  "SELECT COUNT(*) FROM issues WHERE status='open';"
+
+bf ready --limit 0 --format json | jq -r '.[].id'
+```
+
+For the current bead-rs backend, use these read-only commands instead of the
+historical `bf`/`br` commands:
+
+```bash
 cd /home/coding/claude-governor
-
-# Total open issues in database
-sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"
-# Output: 20
-
-# Ready beads (unblocked, open)
-bf ready --limit 0
-# Output: 15 beads
-
-# Open issues with excluded labels
-sqlite3 .beads/beads.db <<'EOF'
-SELECT id, title, status 
-FROM issues 
-WHERE status='open' 
-AND id IN (SELECT issue_id FROM labels WHERE label IN ('deferred', 'human', 'blocked'));
-EOF
-# Output: 5 beads (bf-1y51s, bf-3js6h, bf-4k2j5, bf-5dsgv, bf-156nn7)
+bead list --status open --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -s 'length'
 ```
 
-### 2. Database Schema Verification
+## Full captured Pluck debug output
 
-```bash
-# Check labels table exists
-sqlite3 .beads/beads.db ".schema labels"
-# Expected: CREATE TABLE labels with issue_id and label columns
+The following is the complete retained Pluck sequence for the first starvation
+cycle, reproduced verbatim from the 2026-08-03 analysis of
+`/home/coding/.needle/logs/needle-claude-code-glm-4_7-lab-roam3.stderr.log`
+(lines 123–131):
 
-# Check indexes
-sqlite3 .beads/beads.db ".indexes"
-# Expected: idx_labels_label, idx_labels_issue
-
-# Verify excluded labels exist
-sqlite3 .beads/beads.db "SELECT DISTINCT label FROM labels WHERE label IN ('deferred', 'human', 'blocked');"
-# Expected: blocked, deferred, human
+```text
+2026-08-03T23:04:53.870031Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Pluck strand evaluation starting exclude_labels=["deferred", "human", "blocked"] split_threshold=3
+2026-08-03T23:04:53.870042Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Querying bead store for ready candidates filters=Filters { assignee: None, exclude_labels: ["deferred", "human", "blocked"], exclude_ids: {} }
+2026-08-03T23:04:53.873069Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Bead store returned 0 candidates count=0
+2026-08-03T23:04:53.873094Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by label filter count=0
+2026-08-03T23:04:53.873098Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by status/assignee filter count=0
+2026-08-03T23:04:53.876267Z DEBUG ...strand.pluck{...}: needle::telemetry: telemetry event event_type=strand.pluck.starvation_detected seq=21
+2026-08-03T23:04:53.876291Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Emitted PluckStarvationDetected telemetry, returning NoWork workspace=. open_count=0 excluded_count=0
+2026-08-03T23:04:53.876304Z INFO ...strand.pluck{...}: needle::strand: strand returned no work strand=pluck elapsed_ms=6
 ```
 
-### 3. Filter Configuration Test
+The important combination is `Bead store returned 0 candidates` plus
+`workspace=. open_count=0`. Pluck did not receive 37 candidates and filter
+them all out; it opened the wrong store, which contained no open work.
 
-```bash
-# Run basic query without filters
-bash scripts/basic-pluck-query.sh
+## Independent historical starvation trace
 
-# Expected output:
-# 1. Total issues (no filter): 1208
-# 2. Open issues (no label filter): 20
-# 3-6. Breakdown by status, type, priority
+An earlier 2026-07-06 run captured the same failure as progressive candidate
+loss. Its direct count was 49 open beads, not 37, which is why the counts must
+be labeled by capture date:
+
+```text
+$ br list --status open | wc -l
+49
+
+2026-07-06T12:43:05.404136Z  INFO ... strand found candidates strand=pluck candidates=6 excluded=17 elapsed_ms=2
+2026-07-06T12:43:05.814821Z  INFO ... strand found candidates strand=pluck candidates=5 excluded=18 elapsed_ms=2
+2026-07-06T12:43:05.927291Z  INFO ... strand found candidates strand=pluck candidates=4 excluded=19 elapsed_ms=2
+2026-07-06T12:43:06.139230Z  INFO ... strand found candidates strand=pluck candidates=3 excluded=20 elapsed_ms=2
+2026-07-06T12:43:06.551055Z  INFO ... strand found candidates strand=pluck candidates=2 excluded=21 elapsed_ms=2
+2026-07-06T12:43:06.662621Z  INFO ... strand found candidates strand=pluck candidates=1 excluded=22 elapsed_ms=2
+2026-07-06T12:43:06.874733Z  INFO ... strand found candidates strand=pluck candidates=0 excluded=23 elapsed_ms=2
+2026-07-06T12:43:07.095944Z  INFO ... strand found candidates strand=explore candidates=1 excluded=0 elapsed_ms=62
 ```
 
-### 4. Historical Starvation Reproduction (Pre-Fix)
+This trace demonstrates that Pluck can drain its candidate set to zero while
+Explore still finds work. It is corroborating evidence for starvation, but it
+does not by itself prove that all 49 open beads were eligible at every instant;
+claims, assignees, dependencies, and concurrent workers can change during the
+sequence.
 
-To reproduce the historical starvation condition where beads existed but Pluck found none:
+## Database comparison from the incident
 
-```bash
-# Step 1: Verify open beads exist
-sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';"
-# If this returns >0 but...
+The 2026-08-03 investigation recorded this state:
 
-# Step 2: Pluck finds nothing
-bf ready --limit 0 | wc -l
-# If this returns 0, you've reproduced starvation
+| Query target | Total issues | Open issues | Ready/claimable |
+| --- | ---: | ---: | ---: |
+| `/home/coding/.beads/beads.db` (worker’s store) | 5 | 0 | 0 |
+| `/home/coding/claude-governor/.beads/beads.db` (intended store) | 1,208 | 21 | 10 |
 
-# Step 3: Identify the cause
-# Check for filter misconfiguration:
-cat ~/.config/needle/config.yaml | grep -A 5 "strands:"
+The Pluck debug line reported `workspace=.` because the worker was running
+with `/home/coding` as its home. In that process, `.` resolved to the wrong
+store. The absence of label and status exclusions (`count=0` for both) is
+consistent with an empty wrong store and inconsistent with the hypothesis that
+37 target beads were all removed by Pluck labels.
 
-# Check database integrity
-sqlite3 .beads/beads.db "PRAGMA integrity_check;"
+## Diagnosis
 
-# Check label table presence
-sqlite3 .beads/beads.db "SELECT name FROM sqlite_master WHERE type='table' AND name='labels';"
-```
+1. The target repository contained open/ready work.
+2. The worker’s Pluck home was `/home/coding`, not the target repository.
+3. Pluck queried `/home/coding/.beads/` and received zero candidates.
+4. Pluck emitted starvation telemetry and returned `NoWork`.
+5. Explore could still find work because it scans discovered workspaces
+   independently; its immediate `candidates=1` result confirms that the fleet
+   was not globally empty.
 
-## Current Analysis (2026-08-03)
+Therefore the reproduced bug is a workspace-path mismatch causing Pluck
+starvation. The historical label-filter investigations are separate symptoms
+and should not be used to explain this particular `workspace=.` trace.
 
-### Database State Breakdown
+## References
 
-```
-Total Database: 1208 issues
-├── closed: 1125 (93.1%)
-├── open: 20 (1.7%)
-│   ├── With excluded labels: 5
-│   │   ├── bf-1y51s (deferred)
-│   │   ├── bf-3js6h (deferred)
-│   │   ├── bf-4k2j5 (deferred)
-│   │   ├── bf-5dsgv (deferred)
-│   │   └── bf-156nn7 (deferred)
-│   └── Ready candidates: 15
-│       ├── Priority 3: 1 (bf-3uj0g1)
-│       ├── Priority 2: 13
-│       └── Priority 1: 1 (bf-156nn7)
-├── blocked: 54 (4.5%)
-├── done: 2 (0.2%)
-└── in_progress: 7 (0.6%)
-```
-
-### Filter Performance
-
-**Pluck Query Performance:**
-```sql
--- The query Pluck uses internally
-SELECT COUNT(*) 
-FROM issues 
-WHERE status='open' 
-AND id NOT IN (SELECT issue_id FROM labels WHERE label IN ('deferred', 'human', 'blocked'));
--- Result: 15
--- Execution time: <10ms
-```
-
-**Ready Beads Output:**
-```
-$ bf ready --limit 0
-[bf-39f1ao] Investigate and document commit histories on both clones (priority=2, impact=1, float=1000)
-[bf-4k2j5] Investigate Pluck configuration and workspace setup (priority=2, impact=1, float=500)
-[bf-1876c] Add logging for Pluck filter parameters (priority=2, impact=1, float=500)
-[bf-4fnc20] Fix unused imports in src/ files (priority=2, impact=1, float=500)
-[bf-famm4] Implement guard condition helpers in governor.rs (priority=2, impact=1, float=76.9)
-[bf-156nn7] config/claude-governor.service still ships MemoryMax=512M (priority=1, impact=0, float=1000)
-[bf-54ppq] Investigate Pluck configuration settings (priority=2, impact=0, float=1000)
-[bf-1rac5m] bf-4fnc20 stuck in status=blocked with zero actual blocking dependencies (priority=2, impact=0, float=1000)
-[bf-5pupcb] Default alert-bead command hardcodes deprecated br (priority=2, impact=0, float=1000)
-[bf-1zrdbo] Implement ADR-001: split cgov daemon (priority=2, impact=0, float=1000)
-[bf-56ywhe] Recurring OAuth token-refresh failures (priority=2, impact=0, float=1000)
-[bf-2mwvej] OPS-GATED: 4 Pluck-investigation beads (priority=2, impact=0, float=1000)
-[bf-3uj0g1] Repo hygiene: tracked backup artifacts (priority=3, impact=0, float=1000)
-```
-
-## Historical Context: The "37 Open" References
-
-The phrase "37 open, 0 found" appears in several closed beads:
-
-```bash
-# Historical verification beads (now closed)
-bf-49qnq: "Verify workspace has 37 open beads" - closed
-bf-1xabf: "Verify Pluck workspace has 37 open beads" - closed  
-bf-5n8hp: "Verify open bead count in workspace" - closed
-```
-
-**Analysis:** These beads refer to a historical state when the workspace contained 37 open issues. The current state (20 open) reflects natural bead churn - beads have been completed, closed, or re-prioritized since that measurement was taken.
-
-## Resolution Verification
-
-### Confirm System is Working
-
-```bash
-# 1. Verify Pluck can find candidates
-bf ready --limit 0 | wc -l
-# Expected: 13-15 lines (header + beads)
-
-# 2. Verify no database corruption
-sqlite3 .beads/beads.db "PRAGMA integrity_check;"
-# Expected: "ok"
-
-# 3. Verify label table is functional
-sqlite3 .beads/beads.db "SELECT COUNT(DISTINCT issue_id) FROM labels WHERE label IN ('deferred', 'human', 'blocked');"
-# Expected: 5 (matching current excluded count)
-
-# 4. Test NEEDLE worker can claim
-bf claim --dry-run --assignee test-worker
-# Expected: Shows claimable bead (e.g., bf-3uj0g1, the priority 3)
-```
-
-### What Was Fixed
-
-Based on the investigation beads and current state, the following issues were resolved:
-
-1. **Filter Configuration Alignment**
-   - Verified `DEFAULT_EXCLUDE_LABELS` matches actual label usage
-   - Confirmed no custom overrides causing conflicts
-
-2. **Database Schema Stability**
-   - `labels` table exists and is properly indexed
-   - Query planner efficiently executes exclusion joins
-
-3. **Workspace Path Resolution**
-   - Pluck correctly points to `/home/coding/claude-governor/.beads/`
-   - No path confusion from multiple workspace candidates
-
-## Prevention Measures
-
-To prevent Pluck starvation from recurring:
-
-### 1. Monitoring
-
-```bash
-# Add to cgov monitoring or cron scripts
-#!/bin/bash
-#pluck-health-check.sh
-
-OPEN_COUNT=$(sqlite3 .beads/beads.db "SELECT COUNT(*) FROM issues WHERE status='open';")
-READY_COUNT=$(bf ready --limit 0 | grep -c "^\[bf-")
-
-if [ "$OPEN_COUNT" -gt 0 ] && [ "$READY_COUNT" -eq 0 ]; then
-    echo "WARNING: Pluck starvation detected - $OPEN_COUNT open, $READY_COUNT ready"
-    # Trigger alert or auto-repair
-fi
-```
-
-### 2. Database Maintenance
-
-```bash
-# Regular integrity checks
-sqlite3 .beads/beads.db "PRAGMA optimize;"
-sqlite3 .beads/beads.db "VACUUM;"
-```
-
-### 3. Configuration Validation
-
-```bash
-# Verify NEEDLE config before deployment
-needle config validate  # If available, or manual inspection
-```
-
-## Related Documentation
-
-- **Pluck Configuration:** `/home/coding/claude-governor/docs/plan/pluck-configuration.md`
-- **Workspace Paths:** `/home/coding/claude-governor/docs/pluck-workspace-paths.md`
-- **NEEDLE Source:** `/home/coding/NEEDLE/src/strand/pluck.rs`
-- **bead-forge Source:** `/home/coding/bead-forge/`
-
-## Summary
-
-**Bug:** Pluck strand fails to find ready beads despite database containing open issues  
-**Symptom:** "N open, 0 found" where Pluck returns zero candidates  
-**Current State:** ✅ Resolved - Pluck correctly finds 15/20 open beads (5 properly excluded)  
-**Fix:** Configuration alignment, database schema verification, workspace path validation  
-**Prevention:** Monitoring scripts, regular maintenance, config validation
-
----
-
-**Documentation Complete** - This report provides complete reproduction steps, current state analysis, and preventive measures for the Pluck starvation bug.
+- `/home/coding/NEEDLE/src/strand/pluck.rs` — Pluck implementation and default
+  excluded labels.
+- [`pluck-configuration.md`](../plan/pluck-configuration.md) — current
+  bead-rs filter contract.
+- [`pluck-workspace-paths.md`](../pluck-workspace-paths.md) — workspace
+  selection and precedence.
+- `notes/bf-3js6h.md` in git history — original 2026-07-06 progressive
+  starvation trace.
+- `notes/bf-4f5fw.md` in git history — 2026-08-03 zero-candidate trace and
+  wrong-store comparison.
