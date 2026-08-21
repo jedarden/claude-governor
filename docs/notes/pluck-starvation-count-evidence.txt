@@ -1,0 +1,42 @@
+Pluck starvation count evidence
+================================
+
+Target workspace: /home/coding/claude-governor
+Incident/precondition date: 2026-08-03
+
+The task description referred to a historical "37 open" precondition. The
+exact 37-row `br list` transcript was not retained. The contemporaneous
+ground-truth filter test (git commit dbb129c, 2026-08-03) recorded:
+
+  Main workspace (.beads/beads.db):
+  - Total open beads: 47
+  - Unassigned open beads: 37
+  - Ready beads (excluding deferred/human/blocked): 35
+
+The command and output represented by that finding were:
+
+  $ sqlite3 /home/coding/claude-governor/.beads/beads.db \
+      "SELECT COUNT(*) FROM issues WHERE status='open' AND assignee IS NULL;"
+  37
+
+Historical br count corroboration from the 2026-07-06 starvation trace
+(notes/bf-3js6h.md in git history):
+
+  $ br list --status open | wc -l
+  49
+
+The full retained 2026-07-06 candidate trace was:
+
+  2026-07-06T12:43:05.404136Z  INFO ... strand found candidates strand=pluck candidates=6 excluded=17 elapsed_ms=2
+  2026-07-06T12:43:05.814821Z  INFO ... strand found candidates strand=pluck candidates=5 excluded=18 elapsed_ms=2
+  2026-07-06T12:43:05.927291Z  INFO ... strand found candidates strand=pluck candidates=4 excluded=19 elapsed_ms=2
+  2026-07-06T12:43:06.139230Z  INFO ... strand found candidates strand=pluck candidates=3 excluded=20 elapsed_ms=2
+  2026-07-06T12:43:06.551055Z  INFO ... strand found candidates strand=pluck candidates=2 excluded=21 elapsed_ms=2
+  2026-07-06T12:43:06.662621Z  INFO ... strand found candidates strand=pluck candidates=1 excluded=22 elapsed_ms=2
+  2026-07-06T12:43:06.874733Z  INFO ... strand found candidates strand=pluck candidates=0 excluded=23 elapsed_ms=2
+  2026-07-06T12:43:07.095944Z  INFO ... strand found candidates strand=explore candidates=1 excluded=0 elapsed_ms=62
+
+This appendix deliberately distinguishes 37 unassigned open beads from the
+49 total-open `br` capture. Later checks recorded 50–52 total open beads as
+the queue changed. No current `br` command was run: this checkout uses the
+bead-rs backend, and the retired br CLI must not be run against it.

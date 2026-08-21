@@ -1,0 +1,25 @@
+Pluck starvation reproduction — retained full first-cycle output
+================================================================
+
+Source: /home/coding/.needle/logs/needle-claude-code-glm-4_7-lab-roam3.stderr.log
+Capture date: 2026-08-03
+Relevant source lines: 123–131
+
+The original log path was outside this repository. The following is the full
+retained Pluck sequence for the first starvation cycle, copied from
+notes/bf-4f5fw.md and docs/research/pluck-starvation-reproduction.md.
+
+2026-08-03T23:04:53.870031Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Pluck strand evaluation starting exclude_labels=["deferred", "human", "blocked"] split_threshold=3
+2026-08-03T23:04:53.870042Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Querying bead store for ready candidates filters=Filters { assignee: None, exclude_labels: ["deferred", "human", "blocked"], exclude_ids: {} }
+2026-08-03T23:04:53.873069Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Bead store returned 0 candidates count=0
+2026-08-03T23:04:53.873094Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by label filter count=0
+2026-08-03T23:04:53.873098Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by status/assignee filter count=0
+2026-08-03T23:04:53.876267Z DEBUG ...strand.pluck{...}: needle::telemetry: telemetry event event_type=strand.pluck.starvation_detected seq=21
+2026-08-03T23:04:53.876291Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Emitted PluckStarvationDetected telemetry, returning NoWork workspace=. open_count=0 excluded_count=0
+2026-08-03T23:04:53.876304Z INFO ...strand.pluck{...}: needle::strand: strand returned no work strand=pluck elapsed_ms=6
+
+Interpretation:
+- The store returned zero before any candidate-level label/status exclusions.
+- Pluck emitted starvation telemetry.
+- Pluck returned NoWork for workspace '.', whose open_count was zero.
+- The intended target workspace was /home/coding/claude-governor, not /home/coding.
