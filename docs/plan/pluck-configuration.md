@@ -9,6 +9,9 @@ inventory. It supersedes the older `bf`/`br`-era SQL examples in this
 repository. The target workspace's `.needle.yaml` selects `bead-rs`; it does
 not define a second Pluck configuration.
 
+For the incident diagnosis, test-by-test results, and a safe working filter
+example, see [`docs/research/pluck-filter-root-cause.md`](../research/pluck-filter-root-cause.md).
+
 ## Effective configuration
 
 The configured global configuration is `/home/coding/.config/needle/config.yaml`.
