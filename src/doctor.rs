@@ -323,6 +323,129 @@ fn detect_collector_status() -> CollectorStatus {
 // Individual health checks
 // ---------------------------------------------------------------------------
 
+const ALERT_FP_REENABLE_SAMPLE_THRESHOLD: usize = 100;
+const ALERT_FP_REENABLE_RATE_THRESHOLD: f64 = 0.05;
+
+/// Build the operator-facing progress report for the alert FP re-enablement
+/// gate. The telemetry stores a rolling window per alert type, so the sample
+/// count and FP rate used here intentionally come from each type's outcomes
+/// rather than the lifetime aggregate counters.
+fn alert_fp_telemetry_progress(telemetry: &crate::state::AlertFpTelemetry) -> (bool, String) {
+    let mut alert_types: Vec<_> = telemetry
+        .outcomes
+        .iter()
+        .filter(|(_, outcomes)| !outcomes.is_empty())
+        .collect();
+    alert_types.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    if alert_types.is_empty() {
+        return (
+            false,
+            format!(
+                "Alert FP re-enablement gate (<5% FP over {} samples): no alert samples recorded yet ({} more samples needed per alert type)",
+                ALERT_FP_REENABLE_SAMPLE_THRESHOLD,
+                ALERT_FP_REENABLE_SAMPLE_THRESHOLD,
+            ),
+        );
+    }
+
+    let mut all_ready = true;
+    let mut eligible_types = 0;
+    let mut lines = Vec::with_capacity(alert_types.len() + 1);
+
+    for (alert_type, outcomes) in alert_types {
+        let samples = outcomes.len();
+        let false_positives = outcomes
+            .iter()
+            .filter(|&&is_true_positive| !is_true_positive)
+            .count();
+        let fp_rate = false_positives as f64 / samples as f64;
+        let samples_needed = ALERT_FP_REENABLE_SAMPLE_THRESHOLD.saturating_sub(samples);
+        let ready = samples_needed == 0 && fp_rate < ALERT_FP_REENABLE_RATE_THRESHOLD;
+        all_ready &= ready;
+        if ready {
+            eligible_types += 1;
+        }
+
+        let gate_note = if ready {
+            "eligible"
+        } else if samples_needed > 0 {
+            "not eligible"
+        } else {
+            "not eligible; FP rate must be <5%"
+        };
+
+        lines.push(format!(
+            "  {}: {}/{} samples, {:.1}% FP, {} more samples to 100 [{}]",
+            alert_type,
+            samples,
+            ALERT_FP_REENABLE_SAMPLE_THRESHOLD,
+            fp_rate * 100.0,
+            samples_needed,
+            gate_note,
+        ));
+    }
+
+    let summary = if all_ready {
+        format!(
+            "all {} tracked alert types meet the re-enablement bar",
+            eligible_types
+        )
+    } else {
+        format!(
+            "{} of {} tracked alert types meet the re-enablement bar",
+            eligible_types,
+            lines.len()
+        )
+    };
+
+    (
+        all_ready,
+        format!(
+            "Alert FP re-enablement gate (<5% FP over {} samples): {}\n{}",
+            ALERT_FP_REENABLE_SAMPLE_THRESHOLD,
+            summary,
+            lines.join("\n"),
+        ),
+    )
+}
+
+/// Check progress toward the alert FP re-enablement criterion.
+fn check_alert_fp_telemetry() -> CheckResult {
+    let state_path = default_state_path();
+
+    if !state_path.exists() {
+        return CheckResult::warn(
+            "alert_fp_telemetry",
+            format!(
+                "No state file; alert FP telemetry has 0 samples ({} more samples needed per alert type)",
+                ALERT_FP_REENABLE_SAMPLE_THRESHOLD,
+            ),
+            "Run the governor's observe and act loops; telemetry grows only while alert conditions are evaluated",
+        );
+    }
+
+    match crate::state::load_state(&state_path) {
+        Ok(state) => {
+            let (ready, message) = alert_fp_telemetry_progress(&state.alert_fp_telemetry);
+            if ready {
+                CheckResult::pass("alert_fp_telemetry", message)
+            } else {
+                CheckResult::warn(
+                    "alert_fp_telemetry",
+                    message,
+                    "Keep the governor's alert-evaluating daemon running; re-enable alerts.auto_bead only after every tracked type has 100 samples with FP rate below 5%",
+                )
+            }
+        }
+        Err(e) => CheckResult::fail(
+            "alert_fp_telemetry",
+            format!("Cannot read state: {}", e),
+            "Check state file permissions",
+        ),
+    }
+}
+
 /// Check if the observe daemon is running. Observe is the telemetry source,
 /// so a stopped observe process remains a hard failure.
 fn check_observe_running() -> CheckResult {
@@ -1789,6 +1912,7 @@ pub fn run_doctor() -> DoctorReport {
         check_act_running(),
         check_log_file(),
         check_prediction_accuracy(),
+        check_alert_fp_telemetry(),
         // Additional operational checks
         check_state_file_freshness(),
         check_heartbeat_consistency(),
@@ -1927,6 +2051,39 @@ mod tests {
         let result = CheckResult::fail("test", "It's broken", "Fix it now");
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.remediation, Some("Fix it now".to_string()));
+    }
+
+    #[test]
+    fn alert_fp_progress_reports_samples_rate_and_remaining_samples() {
+        let mut telemetry = crate::state::AlertFpTelemetry::default();
+        telemetry.record("cutoff_imminent", true);
+        telemetry.record("cutoff_imminent", false);
+        telemetry.record("cutoff_imminent", true);
+
+        let (ready, message) = alert_fp_telemetry_progress(&telemetry);
+
+        assert!(!ready);
+        assert!(message.contains("cutoff_imminent: 3/100 samples"));
+        assert!(message.contains("33.3% FP"));
+        assert!(message.contains("97 more samples to 100"));
+    }
+
+    #[test]
+    fn alert_fp_progress_requires_strictly_less_than_five_percent() {
+        let mut telemetry = crate::state::AlertFpTelemetry::default();
+        for index in 0..100 {
+            telemetry.record("eligible", index >= 4);
+            telemetry.record("at_threshold", index >= 5);
+        }
+
+        let (ready, message) = alert_fp_telemetry_progress(&telemetry);
+
+        assert!(!ready);
+        assert!(message
+            .contains("eligible: 100/100 samples, 4.0% FP, 0 more samples to 100 [eligible]"));
+        assert!(message.contains(
+            "at_threshold: 100/100 samples, 5.0% FP, 0 more samples to 100 [not eligible; FP rate must be <5%]"
+        ));
     }
 
     #[test]
