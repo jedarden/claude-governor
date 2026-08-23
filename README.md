@@ -122,6 +122,21 @@ cgov logs --follow
 # Print or edit configuration
 cgov config
 cgov config --edit
+
+# Print version, build info, and component status
+cgov version
+
+# Run one token collection pass (or start daemon)
+cgov collect
+cgov collect --daemon
+
+# Query token history from SQLite mirror
+cgov token-history --last 5
+cgov token-history --compare
+cgov token-history --fleet
+
+# Run the governor daemon (main capacity management loop)
+cgov daemon
 ```
 
 ## Daemon Management
