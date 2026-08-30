@@ -233,3 +233,9 @@ src/
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
+
+---
+
+Part of [jedarden.com](https://jedarden.com)
+
+*This GitHub repo is a read-only mirror of git.ardenone.com/jedarden/claude-governor — issues and PRs are welcome here either way.*
