@@ -393,8 +393,16 @@ pub fn read_new_lines(path: &Path, cursor: &mut CursorStore) -> Result<Vec<Strin
         file.seek(SeekFrom::Start(start_offset))?;
     }
 
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    // Read raw bytes and decode lossily: a Claude Code session transcript can
+    // contain a stray non-UTF-8 byte (e.g. captured binary tool output), and a
+    // strict read_to_string would fail the whole file. Lossy decoding replaces
+    // the bad byte so the surrounding valid JSONL lines still parse. The cursor
+    // offset must advance by the BYTES actually consumed, not the (possibly
+    // longer, due to replacement chars) decoded string length.
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let bytes_read = bytes.len() as u64;
+    let content = String::from_utf8_lossy(&bytes);
 
     let lines: Vec<String> = content
         .split('\n')
@@ -402,7 +410,7 @@ pub fn read_new_lines(path: &Path, cursor: &mut CursorStore) -> Result<Vec<Strin
         .map(|line| line.to_string())
         .collect();
 
-    let new_offset = start_offset + content.len() as u64;
+    let new_offset = start_offset + bytes_read;
     cursor.set_offset(path.to_path_buf(), new_offset);
 
     Ok(lines)
@@ -1280,8 +1288,15 @@ pub fn run_collection_pass_at(paths: &CollectionPaths) -> anyhow::Result<Collect
     let mut total_lines = 0usize;
 
     for file_path in &files {
-        let lines = read_new_lines(file_path, &mut cursors)
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", file_path.display(), e))?;
+        // A single unreadable session file must never abort the whole pass
+        // (one bad-UTF-8 transcript stalled the collector for 17 days). Skip it.
+        let lines = match read_new_lines(file_path, &mut cursors) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("[collector] skipping {}: {}", file_path.display(), e);
+                continue;
+            }
+        };
 
         for line in &lines {
             total_lines += 1;
@@ -2067,6 +2082,35 @@ mod tests {
                 .filter(|msg| msg.contains(pattern))
                 .cloned()
                 .collect()
+        }
+
+        #[test]
+        fn invalid_utf8_is_read_lossily_not_errored() {
+            // Regression (claudego-4f38f04e): a Claude Code session transcript
+            // with a stray non-UTF-8 byte previously errored read_to_string, and
+            // the pass loop's `?` aborted the WHOLE collection pass — the
+            // collector produced nothing for 17 days. read_new_lines must decode
+            // lossily and return the surrounding valid JSONL lines instead.
+            let temp_dir = TempDir::new().unwrap();
+            let file_path = temp_dir.path().join("bad.jsonl");
+
+            // Two valid JSONL lines with an invalid UTF-8 byte (0xFF) embedded.
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"{\"a\":1}\n");
+            bytes.push(0xFF); // lone invalid byte
+            bytes.extend_from_slice(b"garble\n{\"b\":2}\n");
+            fs::write(&file_path, &bytes).unwrap();
+
+            let mut cursor = CursorStore::default();
+            let lines = read_new_lines(&file_path, &mut cursor)
+                .expect("invalid UTF-8 must not error the read");
+
+            // Both valid JSON objects survive; the bad byte became a replacement
+            // char on its own line but did not abort the read.
+            assert!(lines.iter().any(|l| l.contains("\"a\":1")));
+            assert!(lines.iter().any(|l| l.contains("\"b\":2")));
+            // Cursor advanced by the raw bytes consumed, not the decoded length.
+            assert_eq!(cursor.get_offset(&file_path), bytes.len() as u64);
         }
 
         #[test]
