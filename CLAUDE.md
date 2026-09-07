@@ -116,7 +116,8 @@ Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
 5. **Scrub the API-routing environment** — `unset ANTHROPIC_API_KEY
    ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL
-   ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` before the binary, same shape as
+   ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL
+   CLAUDE_CODE_SUBAGENT_MODEL` before the binary, same shape as
    rule 3 but for the vars that decide *where the API call goes* rather than
    whether it goes anywhere. claude-print scrubs `CLAUDECODE` and forces
    `CLAUDE_CODE_ENTRYPOINT=cli` but deliberately passes every other var through
@@ -125,6 +126,11 @@ Three rules make these work under NEEDLE dispatch (all learned the hard way):
    child: the session hangs at init until claude-print's watchdog SIGTERMs it
    (exit 124, `stream_json_first_output_timeout`) — and had it answered, it
    would have billed the proxy pool while wearing the subscription adapter.
+   The model-name overrides belong in the same breath: `ANTHROPIC_MODEL` and
+   `CLAUDE_CODE_SUBAGENT_MODEL` are both set to `glm-5.3-flash` in every
+   proxy-routed worker shell (visible in `ps` for any live dispatch), and an
+   inherited `CLAUDE_CODE_SUBAGENT_MODEL` would point the strand's
+   subagents at a model the subscription endpoint has never heard of.
    Verified 2026-09-07 (bead `claudego-ab0f6871`): the installed template run
    with the proxy vars present dies at 124 with no assistant event; the same
    run with them unset exits 0 with a real `claude-opus-5` reply. cgov/systemd
