@@ -135,9 +135,29 @@ idles. Create it once:
 
 ```bash
 mkdir -p ~/cgov-polish-queue && cd ~/cgov-polish-queue
-bf init && git init -q && echo ".beads/*.db" > .gitignore
-git add -A && git -c user.email=github@jedarden.com -c user.name=jedarden commit -qm "polish queue"
+git init -q && git branch -m main
+printf '.beads/*.db\n.beads/*.db-*\n.needle-predispatch-sha\n' > .gitignore
+printf 'bead_cli:\n  backend: bead-rs\n' > .needle.yaml
+bead init --prefix polishq --skip-foreign-workspace
+git add .gitignore .needle.yaml .beads/config.json .beads/.gitignore .beads/checkpoint
+git -c user.email=github@jedarden.com -c user.name=jedarden commit -qm "polish queue"
 ```
+
+Three things this must get right, all of which bit on first creation
+(2026-09-07):
+
+- **`bead init`, not `bf init`.** bead-rs is the canonical CLI as of 2026-08-14.
+  Running `bf` against a bead-rs store (or the reverse) does not fail cleanly —
+  it reports a generic SQLite column error, and applying the other tool's
+  recovery recipe silently reinitializes the store with the wrong schema.
+- **`--skip-foreign-workspace` is required here.** `/home/coding/.beads` exists
+  on codinghome but is a *log directory* (doctor logs), not a workspace.
+  Workspace discovery walks up, stops at the first `.beads` it finds, and
+  refuses to continue — so a plain `bead init` in a fresh directory under
+  `/home/coding` fails with "No workspace found". The flag lets discovery past
+  it; init still creates the workspace in the current directory.
+- **Write `.needle.yaml` with `backend: bead-rs`** so NEEDLE workers dispatched
+  here use the right CLI rather than guessing.
 
 A meta-bead's **description is the generator prompt** (self-contained — the lab has
 no skills to lean on). It tells the strand to `cd` into the target repo, audit
