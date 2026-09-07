@@ -39,7 +39,7 @@ generation (this loop) and execution (a normal NEEDLE fleet that works the beads
 |---|---|---|
 | `cgov` binary | `~/.local/bin/cgov` | built from this repo (`cargo build --release`, target redirects to `~/target/release/cgov`) |
 | Governor config | `~/.config/claude-governor/governor.yaml` | agents, daemon, pricing; **not** in the repo (machine-specific) |
-| `claude-print` binary | `~/.local/bin/claude-print` | PTY wrapper that keeps sessions on the subscription pool; install per host |
+| `claude-print` binary | `~/.local/bin/claude-print` | PTY wrapper that keeps sessions on the subscription pool. **Establish this path with `deploy/install-claude-print-adapters.sh`** — the adapters call it by absolute path and nothing else creates it (claudego-49195ba4) |
 | NEEDLE adapters | `~/.config/needle/adapters/claude-print-{opus,fable}.yaml` | copies committed under `deploy/needle-adapters/` |
 | Polish queue | `~/cgov-polish-queue/` | dedicated git repo + `.beads`; **only meta-beads live here** |
 | Seeder | `scripts/polish-seeder.sh` (repo) → runs anywhere | reads `~/.config/claude-governor/polish-targets.txt` |
@@ -52,7 +52,22 @@ generation (this loop) and execution (a normal NEEDLE fleet that works the beads
 
 ## 3. The claude-print adapters (`deploy/needle-adapters/`)
 
-Install by copying to `~/.config/needle/adapters/`, then `needle test-agent claude-print-opus`.
+Install with:
+
+```bash
+./deploy/install-claude-print-adapters.sh
+```
+
+It copies the adapters to `~/.config/needle/adapters/`, reads the absolute
+binary path back out of the installed templates, links it to whichever real
+`claude-print` it can find, and verifies each path runs `--version`.
+
+> ⚠️ **`needle test-agent claude-print-opus` is not sufficient proof.** It
+> resolves `agent_cli` through PATH, while dispatch runs `invoke_template`. When
+> the template names a binary that does not exist, test-agent still reports
+> `Status: READY` and every dispatch dies at exit 127 (NEEDLE bead
+> `needle-adef2ccd`). The installer's own check is the authoritative one; to
+> confirm by hand, run the `invoke_template` verbatim and require exit 0.
 
 Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
