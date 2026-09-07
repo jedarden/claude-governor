@@ -182,17 +182,21 @@ agents:
   # Sonnet budget (the seven_day window) to full consumption while the human
   # keeps the reserve — see docs/notes/human-reserve-policy.md.
   needle-sonnet:
-    # Uses the claude-anthropic-sonnet adapter (claude --model claude-sonnet-4-6).
-    # The workspace is pinned explicitly (cgov otherwise substitutes {workspace}
-    # with its own cwd); set it to a repo with a READY bead queue so scaled-up
-    # workers always have work to consume quota on — an idle pool consumes
-    # nothing. --session-prefix needle-cgov namespaces cgov-managed workers so
-    # the governor only sees and scales its own pool, not other fleet workers.
-    launch_cmd: "needle run --agent claude-anthropic-sonnet --workspace /home/coding/BACKLOG_REPO --session-prefix needle-cgov"
-    session_pattern: "needle-cgov-*"
+    # Roaming Sonnet fleet (Anthropic subscription, claude --model
+    # claude-sonnet-4-6). Deliberately NOT pinned with --workspace: NEEDLE's
+    # Explore strand auto-discovers every .beads/ repo under
+    # strands.explore.workspace_root (/home/coding/, ~133 repos), so workers
+    # claim the highest-priority ready beads across ALL explore-owned repos
+    # (owners: jedarden, ardenone) minus explore-excluded — NEEDLE, bead-rs,
+    # ARMOR and everything else with a backlog, not a fixed set. {id} is cgov's
+    # unique per-worker token (timestamp-index), keeping tmux session names and
+    # heartbeat files distinct; --session-prefix was removed from needle run, so
+    # the pool is namespaced via the cgov-sonnet identifier instead.
+    launch_cmd: "needle run --agent claude-anthropic-sonnet --identifier cgov-sonnet-{id}"
+    session_pattern: "needle-claude-anthropic-sonnet-cgov-sonnet-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
-    max_workers: 8       # ceiling on pool size; tuned for weekly saturation in claudego-f1ceaf96
+    max_workers: 8       # starting ceiling; finalize from measured burn per claudego-f1ceaf96
 
   # claude-print workers (Anthropic subscription billing, cc_entrypoint=cli)
   # Requires: claude-print installed (needle run --agent claude-anthropic-sonnet)
