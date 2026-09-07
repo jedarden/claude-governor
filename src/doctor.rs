@@ -205,6 +205,14 @@ const OBSERVE_SESSION: &str = "cgov-observe";
 const ACT_SESSION: &str = "cgov-act";
 const COLLECTOR_SESSION: &str = "cgov-collector";
 
+/// Combined governor units from the pre-observe/act-split installs.
+///
+/// A monolith running `cgov _daemon` executes both halves in one process, so
+/// its act half enforces even though no dedicated act unit exists. These are
+/// the same names `cgov enable` removes as obsolete (see
+/// `LEGACY_GOVERNOR_SERVICES` in main.rs); codinghome still runs one of them.
+const MONOLITH_SERVICES: &[&str] = &["claude-governor.service", "cgov.service"];
+
 /// Check if systemd user sessions are available
 fn systemd_user_available() -> bool {
     Command::new("systemctl")
@@ -245,8 +253,62 @@ fn tmux_session_exists(session: &str) -> bool {
 enum DaemonStatus {
     RunningSystemd,
     RunningTmux,
+    /// Enforcing via the combined pre-ADR unit; carries the unit name.
+    RunningMonolith(&'static str),
     ActiveState(i64), // seconds old
     Stopped,
+}
+
+/// Extract the ExecStart command line from a `systemctl --user show -p
+/// ExecStart --value <unit>` dump.
+///
+/// The value is a semicolon-delimited property dump (`{ path=... ;
+/// argv[]=<cmdline> ; ignore_errors=no ; ... }`); the `argv[]` field is the
+/// command line. Returns None when the output cannot be obtained or parsed —
+/// most commonly because the unit does not exist.
+fn parse_exec_start_argv(show_value: &str) -> Option<Vec<String>> {
+    let argv = show_value
+        .split(';')
+        .map(str::trim)
+        .find_map(|field| field.strip_prefix("argv[]="))?;
+    Some(argv.split_whitespace().map(str::to_string).collect())
+}
+
+/// Does this ExecStart argv run the combined daemon in enforcing mode?
+///
+/// `cgov _daemon` composes both halves in one process, so act enforces through
+/// it. `--dry-run` leaves the act half running but scaling still disabled —
+/// the same operator-facing posture as paused — and a monolith that runs only
+/// `_observe` never executes act at all.
+fn is_enforcing_daemon_argv(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == "_daemon") && !argv.iter().any(|arg| arg.starts_with("--dry-run"))
+}
+
+/// Name of an active monolith unit whose ExecStart enforces, if any.
+///
+/// Used by both the doctor act check and the status line: a live monolith is
+/// easy to mistake for a paused act half, exactly when an operator is
+/// verifying the enforcement posture.
+pub fn enforcing_monolith_service() -> Option<&'static str> {
+    if !systemd_user_available() {
+        return None;
+    }
+
+    MONOLITH_SERVICES.iter().find_map(|unit| {
+        if !systemd_service_is_active(unit) {
+            return None;
+        }
+
+        let show = Command::new("systemctl")
+            .args(["--user", "show", "-p", "ExecStart", "--value", unit])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+
+        parse_exec_start_argv(&String::from_utf8_lossy(&show.stdout))
+            .filter(|argv| is_enforcing_daemon_argv(argv))
+            .map(|_| *unit)
+    })
 }
 
 /// Detect if the governor daemon is running
@@ -281,6 +343,11 @@ fn detect_act_status() -> DaemonStatus {
     }
     if tmux_available_check() && tmux_session_exists(ACT_SESSION) {
         return DaemonStatus::RunningTmux;
+    }
+    // A combined pre-ADR unit runs both halves in one process: when its
+    // ExecStart enforces, act is running even with no dedicated act unit.
+    if let Some(unit) = enforcing_monolith_service() {
+        return DaemonStatus::RunningMonolith(unit);
     }
     DaemonStatus::Stopped
 }
@@ -472,6 +539,12 @@ fn check_observe_running() -> CheckResult {
             }
         }
         DaemonStatus::RunningTmux => CheckResult::pass("observe_running", "running (tmux)"),
+        // The combined pre-ADR unit runs both halves in one process, so observe
+        // is running whenever it is. Mirrors check_act_running below.
+        DaemonStatus::RunningMonolith(unit) => CheckResult::pass(
+            "observe_running",
+            format!("running (monolith {} runs both halves)", unit),
+        ),
         DaemonStatus::ActiveState(age_secs) => CheckResult::pass(
             "observe_running",
             format!("active (state {}s old)", age_secs),
@@ -510,6 +583,10 @@ fn check_act_running() -> CheckResult {
     match detect_act_status() {
         DaemonStatus::RunningSystemd => CheckResult::pass("act_running", "running (systemd)"),
         DaemonStatus::RunningTmux => CheckResult::pass("act_running", "running (tmux)"),
+        DaemonStatus::RunningMonolith(unit) => CheckResult::pass(
+            "act_running",
+            format!("running (monolith {} runs both halves)", unit),
+        ),
         DaemonStatus::ActiveState(age_secs) => {
             CheckResult::pass("act_running", format!("active (state {}s old)", age_secs))
         }

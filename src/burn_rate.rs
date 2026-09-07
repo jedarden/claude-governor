@@ -812,6 +812,13 @@ pub fn compute_composite_safe_workers(
         // without exhausting this non-binding window.
         // Using binding_hours (not the window's own hours_remaining) because
         // we only need to survive until the binding window resets.
+        //
+        // Deliberately floor(), not `duty_cycle_safe_workers`: this path only
+        // ever raises the target ABOVE the binding window's count, and its
+        // budget would be spent past the *binding* window's ceiling (that
+        // window has already said it can afford nothing). Lifting a fractional
+        // quotient to 1 here would cross that ceiling on a partial budget, so
+        // only a fully-sustained worker justifies the cross-window spend.
         let safe = (forecast.remaining_pct / (pct_per_worker * binding_hours)).floor() as u32;
         max_safe = max_safe.max(safe);
     }
@@ -1156,6 +1163,52 @@ pub fn compute_risk_score(
     Some(urgency * weight * volatility)
 }
 
+/// Convert an affordable-worker quotient into an authorised worker count.
+///
+/// `affordable = remaining_pct / (per_worker_rate * hours_remaining)` answers:
+/// *how many workers may run CONTINUOUSLY from now until this window resets?*
+/// Flooring that quotient discards the fractional worker entirely, and near a
+/// reset the quotient reliably lands below 1.0 — hours_remaining is large while
+/// headroom is small — so the governor authorised nothing while use-or-lose
+/// quota expired (claudego-b9e2f08e: 14–38% headroom over ~30h at the 1.5%/hr
+/// baseline gave quotients of 0.31–0.85, every one floored to 0; observed live
+/// on 2026-09-07 as `safe_worker_count: 0 ... target workers: 0` each cycle
+/// with 12% of the weekly window still unspent).
+///
+/// A quotient in (0, 1) is not waste, it is a DUTY CYCLE. 0.63 means one worker
+/// may run for ~63% of the remaining window and must then stop. No scheduler
+/// state is needed to express that: the governor recomputes every cycle, and as
+/// the worker burns, `remaining_pct` falls, so the same closed loop that
+/// authorises the partial worker also withdraws it when the budget is spent
+/// (`remaining_pct` clamps to 0 at the target ceiling → 0 workers). The spend
+/// therefore lands ON the target ceiling rather than past it, the reserve above
+/// the ceiling stays intact, and the emergency brake remains the backstop. Note
+/// the stop point is the *measured* utilization reaching the ceiling, so a
+/// mis-estimated rate changes how many workers run in parallel, not where the
+/// spending stops.
+///
+/// Whole quotients are untouched: floor(2.4) is still 2, and a quotient above 1
+/// is never rounded up (ceil would authorise a worker that cannot be sustained
+/// for the whole window). Only the 0 < q < 1 band is lifted, to 1 worker.
+pub fn duty_cycle_safe_workers(
+    remaining_pct: f64,
+    per_worker_rate: f64,
+    hours_remaining: f64,
+) -> u32 {
+    // `!x > 0.0` (rather than `x <= 0.0`) also rejects NaN inputs.
+    if !(per_worker_rate > 0.0) || !(hours_remaining > 0.0) || !(remaining_pct > 0.0) {
+        return 0;
+    }
+    let affordable = remaining_pct / (per_worker_rate * hours_remaining);
+    if !affordable.is_finite() {
+        return 0;
+    }
+    let whole = affordable.floor() as u64;
+    // Any positive budget at all authorises at least one duty-cycled worker.
+    let authorised = whole.max(u64::from(affordable > 0.0));
+    authorised.min(u32::MAX as u64) as u32
+}
+
 /// Generate a capacity forecast for a single window
 ///
 /// Computes fleet_pct_per_hour, predicted_exhaustion_hours,
@@ -1190,10 +1243,15 @@ pub fn generate_window_forecast(
     // margin_hrs: positive = safe (exhaustion after reset), negative = risky (exhaustion before reset)
     let margin_hrs = predicted_exhaustion_hours - hours_remaining;
 
-    // p50 safe workers: uses the mean per-worker burn rate.
+    // p50 safe workers: uses the mean per-worker burn rate. A fractional
+    // quotient authorises one duty-cycled worker (see `duty_cycle_safe_workers`)
+    // instead of flooring to 0 near a reset.
     let safe_worker_count = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 {
-        let safe = (remaining_pct / (mean_rate_per_worker * hours_remaining)).floor() as u64;
-        Some(safe.min(u32::MAX as u64) as u32)
+        Some(duty_cycle_safe_workers(
+            remaining_pct,
+            mean_rate_per_worker,
+            hours_remaining,
+        ))
     } else {
         None
     };
@@ -1204,12 +1262,17 @@ pub fn generate_window_forecast(
     // p75 safe workers: uses the p75 (fast-burn) per-worker rate — more conservative.
     // Derived by scaling the mean rate by the ratio of the fleet's p75 burn rate to p50.
     // When std_pct_hr == 0, p75 rate == p50 rate and safe_worker_count_p75 == safe_worker_count.
+    // Same duty-cycle rounding as the p50 count: the p75 rate is higher, so its
+    // authorised worker simply stops sooner.
     let safe_worker_count_p75 =
         if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 && fleet_pct_hr > 0.0 {
             let rate_p75_fleet = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
             let rate_p75_per_worker = mean_rate_per_worker * rate_p75_fleet / fleet_pct_hr;
-            let safe = (remaining_pct / (rate_p75_per_worker * hours_remaining)).floor() as u64;
-            Some(safe.min(u32::MAX as u64) as u32)
+            Some(duty_cycle_safe_workers(
+                remaining_pct,
+                rate_p75_per_worker,
+                hours_remaining,
+            ))
         } else {
             safe_worker_count
         };
@@ -1460,6 +1523,41 @@ pub fn estimate_burn_rates(
                 window,
                 base_per_worker,
                 current_workers,
+            );
+        }
+
+        // Zero-worker bootstrap (claudego-d64682d5).
+        //
+        // Every path above that yields a per-worker rate needs workers to
+        // already be running: `p75_per_worker` is `stats.p75_pct_hr /
+        // current_workers`, falling to 0.0 when the fleet is idle, and the
+        // cold-start seeding just above is itself gated on `current_workers >
+        // 0`. Downstream, both the old floor and `duty_cycle_safe_workers`
+        // return 0 for a non-positive rate. The result was a closed loop —
+        // 0 workers -> rate 0 -> authorised 0 -> 0 workers — so a pool could
+        // never be started, and cgov's own scale-to-zero became one-way.
+        //
+        // The sizing question is hypothetical: "if I ran one worker, could I
+        // afford it?" That does not require a worker to exist, so fall back to
+        // the configured baseline whenever no measured per-worker rate is
+        // available. `fleet_pct_hr` is deliberately left at its MEASURED value
+        // — that is what is actually burning the window right now, regardless
+        // of who is burning it.
+        //
+        // This also covers the case the cold-start branch cannot reach: an idle
+        // fleet alongside an active operator session produces instance records,
+        // so `has_fresh_rate` is true and `is_cold_start` is false, yet the
+        // per-worker rate is still 0. See claudego-0ccbae3c for why those
+        // records should not be attributed to the fleet at all.
+        if !(p75_per_worker > 0.0) {
+            p75_per_worker = baseline.pct_per_worker_per_hour;
+            log::info!(
+                "[burn_rate] {}: no measured per-worker rate (fleet at {} worker(s)); \
+                 sizing from the configured baseline {:.3}%/worker/hr so the pool can \
+                 start from zero",
+                window,
+                current_workers,
+                p75_per_worker,
             );
         }
 
@@ -2585,6 +2683,73 @@ mod tests {
     }
 
     #[test]
+    /// claudego-d64682d5: a pool at zero workers must still be sizeable.
+    ///
+    /// Before the fix, `p75_per_worker` fell to 0.0 whenever `current_workers ==
+    /// 0` and the cold-start seeding that would supply a rate was itself gated
+    /// on `current_workers > 0`, so the authorised count was always 0 and a
+    /// pool could never be started. An operator's own interactive session makes
+    /// this worse: it produces instance records, so `has_fresh_rate` is true and
+    /// the cold-start branch is skipped entirely.
+    #[test]
+    fn zero_workers_still_authorises_from_the_baseline() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // One record standing in for an operator session: real burn, but the
+        // FLEET is idle (current_workers = 0).
+        let instances = vec![multi_window_record(
+            "operator-session",
+            "claude-opus-5",
+            26.10,
+            500_000,
+            Some(2.0),
+            Some(1.0),
+            Some(1.0),
+            4.0,
+            2.0,
+            62.0,
+            61.0,
+            76.0,
+            75.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 4.0);
+        utilization.insert("seven_day".to_string(), 62.0);
+        utilization.insert("weekly_scoped".to_string(), 76.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 3.4);
+        hrs_left.insert("seven_day".to_string(), 28.8);
+        hrs_left.insert("weekly_scoped".to_string(), 28.8);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            0, // current_workers: the fleet is idle
+            0,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        for (name, win) in [
+            ("seven_day", &forecast.seven_day),
+            ("weekly_scoped", &forecast.weekly_scoped),
+        ] {
+            assert!(
+                win.safe_worker_count.unwrap_or(0) >= 1,
+                "{name} has real headroom ({}% to the ceiling over {}h) so a pool at zero \
+                 workers must be authorised at least one; got {:?}",
+                win.remaining_pct,
+                win.hours_remaining,
+                win.safe_worker_count,
+            );
+        }
+    }
+
     fn binding_window_is_most_constrained() {
         let baseline = BaselineBurnRates::default();
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
@@ -3180,8 +3345,14 @@ mod tests {
         assert!((f.predicted_exhaustion_hours - 9.0).abs() < 1e-9);
         assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
         assert!((f.margin_hrs + 28.5).abs() < 1e-9); // 9 - 37.5 = -28.5 (negative = risky)
-        assert_eq!(f.safe_worker_count, Some(0)); // floor(18 / (1.0 * 37.5)) = 0
-                                                  // With zero stddev, all cone values equal the p50
+                                                     // 18 / (1.0 * 37.5) = 0.48. Under duty-cycled sizing (claudego-b9e2f08e)
+                                                     // a positive budget authorises one worker for that FRACTION of the
+                                                     // window rather than discarding it: 0.48 means one worker for ~48% of
+                                                     // the remaining 37.5h, which lands on the ceiling rather than past it.
+                                                     // This previously asserted Some(0), which is the behaviour that let
+                                                     // use-or-lose quota expire unused.
+        assert_eq!(f.safe_worker_count, Some(1));
+        // With zero stddev, all cone values equal the p50
         assert!((f.exh_hrs_p25 - 9.0).abs() < 1e-9);
         assert!((f.exh_hrs_p50 - 9.0).abs() < 1e-9);
         assert!((f.exh_hrs_p75 - 9.0).abs() < 1e-9);
@@ -5607,9 +5778,12 @@ mod tests {
         );
 
         // VERIFY: safe_worker_count calculation
-        // remaining = 90 - 72 = 18%
-        // safe = floor(18 / (3.0 * 30)) = floor(18 / 90) = 0 workers
-        let expected_safe = ((90.0 - 72.0) / (mean_rate_per_worker * 30.0)).floor() as u32;
+        // remaining = 90 - 72 = 18%, affordable = 18 / (3.0 * 30) = 0.2
+        // Duty-cycled sizing (claudego-b9e2f08e) authorises one worker for 20%
+        // of the remaining window instead of flooring the fraction away, so the
+        // expectation is computed with the same helper the implementation uses
+        // rather than a bare floor().
+        let expected_safe = duty_cycle_safe_workers(90.0 - 72.0, mean_rate_per_worker, 30.0);
         assert_eq!(
             forecast.safe_worker_count,
             Some(expected_safe),

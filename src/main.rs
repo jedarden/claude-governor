@@ -861,6 +861,13 @@ fn daemon_status_string() -> String {
         || (tmux_available() && tmux_session_exists(OBSERVE_SESSION));
     let act_running = (systemd_user_available() && systemd_service_is_active(ACT_SERVICE))
         || (tmux_available() && tmux_session_exists(ACT_SESSION));
+    let act_status = if act_running {
+        "✓ running".to_string()
+    } else if let Some(unit) = doctor::enforcing_monolith_service() {
+        format!("✓ running (monolith {})", unit)
+    } else {
+        "⚠ paused".to_string()
+    };
 
     let freshness = state::load_state(&state_path)
         .ok()
@@ -877,11 +884,7 @@ fn daemon_status_string() -> String {
             "✗ stopped"
         },
         freshness,
-        if act_running {
-            "✓ running"
-        } else {
-            "⚠ paused"
-        }
+        act_status
     )
 }
 
@@ -1361,13 +1364,22 @@ const OBSERVE_SERVICE: &str = "claude-governor-observe.service";
 const ACT_SERVICE: &str = "claude-governor-act.service";
 const COLLECTOR_SERVICE: &str = "claude-token-collector.service";
 
+/// The pre-split combined daemon unit.
+///
+/// `cgov enable` removes it as legacy once the observe/act split is installed,
+/// but a host that has not been re-enabled since the split still runs the whole
+/// daemon from this one unit. Lifecycle commands must resolve to it there —
+/// acting on the split names instead fails with "unit not found" and restarts
+/// nothing.
+const COMBINED_SERVICE: &str = "claude-governor.service";
+
 /// Obsolete unit names that older installs shipped for the governor daemon.
 ///
 /// `cgov.service` and `claude-governor.service` were the pre-ADR combined
 /// daemon units. Leaving either installed would let an old process continue to
 /// scale and alert outside the independently manageable `act` target, so new
 /// installs remove both.
-const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service", "claude-governor.service"];
+const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service", COMBINED_SERVICE];
 
 /// Run a systemctl --user command without letting it write to our stdout/stderr.
 ///
@@ -1433,6 +1445,143 @@ fn resolve_service_names(service: &str) -> Vec<&'static str> {
         "collector" => vec![COLLECTOR_SERVICE],
         _ => vec![OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE],
     }
+}
+
+/// The units from `candidates` that are installed in `user_dir`.
+///
+/// Probed on the filesystem for the same reason install and disable reason
+/// about `user_dir` directly: it is the state `cgov enable` produced, and a
+/// name systemd does not know is exactly what a lifecycle command must not
+/// pass to `systemctl restart`.
+fn installed_units<'a>(user_dir: &Path, candidates: &[&'a str]) -> Vec<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|unit| user_dir.join(unit).exists())
+        .collect()
+}
+
+/// Resolve a lifecycle target to the units that exist on this host.
+///
+/// Returns `(units, missing)`: what the command should act on, and the
+/// canonical names the target asked for that are not installed here.
+///
+/// The governor halves fall back to [`COMBINED_SERVICE`] when neither split
+/// unit exists, because that unit is what runs the daemon on hosts installed
+/// before the observe/act split — resolving to the split names there made every
+/// `cgov restart` die on "unit not found" *after* reporting whatever it had
+/// already restarted, leaving an operator to believe a config change went live
+/// when nothing was restarted at all. An individual `observe`/`act` target does
+/// not get the fallback: restarting the combined unit would also restart the
+/// other half, which is not what was asked for, so it resolves to nothing and
+/// the caller fails loudly instead.
+fn resolve_installed_service_names(
+    user_dir: &Path,
+    service: &str,
+) -> (Vec<&'static str>, Vec<&'static str>) {
+    let (governor_units, other_units): (Vec<&'static str>, Vec<&'static str>) = match service {
+        "observe" => (vec![OBSERVE_SERVICE], Vec::new()),
+        "act" => (vec![ACT_SERVICE], Vec::new()),
+        // `governor` is retained as a compatibility alias for the two
+        // governor halves; it no longer refers to a combined process.
+        "governor" => (vec![OBSERVE_SERVICE, ACT_SERVICE], Vec::new()),
+        "collector" => (Vec::new(), vec![COLLECTOR_SERVICE]),
+        _ => (vec![OBSERVE_SERVICE, ACT_SERVICE], vec![COLLECTOR_SERVICE]),
+    };
+
+    let mut units = installed_units(user_dir, &governor_units);
+    if units.is_empty()
+        && !governor_units.is_empty()
+        && user_dir.join(COMBINED_SERVICE).exists()
+    {
+        units.push(COMBINED_SERVICE);
+    }
+    units.extend(installed_units(user_dir, &other_units));
+
+    // Everything the target canonically names but this host does not have.
+    // When the combined unit is standing in for the split, the split units are
+    // precisely what it replaces rather than an omission worth acting on.
+    let missing: Vec<&'static str> = if units.contains(&COMBINED_SERVICE) {
+        governor_units
+    } else {
+        governor_units
+            .iter()
+            .chain(other_units.iter())
+            .copied()
+            .filter(|unit| !units.contains(unit))
+            .collect()
+    };
+
+    (units, missing)
+}
+
+/// The error for a target that resolves to no unit on this host.
+///
+/// Names what was tried and says what to do about it, so a failed lifecycle
+/// command is diagnosable from its own message instead of a bare systemctl
+/// exit code.
+fn no_units_installed_error(service: &str, tried: &[&str], user_dir: &Path) -> String {
+    let mut msg = format!(
+        "no installed unit for target '{}'; tried: {}",
+        service,
+        tried.join(", ")
+    );
+    if !tried.contains(&COMBINED_SERVICE) && user_dir.join(COMBINED_SERVICE).exists() {
+        msg.push_str(&format!(
+            "\nthis host runs the combined {} unit instead of the observe/act split; \
+             use `cgov restart all` (or `governor`) to restart the daemon",
+            COMBINED_SERVICE
+        ));
+    }
+    msg.push_str("\nrun `cgov enable` to install the canonical units");
+    msg
+}
+
+/// Apply a lifecycle action to every unit a target resolves to on this host.
+///
+/// `verb` is used verbatim in the error text, so pass the lowercase command
+/// ("restart", "start", "stop"). Units the target names but this host does not
+/// have are reported as skipped; resolution already guaranteed at least one
+/// unit exists, so a non-zero exit here always means an *installed* unit
+/// refused the action, and the error lists every unit that was tried.
+fn run_for_installed_units<F>(service: &str, verb: &str, mut action: F) -> Result<()>
+where
+    F: FnMut(&'static str) -> Result<()>,
+{
+    let user_dir = systemd_user_dir().unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let (units, missing) = resolve_installed_service_names(&user_dir, service);
+
+    if units.is_empty() {
+        anyhow::bail!("{}", no_units_installed_error(service, &missing, &user_dir));
+    }
+
+    for unit in &missing {
+        println!("  - {} not installed on this host (skipped)", unit);
+    }
+
+    let mut failed: Vec<(&'static str, String)> = Vec::new();
+    for unit in &units {
+        if let Err(e) = action(unit) {
+            failed.push((unit, e.to_string()));
+        }
+    }
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{} failed for {} of {} unit(s) tried [{}]:\n  {}",
+        verb,
+        failed.len(),
+        units.len(),
+        units.join(", "),
+        failed
+            .iter()
+            .map(|(unit, err)| format!("{}: {}", unit, err))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )
 }
 
 // --- Daemon mode resolution ---
@@ -1718,13 +1867,11 @@ fn run_start_command(service: &str) -> Result<()> {
         );
     }
 
-    let names = resolve_service_names(service);
-    for name in &names {
-        systemctl_user(&["start", name])?;
-        println!("  ✓ Started {}", name);
-    }
-
-    Ok(())
+    run_for_installed_units(service, "start", |unit| {
+        systemctl_user(&["start", unit])?;
+        println!("  ✓ Started {}", unit);
+        Ok(())
+    })
 }
 
 fn run_stop_command(service: &str) -> Result<()> {
@@ -1748,17 +1895,15 @@ fn run_stop_command(service: &str) -> Result<()> {
         anyhow::bail!("systemd user sessions not available");
     }
 
-    let names = resolve_service_names(service);
-    for name in &names {
-        if systemctl_user(&["is-active", name]).is_ok() {
-            systemctl_user(&["stop", name])?;
-            println!("  ✓ Stopped {}", name);
+    run_for_installed_units(service, "stop", |unit| {
+        if systemctl_user_quiet(&["is-active", unit]) {
+            systemctl_user(&["stop", unit])?;
+            println!("  ✓ Stopped {}", unit);
         } else {
-            println!("  - {} is not running", name);
+            println!("  - {} is not running", unit);
         }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn run_restart_command(service: &str) -> Result<()> {
@@ -1786,13 +1931,11 @@ fn run_restart_command(service: &str) -> Result<()> {
         anyhow::bail!("systemd user sessions not available");
     }
 
-    let names = resolve_service_names(service);
-    for name in &names {
-        systemctl_user(&["restart", name])?;
-        println!("  ✓ Restarted {}", name);
-    }
-
-    Ok(())
+    run_for_installed_units(service, "restart", |unit| {
+        systemctl_user(&["restart", unit])?;
+        println!("  ✓ Restarted {}", unit);
+        Ok(())
+    })
 }
 
 fn run_internal_daemon_command(
@@ -2628,6 +2771,108 @@ mod tests {
             assert_ne!(*svc, OBSERVE_SERVICE);
             assert_ne!(*svc, ACT_SERVICE);
             assert_ne!(*svc, COLLECTOR_SERVICE);
+        }
+    }
+
+    fn write_unit(dir: &Path, unit: &str) {
+        fs::write(dir.join(unit), "[Service]\n").expect("write unit");
+    }
+
+    #[test]
+    fn test_governor_target_falls_back_to_combined_unit() {
+        // Regression for claudego-6960e911: a host installed before the
+        // observe/act split runs the daemon from the combined unit. `cgov
+        // restart` must resolve to it — the split names are not installed, and
+        // restarting them failed with exit 5 while reporting nothing restarted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_unit(dir.path(), COMBINED_SERVICE);
+        write_unit(dir.path(), COLLECTOR_SERVICE);
+
+        let (units, missing) = resolve_installed_service_names(dir.path(), "all");
+
+        assert_eq!(units, vec![COMBINED_SERVICE, COLLECTOR_SERVICE]);
+        assert_eq!(missing, vec![OBSERVE_SERVICE, ACT_SERVICE]);
+    }
+
+    #[test]
+    fn test_split_host_resolves_to_split_units_only() {
+        // A migrated host has no combined unit, so the fallback must not
+        // resurrect it and must not double-restart the daemon.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for unit in [
+            OBSERVE_SERVICE,
+            ACT_SERVICE,
+            COLLECTOR_SERVICE,
+            COMBINED_SERVICE,
+        ] {
+            write_unit(dir.path(), unit);
+        }
+
+        let (units, missing) = resolve_installed_service_names(dir.path(), "all");
+
+        assert_eq!(
+            units,
+            vec![OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE]
+        );
+        assert!(missing.is_empty(), "nothing should be missing: {missing:?}");
+    }
+
+    #[test]
+    fn test_half_installed_split_does_not_use_combined_fallback() {
+        // One split unit present means the host was migrated; restarting the
+        // combined unit here would run a second daemon alongside it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_unit(dir.path(), ACT_SERVICE);
+        write_unit(dir.path(), COMBINED_SERVICE);
+
+        let (units, missing) = resolve_installed_service_names(dir.path(), "governor");
+
+        assert_eq!(units, vec![ACT_SERVICE]);
+        assert_eq!(missing, vec![OBSERVE_SERVICE]);
+    }
+
+    #[test]
+    fn test_individual_half_does_not_fall_back_to_combined_unit() {
+        // Restarting `observe` on a combined-unit host would also restart act,
+        // so it must resolve to nothing and fail loudly rather than restart the
+        // other half under a name it does not have.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_unit(dir.path(), COMBINED_SERVICE);
+
+        let (units, missing) = resolve_installed_service_names(dir.path(), "observe");
+        assert!(units.is_empty(), "no observe unit exists here: {units:?}");
+        assert_eq!(missing, vec![OBSERVE_SERVICE]);
+
+        let err = no_units_installed_error("observe", &missing, dir.path());
+        assert!(err.contains(OBSERVE_SERVICE), "must name what it tried: {err}");
+        assert!(
+            err.contains(COMBINED_SERVICE),
+            "must point at the unit that does run the daemon: {err}"
+        );
+        assert!(err.contains("cgov restart all"), "{err}");
+    }
+
+    #[test]
+    fn test_nothing_installed_fails_naming_every_unit_it_tried() {
+        // A fresh host has no units at all. The error must enumerate the units
+        // it looked for and say how to install them, instead of surfacing a
+        // bare systemctl exit code.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        for target in ["collector", "all", "governor"] {
+            let (units, missing) = resolve_installed_service_names(dir.path(), target);
+            assert!(units.is_empty(), "{target} resolved to {units:?}");
+            let expected = resolve_service_names(target);
+            assert_eq!(
+                missing, expected,
+                "{target} must report every unit it tried"
+            );
+
+            let err = no_units_installed_error(target, &missing, dir.path());
+            for unit in &expected {
+                assert!(err.contains(unit), "{err}");
+            }
+            assert!(err.contains("cgov enable"), "{err}");
         }
     }
 }

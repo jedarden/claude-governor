@@ -181,8 +181,8 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
 
     // Table header
     output.push_str(&format!(
-        "{:<10} {:>6} {:>8} {:>8} {:>8} {:>8}\n",
-        "Window", "Used%", "Ceiling%", "Remain%", "Resets", "Risk"
+        "{:<10} {:>6} {:>8} {:>8} {:>9} {:>8} {:>8}\n",
+        "Window", "Used%", "Ceiling%", "Remain%", "HardLim%", "Resets", "Risk"
     ));
 
     for (name, win) in &windows {
@@ -195,19 +195,24 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         let resets = format_hours(win.hours_remaining);
 
         output.push_str(&format!(
-            "{:<10} {:>5.1}% {:>7.0}% {:>7.1}% {:>8} {:>8}{}\n",
+            "{:<10} {:>5.1}% {:>7.0}% {:>7.1}% {:>8.1}% {:>8} {:>8}{}\n",
             name,
             win.current_utilization,
             win.target_ceiling,
             win.remaining_pct,
+            win.hard_limit_remaining_pct,
             resets,
             risk,
             binding_marker
         ));
     }
 
-    // Legend for binding marker
+    // Legend for binding marker and the two remaining columns — Remain% is
+    // headroom to the ceiling cgov budgets against, HardLim% is headroom to the
+    // platform cutoff. Without the distinction, Remain% reads as quota left.
     output.push_str(" * = binding window\n");
+    output
+        .push_str("Remain% = headroom to ceiling; HardLim% = headroom to platform cutoff (100%)\n");
     output.push_str("\n");
 
     // Confidence Cone section
@@ -545,7 +550,17 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
             (*k, serde_json::json!({
                 "used_pct": v.current_utilization,
                 "ceiling_pct": v.target_ceiling,
+                // remaining_pct is headroom to the TARGET CEILING (ceiling_pct),
+                // not to the platform cutoff — the name says so. used_pct +
+                // remain_to_ceiling_pct = ceiling_pct, not 100.
+                "remain_to_ceiling_pct": v.remaining_pct,
+                // Deprecated alias for remain_to_ceiling_pct, kept one release
+                // so existing consumers do not break. Reads as "remaining
+                // quota" next to used_pct, which is why it is renamed.
                 "remain_pct": v.remaining_pct,
+                // True remaining: distance to the platform-enforced cutoff at
+                // 100%. This is what used_pct + X = 100.
+                "hard_limit_remaining_pct": v.hard_limit_remaining_pct,
                 "resets_in_hrs": v.hours_remaining,
                 "risk": risk_indicator(v),
                 "binding": v.binding,
@@ -689,6 +704,7 @@ mod tests {
                     target_ceiling: 85.0,
                     current_utilization: 36.4,
                     remaining_pct: 48.6,
+                    hard_limit_remaining_pct: 63.6,
                     hours_remaining: 1.5,
                     fleet_pct_per_hour: 7.92,
                     predicted_exhaustion_hours: 6.14,
@@ -702,6 +718,7 @@ mod tests {
                     target_ceiling: 90.0,
                     current_utilization: 72.6,
                     remaining_pct: 17.4,
+                    hard_limit_remaining_pct: 27.4,
                     hours_remaining: 37.5,
                     fleet_pct_per_hour: 6.48,
                     predicted_exhaustion_hours: 2.69,
@@ -715,6 +732,7 @@ mod tests {
                     target_ceiling: 90.0,
                     current_utilization: 63.5,
                     remaining_pct: 26.5,
+                    hard_limit_remaining_pct: 36.5,
                     hours_remaining: 37.5,
                     fleet_pct_per_hour: 9.0,
                     predicted_exhaustion_hours: 2.94,
@@ -941,6 +959,71 @@ mod tests {
 
         // State has cutoff_risk = true, so exit_code should be 2
         assert_eq!(json["exit_code"], 2);
+    }
+
+    #[test]
+    fn format_json_distinguishes_ceiling_and_hard_limit_remaining() {
+        // Regression: used_pct + remain_pct summed to ceiling_pct (90), not 100,
+        // and the true remaining was never exported at all — a reader took
+        // remain_pct for remaining quota. Both distances must be present, each
+        // under a name that says which limit it is measured against.
+        let mut state = make_test_state();
+        state.capacity_forecast.weekly_scoped = WindowForecast {
+            target_ceiling: 90.0,
+            current_utilization: 62.0,
+            remaining_pct: 28.0,
+            hard_limit_remaining_pct: 38.0,
+            binding: true,
+            ..Default::default()
+        };
+        let json = format_status_json(&state);
+        let win = &json["windows"]["weekly_scoped"];
+
+        assert_eq!(win["remain_to_ceiling_pct"], 28.0);
+        assert_eq!(win["hard_limit_remaining_pct"], 38.0);
+
+        // Deprecated alias still resolves, unchanged, for one release.
+        assert_eq!(win["remain_pct"], 28.0);
+
+        // And the sums a reader will assume actually hold: to the ceiling, and
+        // to the platform cutoff.
+        let used = win["used_pct"].as_f64().unwrap();
+        assert_eq!(used + win["remain_to_ceiling_pct"].as_f64().unwrap(), 90.0);
+        assert_eq!(
+            used + win["hard_limit_remaining_pct"].as_f64().unwrap(),
+            100.0
+        );
+    }
+
+    #[test]
+    fn format_dashboard_labels_ceiling_and_hard_limit_remaining() {
+        let mut state = make_test_state();
+        state.capacity_forecast.weekly_scoped = WindowForecast {
+            target_ceiling: 90.0,
+            current_utilization: 62.0,
+            remaining_pct: 28.0,
+            hard_limit_remaining_pct: 38.0,
+            binding: true,
+            ..Default::default()
+        };
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(output.contains("HardLim%"), "missing hard-limit column");
+        assert!(
+            output.contains(
+                "Remain% = headroom to ceiling; HardLim% = headroom to platform cutoff (100%)"
+            ),
+            "missing legend distinguishing the two remaining columns"
+        );
+
+        // 62 / 90 / 28 / 38 all appear on the third window's row.
+        let row = output
+            .lines()
+            .find(|l| l.starts_with("weekly_scoped"))
+            .expect("weekly_scoped row");
+        for expected in ["62.0%", "90%", "28.0%", "38.0%"] {
+            assert!(row.contains(expected), "row `{row}` missing {expected}");
+        }
     }
 
     #[test]
