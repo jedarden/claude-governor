@@ -5125,6 +5125,38 @@ impl CyclePaths {
     }
 }
 
+/// Sync `state.workers` with the configured agents: drop entries for pools
+/// that are no longer configured, upsert entries for pools that are, and
+/// refresh each entry's min/max from config. `current` is left untouched —
+/// the per-agent census in each cycle refreshes it immediately after this.
+///
+/// This replaces an earlier "seed only when the map is empty" rule, which a
+/// pool rename turned into a permanent shadow: a state file that predated the
+/// rename kept the old pool name forever and the real pool never got an entry,
+/// so every per-agent `current` lookup read 0 while the aggregate census still
+/// counted that pool's live workers — a scale-up then launched the full target
+/// on top of the running workers and a graceful scale-down compared against a
+/// current of 0 and never fired (claudego-80eb5eea).
+fn sync_workers_to_agents(state: &mut state::GovernorState, agents: &HashMap<String, AgentConfig>) {
+    if agents.is_empty() {
+        return;
+    }
+    state.workers.retain(|name, _| agents.contains_key(name));
+    for (name, agent) in agents {
+        let ws = state
+            .workers
+            .entry(name.clone())
+            .or_insert(state::WorkerState {
+                current: 0,
+                target: 0,
+                min: agent.min_workers,
+                max: agent.max_workers,
+            });
+        ws.min = agent.min_workers;
+        ws.max = agent.max_workers;
+    }
+}
+
 /// Run one governor cycle: poll → collect → forecast → (maybe) scale.
 ///
 /// This is the core loop body executed every `loop_interval` seconds.
@@ -5518,20 +5550,10 @@ pub fn run_observe_cycle(
     }
 
     // 4. Count current workers (from heartbeat files + tmux)
-    // Seed state.workers from agents config if empty
-    if state.workers.is_empty() && !agents.is_empty() {
-        for (name, agent) in agents {
-            state.workers.insert(
-                name.clone(),
-                state::WorkerState {
-                    current: 0,
-                    target: 0,
-                    min: agent.min_workers,
-                    max: agent.max_workers,
-                },
-            );
-        }
-    }
+    // Sync state.workers to the configured agents first (prune pools that were
+    // renamed away, upsert pools that exist now) so the per-agent census below
+    // lands on the real pools instead of a stale entry.
+    sync_workers_to_agents(&mut state, agents);
 
     // Build per-agent WorkerConfigs and count workers across all agents
     let agent_worker_configs: Vec<(String, WorkerConfig)> = agents
@@ -6529,20 +6551,10 @@ pub fn run_act_cycle(
     // re-derived here (not trusted from state) because act is the half that
     // launches and kills sessions — decisions must be made against the fleet
     // as it exists right now, and this also keeps `workers.*.current` fresh
-    // when `_act` runs standalone.
-    if state.workers.is_empty() && !agents.is_empty() {
-        for (name, agent) in agents {
-            state.workers.insert(
-                name.clone(),
-                state::WorkerState {
-                    current: 0,
-                    target: 0,
-                    min: agent.min_workers,
-                    max: agent.max_workers,
-                },
-            );
-        }
-    }
+    // when `_act` runs standalone. Sync state.workers to the configured agents
+    // first so the census lands on the real pools (see
+    // sync_workers_to_agents for why seeding-only-when-empty was not enough).
+    sync_workers_to_agents(&mut state, agents);
 
     let agent_worker_configs: Vec<(String, WorkerConfig)> = agents
         .iter()
@@ -9888,6 +9900,98 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Basic governor cycle tests
+
+    /// `sync_workers_to_agents` must prune pools that are no longer configured
+    /// and upsert the pools that are. A state file that predates a pool rename
+    /// used to keep the old name forever (entries were seeded only when the map
+    /// was empty), so the real pool never got an entry, per-agent `current`
+    /// read 0 while the aggregate census still counted its live workers, and
+    /// the act half over-launched on scale-up while graceful scale-down never
+    /// fired (claudego-80eb5eea).
+    #[test]
+    fn test_sync_workers_to_agents_prunes_renamed_pool_and_upserts_configured() {
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "needle-sonnet".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-anthropic-sonnet".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "needle-claude-anthropic-sonnet-*".to_string(),
+                min_workers: 0,
+                max_workers: 8,
+                subscription: true,
+                baseline_burn_rate: None,
+            },
+        );
+
+        let mut state = state::GovernorState::new();
+        // A stale pool left behind by a pre-rename config — must be pruned.
+        state.workers.insert(
+            "claude-code-glm-5".to_string(),
+            state::WorkerState {
+                current: 0,
+                target: 0,
+                min: 0,
+                max: 10,
+            },
+        );
+        // The live pool, already tracked — current/target are census/decision
+        // owned and must survive, min/max refresh from config.
+        state.workers.insert(
+            "needle-sonnet".to_string(),
+            state::WorkerState {
+                current: 3,
+                target: 2,
+                min: 0,
+                max: 4,
+            },
+        );
+
+        sync_workers_to_agents(&mut state, &agents);
+
+        assert!(
+            !state.workers.contains_key("claude-code-glm-5"),
+            "unconfigured pool must be pruned"
+        );
+        let ws = &state.workers["needle-sonnet"];
+        assert_eq!(ws.current, 3, "census-owned current must be preserved");
+        assert_eq!(ws.target, 2, "decision-owned target must be preserved");
+        assert_eq!(ws.min, 0, "min must be refreshed from config");
+        assert_eq!(ws.max, 8, "max must be refreshed from config");
+
+        // A newly configured pool with no prior entry is upserted.
+        agents.insert(
+            "polish-opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print-opus".to_string(),
+                heartbeat_dir: "/tmp/heartbeats".to_string(),
+                session_pattern: "needle-claude-print-opus-*".to_string(),
+                min_workers: 0,
+                max_workers: 0,
+                subscription: true,
+                baseline_burn_rate: None,
+            },
+        );
+        sync_workers_to_agents(&mut state, &agents);
+        assert_eq!(state.workers.len(), 2);
+        assert_eq!(state.workers["polish-opus"].max, 0);
+
+        // With no configured agents at all the map is left alone — a
+        // config-parse failure must not wipe worker tracking.
+        let empty: std::collections::HashMap<String, AgentConfig> = std::collections::HashMap::new();
+        state.workers.insert(
+            "orphan".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 1,
+                min: 0,
+                max: 1,
+            },
+        );
+        sync_workers_to_agents(&mut state, &empty);
+        assert!(state.workers.contains_key("orphan"));
+        assert!(state.workers.contains_key("needle-sonnet"));
+    }
     // ---------------------------------------------------------------------------
 
     /// Test basic governor cycle flow without external dependencies.
