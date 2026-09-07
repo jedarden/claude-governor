@@ -17,7 +17,13 @@ StandardError=journal
 
 # Observation performs API polling, collection, and forecasting but never
 # launches or kills a worker and never fires an alert.
-MemoryMax=512M
+# OOM-safety (claudego-37232871): 512M was a fleet-wiping cap - this cgroup
+# also hosts the tmux server and every spawned worker tree; 512M OOM-killed
+# the whole cgroup on lab. Sized for the governor plus max_workers Sonnet
+# trees, MemoryHigh throttling before any hard kill. Prefer isolating workers
+# into a dedicated slice via launch_cmd so a governor OOM never touches them.
+MemoryHigh=12G
+MemoryMax=16G
 CPUQuota=50%
 
 [Install]
