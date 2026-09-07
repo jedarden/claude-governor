@@ -114,6 +114,23 @@ Three rules make these work under NEEDLE dispatch (all learned the hard way):
    that on first creation. Upstream fix: claude-print bead `claudepr-fe3d3160`;
    keep the flag regardless, since it also removes the one-time dialog stall.
 
+5. **Scrub the API-routing environment** — `unset ANTHROPIC_API_KEY
+   ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL
+   ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` before the binary, same shape as
+   rule 3 but for the vars that decide *where the API call goes* rather than
+   whether it goes anywhere. claude-print scrubs `CLAUDECODE` and forces
+   `CLAUDE_CODE_ENTRYPOINT=cli` but deliberately passes every other var through
+   (`src/pty.rs` `SCRUBBED_ENV`), so a worker launched from a shell carrying the
+   glm proxy's `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` hands them to the
+   child: the session hangs at init until claude-print's watchdog SIGTERMs it
+   (exit 124, `stream_json_first_output_timeout`) — and had it answered, it
+   would have billed the proxy pool while wearing the subscription adapter.
+   Verified 2026-09-07 (bead `claudego-ab0f6871`): the installed template run
+   with the proxy vars present dies at 124 with no assistant event; the same
+   run with them unset exits 0 with a real `claude-opus-5` reply. cgov/systemd
+   workers get a clean env and never see this; workers launched from an
+   interactive Claude Code shell — the 46% population of rule 3 — always do.
+
 Also: `--output-format stream-json` (what `needle-transform-claude` expects) and
 `--no-inherit-hooks` (isolation; claude-print still installs its own Stop hook).
 
