@@ -91,6 +91,29 @@ Three rules make these work under NEEDLE dispatch (all learned the hard way):
    was immune. Workers launched by cgov via systemd get a clean environment and never
    see this — the adapter must be immune either way.
 
+4. **Pass `--pretrust-cwd`.** In a workspace that has never been trusted, claude
+   2.1.263 renders its trust dialog with the *refusing* option selected by
+   default:
+
+   ```
+   Quick safety check: Is this a project you created or one you trust?
+   ❯ No, exit
+     Yes, I trust this folder
+   ```
+
+   claude-print confirms whatever is highlighted, so it picks "No, exit" and the
+   session dies before doing any work. The failure surfaces misleadingly as
+   `"claude exited before Stop hook fired"` (`internal_error`, exit 2), because
+   the phase machine records the dismissal as a *successful* `trust-dismissed`
+   transition. `--pretrust-cwd` writes `hasTrustDialogAccepted: true` for the cwd
+   before launch and removes the dialog entirely.
+
+   This is invisible in any directory already carrying
+   `hasTrustDialogAccepted: true` in `~/.claude.json` — which is why it only
+   appears when dispatching somewhere new. `~/cgov-polish-queue` will be exactly
+   that on first creation. Upstream fix: claude-print bead `claudepr-fe3d3160`;
+   keep the flag regardless, since it also removes the one-time dialog stall.
+
 Also: `--output-format stream-json` (what `needle-transform-claude` expects) and
 `--no-inherit-hooks` (isolation; claude-print still installs its own Stop hook).
 
