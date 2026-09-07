@@ -178,12 +178,21 @@ pricing:
 # Agent configuration
 # Each agent is a worker pool that can be scaled by the governor.
 agents:
+  # Sonnet worker pool (Anthropic subscription). Objective: drive the weekly
+  # Sonnet budget (the seven_day window) to full consumption while the human
+  # keeps the reserve — see docs/notes/human-reserve-policy.md.
   needle-sonnet:
-    launch_cmd: "needle run --agent claude-code-glm-5 --workspace {workspace} --session-prefix needle-cgov"
+    # Uses the claude-anthropic-sonnet adapter (claude --model claude-sonnet-4-6).
+    # The workspace is pinned explicitly (cgov otherwise substitutes {workspace}
+    # with its own cwd); set it to a repo with a READY bead queue so scaled-up
+    # workers always have work to consume quota on — an idle pool consumes
+    # nothing. --session-prefix needle-cgov namespaces cgov-managed workers so
+    # the governor only sees and scales its own pool, not other fleet workers.
+    launch_cmd: "needle run --agent claude-anthropic-sonnet --workspace /home/coding/BACKLOG_REPO --session-prefix needle-cgov"
     session_pattern: "needle-cgov-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
-    max_workers: 8
+    max_workers: 8       # ceiling on pool size; tuned for weekly saturation in claudego-f1ceaf96
 
   # claude-print workers (Anthropic subscription billing, cc_entrypoint=cli)
   # Requires: claude-print installed (needle run --agent claude-anthropic-sonnet)
@@ -205,15 +214,19 @@ daemon:
   max_scale_up_per_cycle: 1         # Max workers to scale up per cycle
   max_scale_down_per_cycle: 1       # Max workers to scale down per cycle
   min_scale_interval_secs: 60       # Minimum time between scale operations
-  target_ceiling: 90.0              # Target utilization ceiling percentage
-                                     # Per-window overrides available (optional):
-                                     #   windows:
-                                     #     five_hour:
-                                     #       target_utilization: 0.85  # tighter to avoid mid-task cutoff
-                                     #     seven_day:
-                                     #       target_utilization: 0.90
-                                     #     seven_day_sonnet:
-                                     #       target_utilization: 0.90
+  target_ceiling: 90.0              # Global default ceiling (used for any window not listed below)
+  # Per-window target utilization (fraction 0-1). The live API exposes
+  # five_hour, seven_day (all-model weekly), and weekly_scoped (premium-model
+  # weekly) — there is NO seven_day_sonnet window. Sonnet workers consume
+  # five_hour + seven_day, NOT weekly_scoped, so the human reserve is set on
+  # those two; weekly_scoped is left at the global default since Sonnet load
+  # never touches it. 0.85 = workers held to 85%, leaving the human a 15%
+  # weekly reserve. See docs/notes/human-reserve-policy.md.
+  windows:
+    five_hour:
+      target_utilization: 0.85
+    seven_day:
+      target_utilization: 0.85
   mode: auto                        # Daemon mode: auto, systemd, or tmux
   log_max_bytes: 104857600         # Maximum log file size before rotation (100 MB)
   log_backup_count: 3               # Number of rotated log files to keep (.1, .2, .3)
