@@ -6014,4 +6014,38 @@ mod tests {
             "remaining_pct 5.0 at {RATE}%/worker-h over {HOURS_LEFT}h must still authorise a duty-cycled worker"
         );
     }
+
+    #[test]
+    fn generate_window_forecast_withdraws_at_and_past_ceiling() {
+        // At the ceiling (utilization == target_ceiling) remaining_pct clamps
+        // to exactly 0 via `.max(0.0)`. Past the ceiling, into the 5-point
+        // reserve toward the hard limit (utilization 95.0 vs ceiling 90.0),
+        // remaining_pct clamps to the same 0 — proving the reserve is never
+        // authorised against, only the emergency brake governs it.
+        const RATE: f64 = 1.5;
+        const HOURS_LEFT: f64 = 29.67;
+        const CEILING: f64 = 90.0;
+
+        for utilization in [CEILING, 95.0] {
+            let forecast = generate_window_forecast(
+                "seven_day_sonnet",
+                RATE,
+                utilization,
+                CEILING,
+                HOURS_LEFT,
+                RATE,
+                0.0, // std_pct_hr (no spread)
+                crate::state::EstimateQuality::Calibrated,
+            );
+            assert_eq!(
+                forecast.remaining_pct, 0.0,
+                "utilization {utilization} at/past ceiling {CEILING} must clamp remaining_pct to 0"
+            );
+            assert_eq!(
+                forecast.safe_worker_count,
+                Some(0),
+                "utilization {utilization}% must withdraw to 0 workers, never spending the reserve"
+            );
+        }
+    }
 }
