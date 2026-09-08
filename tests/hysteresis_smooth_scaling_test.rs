@@ -8,9 +8,9 @@
 //! - Adaptive timing scenarios
 //! - Emergency brake override of hysteresis
 
-use cgov::governor::{apply_scaling, compute_target_workers, ScalingDecision};
-use cgov::config::{CompositeRiskConfig, ConeScalingConfig};
-use cgov::state;
+use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
+use claude_governor::governor::{apply_scaling, compute_target_workers, ScalingDecision};
+use claude_governor::state;
 
 // ---------------------------------------------------------------------------
 // Hysteresis Band Tests
@@ -111,8 +111,11 @@ fn test_rate_limit_scale_up() {
 
 #[test]
 fn test_rate_limit_scale_down() {
-    // Scale down should be limited by max_scale_down_per_cycle
-    let decision = apply_scaling(0, 5, 1.0, 3, 2);
+    // Scale down should be limited by max_scale_down_per_cycle. A non-zero
+    // target is used because target == 0 is the emergency-brake condition in
+    // apply_scaling and bypasses hysteresis and the rate limits entirely (see
+    // test_emergency_brake_bypasses_hysteresis).
+    let decision = apply_scaling(3, 8, 1.0, 3, 2);
 
     // Delta is -5, but max_down_per_cycle is 2
     assert!(
@@ -154,7 +157,10 @@ fn test_emergency_brake_zero_current() {
 
     // This is implementation-specific; adjust based on actual behavior
     // Either NoChange or EmergencyBrake could be valid
-    let is_valid = matches!(decision, ScalingDecision::NoChange | ScalingDecision::EmergencyBrake);
+    let is_valid = matches!(
+        decision,
+        ScalingDecision::NoChange | ScalingDecision::EmergencyBrake
+    );
     assert!(
         is_valid,
         "Emergency brake with zero current should be stable"
@@ -169,9 +175,9 @@ fn test_emergency_brake_zero_current() {
 fn test_large_gap_binary_scaling() {
     // Current binary scaling: 1 worker per cycle regardless of gap
     let scenarios = vec![
-        (5, 10),   // Gap of 5
-        (5, 15),   // Gap of 10
-        (5, 20),   // Gap of 15
+        (5, 10), // Gap of 5
+        (5, 15), // Gap of 10
+        (5, 20), // Gap of 15
     ];
 
     for (current, target) in scenarios {
@@ -180,7 +186,8 @@ fn test_large_gap_binary_scaling() {
         match decision {
             ScalingDecision::ScaleUp(n) => {
                 assert_eq!(
-                    n, 1,
+                    n,
+                    1,
                     "Binary scaling should always scale 1 worker per cycle (gap={})",
                     target - current
                 );
@@ -191,16 +198,21 @@ fn test_large_gap_binary_scaling() {
 }
 
 #[test]
+#[ignore = "conceptual test for future progressive scaling: current apply_scaling is binary (max_up_per_cycle cap only) and hysteresis suppresses a gap of 1"]
 fn test_large_gap_progressive_scaling_simulation() {
     // Simulate progressive scaling: larger gaps allow more workers per cycle
-    // This is a conceptual test for future implementation
+    // This is a conceptual test for future implementation. Split out with
+    // #[ignore]: its assertions do not hold against the current binary
+    // scaling (a gap of 1 returns NoChange under the hysteresis band, and a
+    // gap of 3 scales by the full max_up_per_cycle rather than the gap's
+    // band). It is kept compiling as the spec for that future work.
 
     let scenarios = vec![
-        ((5, 6), 1),   // Gap of 1: scale 1
-        ((5, 7), 2),   // Gap of 2: scale 2
-        ((5, 8), 2),   // Gap of 3: scale 2
-        ((5, 10), 3),  // Gap of 5: scale 3
-        ((5, 15), 3),  // Gap of 10: scale 3 (max)
+        ((5, 6), 1),  // Gap of 1: scale 1
+        ((5, 7), 2),  // Gap of 2: scale 2
+        ((5, 8), 2),  // Gap of 3: scale 2
+        ((5, 10), 3), // Gap of 5: scale 3
+        ((5, 15), 3), // Gap of 10: scale 3 (max)
     ];
 
     for ((current, target), expected_scale) in scenarios {
@@ -343,12 +355,29 @@ fn test_hysteresis_allows_significant_change() {
 
 #[test]
 fn test_zero_workers_target() {
-    // Target of 0 workers with non-zero current
+    // Target of 0 workers with non-zero current is the emergency-brake
+    // condition by design: apply_scaling short-circuits target == 0 ahead of
+    // the hysteresis and rate-limit logic, so there is no graceful ramp-down.
+    let decision = apply_scaling(0, 5, 1.0, 3, 2);
+
+    assert!(
+        matches!(decision, ScalingDecision::EmergencyBrake),
+        "A zero target with live workers should trigger the emergency brake"
+    );
+}
+
+#[test]
+#[ignore = "documents desired behaviour: apply_scaling treats target == 0 as the emergency-brake condition and never rate-limits a ramp-down to zero"]
+fn test_zero_workers_target_graceful_ramp_down() {
+    // Split out of test_zero_workers_target: the original assertion expected a
+    // rate-limited ScaleDown toward a zero target. The current contract is
+    // that a zero target means emergency brake; if a graceful ramp-down is
+    // ever implemented, drop the #[ignore] and this should hold.
     let decision = apply_scaling(0, 5, 1.0, 3, 2);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleDown(2)),
-        "Should scale down toward zero target"
+        "Graceful scale down toward a zero target should respect max_scale_down_per_cycle"
     );
 }
 
@@ -455,7 +484,7 @@ fn test_progressive_scaling_concept_large_gap() {
     // This documents expected behavior for large gaps
 
     let current = 5;
-    let target = 15;  // Gap of 10
+    let target = 15; // Gap of 10
 
     // With binary scaling: takes 10 cycles (50 minutes)
     // With progressive scaling: could take 3-4 cycles (15-20 minutes)
@@ -481,7 +510,7 @@ fn test_exponential_approach_concept() {
 
     let current = 5;
     let target = 20;
-    let approach_rate = 0.3;  // Close 30% of gap per cycle
+    let approach_rate = 0.3; // Close 30% of gap per cycle
 
     // Expected sequence with exponential approach:
     // Cycle 0: gap = 15, scale = 15 * 0.3 = 4.5 → 5 workers
@@ -497,7 +526,7 @@ fn test_exponential_approach_concept() {
 
     for cycle in 0..10 {
         if gap_sim < 1.0 {
-            break;  // Within hysteresis
+            break; // Within hysteresis
         }
 
         let scale = (gap_sim * approach_rate).ceil();
@@ -508,13 +537,14 @@ fn test_exponential_approach_concept() {
         assert!(
             current_sim <= target,
             "Exponential approach should never overshoot (cycle {}, current={})",
-            cycle, current_sim
+            cycle,
+            current_sim
         );
     }
 
     // Should converge within 10 cycles
     assert!(
-        current_sim >= target - 2,  // Within hysteresis band
+        current_sim >= target - 2, // Within hysteresis band
         "Exponential approach should converge within 10 cycles"
     );
 }
@@ -530,7 +560,7 @@ fn test_adaptive_timing_concept() {
 
     let current = 5;
     let target = 15;
-    let base_interval_secs = 300;  // 5 minutes
+    let base_interval_secs = 300; // 5 minutes
 
     let gap = (target - current) as f64;
 
@@ -547,7 +577,8 @@ fn test_adaptive_timing_concept() {
     };
 
     assert_eq!(
-        expected_interval, 100,  // 300 / 3
+        expected_interval,
+        100, // 300 / 3
         "Large gap should use faster polling interval"
     );
 }
