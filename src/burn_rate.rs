@@ -5984,4 +5984,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn duty_cycle_safe_workers_withdraws_at_and_past_ceiling() {
+        // claudego-cc95016a (child 1 of umbrella claudego-1ba35288) — pin the
+        // withdrawal half of the closed-loop claim (src/burn_rate.rs:1178-1188):
+        // once remaining_pct is 0 (ceiling reached), negative (ceiling
+        // breached) or NaN, no worker is authorised, so the spend lands ON the
+        // ceiling and the reserve above it is never touched. The guard is
+        // `!(remaining_pct > 0.0)` (src/burn_rate.rs:1199), shaped that way so
+        // NaN fails the same comparison instead of slipping through.
+        //
+        // Positive control: a genuinely positive budget must still authorise at
+        // least one duty-cycled worker, so this pin cannot be satisfied by a
+        // guard that returns 0 unconditionally.
+        const RATE: f64 = 1.5;
+        const HOURS_LEFT: f64 = 29.67;
+
+        for remaining_pct in [0.0_f64, -3.0, f64::NAN] {
+            assert_eq!(
+                duty_cycle_safe_workers(remaining_pct, RATE, HOURS_LEFT),
+                0,
+                "remaining_pct {remaining_pct} must withdraw to 0 workers"
+            );
+        }
+
+        assert!(
+            duty_cycle_safe_workers(5.0, RATE, HOURS_LEFT) >= 1,
+            "remaining_pct 5.0 at {RATE}%/worker-h over {HOURS_LEFT}h must still authorise a duty-cycled worker"
+        );
+    }
 }
