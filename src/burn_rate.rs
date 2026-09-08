@@ -3727,6 +3727,34 @@ mod tests {
         assert_eq!(result.unwrap(), 120);
     }
 
+    #[test]
+    fn compute_composite_safe_workers_fractional_quotient_not_lifted_above_binding() {
+        // claudego-7566d27b (umbrella claudego-1ba35288) — this path is
+        // deliberately floor(), not
+        // duty_cycle_safe_workers (src/burn_rate.rs:816-822): it only ever
+        // raises the target ABOVE the binding window's count, and that budget
+        // is spent past the *binding* window's own ceiling. Lifting a
+        // fractional quotient here would authorise a cross-window spend on a
+        // partial budget.
+        //
+        // Non-binding window: remaining=0.9, pct_per_worker=1.0 (fleet_pct_hr
+        // 3.0 / 3 workers), binding_hours=1.0 → quotient = 0.9. If this were
+        // duty-cycled, 0.9 would lift to 1, exceeding the binding window's
+        // safe count of 0. floor() keeps it at 0, so composite finds no
+        // improvement.
+        let forecasts = vec![
+            wf(5.0, 1.0, 3.0, -1.0, Some(0)), // binding: safe = 0
+            wf(0.9, 150.0, 3.0, 130.0, Some(0)), // non-binding: fractional cross-window quotient
+        ];
+
+        let result = compute_composite_safe_workers(&forecasts, 0, 2.0, 0.0, 3);
+        assert!(
+            result.is_none(),
+            "fractional quotient 0.9 must not be lifted above binding safe count 0, got {:?}",
+            result
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Per-Window Risk Score tests (composite risk edge cases)
     // -----------------------------------------------------------------------
