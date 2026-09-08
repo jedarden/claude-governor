@@ -6048,4 +6048,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn generate_window_forecast_p75_withdraws_at_ceiling() {
+        // The p75 (fast-burn) safe count shares duty_cycle_safe_workers, so it
+        // must withdraw to 0 at the ceiling exactly like the p50 count. A
+        // nonzero std_pct_hr exercises the scaled p75 rate path distinctly
+        // from p50 (src/burn_rate.rs:1267-1278).
+        let forecast = generate_window_forecast(
+            "seven_day_sonnet",
+            1.5,
+            90.0, // at ceiling
+            90.0,
+            29.67,
+            1.5,
+            0.3, // nonzero std so p75 rate differs from p50
+            crate::state::EstimateQuality::Calibrated,
+        );
+        // rate_p75_fleet = 1.5 + 0.675*0.3 = 1.7025 ≠ fleet rate 1.5, so the
+        // p75 branch runs its own scaled rate rather than falling through.
+        assert_eq!(
+            forecast.safe_worker_count_p75,
+            Some(0),
+            "p75 path must also withdraw to 0 at the ceiling"
+        );
+        assert_eq!(
+            forecast.safe_worker_count,
+            Some(0),
+            "p50 path must withdraw to 0 at the ceiling in the same scenario"
+        );
+    }
 }
