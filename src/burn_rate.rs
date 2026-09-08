@@ -5931,4 +5931,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn near_reset_scenarios_authorise_one_duty_cycled_worker() {
+        // claudego-b9e2f08e — pins the scenarios AS FILED in that bead: a weekly
+        // window with 29.67h to reset (Tue 21:00) and a 1.5%/h per-worker rate
+        // (config::default_baseline_pct). Each remaining_pct gives a quotient in
+        // the 0 < q < 1 band (0.31 / 0.63 / 0.85) that the old bare floor()
+        // flattened to 0 workers and duty-cycled sizing lifts to exactly 1.
+        const RATE: f64 = 1.5;
+        const HOURS_LEFT: f64 = 29.67;
+
+        for remaining_pct in [14.0_f64, 28.0, 38.0] {
+            assert_eq!(
+                duty_cycle_safe_workers(remaining_pct, RATE, HOURS_LEFT),
+                1,
+                "remaining {remaining_pct}% with {HOURS_LEFT}h left must authorise exactly 1 worker"
+            );
+        }
+
+        // Whole quotients are untouched: a quotient of 2.4 floors to 2 and is
+        // never rounded up — only the 0 < q < 1 band is lifted.
+        assert_eq!(
+            duty_cycle_safe_workers(2.4 * RATE * HOURS_LEFT, RATE, HOURS_LEFT),
+            2,
+            "quotient 2.4 must stay 2 workers, not round up to 3"
+        );
+
+        // The same three scenarios through the wiring, not just the helper:
+        // ceiling 90.0 with utilization 76 / 62 / 52 reproduces remaining
+        // 14 / 28 / 38. Fleet burn is one 1.5%/h worker and std is 0, so the
+        // p75 count degenerates to the p50 count.
+        for (utilization, remaining_pct) in [(76.0_f64, 14.0), (62.0, 28.0), (52.0, 38.0)] {
+            let forecast = generate_window_forecast(
+                "seven_day_sonnet",
+                RATE, // fleet_pct_hr: a single 1.5%/h worker
+                utilization,
+                90.0, // target ceiling
+                HOURS_LEFT,
+                RATE, // mean_rate_per_worker
+                0.0,  // std_pct_hr (no spread)
+                crate::state::EstimateQuality::Calibrated,
+            );
+            assert!(
+                (forecast.remaining_pct - remaining_pct).abs() < 1e-9,
+                "utilization {utilization} against ceiling 90.0 should leave {remaining_pct}%"
+            );
+            assert_eq!(
+                forecast.safe_worker_count,
+                Some(1),
+                "utilization {utilization}% with {HOURS_LEFT}h left must authorise 1 duty-cycled worker"
+            );
+        }
+    }
 }
