@@ -2682,7 +2682,6 @@ mod tests {
         assert!(forecast.binding_window.is_empty());
     }
 
-    #[test]
     /// claudego-d64682d5: a pool at zero workers must still be sizeable.
     ///
     /// Before the fix, `p75_per_worker` fell to 0.0 whenever `current_workers ==
