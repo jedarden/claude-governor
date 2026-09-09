@@ -15,5 +15,13 @@ ExecStart=%h/claude-governor/scripts/polish-seeder.sh
 # Push produced beads to the remote (Forgejo) each pass, best-effort — a non-ff
 # rejection just leaves them committed locally to push on a later pass.
 Environment=CGOV_POLISH_PUSH=1
+# Discover the current active, non-fork public repository set from GitHub on
+# every pass. Discovery controls selection only; bead commits still push to
+# each local clone's configured Forgejo origin.
+Environment=CGOV_POLISH_GITHUB_OWNER=jedarden
+Environment=CGOV_POLISH_REPO_ROOT=%h
+# Bound queue growth and avoid re-auditing a clean repo every timer tick.
+Environment=CGOV_POLISH_MAX_SEED_PER_PASS=8
+Environment=CGOV_POLISH_COOLDOWN_HOURS=168
 # Other overrides if needed:
-# Environment=CGOV_POLISH_LOW_WATER=5 CGOV_POLISH_TARGETS=%h/.config/claude-governor/polish-targets.txt
+# Environment=CGOV_POLISH_LOW_WATER=5

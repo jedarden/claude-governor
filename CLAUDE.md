@@ -23,9 +23,10 @@ cgov daemon ──(reconcile per-agent min)──► launches the polish-opus st
    within existing scope, creates ≤5 polish beads IN THE TARGET repo, then
    closes the meta-bead. Idles (no cost) when the queue is empty.
 
- polish-seeder (cron/timer) ──► tops the QUEUE up with new "Polish-gen: <repo>"
-   meta-beads, but only when a repo's own ready-bead backlog is low (two-tank:
-   generation follows consumption, so it converges instead of over-polishing).
+ polish-seeder (cron/timer) ──► discovers jedarden's current active public
+   GitHub repos and tops the QUEUE up with new "Polish-gen: <repo>" meta-beads,
+   but only when a repo's own ready-bead backlog is low and its last completed
+   pass is outside the cooldown (two-tank: generation follows consumption).
 ```
 
 Two tiers, both billed to the **subscription** (`cc_entrypoint=cli`) via `claude-print`:
@@ -42,7 +43,7 @@ generation (this loop) and execution (a normal NEEDLE fleet that works the beads
 | `claude-print` binary | `~/.local/bin/claude-print` | PTY wrapper that keeps sessions on the subscription pool. **Establish this path with `deploy/install-claude-print-adapters.sh`** — the adapters call it by absolute path and nothing else creates it (claudego-49195ba4) |
 | NEEDLE adapters | `~/.config/needle/adapters/claude-print-{opus,fable}.yaml` | copies committed under `deploy/needle-adapters/` |
 | Polish queue | `~/cgov-polish-queue/` | dedicated git repo + `.beads`; **only meta-beads live here** |
-| Seeder | `scripts/polish-seeder.sh` (repo) → runs anywhere | reads `~/.config/claude-governor/polish-targets.txt` |
+| Seeder | `scripts/polish-seeder.sh` (repo) → runs anywhere | deployed mode discovers GitHub owner `jedarden`; static target file remains available as fallback |
 
 > ⚠️ **The live NEEDLE adapters directory is `~/.config/needle/adapters/`, NOT
 > `~/.needle/agents/`.** The latter is a stale staging path (`claude-print`'s
@@ -183,9 +184,10 @@ Three things this must get right, all of which bit on first creation
   here use the right CLI rather than guessing.
 
 A meta-bead's **description is the generator prompt** (self-contained — the lab has
-no skills to lean on). It tells the strand to `cd` into the target repo, audit
-plan.md for verifiable polish within scope, create ≤5 beads in the target, and close
-itself in the queue. The seeder writes these; see `scripts/polish-seeder.sh`.
+no skills to lean on). It tells the strand to `cd` into the target repo, read its
+applicable AGENTS/README and authoritative plan when present, audit for verifiable
+polish within documented scope, create ≤5 beads in the target, and close itself in
+the queue. The seeder writes these; see `scripts/polish-seeder.sh`.
 
 ---
 
@@ -226,18 +228,26 @@ forces 0 regardless.
 
 ## 6. The seeder (`scripts/polish-seeder.sh`)
 
-Keeps the queue fed. For each target repo it creates a `Polish-gen: <repo>` meta-bead
-**only if** (a) no such meta-bead is already pending in the queue, and (b) the repo's
-own ready-bead backlog is below `LOW_WATER` — so generation follows consumption and
-converges instead of endlessly re-polishing.
+Keeps the queue fed. The deployed service queries GitHub on every pass for current
+public repositories owned by `jedarden`, excludes archived repositories and forks,
+maps names to existing clones under `/home/coding`, and requires each clone to be a
+bead-rs workspace. GitHub is used only for selection; Forgejo remains the configured
+`origin` and the only push destination.
+
+For each eligible repo it creates a `Polish-gen: <repo>` meta-bead **only if** (a) no
+such meta-bead is already pending, (b) its last completed generation pass is outside
+the seven-day cooldown, and (c) its ready-bead backlog is below `LOW_WATER`. A pass
+creates at most eight meta-beads, so enabling a large public inventory cannot flood
+the queue at once. API failure is fail-closed and never falls back to a stale list.
 
 ```bash
-# 1. list target repos (one absolute path per line)
-cp scripts/polish-targets.example.txt ~/.config/claude-governor/polish-targets.txt
-$EDITOR ~/.config/claude-governor/polish-targets.txt
+# 1. inspect current GitHub-derived targets without creating beads
+CGOV_POLISH_GITHUB_OWNER=jedarden CGOV_POLISH_REPO_ROOT=/home/coding \
+  scripts/polish-seeder.sh --list-targets
 
 # 2. one pass (safe, idempotent)
-scripts/polish-seeder.sh
+CGOV_POLISH_GITHUB_OWNER=jedarden CGOV_POLISH_REPO_ROOT=/home/coding \
+  scripts/polish-seeder.sh
 
 # 3. on a cadence — systemd user timer (NixOS has no crontab):
 cp deploy/claude-polish-seeder.{service,timer} ~/.config/systemd/user/
@@ -247,13 +257,18 @@ systemctl --user enable --now claude-polish-seeder.timer   # every 30 min
 ```
 
 Env overrides: `CGOV_POLISH_QUEUE`, `CGOV_POLISH_LOW_WATER`, `CGOV_POLISH_TARGETS`,
-`CGOV_POLISH_PUSH` (1 = also `git push` bead commits, best-effort; default 0 = local commit only).
+`CGOV_POLISH_GITHUB_OWNER`, `CGOV_POLISH_REPO_ROOT`, `CGOV_POLISH_COOLDOWN_HOURS`,
+`CGOV_POLISH_MAX_SEED_PER_PASS`, and `CGOV_POLISH_PUSH` (1 = also `git push` bead
+commits, best-effort; default 0 = local commit only). If no GitHub owner is set, the
+static target file remains the fallback. When an owner is set, the static file is
+ignored deliberately so a newly-private repo cannot remain targeted through stale data.
 
-**Bead git durability:** `bf create` writes to the live SQLite store (`.beads/beads.db`,
-gitignored); only `bf sync --flush-only` updates the committed `.beads/issues.jsonl`
-checkpoint. So each seeder pass **flushes and commits** every target repo's (and the
-queue's) beads — scoped to the `.beads/` pathspec so a dirty tree is untouched — so
-runner-produced beads survive a fresh clone / db rebuild and are visible to other hosts.
+**Bead git durability:** `bead create` writes to the live SQLite store
+(`.beads/beads.db`, gitignored); `bead sync flush-only` updates the committed
+`.beads/checkpoint/`. So each seeder pass **flushes and commits** every eligible
+target repo's (and the queue's) beads — scoped to the `.beads/` pathspec so a dirty
+tree is untouched — so runner-produced beads survive a fresh clone / db rebuild and
+are visible to other hosts.
 
 **Runners can view deployed artifacts via ADB:** the generator prompt reminds runners
 that for a repo with a deployed web frontend they have ADB access to a Pixel 6 over

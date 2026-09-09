@@ -1,10 +1,21 @@
-# polish-seeder targets — one ABSOLUTE repo path per line.
+# polish-seeder static targets — one ABSOLUTE repo path per line.
 # Blank lines and lines starting with '#' are ignored.
 # Copy to ~/.config/claude-governor/polish-targets.txt and edit.
 #
+# Static targets are the fallback mode. To discover the current active,
+# non-fork public repositories owned by a GitHub account on every pass, set:
+#
+#   CGOV_POLISH_GITHUB_OWNER=jedarden
+#   CGOV_POLISH_REPO_ROOT=/home/coding
+#
+# When CGOV_POLISH_GITHUB_OWNER is set, this file is intentionally ignored so
+# a repository that becomes private cannot remain targeted through stale data.
+# Run `scripts/polish-seeder.sh --list-targets` to inspect eligibility without
+# creating beads.
+#
 # Only list "finished" repos you want continuously, gently improved. Each must have
-# docs/plan/plan.md and a .beads workspace. Generation is additive-within-scope, so
-# do NOT list repos that should be frozen — the loop keeps them warm indefinitely.
+# a bead-rs workspace. Generation is additive-within-scope, so do NOT list repos
+# that should be frozen — the loop keeps them warm indefinitely.
 
 /home/coding/claude-print
 # /home/coding/claude-governor
