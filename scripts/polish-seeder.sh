@@ -235,7 +235,11 @@ sync_beads_git() {
         commit -q -m "chore(beads): sync polish-loop beads [$label]" -- .beads 2>/dev/null; then
       log "committed beads: $label"
       if [ "$GIT_PUSH" = "1" ]; then
-        if git push >/dev/null 2>&1; then log "pushed beads: $label"; else log "push failed (committed locally): $label"; fi
+        if GIT_TERMINAL_PROMPT=0 git push origin >/dev/null 2>&1; then
+          log "pushed beads: $label"
+        else
+          log "push failed (committed locally): $label"
+        fi
       fi
     fi
   )
