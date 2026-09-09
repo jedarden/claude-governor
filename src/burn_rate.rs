@@ -141,6 +141,22 @@ pub struct InstanceBurnRate {
 /// Minimum elapsed time to compute burn rates (2 minutes)
 const MIN_ELAPSED_MINUTES: f64 = 2.0;
 
+/// Reserved `ema_state` model key holding the EXOGENOUS burn baseline per window.
+///
+/// Not a real model. cgov measures burn account-wide, but only governs its own
+/// pool; everything else on the account — the operator's interactive sessions,
+/// other fleets — is exogenous. Dividing that by the pool's worker count charged
+/// it all to the pool: with one worker and the operator burning ~12%/hr, the
+/// per-worker rate read as ~12%/hr instead of the measured ~0.48%/hr, so the
+/// affordable worker count collapsed to 1 and never recovered (claudego-0ccbae3c).
+///
+/// The baseline needs no session-to-worker mapping, which the collector cannot
+/// currently provide (`sess` is a Claude session UUID and `entry` is always
+/// "unknown"). Instead it uses the one moment attribution is unambiguous: when
+/// the pool is at ZERO workers, every observed percent is exogenous by
+/// definition. cgov scales to zero routinely, so this re-calibrates on its own.
+const EXOGENOUS_MODEL_KEY: &str = "<exogenous>";
+
 /// Utilization drop threshold for window reset detection (1 percentage point)
 const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 
@@ -1401,7 +1417,15 @@ pub fn estimate_burn_rates(
     // windows are cleared; calibration for the others is untouched.
     let reset_windows = detect_window_resets(instance_records);
     if !reset_windows.is_empty() {
-        ema_state.retain(|(_, window), _| !reset_windows.contains(window));
+        // The exogenous baseline is deliberately preserved. It measures burn
+        // that is not ours, in that window's percentage units, and those units
+        // do not change when the window rolls — a 5h window is always 5h of
+        // capacity. Clearing it would discard attribution at exactly the moment
+        // a fresh window has the most headroom to allocate, and it re-calibrates
+        // on its own whenever the pool next sits at zero workers.
+        ema_state.retain(|(model, window), _| {
+            model == EXOGENOUS_MODEL_KEY || !reset_windows.contains(window)
+        });
         for window in &reset_windows {
             log::info!(
                 "[burn_rate] {window}: window reset detected — cleared stale burn-rate \
@@ -1482,12 +1506,50 @@ pub fn estimate_burn_rates(
                 mean_usd_hr: 0.0,
             });
 
-        // Use fleet-level mean pct/hr as the fleet burn rate
+        // Total observed burn for the window. This stays TOTAL on purpose:
+        // exhaustion and cutoff risk must account for every percent leaving the
+        // window, whoever spent it.
         let mut fleet_pct_hr = stats.mean_pct_hr;
 
-        // Get p75 per-worker rate for safe worker computation
+        // Exogenous baseline: burn not attributable to this pool.
+        //
+        // With no workers running, whatever is burning is by definition not
+        // ours, so record it. With workers running, subtract it before deriving
+        // a PER-WORKER rate — otherwise the operator's own consumption is
+        // charged to the pool and divided by its worker count.
+        // Measured from the raw per-instance rates, NOT from `stats`:
+        // compute_fleet_stats returns all zeros when total_workers == 0, because
+        // it assumes every observed percent belongs to the fleet and therefore
+        // that an empty fleet burns nothing. That assumption is the defect this
+        // baseline exists to correct, so reading `stats` here would record a
+        // permanent zero and silently disable attribution.
+        let exo_key = (EXOGENOUS_MODEL_KEY.to_string(), (*window).to_string());
+        if current_workers == 0 {
+            if let Some(rates) = rates_by_window.get(*window) {
+                if !rates.is_empty() {
+                    let n = rates.len() as f64;
+                    let observed_pct = rates.iter().map(|r| r.pct_per_hour).sum::<f64>() / n;
+                    let observed_usd = rates.iter().map(|r| r.dollar_per_hour).sum::<f64>() / n;
+                    if observed_pct > 0.0 {
+                        let exo = ema_state.entry(exo_key.clone()).or_default();
+                        update_ema(exo, observed_pct, observed_usd);
+                    }
+                }
+            }
+        }
+        let exogenous_pct_hr = ema_state
+            .get(&exo_key)
+            .filter(|e| e.samples > 0)
+            .map(|e| e.ema_pct)
+            .unwrap_or(0.0);
+
+        // Get p75 per-worker rate for safe worker computation, net of exogenous
+        // burn. Clamped at 0: a noisy interval can put the baseline above the
+        // instantaneous total, which must read as "no fleet burn observed", not
+        // a negative rate.
         let mut p75_per_worker = if current_workers > 0 {
-            stats.p75_pct_hr / current_workers as f64
+            let fleet_only = (stats.p75_pct_hr - exogenous_pct_hr).max(0.0);
+            fleet_only / current_workers as f64
         } else {
             0.0
         };
@@ -1543,7 +1605,7 @@ pub fn estimate_burn_rates(
             .unwrap_or(false);
         let window_samples: u32 = ema_state
             .iter()
-            .filter(|((_, w), _)| w == *window)
+            .filter(|((m, w), _)| w == *window && m != EXOGENOUS_MODEL_KEY)
             .map(|(_, e)| e.samples)
             .max()
             .unwrap_or(0);
@@ -1723,6 +1785,10 @@ pub fn build_burn_rate_state(
     // Aggregate per-model: use the max samples across windows, and average rates
     let mut model_windows: HashMap<String, Vec<&ModelWindowEma>> = HashMap::new();
     for ((model, _window), ema) in ema_state {
+        // The exogenous baseline is not a model and must not surface as one.
+        if model == EXOGENOUS_MODEL_KEY {
+            continue;
+        }
         model_windows.entry(model.clone()).or_default().push(ema);
     }
 
@@ -2883,6 +2949,165 @@ mod tests {
         assert!(reset.contains("five_hour"));
         assert!(!reset.contains("seven_day"));
         assert!(!reset.contains("weekly_scoped"));
+    }
+
+    // ── Exogenous burn attribution (claudego-0ccbae3c) ──────────────────────
+
+    fn util_maps() -> (HashMap<String, f64>, HashMap<String, f64>) {
+        let mut util = HashMap::new();
+        util.insert("five_hour".to_string(), 10.0);
+        util.insert("seven_day".to_string(), 20.0);
+        util.insert("weekly_scoped".to_string(), 20.0);
+        let mut hrs = HashMap::new();
+        hrs.insert("five_hour".to_string(), 4.0);
+        hrs.insert("seven_day".to_string(), 100.0);
+        hrs.insert("weekly_scoped".to_string(), 100.0);
+        (util, hrs)
+    }
+
+    /// With zero workers, everything burning is someone else's. Record it.
+    #[test]
+    fn zero_workers_records_burn_as_exogenous() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+        let (util, hrs) = util_maps();
+        let instances = vec![multi_window_record(
+            "operator",
+            "claude-opus-5",
+            26.0,
+            500_000,
+            Some(6.0),
+            Some(6.0),
+            Some(6.0),
+            10.0,
+            4.0,
+            20.0,
+            14.0,
+            20.0,
+            14.0,
+        )];
+        let _ = estimate_burn_rates(
+            &instances, 1.0, 0, 0, &mut ema, &baseline, &util, 90.0, &hrs,
+        );
+        let recorded = ema
+            .iter()
+            .find(|((m, w), _)| m == EXOGENOUS_MODEL_KEY && w == "seven_day")
+            .map(|(_, e)| e.ema_pct);
+        assert!(
+            recorded.is_some_and(|r| r > 0.0),
+            "burn observed at zero workers must be recorded as exogenous, got {recorded:?}"
+        );
+    }
+
+    /// The core defect: exogenous burn must not be charged to the pool's workers.
+    /// A single worker alongside a heavy operator session previously read as if
+    /// that one worker were burning the operator's rate.
+    #[test]
+    fn exogenous_burn_is_not_charged_to_workers() {
+        let baseline = BaselineBurnRates::default();
+        let (util, hrs) = util_maps();
+
+        // Calibrate: 6%/hr of burn observed with NO workers running.
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+        let operator_only = vec![multi_window_record(
+            "operator",
+            "claude-opus-5",
+            26.0,
+            500_000,
+            Some(6.0),
+            Some(6.0),
+            Some(6.0),
+            10.0,
+            4.0,
+            20.0,
+            14.0,
+            20.0,
+            14.0,
+        )];
+        let _ = estimate_burn_rates(
+            &operator_only,
+            1.0,
+            0,
+            0,
+            &mut ema,
+            &baseline,
+            &util,
+            90.0,
+            &hrs,
+        );
+
+        // Now one worker runs and total burn rises only slightly.
+        let with_worker = vec![multi_window_record(
+            "operator",
+            "claude-opus-5",
+            27.0,
+            520_000,
+            Some(6.5),
+            Some(6.5),
+            Some(6.5),
+            16.5,
+            10.0,
+            26.5,
+            20.0,
+            26.5,
+            20.0,
+        )];
+        let (_est, forecast) = estimate_burn_rates(
+            &with_worker,
+            1.0,
+            1,
+            1,
+            &mut ema,
+            &baseline,
+            &util,
+            90.0,
+            &hrs,
+        );
+
+        // five_hour makes the difference legible: 80% budget over 4h.
+        //   netted   -> worker costs ~0.5%/hr  -> 80 / (0.5 * 4)  = 40 workers
+        //   un-netted-> worker "costs" 6.5%/hr -> 80 / (6.5 * 4)  =  3 workers
+        // A long horizon hides this: over 100h both quotients floor to 1, which
+        // is why the pool sat at a single worker while the operator burned.
+        let safe = forecast.five_hour.safe_worker_count.unwrap_or(0);
+        assert!(
+            safe > 10,
+            "exogenous burn must be netted out before dividing by worker count; \
+             got {safe}, which is the un-netted answer"
+        );
+    }
+
+    /// The reserved key is bookkeeping, not a model, and must never surface as one.
+    #[test]
+    fn exogenous_key_is_not_reported_as_a_model() {
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+        let e = ema
+            .entry((EXOGENOUS_MODEL_KEY.to_string(), "seven_day".to_string()))
+            .or_default();
+        update_ema(e, 6.0, 20.0);
+        let e2 = ema
+            .entry(("claude-sonnet-5".to_string(), "seven_day".to_string()))
+            .or_default();
+        update_ema(e2, 0.5, 2.0);
+
+        let state = build_burn_rate_state(
+            &ema,
+            0,
+            0,
+            1.0,
+            1.0,
+            true,
+            0,
+            0,
+            None,
+            crate::state::CalibrationState::default(),
+        );
+        assert!(
+            !state.by_model.contains_key(EXOGENOUS_MODEL_KEY),
+            "the exogenous baseline must not appear in by_model: {:?}",
+            state.by_model.keys().collect::<Vec<_>>()
+        );
+        assert!(state.by_model.contains_key("claude-sonnet-5"));
     }
 
     fn binding_window_is_most_constrained() {
