@@ -196,6 +196,33 @@ pub fn compute_instance_burn(record: &InstanceRecord, elapsed_hours: f64) -> Vec
     results
 }
 
+/// Windows whose utilization dropped far enough this interval to mean the window
+/// rolled over rather than that usage fell.
+///
+/// `compute_instance_burn` already recognises this and skips the sample, which
+/// is right — the delta across a rollover is meaningless. But skipping alone
+/// leaves the EMA holding the PRE-reset rate, and nothing later corrects it:
+/// once the fresh window sits near 0% the `pct_delta == 0.0 && tokens > 0` guard
+/// skips too, so no sample arrives to decay it.
+///
+/// Observed 2026-09-09: `five_hour` reported 0.0% utilization alongside a
+/// 28.34%/hr burn rate carried over from the previous window, giving
+/// `Exhaustion: 3.0h` and `Margin: -1.8h` on a window with 85% headroom. The
+/// governor read CUTOFF_RISK and refused to scale at exactly the moment a
+/// freshly-reset window had the most capacity to give (claudego-d64682d5 covers
+/// the zero-worker half of the same "cannot scale up" symptom).
+pub fn detect_window_resets(records: &[InstanceRecord]) -> std::collections::HashSet<String> {
+    let mut reset = std::collections::HashSet::new();
+    for record in records {
+        for win in &record.windows {
+            if win.current_utilization < win.previous_utilization - WINDOW_RESET_THRESHOLD {
+                reset.insert(win.window.clone());
+            }
+        }
+    }
+    reset
+}
+
 // ---------------------------------------------------------------------------
 // Promotion validation
 // ---------------------------------------------------------------------------
@@ -1368,6 +1395,22 @@ pub fn estimate_burn_rates(
     }
 
     // Compute per-instance burn rates
+    // Drop stale calibration for any window that rolled over this interval, so
+    // the fresh window is treated as cold-start and re-seeded from the baseline
+    // instead of inheriting the previous window's rate. Only the affected
+    // windows are cleared; calibration for the others is untouched.
+    let reset_windows = detect_window_resets(instance_records);
+    if !reset_windows.is_empty() {
+        ema_state.retain(|(_, window), _| !reset_windows.contains(window));
+        for window in &reset_windows {
+            log::info!(
+                "[burn_rate] {window}: window reset detected — cleared stale burn-rate \
+                 calibration so the new window is re-measured rather than inheriting \
+                 the previous window's rate"
+            );
+        }
+    }
+
     let mut all_instance_rates: Vec<InstanceBurnRate> = Vec::new();
     for record in instance_records {
         let rates = compute_instance_burn(record, elapsed_hours);
@@ -2749,6 +2792,99 @@ mod tests {
         }
     }
 
+    /// A window rollover must DISCARD that window's calibration, not just skip
+    /// the sample. Leaving it in place made a freshly-reset window inherit the
+    /// previous window's burn rate, so the governor read CUTOFF_RISK against
+    /// ~full headroom and refused to scale (five_hour: 0.0% utilization carrying
+    /// 28.34%/hr, margin -1.8h, observed 2026-09-09).
+    #[test]
+    fn window_reset_clears_only_that_windows_calibration() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+        // Pre-seed calibration for both windows, as a long-running daemon would.
+        for window in ["five_hour", "seven_day"] {
+            let ema = ema_state
+                .entry(("claude-sonnet-5".to_string(), window.to_string()))
+                .or_default();
+            update_ema(ema, 28.34, 50.0);
+            update_ema(ema, 28.34, 50.0);
+            update_ema(ema, 28.34, 50.0);
+        }
+        assert_eq!(ema_state.len(), 2, "precondition: both windows calibrated");
+
+        // five_hour rolls over (81 -> 0); seven_day keeps climbing.
+        let instances = vec![multi_window_record(
+            "s1",
+            "claude-sonnet-5",
+            1.0,
+            1000,
+            Some(0.0),
+            Some(1.0),
+            Some(1.0),
+            0.0,
+            81.0,
+            62.0,
+            61.0,
+            76.0,
+            75.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 0.0);
+        utilization.insert("seven_day".to_string(), 62.0);
+        utilization.insert("weekly_scoped".to_string(), 76.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 4.8);
+        hrs_left.insert("seven_day".to_string(), 165.8);
+        hrs_left.insert("weekly_scoped".to_string(), 165.8);
+
+        let _ = estimate_burn_rates(
+            &instances,
+            1.0,
+            1,
+            1,
+            &mut ema_state,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        let five = ema_state.keys().any(|(_, w)| w == "five_hour");
+        let seven = ema_state.keys().any(|(_, w)| w == "seven_day");
+        assert!(
+            !five,
+            "five_hour rolled over; its stale calibration must be cleared"
+        );
+        assert!(
+            seven,
+            "seven_day did not roll over; its calibration must survive"
+        );
+    }
+
+    #[test]
+    fn detect_window_resets_identifies_only_rolled_windows() {
+        let records = vec![multi_window_record(
+            "s1",
+            "m",
+            1.0,
+            10,
+            Some(0.0),
+            Some(1.0),
+            Some(1.0),
+            0.0,
+            81.0, // five_hour reset
+            62.0,
+            61.0, // seven_day climbing
+            76.0,
+            75.0, // weekly_scoped climbing
+        )];
+        let reset = detect_window_resets(&records);
+        assert!(reset.contains("five_hour"));
+        assert!(!reset.contains("seven_day"));
+        assert!(!reset.contains("weekly_scoped"));
+    }
+
     fn binding_window_is_most_constrained() {
         let baseline = BaselineBurnRates::default();
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
@@ -3743,7 +3879,7 @@ mod tests {
         // safe count of 0. floor() keeps it at 0, so composite finds no
         // improvement.
         let forecasts = vec![
-            wf(5.0, 1.0, 3.0, -1.0, Some(0)), // binding: safe = 0
+            wf(5.0, 1.0, 3.0, -1.0, Some(0)),    // binding: safe = 0
             wf(0.9, 150.0, 3.0, 130.0, Some(0)), // non-binding: fractional cross-window quotient
         ];
 

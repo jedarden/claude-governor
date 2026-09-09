@@ -1393,8 +1393,13 @@ fn evaluate_pricing_coverage(counts: &[(String, i64)], priced: &[String]) -> Che
     );
     let remediation = format!(
         "Add pricing entries for {} to the pricing.models block in \
-         ~/.config/claude-governor/governor.yaml — dollar figures for these \
-         models are fallback estimates, not exact",
+         ~/.config/claude-governor/governor.yaml. These are priced by \
+         auto-resolution, not guesswork: a versioned variant resolves to its own \
+         family and generation by longest-prefix match, and anything unrecognised \
+         is rounded UP to the most expensive candidate so consumption is never \
+         understated. The figures are still stand-ins — add exact entries for \
+         accurate dollars. The daemon also logs each unconfigured model once, \
+         naming the rate it was priced at",
         names.join(", ")
     );
 

@@ -112,13 +112,19 @@ impl PricingEngine {
         }
     }
 
-    /// Get pricing for a specific model with fallback
+    /// Get pricing for a specific model, resolving unconfigured ids automatically.
     ///
-    /// If the exact model is not found, falls back to a similar model:
-    /// - "opus" models -> latest Opus pricing
-    /// - "sonnet" models -> latest Sonnet pricing
-    /// - "haiku" models -> latest Haiku pricing
-    /// - Default -> Sonnet pricing (most common)
+    /// Resolution order (see `find_fallback_model`):
+    /// 1. Exact configured id.
+    /// 2. Longest configured id that is a PREFIX of this one — so a versioned
+    ///    variant resolves to its own family and version.
+    /// 3. Family token, taking the most EXPENSIVE entry in that family.
+    /// 4. The most expensive configured model overall.
+    ///
+    /// Steps 3 and 4 deliberately round UP. For a capacity governor,
+    /// underpricing is the dangerous direction: it makes observed consumption
+    /// look cheaper than it was, which inflates the affordable worker count and
+    /// over-scales against a real budget. Overpricing only costs throughput.
     fn get_pricing_for_model(&self, model: &str) -> ModelPricing {
         // Direct lookup
         if let Some(pricing) = self.pricing_map.get(model) {
@@ -134,11 +140,26 @@ impl PricingEngine {
         let fallback = self.find_fallback_model(model);
 
         if fallback != model {
-            log::warn!(
-                "Unknown model '{}', falling back to '{}' for pricing — add it to governor.yaml",
-                model,
-                fallback
-            );
+            // Log each unconfigured model ONCE per process rather than on every
+            // poll. The undeduplicated version emitted the same line every cycle,
+            // which made a real signal — "this account is consuming a model the
+            // governor cannot price" — indistinguishable from log noise, and it
+            // went unread for as long as the model was in use.
+            //
+            // This is the operator-facing half of model auto-detection: the
+            // resolver keeps costing correct without a config edit, and this
+            // line names what to add for an exact rate.
+            if Self::note_unconfigured_model(model) {
+                let priced_as = self
+                    .pricing_map
+                    .get(fallback)
+                    .map(|p| format!("{}/{} per Mtok", p.input_per_mtok, p.output_per_mtok))
+                    .unwrap_or_else(|| "built-in default".to_string());
+                log::warn!(
+                    "Model '{model}' is not configured; pricing it as '{fallback}' ({priced_as}). \
+                     Add an exact entry under pricing.models in governor.yaml if this is wrong."
+                );
+            }
         }
 
         self.pricing_map
@@ -147,26 +168,104 @@ impl PricingEngine {
             .unwrap_or_else(|| Self::default_sonnet_pricing())
     }
 
-    /// Find a fallback model for pricing
+    /// Record an unconfigured model id, returning true the first time it is seen.
+    ///
+    /// Process-local and intentionally unbounded: the set of distinct model ids
+    /// an account can emit is tiny, and the daemon is long-lived, so this is a
+    /// handful of short strings for the life of the process.
+    fn note_unconfigured_model(model: &str) -> bool {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        match seen.lock() {
+            Ok(mut set) => set.insert(model.to_string()),
+            // A poisoned lock must not silence the warning entirely.
+            Err(_) => true,
+        }
+    }
+
+    /// Total price of a configured model, used to pick conservatively between
+    /// same-family candidates. Input + output is enough to order them; cache
+    /// rates track those on every real entry.
+    fn price_rank(p: &ModelPricing) -> f64 {
+        p.input_per_mtok + p.output_per_mtok
+    }
+
+    /// Resolve an unconfigured model id to the best configured stand-in.
+    ///
+    /// Auto-detection of new models in a deployed environment rests on step 1:
+    /// Anthropic ships versioned variants of an existing family ("claude-fable-5"
+    /// -> "claude-fable-5-1"), and a prefix match picks up the new id with the
+    /// right family AND the right generation, with no config edit.
+    ///
+    /// The previous implementation knew only opus/sonnet/haiku, so
+    /// "claude-fable-5-1" matched no family and fell through to
+    /// claude-sonnet-4-20250514 — 3/15 per Mtok against Fable's 10/50, a 3.3x
+    /// UNDERPRICE of the most expensive model on the account. It also iterated a
+    /// HashMap and returned the first hit, so even a known family resolved
+    /// non-deterministically between e.g. claude-opus-5 and
+    /// claude-opus-4-20250514.
     fn find_fallback_model(&self, model: &str) -> &str {
+        Self::resolve_model(&self.pricing_map, model)
+    }
+
+    /// Pure core of [`find_fallback_model`], taking the pricing map explicitly so
+    /// it can be tested without constructing a whole engine and config.
+    fn resolve_model<'a>(pricing_map: &'a HashMap<String, ModelPricing>, model: &str) -> &'a str {
         let model_lower = model.to_lowercase();
 
-        // Try to find by model family
-        for (key, _) in &self.pricing_map {
-            let key_lower = key.to_lowercase();
-            if model_lower.contains("opus") && key_lower.contains("opus") {
-                return key;
+        // 1. Longest configured id that prefixes this one. Most specific wins,
+        //    so claude-fable-5-1 takes claude-fable-5 over any shorter match.
+        let mut best_prefix: Option<&str> = None;
+        for key in pricing_map.keys() {
+            if model_lower.starts_with(&key.to_lowercase())
+                && best_prefix.is_none_or(|b| key.len() > b.len())
+            {
+                best_prefix = Some(key);
             }
-            if model_lower.contains("sonnet") && key_lower.contains("sonnet") {
-                return key;
+        }
+        if let Some(key) = best_prefix {
+            return key;
+        }
+
+        // 2. Family token — most expensive entry in the family, deterministic.
+        //    "fable" is listed first only for readability; matching is by token
+        //    presence, and each family is resolved independently.
+        const FAMILIES: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+        for family in FAMILIES {
+            if !model_lower.contains(family) {
+                continue;
             }
-            if model_lower.contains("haiku") && key_lower.contains("haiku") {
+            let mut candidates: Vec<(&String, &ModelPricing)> = pricing_map
+                .iter()
+                .filter(|(k, _)| k.to_lowercase().contains(family))
+                .collect();
+            // Descending price, then id, so the choice never depends on HashMap
+            // iteration order.
+            candidates.sort_by(|(ak, ap), (bk, bp)| {
+                Self::price_rank(bp)
+                    .partial_cmp(&Self::price_rank(ap))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| ak.cmp(bk))
+            });
+            if let Some((key, _)) = candidates.first() {
                 return key;
             }
         }
 
-        // Default to latest Sonnet
-        "claude-sonnet-4-20250514"
+        // 3. Nothing recognisable: the most expensive configured model, so an
+        //    entirely new family is never silently treated as cheap.
+        let mut all: Vec<(&String, &ModelPricing)> = pricing_map.iter().collect();
+        all.sort_by(|(ak, ap), (bk, bp)| {
+            Self::price_rank(bp)
+                .partial_cmp(&Self::price_rank(ap))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| ak.cmp(bk))
+        });
+        all.first()
+            .map(|(k, _)| k.as_str())
+            .unwrap_or("claude-sonnet-4-20250514")
     }
 
     /// Default Sonnet 4.6 pricing (used as ultimate fallback)
@@ -257,6 +356,102 @@ mod tests {
             cache_write_1h_per_mtok: 2.0,
             cache_read_per_mtok: 0.10,
         }
+    }
+
+    // ── Model auto-detection (unconfigured ids) ─────────────────────────────
+
+    fn resolver_map() -> HashMap<String, ModelPricing> {
+        let mut m = HashMap::new();
+        m.insert("claude-sonnet-5".to_string(), make_sonnet_pricing());
+        m.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            make_sonnet_pricing(),
+        );
+        m.insert("claude-opus-5".to_string(), make_opus_pricing());
+        m.insert("claude-haiku-4-5".to_string(), make_haiku_pricing());
+        // Fable is the most expensive model on the account.
+        m.insert(
+            "claude-fable-5".to_string(),
+            ModelPricing {
+                input_per_mtok: 10.0,
+                output_per_mtok: 50.0,
+                cache_write_5m_per_mtok: 12.5,
+                cache_write_1h_per_mtok: 20.0,
+                cache_read_per_mtok: 1.0,
+            },
+        );
+        m
+    }
+
+    /// The live regression: a versioned variant must resolve to its OWN family.
+    /// Before the fix "fable" was not a known family at all, so this fell through
+    /// to claude-sonnet-4-20250514 and underpriced Fable by 3.3x.
+    #[test]
+    fn versioned_variant_resolves_to_its_own_family() {
+        let m = resolver_map();
+        assert_eq!(
+            PricingEngine::resolve_model(&m, "claude-fable-5-1"),
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn prefix_match_prefers_the_most_specific_id() {
+        let m = resolver_map();
+        // Both claude-sonnet-5 and (no shorter entry) could match; the longest
+        // configured prefix wins.
+        assert_eq!(
+            PricingEngine::resolve_model(&m, "claude-sonnet-5-20260901"),
+            "claude-sonnet-5"
+        );
+    }
+
+    /// Family fallback must be deterministic AND conservative: with two Opus
+    /// entries the more expensive one is chosen, and repeated calls agree.
+    /// The old implementation returned whichever key HashMap iteration yielded
+    /// first.
+    #[test]
+    fn family_fallback_is_deterministic_and_rounds_up() {
+        let mut m = resolver_map();
+        m.insert(
+            "claude-opus-cheap".to_string(),
+            ModelPricing {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                cache_write_5m_per_mtok: 1.0,
+                cache_write_1h_per_mtok: 1.0,
+                cache_read_per_mtok: 0.1,
+            },
+        );
+        let first = PricingEngine::resolve_model(&m, "opus-something-unversioned");
+        assert_eq!(first, "claude-opus-5", "must pick the pricier Opus entry");
+        for _ in 0..25 {
+            assert_eq!(
+                PricingEngine::resolve_model(&m, "opus-something-unversioned"),
+                first,
+                "resolution must not depend on HashMap iteration order"
+            );
+        }
+    }
+
+    /// An entirely unrecognised family must not be treated as cheap: for a
+    /// capacity governor, underpricing inflates the affordable worker count.
+    #[test]
+    fn unknown_family_falls_back_to_the_most_expensive_model() {
+        let m = resolver_map();
+        assert_eq!(
+            PricingEngine::resolve_model(&m, "claude-newthing-9"),
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn exact_configured_id_is_unchanged() {
+        let m = resolver_map();
+        assert_eq!(
+            PricingEngine::resolve_model(&m, "claude-opus-5"),
+            "claude-opus-5"
+        );
     }
 
     #[test]
