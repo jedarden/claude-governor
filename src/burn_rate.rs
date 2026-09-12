@@ -1206,6 +1206,51 @@ pub fn compute_risk_score(
     Some(urgency * weight * volatility)
 }
 
+/// Nominal length of a usage window, used to place the flat-spend pace line.
+///
+/// `hours_remaining` alone says how long is left but not how far through the
+/// window we are, and the pace line needs both.
+fn window_duration_hours(window: &str) -> Option<f64> {
+    match window {
+        "five_hour" => Some(5.0),
+        "seven_day" | "weekly_scoped" => Some(168.0),
+        _ => None,
+    }
+}
+
+/// Is consumption at or behind the flat-spend line for this window?
+///
+/// Flat spend means the budget depletes linearly with time: at any moment the
+/// budget still unspent should be `ceiling * (hours_remaining / window_length)`.
+/// More than that means we are UNDER-spending and may run; less means we are
+/// ahead of the line and must idle to let the clock catch up.
+///
+/// This is what makes fractional worker counts achievable. A window whose ideal
+/// is 0.2 workers cannot be served by 0.2 of a process — it is served by one
+/// worker running about a fifth of the time. Gating on the pace line produces
+/// that duty cycle as a sawtooth: run, cross below the line, stop, the line
+/// falls as time passes, cross above it, run again. The average tracks the line
+/// while the instantaneous count is always a whole number.
+///
+/// An unrecognised window does not gate (returns true): a window whose length
+/// we cannot place must not silently stop all scaling.
+pub fn behind_flat_spend_pace(
+    window: &str,
+    remaining_pct: f64,
+    hours_remaining: f64,
+    target_ceiling: f64,
+) -> bool {
+    let Some(window_hours) = window_duration_hours(window) else {
+        return true;
+    };
+    if !(window_hours > 0.0) || !hours_remaining.is_finite() {
+        return true;
+    }
+    let elapsed_fraction_left = (hours_remaining / window_hours).clamp(0.0, 1.0);
+    let ideal_remaining = target_ceiling * elapsed_fraction_left;
+    remaining_pct > ideal_remaining
+}
+
 /// Convert an affordable-worker quotient into an authorised worker count.
 ///
 /// `affordable = remaining_pct / (per_worker_rate * hours_remaining)` answers:
@@ -1234,9 +1279,11 @@ pub fn compute_risk_score(
 /// is never rounded up (ceil would authorise a worker that cannot be sustained
 /// for the whole window). Only the 0 < q < 1 band is lifted, to 1 worker.
 pub fn duty_cycle_safe_workers(
+    window: &str,
     remaining_pct: f64,
     per_worker_rate: f64,
     hours_remaining: f64,
+    target_ceiling: f64,
 ) -> u32 {
     // `!x > 0.0` (rather than `x <= 0.0`) also rejects NaN inputs.
     if !(per_worker_rate > 0.0) || !(hours_remaining > 0.0) || !(remaining_pct > 0.0) {
@@ -1247,9 +1294,26 @@ pub fn duty_cycle_safe_workers(
         return 0;
     }
     let whole = affordable.floor() as u64;
-    // Any positive budget at all authorises at least one duty-cycled worker.
-    let authorised = whole.max(u64::from(affordable > 0.0));
-    authorised.min(u32::MAX as u64) as u32
+    if whole >= 1 {
+        // A whole worker is sustainable for the rest of the window; running it
+        // continuously IS the flat-spend answer, so no duty cycling is needed.
+        return whole.min(u32::MAX as u64) as u32;
+    }
+
+    // Fractional budget: the flat-spend ideal is less than one worker, which no
+    // whole number of processes can hold continuously. Previously this rounded
+    // up to 1 unconditionally, which over-spends by 1/affordable — an ideal of
+    // 0.2 workers ran 5x the budgeted rate, exhausted the window early and then
+    // idled at the ceiling. Flat spend with whole workers requires a DUTY CYCLE,
+    // so authorise one worker only while consumption is behind the pace line and
+    // idle otherwise. Alternating produces the sawtooth whose average tracks the
+    // line.
+    u32::from(behind_flat_spend_pace(
+        window,
+        remaining_pct,
+        hours_remaining,
+        target_ceiling,
+    ))
 }
 
 /// Generate a capacity forecast for a single window
@@ -1286,14 +1350,16 @@ pub fn generate_window_forecast(
     // margin_hrs: positive = safe (exhaustion after reset), negative = risky (exhaustion before reset)
     let margin_hrs = predicted_exhaustion_hours - hours_remaining;
 
-    // p50 safe workers: uses the mean per-worker burn rate. A fractional
-    // quotient authorises one duty-cycled worker (see `duty_cycle_safe_workers`)
-    // instead of flooring to 0 near a reset.
+    // p50 safe workers: uses the mean per-worker burn rate. A whole quotient runs
+    // continuously; a fractional one is served by duty-cycling a single worker
+    // against the flat-spend pace line (see `duty_cycle_safe_workers`).
     let safe_worker_count = if mean_rate_per_worker > 0.0 && hours_remaining > 0.0 {
         Some(duty_cycle_safe_workers(
+            window,
             remaining_pct,
             mean_rate_per_worker,
             hours_remaining,
+            target_ceiling,
         ))
     } else {
         None
@@ -1312,9 +1378,11 @@ pub fn generate_window_forecast(
             let rate_p75_fleet = (fleet_pct_hr + Z_0_675 * std_pct_hr).max(MIN_RATE);
             let rate_p75_per_worker = mean_rate_per_worker * rate_p75_fleet / fleet_pct_hr;
             Some(duty_cycle_safe_workers(
+                window,
                 remaining_pct,
                 rate_p75_per_worker,
                 hours_remaining,
+                target_ceiling,
             ))
         } else {
             safe_worker_count
@@ -2843,19 +2911,27 @@ mod tests {
             &hrs_left,
         );
 
-        for (name, win) in [
-            ("seven_day", &forecast.seven_day),
-            ("weekly_scoped", &forecast.weekly_scoped),
-        ] {
-            assert!(
-                win.safe_worker_count.unwrap_or(0) >= 1,
-                "{name} has real headroom ({}% to the ceiling over {}h) so a pool at zero \
-                 workers must be authorised at least one; got {:?}",
-                win.remaining_pct,
-                win.hours_remaining,
-                win.safe_worker_count,
-            );
-        }
+        // seven_day: 28% remaining over 28.8h against a pace line of
+        // 90 * (28.8/168) = 15.43% — behind the line, so a worker is authorised.
+        // That is what the bootstrap fix must deliver: a usable per-worker rate
+        // with zero workers running.
+        assert!(
+            forecast.seven_day.safe_worker_count.unwrap_or(0) >= 1,
+            "seven_day is behind the pace line ({}% over {}h); got {:?}",
+            forecast.seven_day.remaining_pct,
+            forecast.seven_day.hours_remaining,
+            forecast.seven_day.safe_worker_count,
+        );
+
+        // weekly_scoped has only 14% left against that same line, i.e. already
+        // over-spent, so 0 is correct and is NOT a bootstrap failure. Asserting
+        // >= 1 on both would conflate "can size a pool from zero workers" with
+        // "should be spending right now".
+        assert_eq!(
+            forecast.weekly_scoped.safe_worker_count,
+            Some(0),
+            "weekly_scoped is ahead of the pace line and must idle"
+        );
     }
 
     /// A window rollover must DISCARD that window's calibration, not just skip
@@ -3108,6 +3184,47 @@ mod tests {
             state.by_model.keys().collect::<Vec<_>>()
         );
         assert!(state.by_model.contains_key("claude-sonnet-5"));
+    }
+
+    /// The sawtooth: a fractional ideal is served by alternating 1 and 0, and
+    /// the alternation is self-driving because idling raises the quotient.
+    ///
+    /// Holding the budget fixed and advancing the clock is what happens while a
+    /// worker is idle — time passes, nothing is spent — and the pace line falls
+    /// with it, so a budget that was ahead of the line becomes behind it and the
+    /// worker resumes. That is the whole control law; no extra state is needed.
+    #[test]
+    fn idling_lets_the_pace_line_fall_and_the_worker_resume() {
+        const RATE: f64 = 1.5;
+        const CEILING: f64 = 90.0;
+        const REMAINING: f64 = 14.0;
+
+        // 28.8h left of 168h: line = 90 * 0.171 = 15.43% > 14% remaining, so we
+        // are over-spent and must idle.
+        assert_eq!(
+            duty_cycle_safe_workers("weekly_scoped", REMAINING, RATE, 28.8, CEILING),
+            0,
+            "ahead of the line: must idle"
+        );
+
+        // Same budget, clock advanced to 20h left: line = 90 * 0.119 = 10.71%,
+        // now below the 14% still in hand, so spending resumes.
+        assert_eq!(
+            duty_cycle_safe_workers("weekly_scoped", REMAINING, RATE, 20.0, CEILING),
+            1,
+            "the line fell past the untouched budget: must resume"
+        );
+    }
+
+    /// An unrecognised window must not silently stop all scaling.
+    #[test]
+    fn unknown_window_is_not_pace_gated() {
+        assert!(behind_flat_spend_pace("some_new_window", 1.0, 100.0, 90.0));
+        assert_eq!(
+            duty_cycle_safe_workers("some_new_window", 5.0, 1.5, 29.67, 90.0),
+            1,
+            "an unplaceable window must fall back to authorising, not to idling"
+        );
     }
 
     fn binding_window_is_most_constrained() {
@@ -3705,13 +3822,17 @@ mod tests {
         assert!((f.predicted_exhaustion_hours - 9.0).abs() < 1e-9);
         assert!(f.cutoff_risk); // 9h < 37.5h → exhausts before reset
         assert!((f.margin_hrs + 28.5).abs() < 1e-9); // 9 - 37.5 = -28.5 (negative = risky)
-                                                     // 18 / (1.0 * 37.5) = 0.48. Under duty-cycled sizing (claudego-b9e2f08e)
-                                                     // a positive budget authorises one worker for that FRACTION of the
-                                                     // window rather than discarding it: 0.48 means one worker for ~48% of
-                                                     // the remaining 37.5h, which lands on the ceiling rather than past it.
-                                                     // This previously asserted Some(0), which is the behaviour that let
-                                                     // use-or-lose quota expire unused.
-        assert_eq!(f.safe_worker_count, Some(1));
+                                                     // 18 / (1.0 * 37.5) = 0.48 — a fractional quotient, so the answer is a
+                                                     // duty cycle rather than a continuous worker. The flat-spend pace line
+                                                     // for weekly_scoped with 37.5h left of 168h at ceiling 90 sits at
+                                                     // 90 * (37.5/168) = 20.09% remaining; this scenario has only 18% left,
+                                                     // i.e. it is already AHEAD of the line (over-spent), so the correct
+                                                     // action is to idle and let the clock catch up.
+                                                     //
+                                                     // History: originally Some(0) from a bare floor() that discarded the
+                                                     // fraction; then Some(1) unconditionally, which over-spends by 2.1x;
+                                                     // now pace-aware.
+        assert_eq!(f.safe_worker_count, Some(0));
         // With zero stddev, all cone values equal the p50
         assert!((f.exh_hrs_p25 - 9.0).abs() < 1e-9);
         assert!((f.exh_hrs_p50 - 9.0).abs() < 1e-9);
@@ -6171,7 +6292,13 @@ mod tests {
         // of the remaining window instead of flooring the fraction away, so the
         // expectation is computed with the same helper the implementation uses
         // rather than a bare floor().
-        let expected_safe = duty_cycle_safe_workers(90.0 - 72.0, mean_rate_per_worker, 30.0);
+        let expected_safe = duty_cycle_safe_workers(
+            "weekly_scoped",
+            90.0 - 72.0,
+            mean_rate_per_worker,
+            30.0,
+            90.0,
+        );
         assert_eq!(
             forecast.safe_worker_count,
             Some(expected_safe),
@@ -6331,18 +6458,29 @@ mod tests {
         const RATE: f64 = 1.5;
         const HOURS_LEFT: f64 = 29.67;
 
-        for remaining_pct in [14.0_f64, 28.0, 38.0] {
+        // Flat-spend refinement: a fractional quotient is now served by DUTY
+        // CYCLING one worker against the pace line, not by running one
+        // continuously. With 29.67h left of a 168h window at ceiling 90, the
+        // line sits at 90 * (29.67/168) = 15.89% remaining. Above it we are
+        // under-spent and may run; below it we have already over-spent and must
+        // idle so the clock can catch up. Unconditional 1 over-spends by
+        // 1/quotient — at 0.31 that is 3.2x the budgeted rate, which exhausts
+        // the window early and then sits idle at the ceiling.
+        const WINDOW: &str = "weekly_scoped";
+        const CEILING: f64 = 90.0;
+
+        for (remaining_pct, expected) in [(14.0_f64, 0), (28.0, 1), (38.0, 1)] {
             assert_eq!(
-                duty_cycle_safe_workers(remaining_pct, RATE, HOURS_LEFT),
-                1,
-                "remaining {remaining_pct}% with {HOURS_LEFT}h left must authorise exactly 1 worker"
+                duty_cycle_safe_workers(WINDOW, remaining_pct, RATE, HOURS_LEFT, CEILING),
+                expected,
+                "remaining {remaining_pct}% with {HOURS_LEFT}h left: pace line is 15.89%"
             );
         }
 
-        // Whole quotients are untouched: a quotient of 2.4 floors to 2 and is
-        // never rounded up — only the 0 < q < 1 band is lifted.
+        // Whole quotients are untouched and never gated: a sustainable whole
+        // worker IS the flat-spend answer, so it runs continuously.
         assert_eq!(
-            duty_cycle_safe_workers(2.4 * RATE * HOURS_LEFT, RATE, HOURS_LEFT),
+            duty_cycle_safe_workers(WINDOW, 2.4 * RATE * HOURS_LEFT, RATE, HOURS_LEFT, CEILING),
             2,
             "quotient 2.4 must stay 2 workers, not round up to 3"
         );
@@ -6392,15 +6530,21 @@ mod tests {
 
         for remaining_pct in [0.0_f64, -3.0, f64::NAN] {
             assert_eq!(
-                duty_cycle_safe_workers(remaining_pct, RATE, HOURS_LEFT),
+                duty_cycle_safe_workers("weekly_scoped", remaining_pct, RATE, HOURS_LEFT, 90.0),
                 0,
                 "remaining_pct {remaining_pct} must withdraw to 0 workers"
             );
         }
 
+        // Positive control, now stated against the pace line rather than as an
+        // unconditional 1: a budget that is BEHIND the line must still authorise
+        // a duty-cycled worker, so this pin cannot be satisfied by a guard that
+        // returns 0 unconditionally. 5% remaining sits below the 15.89% line for
+        // weekly_scoped, so use the five_hour window, whose line at 1.0h left of
+        // 5h is 90 * 0.2 = 18% — 25% remaining is comfortably behind it.
         assert!(
-            duty_cycle_safe_workers(5.0, RATE, HOURS_LEFT) >= 1,
-            "remaining_pct 5.0 at {RATE}%/worker-h over {HOURS_LEFT}h must still authorise a duty-cycled worker"
+            duty_cycle_safe_workers("five_hour", 25.0, RATE, 1.0, 90.0) >= 1,
+            "a budget behind the pace line must still authorise a duty-cycled worker"
         );
     }
 
