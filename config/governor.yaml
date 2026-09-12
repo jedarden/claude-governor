@@ -70,6 +70,17 @@ pricing:
       cache_write_1h_per_mtok: 20.0
       cache_read_per_mtok: 1.0
 
+    # Claude Fable 5.1 (claude-fable-5-1)
+    # Input: $10.00/MTok, Output: $50.00/MTok. Same tier as Fable 5, but cache
+    # reads are documented at $0.25/MTok (not the 0.1x-input derivation) — the
+    # one rate that differs from the Fable 5 entry above.
+    claude-fable-5-1:
+      input_per_mtok: 10.0
+      output_per_mtok: 50.0
+      cache_write_5m_per_mtok: 12.5
+      cache_write_1h_per_mtok: 20.0
+      cache_read_per_mtok: 0.25
+
     # ---------------------------------------------------------------------
     # Previous generations
     # ---------------------------------------------------------------------
