@@ -560,6 +560,13 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 "remain_pct": v.remaining_pct,
                 // True remaining: distance to the platform-enforced cutoff at
                 // 100%. This is what used_pct + X = 100.
+                // Flat-spend pacing. pace_delta_pct is the quantity that decides
+                // whether a fractional worker budget authorises anything:
+                // positive = under-spent (workers may run), negative = ahead of
+                // the line (idle). Without it a reader can see utilization and
+                // ceiling but cannot explain the governor's decision.
+                "pace_target_pct": v.pace_target_pct,
+                "pace_delta_pct": v.pace_delta_pct,
                 "hard_limit_remaining_pct": v.hard_limit_remaining_pct,
                 "resets_in_hrs": v.hours_remaining,
                 "risk": risk_indicator(v),

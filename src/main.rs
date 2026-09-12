@@ -208,6 +208,15 @@ enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+
+        /// Redraw every N seconds instead of printing once.
+        ///
+        /// The daemon polls on its own loop (default 300s), so a faster refresh
+        /// redraws identical numbers. The rendered "age" line says how stale the
+        /// underlying reading is, so a short interval animates the countdown
+        /// without implying the data moved.
+        #[arg(long, value_name = "SECS")]
+        watch: Option<u64>,
     },
 
     /// Show worker count, targets, and heartbeat status per agent
@@ -602,14 +611,32 @@ fn format_forecast_human(state: &GovernorState) -> String {
         } else {
             ""
         };
+        // Flat-spend pacing, rendered as a one-line verdict because it is what
+        // decides whether workers run. "behind" means under-spent relative to a
+        // linear burn-down and therefore free to spend.
+        let pace = match (win.pace_target_pct, win.pace_delta_pct) {
+            (Some(target), Some(delta)) => {
+                let verdict = if delta > 0.0 {
+                    "behind — may spend"
+                } else {
+                    "ahead — idling"
+                };
+                format!(
+                    "  Pace:        {:.1}% target / {:+.1}% {}\n",
+                    target, delta, verdict
+                )
+            }
+            _ => String::new(),
+        };
         output.push_str(&format!(
-            "{}{}\n  Utilization: {:.1}% / {:.0}% ceiling\n  Remaining: {:.1}% ({:.1}h)\n  Burn Rate: {:.2}%/hr\n  Exhaustion: {:.1}h {}\n  Margin: {:.1}h\n\n",
+            "{}{}\n  Utilization: {:.1}% / {:.0}% ceiling\n  Remaining: {:.1}% ({:.1}h to reset)\n{}  Burn Rate: {:.2}%/hr\n  Exhaustion: {:.1}h {}\n  Margin: {:.1}h\n\n",
             name,
             binding,
             win.current_utilization,
             win.target_ceiling,
             win.remaining_pct,
             win.hours_remaining,
+            pace,
             win.fleet_pct_per_hour,
             win.predicted_exhaustion_hours,
             cutoff,
@@ -628,6 +655,15 @@ fn format_forecast_human(state: &GovernorState) -> String {
     output.push_str(&format!(
         "Remaining Budget: ~${:.2}\n",
         forecast.estimated_remaining_dollars
+    ));
+    // Reading age. The daemon polls on its own loop, so under --watch the
+    // numbers above are as old as this says; only the reset countdown moves
+    // between polls. Stating it stops a fast refresh from implying fresh data.
+    let age = (chrono::Utc::now() - state.updated_at).num_seconds().max(0);
+    output.push_str(&format!(
+        "Reading age: {}m{:02}s (daemon polls every 300s)\n",
+        age / 60,
+        age % 60
     ));
 
     output
@@ -1124,9 +1160,21 @@ fn main() -> Result<()> {
         } => {
             run_poll_command(&format, fail_on_stale)?;
         }
-        Commands::Forecast { json } => {
-            run_forecast_command(json)?;
-        }
+        Commands::Forecast { json, watch } => match watch {
+            None => run_forecast_command(json)?,
+            Some(secs) => {
+                let interval = std::time::Duration::from_secs(secs.max(1));
+                loop {
+                    // Clear + home rather than a full reset, so scrollback is
+                    // preserved and the redraw does not flicker the whole pane.
+                    print!("\x1b[H\x1b[2J");
+                    run_forecast_command(json)?;
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    std::thread::sleep(interval);
+                }
+            }
+        },
         Commands::Workers { json } => {
             run_workers_command(json)?;
         }
@@ -1466,34 +1514,40 @@ fn installed_units<'a>(user_dir: &Path, candidates: &[&'a str]) -> Vec<&'a str> 
 /// Returns `(units, missing)`: what the command should act on, and the
 /// canonical names the target asked for that are not installed here.
 ///
-/// The governor halves fall back to [`COMBINED_SERVICE`] when neither split
-/// unit exists, because that unit is what runs the daemon on hosts installed
-/// before the observe/act split — resolving to the split names there made every
-/// `cgov restart` die on "unit not found" *after* reporting whatever it had
-/// already restarted, leaving an operator to believe a config change went live
-/// when nothing was restarted at all. An individual `observe`/`act` target does
-/// not get the fallback: restarting the combined unit would also restart the
-/// other half, which is not what was asked for, so it resolves to nothing and
-/// the caller fails loudly instead.
+/// Targets naming both halves (`governor`, and the catch-all) fall back to
+/// [`COMBINED_SERVICE`] when neither split unit exists, because that unit is
+/// what runs the daemon on hosts installed before the observe/act split —
+/// resolving to the split names there made every `cgov restart` die on "unit
+/// not found" *after* reporting whatever it had already restarted, leaving an
+/// operator to believe a config change went live when nothing was restarted at
+/// all. An individual `observe`/`act` target does not get the fallback: the
+/// combined unit also runs the other half, so restarting it under a name that
+/// names only one half would restart a daemon the target does not name. It
+/// resolves to nothing and the caller fails loudly instead.
 fn resolve_installed_service_names(
     user_dir: &Path,
     service: &str,
 ) -> (Vec<&'static str>, Vec<&'static str>) {
-    let (governor_units, other_units): (Vec<&'static str>, Vec<&'static str>) = match service {
-        "observe" => (vec![OBSERVE_SERVICE], Vec::new()),
-        "act" => (vec![ACT_SERVICE], Vec::new()),
+    let (governor_units, other_units, combined_may_stand_in): (
+        Vec<&'static str>,
+        Vec<&'static str>,
+        bool,
+    ) = match service {
+        "observe" => (vec![OBSERVE_SERVICE], Vec::new(), false),
+        "act" => (vec![ACT_SERVICE], Vec::new(), false),
         // `governor` is retained as a compatibility alias for the two
         // governor halves; it no longer refers to a combined process.
-        "governor" => (vec![OBSERVE_SERVICE, ACT_SERVICE], Vec::new()),
-        "collector" => (Vec::new(), vec![COLLECTOR_SERVICE]),
-        _ => (vec![OBSERVE_SERVICE, ACT_SERVICE], vec![COLLECTOR_SERVICE]),
+        "governor" => (vec![OBSERVE_SERVICE, ACT_SERVICE], Vec::new(), true),
+        "collector" => (Vec::new(), vec![COLLECTOR_SERVICE], false),
+        _ => (
+            vec![OBSERVE_SERVICE, ACT_SERVICE],
+            vec![COLLECTOR_SERVICE],
+            true,
+        ),
     };
 
     let mut units = installed_units(user_dir, &governor_units);
-    if units.is_empty()
-        && !governor_units.is_empty()
-        && user_dir.join(COMBINED_SERVICE).exists()
-    {
+    if combined_may_stand_in && units.is_empty() && user_dir.join(COMBINED_SERVICE).exists() {
         units.push(COMBINED_SERVICE);
     }
     units.extend(installed_units(user_dir, &other_units));
@@ -2810,10 +2864,7 @@ mod tests {
 
         let (units, missing) = resolve_installed_service_names(dir.path(), "all");
 
-        assert_eq!(
-            units,
-            vec![OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE]
-        );
+        assert_eq!(units, vec![OBSERVE_SERVICE, ACT_SERVICE, COLLECTOR_SERVICE]);
         assert!(missing.is_empty(), "nothing should be missing: {missing:?}");
     }
 
@@ -2832,6 +2883,21 @@ mod tests {
     }
 
     #[test]
+    fn test_governor_alias_still_falls_back_to_combined_unit() {
+        // The alias names both halves, so on a pre-split host the combined
+        // unit genuinely stands in for the whole target. Losing this mapping
+        // would make `cgov restart governor` fail on exactly the hosts the
+        // fallback exists for (claudego-6960e911).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_unit(dir.path(), COMBINED_SERVICE);
+
+        let (units, missing) = resolve_installed_service_names(dir.path(), "governor");
+
+        assert_eq!(units, vec![COMBINED_SERVICE]);
+        assert_eq!(missing, vec![OBSERVE_SERVICE, ACT_SERVICE]);
+    }
+
+    #[test]
     fn test_individual_half_does_not_fall_back_to_combined_unit() {
         // Restarting `observe` on a combined-unit host would also restart act,
         // so it must resolve to nothing and fail loudly rather than restart the
@@ -2844,7 +2910,10 @@ mod tests {
         assert_eq!(missing, vec![OBSERVE_SERVICE]);
 
         let err = no_units_installed_error("observe", &missing, dir.path());
-        assert!(err.contains(OBSERVE_SERVICE), "must name what it tried: {err}");
+        assert!(
+            err.contains(OBSERVE_SERVICE),
+            "must name what it tried: {err}"
+        );
         assert!(
             err.contains(COMBINED_SERVICE),
             "must point at the unit that does run the daemon: {err}"

@@ -1234,21 +1234,34 @@ fn window_duration_hours(window: &str) -> Option<f64> {
 ///
 /// An unrecognised window does not gate (returns true): a window whose length
 /// we cannot place must not silently stop all scaling.
+/// The unspent budget the flat-spend line says should still be in hand right now.
+///
+/// `None` for a window whose nominal length is unknown — the same case in which
+/// pacing does not gate scaling.
+pub fn flat_spend_pace_target(
+    window: &str,
+    hours_remaining: f64,
+    target_ceiling: f64,
+) -> Option<f64> {
+    let window_hours = window_duration_hours(window)?;
+    if !(window_hours > 0.0) || !hours_remaining.is_finite() {
+        return None;
+    }
+    let fraction_left = (hours_remaining / window_hours).clamp(0.0, 1.0);
+    Some(target_ceiling * fraction_left)
+}
+
 pub fn behind_flat_spend_pace(
     window: &str,
     remaining_pct: f64,
     hours_remaining: f64,
     target_ceiling: f64,
 ) -> bool {
-    let Some(window_hours) = window_duration_hours(window) else {
-        return true;
-    };
-    if !(window_hours > 0.0) || !hours_remaining.is_finite() {
-        return true;
+    match flat_spend_pace_target(window, hours_remaining, target_ceiling) {
+        Some(ideal_remaining) => remaining_pct > ideal_remaining,
+        // An unplaceable window must not silently stop all scaling.
+        None => true,
     }
-    let elapsed_fraction_left = (hours_remaining / window_hours).clamp(0.0, 1.0);
-    let ideal_remaining = target_ceiling * elapsed_fraction_left;
-    remaining_pct > ideal_remaining
 }
 
 /// Convert an affordable-worker quotient into an authorised worker count.
@@ -1433,6 +1446,9 @@ pub fn generate_window_forecast(
         exh_hrs_p75,
         cone_ratio,
         risk_score,
+        pace_target_pct: flat_spend_pace_target(window, hours_remaining, target_ceiling),
+        pace_delta_pct: flat_spend_pace_target(window, hours_remaining, target_ceiling)
+            .map(|ideal| remaining_pct - ideal),
         hard_limit_remaining_pct: (100.0 - current_utilization).max(0.0),
         hard_limit_margin_hrs: if fleet_pct_hr > 0.0 {
             (100.0 - current_utilization).max(0.0) / fleet_pct_hr - hours_remaining
@@ -3225,6 +3241,62 @@ mod tests {
             1,
             "an unplaceable window must fall back to authorising, not to idling"
         );
+    }
+
+    /// The pace line must be surfaced on the forecast, not merely used
+    /// internally: it is the quantity that explains why a fractional budget
+    /// authorises a worker or not, and a reader comparing utilization to the
+    /// ceiling cannot derive the governor's decision without it.
+    #[test]
+    fn forecast_surfaces_the_pace_line() {
+        // weekly_scoped, 84h left of 168h at ceiling 90 -> line at 45.0%.
+        let f = generate_window_forecast(
+            "weekly_scoped",
+            1.0,
+            30.0, // utilization -> remaining 60.0
+            90.0,
+            84.0,
+            1.0,
+            0.0,
+            crate::state::EstimateQuality::Calibrated,
+        );
+        assert!((f.pace_target_pct.unwrap() - 45.0).abs() < 1e-9);
+        // 60 remaining against a 45 line -> 15 points under-spent, may spend.
+        assert!((f.pace_delta_pct.unwrap() - 15.0).abs() < 1e-9);
+        assert!(f.pace_delta_pct.unwrap() > 0.0);
+
+        // Same window late in its life with little left: ahead of the line.
+        let g = generate_window_forecast(
+            "weekly_scoped",
+            1.0,
+            80.0, // remaining 10.0
+            90.0,
+            84.0, // line still 45.0
+            1.0,
+            0.0,
+            crate::state::EstimateQuality::Calibrated,
+        );
+        assert!(
+            g.pace_delta_pct.unwrap() < 0.0,
+            "over-spent must read negative"
+        );
+    }
+
+    /// A window whose length is unknown has no line, and must not report one.
+    #[test]
+    fn unknown_window_has_no_pace_line() {
+        let f = generate_window_forecast(
+            "some_new_window",
+            1.0,
+            30.0,
+            90.0,
+            84.0,
+            1.0,
+            0.0,
+            crate::state::EstimateQuality::Calibrated,
+        );
+        assert!(f.pace_target_pct.is_none());
+        assert!(f.pace_delta_pct.is_none());
     }
 
     fn binding_window_is_most_constrained() {

@@ -370,6 +370,23 @@ pub struct WindowForecast {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub risk_score: f64,
+    /// Unspent budget the flat-spend pace line says should still be in hand at
+    /// this moment: `target_ceiling * (hours_remaining / window_length)`.
+    ///
+    /// `None` for a window whose nominal length is unknown, which is also the
+    /// case in which pacing does not gate scaling.
+    #[serde(default)]
+    pub pace_target_pct: Option<f64>,
+
+    /// `remaining_pct - pace_target_pct`. Positive means UNDER-spent (behind the
+    /// line, so workers may run); negative means over-spent (idle and let the
+    /// clock catch up). This is the quantity that actually decides whether a
+    /// fractional worker budget authorises anything, so it is surfaced rather
+    /// than left derivable — a reader comparing utilization to the ceiling
+    /// cannot explain the governor's behaviour without it.
+    #[serde(default)]
+    pub pace_delta_pct: Option<f64>,
+
     /// Remaining headroom to the hard platform limit (100% - current_utilization).
     /// Unlike remaining_pct (which uses the target ceiling), this measures distance to the
     /// platform-enforced cutoff at 100%.
@@ -409,6 +426,8 @@ impl Default for WindowForecast {
             exh_hrs_p75: 0.0,
             cone_ratio: 0.0,
             risk_score: 0.0,
+            pace_target_pct: None,
+            pace_delta_pct: None,
             hard_limit_remaining_pct: 0.0,
             hard_limit_margin_hrs: 0.0,
             estimate_quality: EstimateQuality::Calibrated,
