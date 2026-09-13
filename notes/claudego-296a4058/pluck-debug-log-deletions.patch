@@ -1,0 +1,439 @@
+diff --git a/docs/notes/pluck-starvation-pluck-output.log b/docs/notes/pluck-starvation-pluck-output.log
+deleted file mode 100644
+index 0e8ad53..0000000
+--- a/docs/notes/pluck-starvation-pluck-output.log
++++ /dev/null
+@@ -1,25 +0,0 @@
+-Pluck starvation reproduction — retained full first-cycle output
+-================================================================
+-
+-Source: /home/coding/.needle/logs/needle-claude-code-glm-4_7-lab-roam3.stderr.log
+-Capture date: 2026-08-03
+-Relevant source lines: 123–131
+-
+-The original log path was outside this repository. The following is the full
+-retained Pluck sequence for the first starvation cycle, copied from
+-notes/bf-4f5fw.md and docs/research/pluck-starvation-reproduction.md.
+-
+-2026-08-03T23:04:53.870031Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Pluck strand evaluation starting exclude_labels=["deferred", "human", "blocked"] split_threshold=3
+-2026-08-03T23:04:53.870042Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Querying bead store for ready candidates filters=Filters { assignee: None, exclude_labels: ["deferred", "human", "blocked"], exclude_ids: {} }
+-2026-08-03T23:04:53.873069Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Bead store returned 0 candidates count=0
+-2026-08-03T23:04:53.873094Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by label filter count=0
+-2026-08-03T23:04:53.873098Z DEBUG ...strand.pluck{...}: needle::strand::pluck: No beads excluded by status/assignee filter count=0
+-2026-08-03T23:04:53.876267Z DEBUG ...strand.pluck{...}: needle::telemetry: telemetry event event_type=strand.pluck.starvation_detected seq=21
+-2026-08-03T23:04:53.876291Z DEBUG ...strand.pluck{...}: needle::strand::pluck: Emitted PluckStarvationDetected telemetry, returning NoWork workspace=. open_count=0 excluded_count=0
+-2026-08-03T23:04:53.876304Z INFO ...strand.pluck{...}: needle::strand: strand returned no work strand=pluck elapsed_ms=6
+-
+-Interpretation:
+-- The store returned zero before any candidate-level label/status exclusions.
+-- Pluck emitted starvation telemetry.
+-- Pluck returned NoWork for workspace '.', whose open_count was zero.
+-- The intended target workspace was /home/coding/claude-governor, not /home/coding.
+diff --git a/notes/bf-56wnh-pluck-debug.log b/notes/bf-56wnh-pluck-debug.log
+deleted file mode 100644
+index eb1f9f1..0000000
+--- a/notes/bf-56wnh-pluck-debug.log
++++ /dev/null
+@@ -1,131 +0,0 @@
+-NEEDLE worker boot: creating tokio runtime...
+-NEEDLE worker boot: tokio runtime created
+-NEEDLE worker boot: initializing tracing subscriber...
+-NEEDLE worker boot: tracing subscriber initialized
+-NEEDLE worker boot: creating telemetry...
+-NEEDLE worker boot: telemetry created
+-NEEDLE worker boot: emitting worker.booting event (sync)...
+-NEEDLE worker boot: worker.booting written to disk
+-NEEDLE worker boot: starting telemetry writer thread...
+-NEEDLE telemetry: starting writer thread and waiting for ready signal...
+-NEEDLE telemetry: waiting for writer thread ready signal (timeout 5s)...
+-NEEDLE telemetry writer thread: started successfully
+-NEEDLE telemetry writer thread: signaling ready to main thread...
+-NEEDLE telemetry writer thread: ready, waiting for events...
+-NEEDLE telemetry: writer thread ready signal received
+-NEEDLE telemetry: start_and_wait complete
+-NEEDLE worker boot: writer thread started
+-NEEDLE worker boot: starting init step 'bead_store_discover'...
+-2026-08-03T23:43:25.760108Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=1
+-NEEDLE telemetry writer thread: first event written: init.step.started
+-2026-08-03T23:43:25.762186Z DEBUG needle::bead_store: bead-forge version check passed
+-2026-08-03T23:43:25.762674Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=2
+-NEEDLE worker boot: init step 'bead_store_discover' completed in 2ms
+-NEEDLE worker boot: starting init step 'worker_construction'...
+-2026-08-03T23:43:25.812897Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=3
+-2026-08-03T23:43:25.813029Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/SIGIL
+-2026-08-03T23:43:25.813038Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/vibecodeleaderboard-backend
+-2026-08-03T23:43:25.813065Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/pdftract
+-2026-08-03T23:43:25.813071Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/gantry-rs
+-2026-08-03T23:43:25.813078Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/pdftract-php
+-2026-08-03T23:43:25.813084Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/mta-my-way
+-2026-08-03T23:43:25.813088Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/NEEDLE
+-2026-08-03T23:43:25.813093Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/telegram-claude-bridge
+-2026-08-03T23:43:25.813104Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/pdftract-dotnet
+-2026-08-03T23:43:25.813111Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/pose-detection
+-2026-08-03T23:43:25.813113Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/SEAM
+-2026-08-03T23:43:25.813134Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/pdftract-swift
+-2026-08-03T23:43:25.813138Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/drawrace
+-2026-08-03T23:43:25.813147Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/cgov-polish-queue
+-2026-08-03T23:43:25.813150Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/mobile-gaming
+-2026-08-03T23:43:25.813155Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/declarative-config
+-2026-08-03T23:43:25.813161Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/miroir
+-2026-08-03T23:43:25.813166Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/swift-sdk-temp
+-2026-08-03T23:43:25.813170Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/HOOP
+-2026-08-03T23:43:25.813178Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/vista
+-2026-08-03T23:43:25.813181Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/spaxel
+-2026-08-03T23:43:25.813188Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/gribtract
+-2026-08-03T23:43:25.813194Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/claude-print
+-2026-08-03T23:43:25.813197Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/claude-governor
+-2026-08-03T23:43:25.813200Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/domain-check
+-2026-08-03T23:43:25.813203Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/commitgraph
+-2026-08-03T23:43:25.813208Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/test_bf_2hqt
+-2026-08-03T23:43:25.813213Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/zai-proxy
+-2026-08-03T23:43:25.813222Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/AgentScribe
+-2026-08-03T23:43:25.813226Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/aide-de-camp
+-2026-08-03T23:43:25.813236Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/ai-code-battle
+-2026-08-03T23:43:25.813239Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/ARMOR
+-2026-08-03T23:43:25.813243Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/FABRIC
+-2026-08-03T23:43:25.813247Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/jeds-curated-skills
+-2026-08-03T23:43:25.813263Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/sun-sim
+-2026-08-03T23:43:25.813281Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/twitterapi-proxy
+-2026-08-03T23:43:25.813295Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/bead-forge
+-2026-08-03T23:43:25.813302Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/testrepo
+-2026-08-03T23:43:25.813308Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/test-unflushed-workspace
+-2026-08-03T23:43:25.813316Z DEBUG needle::strand::explore: discovered workspace workspace=/home/coding/warden
+-2026-08-03T23:43:25.813346Z DEBUG needle::strand::explore: workspace discovery complete root=/home/coding/ count=40
+-2026-08-03T23:43:25.813349Z  INFO needle::strand::explore: Explore auto-discovery: workspaces re-discovered every cycle (rediscovery_cycles throttle no longer applied) worker=claude-code-glm-4.7-test-debug-worker configured_rediscovery_cycles=60
+-2026-08-03T23:43:25.813355Z  WARN needle::strand: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-Splice strand is ENABLED but strands.splice.report_workspace is NOT SET!
+-Worker failure and live-loop detection will NOT create escalation beads.
+-To fix, add to your ~/.config/needle/config.yaml:
+-strands:splice:report_workspace: /path/to/your/workspace
+-Or set NEEDLE_STRANDS__SPLICE__REPORT_WORKSPACE=/path/to/workspace
+-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-2026-08-03T23:43:25.817188Z DEBUG needle::sanitize: skipping invalid allowlist regex rule="global-allowlist" error=regex parse error:
+-    ^\$(?:\d+|{\d+})$
+-              ^
+-error: repetition operator missing expression pattern=^\$(?:\d+|{\d+})$
+-2026-08-03T23:43:25.817264Z DEBUG needle::sanitize: skipping invalid allowlist regex rule="global-allowlist" error=regex parse error:
+-    ^\${(?:[A-Z_]+|[a-z_]+)}$
+-        ^
+-error: repetition quantifier expects a valid decimal pattern=^\${(?:[A-Z_]+|[a-z_]+)}$
+-2026-08-03T23:43:26.394533Z DEBUG needle::sanitize: skipping invalid allowlist regex rule_id=curl-auth-user error=regex parse error:
+-    ['"]?\$?{{[^}]+}}['"]?:['"]?\$?{{[^}]+}}['"]?
+-             ^
+-error: repetition quantifier expects a valid decimal pattern=['"]?\$?{{[^}]+}}['"]?:['"]?\$?{{[^}]+}}['"]?
+-2026-08-03T23:43:26.924522Z DEBUG needle::sanitize: gitleaks rule regex compile error rule_id=generic-api-key error=Compiled regex exceeds size limit of 10485760 bytes. pattern=(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)
+-2026-08-03T23:43:26.924537Z DEBUG needle::sanitize: skipping gitleaks rule: regex failed to compile rule_id=generic-api-key
+-2026-08-03T23:43:27.853021Z DEBUG needle::sanitize: skipping gitleaks rule: regex failed to compile rule_id=pkcs12-file
+-2026-08-03T23:43:28.138153Z DEBUG needle::sanitize: gitleaks rule regex compile error rule_id=pypi-upload-token error=Compiled regex exceeds size limit of 10485760 bytes. pattern=pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}
+-2026-08-03T23:43:28.138167Z DEBUG needle::sanitize: skipping gitleaks rule: regex failed to compile rule_id=pypi-upload-token
+-2026-08-03T23:43:28.830925Z DEBUG needle::sanitize: gitleaks rule regex compile error rule_id=vault-batch-token error=Compiled regex exceeds size limit of 10485760 bytes. pattern=\b(hvb\.[\w-]{138,300})(?:[\x60'"\s;]|\\[nr]|$)
+-2026-08-03T23:43:28.830939Z DEBUG needle::sanitize: skipping gitleaks rule: regex failed to compile rule_id=vault-batch-token
+-2026-08-03T23:43:28.993956Z  INFO needle::dispatch: trace sanitizer initialized rule_count=218 custom_count=0
+-2026-08-03T23:43:28.994477Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=4
+-NEEDLE worker boot: init step 'worker_construction' completed in 3181ms
+-NEEDLE worker boot: all init steps completed in 3287ms, starting worker loop...
+-2026-08-03T23:43:29.044973Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=5
+-2026-08-03T23:43:29.044999Z  WARN needle::config: strands.splice.enabled is true, but strands.splice.report_workspace is not set. Splice will not create worker failure or loop detection beads. Set strands.splice.report_workspace to a valid workspace path in your config (e.g., ~/.config/needle/config.yaml or .needle.yaml).
+-2026-08-03T23:43:29.045007Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=6
+-2026-08-03T23:43:29.045010Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=7
+-2026-08-03T23:43:29.045264Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=8
+-2026-08-03T23:43:29.045269Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=9
+-2026-08-03T23:43:29.045270Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=10
+-2026-08-03T23:43:29.045273Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=11
+-2026-08-03T23:43:29.045338Z  INFO needle::health: heartbeat emitter started worker=test-debug-worker interval_secs=30 path=/home/coding/.needle/state/heartbeats/claude-code-glm-4.7-test-debug-worker.json
+-2026-08-03T23:43:29.045342Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=12
+-2026-08-03T23:43:29.045345Z DEBUG needle::telemetry: telemetry event event_type=worker.started seq=13
+-2026-08-03T23:43:29.045350Z DEBUG needle::worker: state transition from=BOOTING to=SELECTING
+-2026-08-03T23:43:29.045365Z  INFO needle::worker: worker booted worker=test-debug-worker strands=["pluck", "mend", "explore", "weave", "unravel", "pulse", "reflect", "splice", "knot"]
+-2026-08-03T23:43:29.045369Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=15
+-2026-08-03T23:43:29.047081Z DEBUG needle::bead_store: bead-forge version check passed
+-2026-08-03T23:43:29.047105Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=16
+-2026-08-03T23:43:29.047128Z DEBUG needle::telemetry: telemetry event event_type=init.step.started seq=17
+-2026-08-03T23:43:29.080164Z  INFO needle::worker: recorded spawn-path binary metadata path=/home/coding/.needle/bin/needle-stable inode=18483325 mtime_secs=1785528128 size=12829688 hash=1013b3f85ac470f6
+-2026-08-03T23:43:29.080203Z DEBUG needle::telemetry: telemetry event event_type=init.step.completed seq=18
+-2026-08-03T23:43:29.080267Z DEBUG needle::worker: installed synchronous signal handler signal=15
+-2026-08-03T23:43:29.080275Z DEBUG needle::worker: installed synchronous signal handler signal=2
+-2026-08-03T23:43:29.080283Z DEBUG needle::worker: installed synchronous signal handler signal=1
+-2026-08-03T23:43:29.080309Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::telemetry: telemetry event event_type=bead.claim.attempted seq=19
+-2026-08-03T23:43:29.104214Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::telemetry: telemetry event event_type=bead.claim.succeeded seq=20
+-2026-08-03T23:43:29.104255Z  INFO worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::worker: atomically claimed bead via claim_auto bead_id=bf-4026a
+-2026-08-03T23:43:29.104263Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::worker: state transition from=SELECTING to=BUILDING
+-2026-08-03T23:43:29.105401Z DEBUG needle::telemetry: telemetry event event_type=build.heartbeat seq=22
+-2026-08-03T23:43:29.107913Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}:bead.prompt_build{needle.bead.id=bf-4026a}: needle::worker: state transition from=BUILDING to=DISPATCHING
+-2026-08-03T23:43:29.107966Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::telemetry: telemetry event event_type=agent.routing_decision seq=24
+-2026-08-03T23:43:29.108289Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}:agent.dispatch{gen_ai.system=zai gen_ai.request.model=glm-4.7}: needle::telemetry: telemetry event event_type=rate_limit.allowed seq=25
+-2026-08-03T23:43:29.108410Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}:agent.dispatch{gen_ai.system=zai gen_ai.request.model=glm-4.7}: needle::worker: state transition from=DISPATCHING to=EXECUTING
+-2026-08-03T23:43:29.108446Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}: needle::telemetry: telemetry event event_type=agent.routing_decision seq=27
+-2026-08-03T23:43:29.110273Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}:agent.execution{needle.bead.id=bf-4026a}:agent.dispatch{needle.bead.id=bf-4026a gen_ai.system=zai gen_ai.operation.name="chat" gen_ai.request.id=bf-4026a}: needle::telemetry: telemetry event event_type=agent.dispatched seq=28
+-2026-08-03T23:43:29.129488Z DEBUG worker.session{needle.worker_id=claude-code-glm-4.7-test-debug-worker needle.session_id=17c54440 needle.agent=claude-code-glm-4.7 needle.model=claude-code-glm-4.7 needle.workspace=/home/coding/claude-governor}:agent.execution{needle.bead.id=bf-4026a}:agent.dispatch{needle.bead.id=bf-4026a gen_ai.system=zai gen_ai.operation.name="chat" gen_ai.request.id=bf-4026a}:agent.execution{needle.bead.id=bf-4026a needle.agent.pid=1792415}: needle::telemetry: telemetry event event_type=transform.skipped seq=29
+diff --git a/notes/pluck-debug-output-full.log b/notes/pluck-debug-output-full.log
+deleted file mode 100644
+index bd10527..0000000
+--- a/notes/pluck-debug-output-full.log
++++ /dev/null
+@@ -1,265 +0,0 @@
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 723 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+-
+-
+-running 1 test
+-
+-=== PLUCK FILTER PARAMETERS ===
+-Workspace path: /home/coding/claude-governor/.beads/beads.db
+-State filter: 'open'
+-Labels (include filter): [] (0 labels)
+-Exclude labels (exclude filter): ["deferred", "human", "blocked"] (3 labels)
+-Assignee filter: 'IS NULL' (always filters unassigned issues)
+-===============================
+-
+-
+---- QUERY CONSTRUCTION LOG ---
+-=== QUERY CONSTRUCTION START ===
+-Workspace: /home/coding/claude-governor/.beads/beads.db
+-Initial parameters provided:
+-  - state_filter: 'open'
+-  - labels_filter: 0 labels
+-  - exclude_labels_filter: 3 labels
+-✓ Added SELECT clause for counting distinct issue IDs
+-✓ Added FROM clause (issues table aliased as 'i')
+-✓ Added LEFT JOIN for labels table
+-✓ Added WHERE clause with state filter: 'open'
+-✓ Added assignee filter: IS NULL (Pluck always filters unassigned issues)
+-✓ Added exclude_labels filter (NOT EXISTS):
+-    Excluded labels: ["deferred", "human", "blocked"]
+-○ No labels filter (empty - no label inclusion requirement)
+-=== QUERY CONSTRUCTION COMPLETE ===
+-Total query components: 6
+-Total filter parameters tracked: 5
+-Final query parameters: ["state:open", "assignee:NULL", "exclude:deferred", "exclude:human", "exclude:blocked"]
+-===============================
+--------------------------------
+-
+-
+-=== PLUCK QUERY CONSTRUCTION ===
+-Workspace path: /home/coding/claude-governor/.beads/beads.db
+-State filter: 'open'
+-Labels filter (include): []
+-Exclude labels filter: ["deferred", "human", "blocked"]
+---- CONSTRUCTED QUERY ---
+-SELECT COUNT(DISTINCT i.id)
+-  FROM issues i
+-  LEFT JOIN labels l ON l.issue_id = i.id
+-  WHERE i.status = 'open'
+-  AND i.assignee IS NULL
+-  AND NOT EXISTS (SELECT 1 FROM labels WHERE issue_id = i.id AND label IN ('deferred', 'human', 'blocked') )
+-Query parameters: ["state:open", "assignee:NULL", "exclude:deferred", "exclude:human", "exclude:blocked"]
+-===============================
+-
+-=== QUERY VERIFICATION ===
+-✓ Query constructed from provided filter parameters
+-✓ Workspace path: /home/coding/claude-governor/.beads/beads.db
+-✓ State filter: 'open'
+-✓ Exclude labels: ["deferred", "human", "blocked"] (3 labels)
+-✓ Include labels: [] (0 labels)
+-✓ Assignee filter: always applied (IS NULL)
+-========================
+-
+-=== QUERY STRUCTURE VERIFICATION ===
+-✓ Query structure is valid
+-✓ All expected clauses present
+-==================================
+-
+-=== QUERY EXECUTION RESULTS ===
+-Claimable issues (Pluck query result): 36
+-✓ Query executed successfully
+-==============================
+-
+-=== QUERY EXECUTION SUMMARY ===
+-✓ Query constructed and verified
+-✓ Database: /home/coding/claude-governor/.beads/beads.db
+-✓ Result: 36 claimable issues
+-✓ Filters applied:
+-    - State: 'open'
+-    - Assignee: IS NULL
+-    - Excluded labels: ["deferred", "human", "blocked"]
+-================================
+-
+-Issues excluded by Pluck filters: 83
+-
+-=== PLUCK DATABASE CONNECTIVITY TEST RESULTS ===
+-Database path: /home/coding/claude-governor/.beads/beads.db
+-File exists: true
+-Connection successful: true
+-Database integrity check: true
+-Database schema valid: true
+-Total issues in database: 1262
+-Open issues: 41
+-Issues with labels: 768
+-Test errors: None
+-===================================================
+-
+-test test_pluck_database_connectivity ... ok
+-
+-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+-
+-
+-running 0 tests
+-
+-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+-
+-
+-running 1 test
+-
+-=== SYSTEMATIC PLUCK FILTER COMBINATION TEST ===
+-Database path: /home/coding/claude-governor/.beads/beads.db
+-================================================
+-
+-✓ BASE - No filters: 1262 issues
+-✓ Only state = 'open': 41 issues
+-✓ Only assignee IS NULL: 373 issues
+-✓ Only exclude_labels (deferred, human, blocked): 1179 issues
+-✓ state + assignee: 40 issues
+-✓ state + exclude_labels: 36 issues
+-✓ assignee + exclude_labels: 369 issues
+-✓ FULL QUERY - state + assignee + exclude_labels: 36 issues
+-
+-=== ANALYSIS ===
+-Total scenarios tested: 8
+-Blocking conditions found: 0
+-
+-=== FILTER IMPACT ANALYSIS ===
+-Base count (no filters): 1262
+-BASE - No filters: Δ=0 (0% reduction)
+-Only state = 'open': Δ=1221 (96.75118858954042% reduction)
+-Only assignee IS NULL: Δ=889 (70.44374009508716% reduction)
+-Only exclude_labels (deferred, human, blocked): Δ=83 (6.576862123613313% reduction)
+-state + assignee: Δ=1222 (96.83042789223455% reduction)
+-state + exclude_labels: Δ=1226 (97.1473851030111% reduction)
+-assignee + exclude_labels: Δ=893 (70.7606973058637% reduction)
+-FULL QUERY - state + assignee + exclude_labels: Δ=1226 (97.1473851030111% reduction)
+-=========================
+-
+-=== BLOCKING CONDITION IDENTIFICATION ===
+-=========================================
+-
+-test test_pluck_filter_combinations ... ok
+-
+-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+-
+-
+-running 2 tests
+-
+-=== DOT PATH RESOLUTION TEST ===
+-Showing how '.' resolves in different contexts
+-
+-Rust std::env::current_dir(): /home/coding/claude-governor
+-
+-=== PLUCK WORKSPACE MISMATCH TEST ===
+-Testing if workspace='.' resolves to wrong directory
+-
+-PathBuf::from('.'): .
+-
+---- Testing: Current workspace (correct) ---
+-Workspace path: /home/coding/claude-governor
+-canonicalize('.'): /home/coding/claude-governor
+-Database path: /home/coding/claude-governor/.beads/beads.db
+-
+-Parent directory database:
+-  Path: /home/coding/.beads/beads.db
+-  Exists: true
+-
+-Current directory database:
+-  Path: /home/coding/claude-governor/.beads/beads.db
+-  Exists: true
+-
+-💡 ISSUE: If Pluck resolves '.' to parent instead of current,
+-   it queries the wrong database and finds 0 ready beads!
+-=====================================
+-
+-test test_dot_path_resolution ... ok
+-✅ Connection successful
+-   Total issues: 1262
+-   Open issues: 41
+-   Ready beads (Pluck query): 36
+-
+---- Testing: Parent workspace (wrong - where '.' resolves) ---
+-Workspace path: /home/coding
+-Database path: /home/coding/.beads/beads.db
+-✅ Connection successful
+-   Total issues: 5
+-   Open issues: 0
+-   Ready beads (Pluck query): 0
+-   ⚠️  BLOCKING: Pluck would return 0 candidates here!
+-   💡 This explains why Pluck starves when workspace='.'
+-
+-=== ROOT CAUSE ANALYSIS ===
+-Problem: Pluck uses workspace='.' which resolves differently than expected
+-
+-Current directory resolution:
+-  - In shell: cwd = /home/coding/claude-governor
+-  - In NEEDLE: workspace='.' → /home/coding (parent!)
+-
+-Result:
+-  - Correct database: /home/coding/claude-governor/.beads/beads.db → 36 ready beads
+-  - Wrong database:   /home/coding/.beads/beads.db → 0 ready beads
+-
+-💡 SOLUTION: Pluck needs absolute workspace path, not relative '.'
+-==============================
+-
+-test test_pluck_workspace_mismatch ... ok
+-
+-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+-

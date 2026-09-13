@@ -1,0 +1,207 @@
+diff --git a/src/db.rs b/src/db.rs
+index f950a56..99f1cb0 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -2125,7 +2125,10 @@ mod tests {
+                 |row| row.get(0),
+             )
+             .unwrap();
+-        assert_eq!(annotated, 2, "both instance rows should have been annotated");
++        assert_eq!(
++            annotated, 2,
++            "both instance rows should have been annotated"
++        );
+ 
+         let after_bytes = fs::read(&jsonl_path).unwrap();
+         assert_eq!(
+@@ -2143,11 +2146,9 @@ mod tests {
+         rebuild_from_jsonl(&jsonl_path, &db_path).unwrap();
+         let conn = open_db(&db_path).unwrap();
+         let still_annotated: i64 = conn
+-            .query_row(
+-                "SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL",
+-                [],
+-                |row| row.get(0),
+-            )
++            .query_row("SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL", [], |row| {
++                row.get(0)
++            })
+             .unwrap();
+         assert_eq!(
+             still_annotated, 0,
+diff --git a/src/poller.rs b/src/poller.rs
+index a29af54..2f1c48f 100644
+--- a/src/poller.rs
++++ b/src/poller.rs
+@@ -393,9 +393,10 @@ impl Poller {
+             ))
+         })?;
+ 
+-        let creds: Credentials = serde_json::from_str(&content).map_err(|e: serde_json::Error| {
+-            anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
+-        })?;
++        let creds: Credentials =
++            serde_json::from_str(&content).map_err(|e: serde_json::Error| {
++                anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
++            })?;
+ 
+         // Validate credentials are not corrupted
+         if creds.claude_ai_oauth.access_token.is_empty() {
+@@ -434,8 +435,8 @@ impl Poller {
+ 
+         // Write to temp file
+         {
+-            let mut file = File::create(&temp_path)
+-                .context("Failed to create temp credentials file")?;
++            let mut file =
++                File::create(&temp_path).context("Failed to create temp credentials file")?;
+             file.write_all(content.as_bytes())
+                 .context("Failed to write temp credentials file")?;
+             // fsync to ensure data is on disk before rename
+diff --git a/tests/apportioning_test.rs b/tests/apportioning_test.rs
+index 91e35a5..193760e 100644
+--- a/tests/apportioning_test.rs
++++ b/tests/apportioning_test.rs
+@@ -107,11 +107,7 @@ fn test_four_rows_complex_distribution() {
+ #[test]
+ fn test_zero_delta_all_zeros() {
+     // When delta is zero, all rows should get zero
+-    let rows = vec![
+-        (0.10, 0.0),
+-        (0.20, 0.0),
+-        (0.30, 0.0),
+-    ];
++    let rows = vec![(0.10, 0.0), (0.20, 0.0), (0.30, 0.0)];
+     verify_apportioning(rows, 0.0);
+ }
+ 
+@@ -146,9 +142,9 @@ fn test_small_fractional_weights() {
+     // Total: 0.001 + 0.002 + 0.003 = 0.006
+     // Delta: 0.12
+     let rows = vec![
+-        (0.001, 0.02),  // 1/6 of delta = 0.02
+-        (0.002, 0.04),  // 2/6 of delta = 0.04
+-        (0.003, 0.06),  // 3/6 of delta = 0.06
++        (0.001, 0.02), // 1/6 of delta = 0.02
++        (0.002, 0.04), // 2/6 of delta = 0.04
++        (0.003, 0.06), // 3/6 of delta = 0.06
+     ];
+     verify_apportioning(rows, 0.12);
+ 
+@@ -161,8 +157,8 @@ fn test_small_fractional_weights() {
+ fn test_one_row_zero_weight_gets_nothing() {
+     // One row has zero weight, another has all the weight
+     let rows = vec![
+-        (0.0, 0.0),   // Zero weight → zero apportioned
+-        (1.0, 1.5),   // All weight → full delta
++        (0.0, 0.0), // Zero weight → zero apportioned
++        (1.0, 1.5), // All weight → full delta
+     ];
+     verify_apportioning(rows, 1.5);
+ }
+diff --git a/tests/pluck_filter_combinations_test.rs b/tests/pluck_filter_combinations_test.rs
+index 1b0c941..d5f9ea2 100644
+--- a/tests/pluck_filter_combinations_test.rs
++++ b/tests/pluck_filter_combinations_test.rs
+@@ -1,8 +1,8 @@
+ // Systematic Pluck filter combination test
+ // Tests each filter individually and in combination to identify blocking conditions
+ 
+-use std::path::PathBuf;
+ use rusqlite::Connection;
++use std::path::PathBuf;
+ 
+ #[test]
+ fn test_pluck_filter_combinations() {
+@@ -87,7 +87,7 @@ fn test_pluck_filter_combinations() {
+ 
+     // Find the delta - what each filter removes
+     println!("\n=== FILTER IMPACT ANALYSIS ===");
+-    let base_count = results[0].1;  // BASE - No filters
++    let base_count = results[0].1; // BASE - No filters
+     println!("Base count (no filters): {}", base_count);
+ 
+     for (name, count, _) in &results {
+diff --git a/tests/pluck_workspace_mismatch_test.rs b/tests/pluck_workspace_mismatch_test.rs
+index 76dfd08..118f736 100644
+--- a/tests/pluck_workspace_mismatch_test.rs
++++ b/tests/pluck_workspace_mismatch_test.rs
+@@ -1,8 +1,8 @@
+ // Test Pluck workspace mismatch bug
+ // Demonstrates that Pluck returns 0 results due to incorrect workspace path resolution
+ 
+-use std::path::PathBuf;
+ use rusqlite::Connection;
++use std::path::PathBuf;
+ 
+ #[test]
+ fn test_pluck_workspace_mismatch() {
+@@ -16,7 +16,10 @@ fn test_pluck_workspace_mismatch() {
+     // Test both databases
+     let test_dbs = vec![
+         ("Current workspace (correct)", current_workspace),
+-        ("Parent workspace (wrong - where '.' resolves)", parent_workspace),
++        (
++            "Parent workspace (wrong - where '.' resolves)",
++            parent_workspace,
++        ),
+     ];
+ 
+     for (description, workspace_path) in test_dbs {
+@@ -36,11 +39,19 @@ fn test_pluck_workspace_mismatch() {
+                 println!("✅ Connection successful");
+ 
+                 // Count total issues
+-                let total: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0)).unwrap_or(0);
++                let total: i64 = conn
++                    .query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))
++                    .unwrap_or(0);
+                 println!("   Total issues: {}", total);
+ 
+                 // Count open issues
+-                let open: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE status = 'open'", [], |row| row.get(0)).unwrap_or(0);
++                let open: i64 = conn
++                    .query_row(
++                        "SELECT COUNT(*) FROM issues WHERE status = 'open'",
++                        [],
++                        |row| row.get(0),
++                    )
++                    .unwrap_or(0);
+                 println!("   Open issues: {}", open);
+ 
+                 // Run full Pluck query
+@@ -56,7 +67,9 @@ fn test_pluck_workspace_mismatch() {
+                     )
+                 ";
+ 
+-                let ready: i64 = conn.query_row(pluck_query, [], |row| row.get(0)).unwrap_or(0);
++                let ready: i64 = conn
++                    .query_row(pluck_query, [], |row| row.get(0))
++                    .unwrap_or(0);
+                 println!("   Ready beads (Pluck query): {}", ready);
+ 
+                 if ready == 0 && total > 0 {
+diff --git a/tests/test_workspace_path_formats.rs b/tests/test_workspace_path_formats.rs
+index 69d4e96..e2b6dd0 100644
+--- a/tests/test_workspace_path_formats.rs
++++ b/tests/test_workspace_path_formats.rs
+@@ -59,7 +59,9 @@ fn test_path_format(db_path: &PathBuf, description: &str) -> bool {
+             println!("✅ {} - Connection successful", description);
+ 
+             // Count total beads
+-            match conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get::<_, i64>(0)) {
++            match conn.query_row("SELECT COUNT(*) FROM issues", [], |row| {
++                row.get::<_, i64>(0)
++            }) {
+                 Ok(count) => println!("   Total beads: {}", count),
+                 Err(e) => println!("   Query failed: {}", e),
+             }
+@@ -68,7 +70,7 @@ fn test_path_format(db_path: &PathBuf, description: &str) -> bool {
+             match conn.query_row(
+                 "SELECT COUNT(*) FROM issues WHERE status = 'open'",
+                 [],
+-                |row| row.get::<_, i64>(0)
++                |row| row.get::<_, i64>(0),
+             ) {
+                 Ok(count) => println!("   Open beads: {}", count),
+                 Err(e) => println!("   Query failed: {}", e),

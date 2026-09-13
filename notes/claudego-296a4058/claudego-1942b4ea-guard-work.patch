@@ -1,0 +1,721 @@
+diff --git a/src/burn_rate.rs b/src/burn_rate.rs
+index 5209da8..f85c30f 100644
+--- a/src/burn_rate.rs
++++ b/src/burn_rate.rs
+@@ -3091,6 +3091,202 @@ mod tests {
+         );
+     }
+ 
++    /// claudego-1942b4ea: at zero workers, session burn is by definition not
++    /// fleet burn. The incident this pins (2026-09-07): the operator's Opus
++    /// session burned 11.9-14.4%/hr account-wide with NO workers running, and
++    /// the forecast charged all of it to the fleet — every window CUTOFF_RISK,
++    /// hard-limit margins -26h to -28h — against near-full real headroom.
++    ///
++    /// This session's burn must therefore NOT:
++    ///   - raise fleet CUTOFF_RISK on any window,
++    ///   - drive the reported fleet burn above zero,
++    ///   - produce a finite/negative hard-limit margin,
++    /// and where a window's real headroom supports a worker, the pool must
++    /// still be authorising one (the claudego-d64682d5 bootstrap must survive
++    /// this guard).
++    #[test]
++    fn zero_workers_session_burn_cannot_raise_cutoff_risk() {
++        let baseline = BaselineBurnRates::default();
++        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
++
++        // One operator session burning hard (12-14%/hr per window), fleet idle.
++        // Geometry chosen so that IF the session burn were attributed to the
++        // fleet, every window would sit at CUTOFF_RISK: five_hour would exhaust
++        // in 5/14 = 0.36h of the 4.0h remaining, seven_day in 28/12 = 2.33h of
++        // 28.8h, weekly_scoped in 30/13 = 2.31h of 100h.
++        let instances = vec![multi_window_record(
++            "operator-session",
++            "claude-opus-5",
++            26.10,
++            500_000,
++            Some(14.0),
++            Some(12.0),
++            Some(13.0),
++            85.0,
++            71.0,
++            62.0,
++            50.0,
++            60.0,
++            47.0,
++        )];
++
++        let mut utilization = HashMap::new();
++        utilization.insert("five_hour".to_string(), 85.0);
++        utilization.insert("seven_day".to_string(), 62.0);
++        utilization.insert("weekly_scoped".to_string(), 60.0);
++        let mut hrs_left = HashMap::new();
++        hrs_left.insert("five_hour".to_string(), 4.0);
++        hrs_left.insert("seven_day".to_string(), 28.8);
++        hrs_left.insert("weekly_scoped".to_string(), 100.0);
++
++        let (_estimate, forecast) = estimate_burn_rates(
++            &instances,
++            1.0,
++            0,
++            0,
++            &mut ema,
++            &baseline,
++            &utilization,
++            90.0,
++            &hrs_left,
++        );
++
++        for (name, window) in [
++            ("five_hour", &forecast.five_hour),
++            ("seven_day", &forecast.seven_day),
++            ("weekly_scoped", &forecast.weekly_scoped),
++        ] {
++            assert!(
++                !window.cutoff_risk,
++                "{name}: session burn at zero workers must not raise fleet CUTOFF_RISK"
++            );
++            assert_eq!(
++                window.fleet_pct_per_hour, 0.0,
++                "{name}: reported fleet burn must be 0 with no fleet running"
++            );
++            assert!(
++                window.hard_limit_margin_hrs.is_infinite() && window.hard_limit_margin_hrs > 0.0,
++                "{name}: hard-limit margin must read as unbounded, got {}",
++                window.hard_limit_margin_hrs
++            );
++            assert!(
++                window.predicted_exhaustion_hours.is_infinite(),
++                "{name}: exhaustion must read as never, got {}",
++                window.predicted_exhaustion_hours
++            );
++        }
++
++        // seven_day has real headroom (28% remaining over 28.8h, behind the
++        // flat-spend pace line), so the pool must still be sizeable from zero:
++        // the sizing question is hypothetical and needs no running worker.
++        assert!(
++            forecast.seven_day.safe_worker_count.unwrap_or(0) >= 1,
++            "real headroom at zero workers must still authorise a worker, got {:?}",
++            forecast.seven_day.safe_worker_count
++        );
++        // five_hour is genuinely spent (5% remaining, ahead of its pace line),
++        // so 0 there is the pace gate working, not the bootstrap failing.
++        assert_eq!(forecast.five_hour.safe_worker_count, Some(0));
++    }
++
++    /// claudego-1942b4ea regression pin: with workers actually running, the
++    /// zero-worker guard must not dampen anything — measured fleet burn is
++    /// reported as measured, cutoff risk is raised when burn really does
++    /// outrun a window, and per-window fleet stats stay per-worker-honest.
++    #[test]
++    fn workers_present_burn_behavior_is_unchanged() {
++        let baseline = BaselineBurnRates::default();
++        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
++
++        // Two workers burning 12-14%/hr per window (fleet means 13 and 12).
++        let instances = vec![
++            multi_window_record(
++                "w1",
++                "claude-sonnet-4-20250514",
++                26.10,
++                500_000,
++                Some(14.0),
++                Some(12.0),
++                Some(1.0),
++                85.0,
++                71.0,
++                62.0,
++                50.0,
++                60.0,
++                59.0,
++            ),
++            multi_window_record(
++                "w2",
++                "claude-sonnet-4-20250514",
++                22.0,
++                450_000,
++                Some(12.0),
++                Some(12.0),
++                Some(1.0),
++                85.0,
++                71.0,
++                62.0,
++                50.0,
++                60.0,
++                59.0,
++            ),
++        ];
++
++        let mut utilization = HashMap::new();
++        utilization.insert("five_hour".to_string(), 85.0);
++        utilization.insert("seven_day".to_string(), 62.0);
++        utilization.insert("weekly_scoped".to_string(), 60.0);
++        let mut hrs_left = HashMap::new();
++        hrs_left.insert("five_hour".to_string(), 4.0);
++        hrs_left.insert("seven_day".to_string(), 28.8);
++        hrs_left.insert("weekly_scoped".to_string(), 100.0);
++
++        let (estimate, forecast) = estimate_burn_rates(
++            &instances,
++            1.0,
++            2,
++            2,
++            &mut ema,
++            &baseline,
++            &utilization,
++            90.0,
++            &hrs_left,
++        );
++
++        // Fleet stats unchanged: per-session mean over 2 workers.
++        let five = estimate.fleet_stats.get("five_hour").unwrap();
++        assert!(
++            (five.mean_pct_hr - 13.0).abs() < 1e-9,
++            "got {}",
++            five.mean_pct_hr
++        );
++        assert_eq!(five.worker_count, 2);
++
++        // five_hour: 5% headroom over 4.0h against 13%/hr fleet burn — a REAL
++        // cutoff risk, unlike the zero-worker case above.
++        assert!(
++            forecast.five_hour.cutoff_risk,
++            "real fleet burn outrunning five_hour must raise CUTOFF_RISK"
++        );
++        assert!(
++            (forecast.five_hour.fleet_pct_per_hour - 13.0).abs() < 1e-9,
++            "fleet burn must be reported as measured, got {}",
++            forecast.five_hour.fleet_pct_per_hour
++        );
++        assert!(forecast.five_hour.hard_limit_margin_hrs < 0.0);
++        assert!(forecast.five_hour.hard_limit_margin_hrs.is_finite());
++
++        // seven_day: burn outruns the window too, and the pace line still
++        // duty-cycles one worker (remaining 28% over 28.8h is behind the line).
++        assert!(forecast.seven_day.cutoff_risk);
++        assert!(
++            (forecast.seven_day.fleet_pct_per_hour - 12.0).abs() < 1e-9,
++            "got {}",
++            forecast.seven_day.fleet_pct_per_hour
++        );
++        assert_eq!(forecast.seven_day.safe_worker_count, Some(1));
++    }
++
+     /// The core defect: exogenous burn must not be charged to the pool's workers.
+     /// A single worker alongside a heavy operator session previously read as if
+     /// that one worker were burning the operator's rate.
+diff --git a/src/governor.rs b/src/governor.rs
+index c6224b4..0615e56 100644
+--- a/src/governor.rs
++++ b/src/governor.rs
+@@ -1325,6 +1325,72 @@ pub fn calculate_window_pct_delta(
+     (delta_5h, delta_7d, delta_7ds)
+ }
+ 
++/// Effective fleet burn rate (%/hr) for one window, resolved from the four
++/// sources in priority order: (A) the API-delta EMA, (B) the learned
++/// dollars-per-percent ratio, (C) the baseline ratio fallback, (D) zero.
++///
++/// Zero-worker guard (claudego-1942b4ea): with no fleet running, measured burn
++/// is by definition not fleet burn, so the rate is pinned to 0 regardless of
++/// what the other sources hold. Strategy (A) especially needs this: the
++/// API-delta EMA can carry a nonzero value written while workers were last
++/// running (state persists across restarts), and without the pin every
++/// forecast, `cgov status` line and `cgov forecast` pane would dress the
++/// operator's interactive session up as fleet burn — exhaustion margins
++/// collapsing to -26h and every window flagged CUTOFF_RISK against near-full
++/// headroom, as observed 2026-09-07 with zero workers running. Strategies
++/// (B)/(C) already fold to 0 on their own via `fleet_usd_hr == 0`.
++pub fn effective_fleet_pct_rate(
++    current_total: u32,
++    samples: u32,
++    ema_val: f64,
++    fleet_usd_hr: f64,
++    usd_per_pct: f64,
++    baseline_usd_per_pct: f64,
++) -> f64 {
++    if current_total == 0 {
++        0.0
++    } else if samples >= 1 && ema_val > 0.0 {
++        ema_val // (A) API delta EMA
++    } else if fleet_usd_hr > 0.0 && usd_per_pct > 0.0 {
++        fleet_usd_hr / usd_per_pct // (B) learned ratio
++    } else if fleet_usd_hr > 0.0 {
++        fleet_usd_hr / baseline_usd_per_pct // (C) baseline ratio fallback
++    } else {
++        0.0 // (D) no data at all
++    }
++}
++
++/// Per-worker pct/hr rate used to size the fleet ("if I ran one worker, could
++/// I afford it?").
++///
++/// Zero-worker bootstrap (claudego-d64682d5's live-path twin, wired in by the
++/// claudego-1942b4ea guard): with the fleet at 0 workers there is no measured
++/// per-worker rate — [`effective_fleet_pct_rate`] pins the fleet rate to 0 —
++/// so size the hypothetical from the configured baseline. Without this the
++/// gate closes the claudego-d64682d5 loop again: 0 workers -> rate 0 ->
++/// safe_worker_count None -> the governor holds at current (0) -> 0 workers
++/// forever, and the pool can never start.
++///
++/// With workers running, `current_total.max(1)` rather than a strict divide:
++/// when the fleet has genuinely scaled to 0-but-holding while real aggregate
++/// rate data exists, dividing by a hypothetical 1 worker yields a
++/// conservative (pessimistic) per-worker estimate. True cold start
++/// (`fleet_pct_hr == 0`, workers running) yields 0.0 and falls through to the
++/// max_workers-ceiling bootstrap path downstream.
++pub fn per_worker_pct_for_sizing(
++    current_total: u32,
++    fleet_pct_hr: f64,
++    baseline_pct_per_worker: f64,
++) -> f64 {
++    if current_total == 0 {
++        baseline_pct_per_worker
++    } else if fleet_pct_hr > 0.0 {
++        fleet_pct_hr / current_total.max(1) as f64
++    } else {
++        0.0
++    }
++}
++
+ /// Render a snapshot instant for a delta log line.
+ ///
+ /// `to_rfc3339()` emits nanosecond precision, which put 9 fractional digits —
+@@ -5656,108 +5722,133 @@ pub fn run_observe_cycle(
+                 let elapsed_hours_snap = elapsed_secs / 3600.0;
+ 
+                 if elapsed_secs >= MIN_ELAPSED_SECS && elapsed_secs <= MAX_ELAPSED_SECS {
+-                    // Compute per-window deltas from consecutive API snapshots
+-                    let old_pct = crate::db::WindowPctSnapshot {
+-                        five_hour: snap.five_hour_pct,
+-                        seven_day: snap.seven_day_pct,
+-                        weekly_scoped: snap.weekly_scoped_pct,
+-                    };
+-                    let new_pct = crate::db::WindowPctSnapshot {
+-                        five_hour: new_five_hour,
+-                        seven_day: new_seven_day,
+-                        weekly_scoped: new_weekly_scoped,
+-                    };
+-                    let (delta_5h, delta_7d, delta_7ds) =
+-                        calculate_window_pct_delta(&old_pct, &new_pct);
+-
+-                    // Fleet total USD/hr from the most recent fleet aggregate (with staleness checking)
+-                    let baseline = get_sonnet_baseline_config(&state, agents);
+-                    let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
+-                        &state.last_fleet_aggregate,
+-                        &baseline,
+-                    );
+-                    let fleet_usd_hr =
+-                        usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
+-
+-                    let samples = state.burn_rate.fleet_pct_ema_samples;
+-                    let mut updated_any = false;
+-
+-                    if delta_5h > 0.0 {
+-                        let rate = delta_5h / elapsed_hours_snap;
+-                        if samples == 0 {
+-                            state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
+-                        } else {
+-                            state.burn_rate.fleet_pct_hr_ema.five_hour = EMA_ALPHA * rate
+-                                + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.five_hour;
+-                        }
+-                        if fleet_usd_hr > 0.0 {
+-                            let ratio = fleet_usd_hr / rate;
++                    // Zero-worker guard (claudego-1942b4ea): the API reading is
++                    // account-wide, so with no fleet running every observed
++                    // percent is someone else's — the operator's interactive
++                    // session, another pool. Feeding it here would dress
++                    // account burn up as fleet burn in `fleet_pct_hr_ema`, and
++                    // the value outlives the idle period: when workers return,
++                    // strategy (A) below would keep charging the operator's
++                    // session to the fleet until the EMA decayed back. The
++                    // snapshot below still advances, so no stale-span delta is
++                    // computed across the idle stretch either.
++                    if current_total == 0 {
++                        log::info!(
++                            "[governor] 0 workers: skipping fleet EMA update — observed burn is \
++                             not fleet burn (5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% over {:.0}s)",
++                            new_five_hour - snap.five_hour_pct,
++                            new_seven_day - snap.seven_day_pct,
++                            new_weekly_scoped - snap.weekly_scoped_pct,
++                            elapsed_secs,
++                        );
++                    } else {
++                        // Compute per-window deltas from consecutive API snapshots
++                        let old_pct = crate::db::WindowPctSnapshot {
++                            five_hour: snap.five_hour_pct,
++                            seven_day: snap.seven_day_pct,
++                            weekly_scoped: snap.weekly_scoped_pct,
++                        };
++                        let new_pct = crate::db::WindowPctSnapshot {
++                            five_hour: new_five_hour,
++                            seven_day: new_seven_day,
++                            weekly_scoped: new_weekly_scoped,
++                        };
++                        let (delta_5h, delta_7d, delta_7ds) =
++                            calculate_window_pct_delta(&old_pct, &new_pct);
++
++                        // Fleet total USD/hr from the most recent fleet aggregate (with staleness checking)
++                        let baseline = get_sonnet_baseline_config(&state, agents);
++                        let usd_per_worker = crate::burn_rate::staleness_checked_fleet_dollar_rate(
++                            &state.last_fleet_aggregate,
++                            &baseline,
++                        );
++                        let fleet_usd_hr =
++                            usd_per_worker * state.last_fleet_aggregate.sonnet_workers as f64;
++
++                        let samples = state.burn_rate.fleet_pct_ema_samples;
++                        let mut updated_any = false;
++
++                        if delta_5h > 0.0 {
++                            let rate = delta_5h / elapsed_hours_snap;
+                             if samples == 0 {
+-                                state.burn_rate.usd_per_pct_ema_five_hour = ratio;
++                                state.burn_rate.fleet_pct_hr_ema.five_hour = rate;
+                             } else {
+-                                state.burn_rate.usd_per_pct_ema_five_hour = EMA_ALPHA * ratio
+-                                    + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_five_hour;
++                                state.burn_rate.fleet_pct_hr_ema.five_hour = EMA_ALPHA * rate
++                                    + (1.0 - EMA_ALPHA)
++                                        * state.burn_rate.fleet_pct_hr_ema.five_hour;
++                            }
++                            if fleet_usd_hr > 0.0 {
++                                let ratio = fleet_usd_hr / rate;
++                                if samples == 0 {
++                                    state.burn_rate.usd_per_pct_ema_five_hour = ratio;
++                                } else {
++                                    state.burn_rate.usd_per_pct_ema_five_hour = EMA_ALPHA * ratio
++                                        + (1.0 - EMA_ALPHA)
++                                            * state.burn_rate.usd_per_pct_ema_five_hour;
++                                }
+                             }
++                            updated_any = true;
+                         }
+-                        updated_any = true;
+-                    }
+ 
+-                    if delta_7d > 0.0 {
+-                        let rate = delta_7d / elapsed_hours_snap;
+-                        if samples == 0 {
+-                            state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
+-                        } else {
+-                            state.burn_rate.fleet_pct_hr_ema.seven_day = EMA_ALPHA * rate
+-                                + (1.0 - EMA_ALPHA) * state.burn_rate.fleet_pct_hr_ema.seven_day;
+-                        }
+-                        if fleet_usd_hr > 0.0 {
+-                            let ratio = fleet_usd_hr / rate;
++                        if delta_7d > 0.0 {
++                            let rate = delta_7d / elapsed_hours_snap;
+                             if samples == 0 {
+-                                state.burn_rate.usd_per_pct_ema_seven_day = ratio;
++                                state.burn_rate.fleet_pct_hr_ema.seven_day = rate;
+                             } else {
+-                                state.burn_rate.usd_per_pct_ema_seven_day = EMA_ALPHA * ratio
+-                                    + (1.0 - EMA_ALPHA) * state.burn_rate.usd_per_pct_ema_seven_day;
++                                state.burn_rate.fleet_pct_hr_ema.seven_day = EMA_ALPHA * rate
++                                    + (1.0 - EMA_ALPHA)
++                                        * state.burn_rate.fleet_pct_hr_ema.seven_day;
++                            }
++                            if fleet_usd_hr > 0.0 {
++                                let ratio = fleet_usd_hr / rate;
++                                if samples == 0 {
++                                    state.burn_rate.usd_per_pct_ema_seven_day = ratio;
++                                } else {
++                                    state.burn_rate.usd_per_pct_ema_seven_day = EMA_ALPHA * ratio
++                                        + (1.0 - EMA_ALPHA)
++                                            * state.burn_rate.usd_per_pct_ema_seven_day;
++                                }
+                             }
++                            updated_any = true;
+                         }
+-                        updated_any = true;
+-                    }
+ 
+-                    if delta_7ds > 0.0 {
+-                        let rate = delta_7ds / elapsed_hours_snap;
+-                        // VERIFICATION: Log that the weekly_scoped EMA is using the new model's pct
+-                        log::info!(
++                        if delta_7ds > 0.0 {
++                            let rate = delta_7ds / elapsed_hours_snap;
++                            // VERIFICATION: Log that the weekly_scoped EMA is using the new model's pct
++                            log::info!(
+                             "[governor] updating weekly_scoped EMA: delta={:+.3}%, rate={:.4}%/hr, model={:?}, source_pct={:.2}%",
+                             delta_7ds,
+                             rate,
+                             state.usage.weekly_scoped_model,
+                             new_weekly_scoped
+                         );
+-                        if samples == 0 {
+-                            state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
+-                        } else {
+-                            state.burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate
+-                                + (1.0 - EMA_ALPHA)
+-                                    * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
+-                        }
+-                        if fleet_usd_hr > 0.0 {
+-                            let ratio = fleet_usd_hr / rate;
+                             if samples == 0 {
+-                                state.burn_rate.usd_per_pct_ema_weekly_scoped = ratio;
++                                state.burn_rate.fleet_pct_hr_ema.weekly_scoped = rate;
+                             } else {
+-                                state.burn_rate.usd_per_pct_ema_weekly_scoped = EMA_ALPHA * ratio
++                                state.burn_rate.fleet_pct_hr_ema.weekly_scoped = EMA_ALPHA * rate
+                                     + (1.0 - EMA_ALPHA)
+-                                        * state.burn_rate.usd_per_pct_ema_weekly_scoped;
++                                        * state.burn_rate.fleet_pct_hr_ema.weekly_scoped;
+                             }
++                            if fleet_usd_hr > 0.0 {
++                                let ratio = fleet_usd_hr / rate;
++                                if samples == 0 {
++                                    state.burn_rate.usd_per_pct_ema_weekly_scoped = ratio;
++                                } else {
++                                    state.burn_rate.usd_per_pct_ema_weekly_scoped = EMA_ALPHA
++                                        * ratio
++                                        + (1.0 - EMA_ALPHA)
++                                            * state.burn_rate.usd_per_pct_ema_weekly_scoped;
++                                }
++                            }
++                            updated_any = true;
+                         }
+-                        updated_any = true;
+-                    }
+ 
+-                    if updated_any {
+-                        state.burn_rate.fleet_pct_ema_samples =
+-                            state.burn_rate.fleet_pct_ema_samples.saturating_add(1);
+-                    }
++                        if updated_any {
++                            state.burn_rate.fleet_pct_ema_samples =
++                                state.burn_rate.fleet_pct_ema_samples.saturating_add(1);
++                        }
+ 
+-                    log::info!(
++                        log::info!(
+                         "[governor] {} computed window deltas (in {:.0}s): 5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% \
+                          → EMA pct/hr: 5h={:.4} 7d={:.4} 7ds={:.4} (samples={})",
+                         current_reading_at.to_rfc3339(),
+@@ -5770,6 +5861,7 @@ pub fn run_observe_cycle(
+                         state.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+                         state.burn_rate.fleet_pct_ema_samples,
+                     );
++                    }
+                 }
+             }
+ 
+@@ -6021,15 +6113,14 @@ pub fn run_observe_cycle(
+             baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
+ 
+         let rate_for = |ema_val: f64, usd_per_pct: f64| -> f64 {
+-            if samples >= 1 && ema_val > 0.0 {
+-                ema_val // (A) API delta EMA
+-            } else if fleet_usd_hr > 0.0 && usd_per_pct > 0.0 {
+-                fleet_usd_hr / usd_per_pct // (B) learned ratio
+-            } else if fleet_usd_hr > 0.0 {
+-                fleet_usd_hr / baseline_usd_per_pct // (C) baseline ratio fallback
+-            } else {
+-                0.0 // (D) no data at all
+-            }
++            effective_fleet_pct_rate(
++                current_total,
++                samples,
++                ema_val,
++                fleet_usd_hr,
++                usd_per_pct,
++                baseline_usd_per_pct,
++            )
+         };
+ 
+         let mut map = HashMap::new();
+@@ -6151,31 +6242,19 @@ pub fn run_observe_cycle(
+         // Store effective target ceiling for this window (used later for logging)
+         effective_target_ceilings.insert(window.to_string(), effective_target_ceiling);
+ 
+-        // Per-worker pct/hr rate for safe_worker_count calculation
+         // Per-worker pct/hr rate for safe_worker_count calculation.
+         //
+-        // Use current_total.max(1) rather than requiring current_total > 0: when the
+-        // fleet has genuinely scaled to 0 (e.g. correctly holding at 0 to protect a
+-        // tight window) but we DO have real aggregate rate data (fleet_pct_hr > 0),
+-        // dividing by a hypothetical 1 worker yields a conservative (pessimistic)
+-        // per-worker estimate, letting safe_worker_count compute a real, stable 0
+-        // instead of collapsing to None ("insufficient data"). Previously, hitting
+-        // current_total == 0 made this 0.0 regardless of fleet_pct_hr, which flowed
+-        // into safe_worker_count_or_max's None branch and reset the ceiling to
+-        // max_workers — causing a 0 -> None -> max_workers -> real-0-again flap every
+-        // cycle the fleet drained to 0, launching (and billing) workers each time.
+-        // True cold start (fleet_pct_hr == 0, no samples ever) is unaffected: it still
+-        // yields 0.0 here and correctly falls through to the max_workers-ceiling
+-        // bootstrap path downstream.
+-        let pct_per_worker = if fleet_pct_hr > 0.0 {
+-            fleet_pct_hr / current_total.max(1) as f64
+-        } else {
+-            0.0
+-        };
++        // Baseline first: `get_sonnet_baseline_config` is also what backs the
++        // zero-worker bootstrap inside `per_worker_pct_for_sizing`.
++        let baseline = get_sonnet_baseline_config(&state, agents);
++        let pct_per_worker = per_worker_pct_for_sizing(
++            current_total,
++            fleet_pct_hr,
++            baseline.pct_per_worker_per_hour,
++        );
+ 
+         // Convert per-worker USD/hr stddev to pct/hr stddev using per-window USD-per-pct ratio.
+         // Falls back to baseline ratio from config when the learned ratio is unavailable.
+-        let baseline = get_sonnet_baseline_config(&state, agents);
+         let baseline_usd_per_pct =
+             baseline.dollars_per_worker_per_hour / baseline.pct_per_worker_per_hour;
+         let usd_per_pct = match *window {
+@@ -8513,6 +8592,141 @@ mod tests {
+         );
+     }
+ 
++    // ── Zero-worker burn guard (claudego-1942b4ea) ──────────────────────────
++
++    /// The incident this pins (2026-09-07): zero workers running, operator's
++    /// Opus session burning ~14%/hr, and `cgov forecast` showing fleet burn
++    /// 11.9-14.4%/hr with every window CUTOFF_RISK and margins -26h to -28h —
++    /// all of it the operator's session, none of it fleet burn.
++    ///
++    /// The API-delta EMA legitimately holds a nonzero rate written while
++    /// workers were last running (state persists across restarts), so with the
++    /// fleet at 0 the production path must pin the reported fleet rate to 0 —
++    /// forecast exhausts at +inf, no window can sit at CUTOFF_RISK on someone
++    /// else's spend, and `cgov forecast` prints Burn Rate 0.00%/hr.
++    #[test]
++    fn zero_workers_pin_reported_fleet_rate_to_zero_even_with_stale_ema() {
++        // Stale EMA from the last active period; strategy (A) would return it.
++        let samples = 7;
++        let stale_ema = 14.0;
++        let baseline_usd_per_pct = 5.0 / 1.5;
++
++        // fleet_usd_hr == 0 (no workers → no fleet aggregate): without the pin,
++        // strategy (A) alone would leak the operator's session in.
++        assert_eq!(
++            effective_fleet_pct_rate(0, samples, stale_ema, 0.0, 3.33, baseline_usd_per_pct),
++            0.0,
++            "0 workers must report 0 fleet burn regardless of a stale EMA"
++        );
++
++        // Even a nonzero fleet aggregate (e.g. a stale last_fleet_aggregate)
++        // must not resurrect a rate: the pin dominates every strategy.
++        assert_eq!(
++            effective_fleet_pct_rate(0, samples, stale_ema, 9.0, 3.33, baseline_usd_per_pct),
++            0.0,
++            "0 workers must report 0 fleet burn regardless of fleet_usd_hr"
++        );
++    }
++
++    /// With workers running, the rate resolution order is exactly as before the
++    /// zero-worker guard: (A) EMA, (B) learned ratio, (C) baseline ratio,
++    /// (D) zero.
++    #[test]
++    fn workers_present_rate_resolution_order_unchanged() {
++        let baseline_usd_per_pct = 5.0 / 1.5;
++
++        // (A) calibrated EMA wins
++        assert_eq!(
++            effective_fleet_pct_rate(2, 7, 14.0, 9.0, 3.33, baseline_usd_per_pct),
++            14.0
++        );
++        // (B) learned ratio when no EMA
++        let b = effective_fleet_pct_rate(2, 7, 0.0, 9.0, 3.0, baseline_usd_per_pct);
++        assert!((b - 3.0).abs() < 1e-9, "got {b}");
++        // (C) baseline ratio when the learned ratio is absent too
++        let c = effective_fleet_pct_rate(2, 0, 0.0, 9.0, 0.0, baseline_usd_per_pct);
++        assert!((c - 9.0 / baseline_usd_per_pct).abs() < 1e-9, "got {c}");
++        // (D) nothing at all
++        assert_eq!(
++            effective_fleet_pct_rate(2, 0, 0.0, 0.0, 0.0, baseline_usd_per_pct),
++            0.0
++        );
++    }
++
++    /// The sizing side of the guard: at zero workers there is no measured
++    /// per-worker rate, so the hypothetical "if I ran one worker, could I
++    /// afford it?" is sized from the configured baseline (claudego-d64682d5's
++    /// live-path twin). Without it, 0 workers -> rate 0 -> no authorised count
++    /// -> hold at 0 -> the pool could never start.
++    #[test]
++    fn zero_workers_size_from_baseline_and_stay_startable() {
++        let baseline = 1.5;
++
++        // 0 workers: baseline bootstrap.
++        assert_eq!(per_worker_pct_for_sizing(0, 0.0, baseline), baseline);
++        // Even with a (impossible-by-guard, but defensive) nonzero fleet rate.
++        assert_eq!(per_worker_pct_for_sizing(0, 14.0, baseline), baseline);
++
++        // Workers running: unchanged division by the fleet size (max(1) makes
++        // the current_total == 1 case identical to before).
++        assert_eq!(per_worker_pct_for_sizing(2, 13.0, baseline), 6.5);
++        assert_eq!(per_worker_pct_for_sizing(1, 13.0, baseline), 13.0);
++        // Workers running, no rate yet (true cold start): 0.0, which falls
++        // through to the max_workers-ceiling bootstrap downstream.
++        assert_eq!(per_worker_pct_for_sizing(2, 0.0, baseline), 0.0);
++    }
++
++    /// End-to-end over the seams the observe cycle actually calls, with the
++    /// incident's numbers: stale 14%/hr EMA, zero workers, a window with real
++    /// headroom. The forecast the cycle would build and `cgov forecast` would
++    /// print must report no fleet burn, no CUTOFF_RISK, an unbounded hard-limit
++    /// margin — and still authorise a worker, because sizing is hypothetical.
++    #[test]
++    fn zero_worker_production_forecast_reports_no_fleet_burn() {
++        use crate::state::EstimateQuality;
++
++        let current_total = 0;
++        let stale_ema = 14.0;
++        let baseline_pct = 1.5;
++        let baseline_usd_per_pct = 5.0 / baseline_pct;
++
++        let fleet_pct_hr =
++            effective_fleet_pct_rate(current_total, 7, stale_ema, 0.0, 3.33, baseline_usd_per_pct);
++        let pct_per_worker = per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
++
++        // seven_day: 28% remaining over 28.8h — real headroom, behind the
++        // flat-spend pace line.
++        let forecast = generate_window_forecast(
++            "seven_day",
++            fleet_pct_hr,
++            62.0,
++            90.0,
++            28.8,
++            pct_per_worker,
++            0.0,
++            EstimateQuality::Calibrated,
++        );
++
++        assert_eq!(
++            forecast.fleet_pct_per_hour, 0.0,
++            "cgov forecast must not report the operator's session as fleet burn"
++        );
++        assert!(
++            !forecast.cutoff_risk,
++            "no window may sit at CUTOFF_RISK on burn no fleet worker produced"
++        );
++        assert!(
++            forecast.hard_limit_margin_hrs.is_infinite() && forecast.hard_limit_margin_hrs > 0.0,
++            "hard-limit margin must be unbounded, got {} (incident showed -26h)",
++            forecast.hard_limit_margin_hrs
++        );
++        assert!(
++            forecast.safe_worker_count.unwrap_or(0) >= 1,
++            "real headroom must still authorise a worker at 0 running, got {:?}",
++            forecast.safe_worker_count
++        );
++    }
++
+     /// Comprehensive test for cold-start production path behavior.
+     ///
+     /// This test verifies that a window with 0 prior samples (cold-start) produces
+@@ -9978,7 +10192,8 @@ mod tests {
+ 
+         // With no configured agents at all the map is left alone — a
+         // config-parse failure must not wipe worker tracking.
+-        let empty: std::collections::HashMap<String, AgentConfig> = std::collections::HashMap::new();
++        let empty: std::collections::HashMap<String, AgentConfig> =
++            std::collections::HashMap::new();
+         state.workers.insert(
+             "orphan".to_string(),
+             state::WorkerState {
