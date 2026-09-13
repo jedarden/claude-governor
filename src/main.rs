@@ -2944,4 +2944,68 @@ mod tests {
             assert!(err.contains("cgov enable"), "{err}");
         }
     }
+
+    #[test]
+    fn test_restart_wiring_fails_loudly_on_combined_only_host_without_acting() {
+        // The resolver tests above call resolve_installed_service_names
+        // directly. This one drives the function the restart command actually
+        // dispatches through (Commands::Restart -> run_restart_command ->
+        // run_for_installed_units) on a combined-only host, with the unit-dir
+        // probe redirected into a tempdir, and asserts both halves of the
+        // contract: the loud combined-unit error, and that the action — the
+        // only seam that would invoke `systemctl restart` — is never called,
+        // because restarting the combined unit under a half's name would also
+        // restart the other half.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unit_dir = dir.path().join("config/systemd/user");
+        fs::create_dir_all(&unit_dir).expect("create unit dir");
+        write_unit(&unit_dir, COMBINED_SERVICE);
+
+        let prev_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        // Guard the harness itself: this box's real user dir is also
+        // combined-only, so an injection that silently failed would still see
+        // a combined unit and pass for the wrong reason.
+        assert_eq!(
+            systemd_user_dir().as_deref(),
+            Some(unit_dir.as_path()),
+            "XDG_CONFIG_HOME must redirect the unit-dir probe to the tempdir"
+        );
+
+        let invocations = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let mut results = Vec::new();
+        for (target, half) in [("observe", OBSERVE_SERVICE), ("act", ACT_SERVICE)] {
+            let invocations = &invocations;
+            let result = run_for_installed_units(target, "restart", move |unit| {
+                invocations.borrow_mut().push(unit);
+                Ok(())
+            });
+            results.push((target, half, result));
+        }
+
+        match prev_config_home {
+            Some(prev) => std::env::set_var("XDG_CONFIG_HOME", prev),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert!(
+            invocations.borrow().is_empty(),
+            "an individual half must restart nothing on a combined-only host: {:?}",
+            invocations.borrow()
+        );
+
+        for (target, half, result) in results {
+            let err =
+                result.expect_err(&format!("restart {target} must fail loudly, not succeed"));
+            assert!(err.to_string().contains(half), "must name the half it tried: {err}");
+            assert!(
+                err.to_string().contains(COMBINED_SERVICE),
+                "must point at the unit that really runs the daemon: {err}"
+            );
+            assert!(
+                err.to_string().contains("cgov restart all"),
+                "must tell the operator what restarts the daemon here: {err}"
+            );
+        }
+    }
 }
