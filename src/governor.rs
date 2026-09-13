@@ -8779,6 +8779,256 @@ mod tests {
         }
     }
 
+    /// The decision half of the guard (claudego-c1bab86b): the sizing bootstrap
+    /// (`per_worker_pct_for_sizing` at 0 workers) only matters if the cycle
+    /// converts its `Some(1)` into an actual start. That conversion runs through
+    /// `compute_target_workers`, where `compute_composite_safe_workers`
+    /// unconditionally returns `None` at 0 workers and `safe_worker_count_or_hold`
+    /// turns a `None` safe count into "hold at current" — at a cold fleet that is
+    /// hold-at-0, the leak shape. With real headroom behind the pace line the
+    /// bootstrapped forecast must arrive as `Some(>= 1)`, so the fallback lands on
+    /// the `Some` arm and the target authorises a start.
+    ///
+    /// The worker entry is declared `min: 0` on purpose: the 98%-brake control
+    /// (`test_cycle_forecast_at_98_percent_forces_zero_target`) asserts `> 0` with
+    /// `min: 1`, which the min-clamp alone satisfies — a regression that broke the
+    /// bootstrap (Some(1) -> None -> hold at 0) would stay green there. With the
+    /// floor at 0, target == 1 can only come from the bootstrapped `Some`.
+    /// The None arm itself is already pinned by
+    /// `compute_target_workers_none_safe_count_at_fresh_restart_stays_zero`.
+    #[test]
+    fn zero_worker_headroom_authorises_a_start_in_compute_target_workers() {
+        use crate::state::EstimateQuality;
+
+        let current_total = 0;
+        let baseline_pct = 1.5;
+        let baseline_usd_per_pct = 5.0 / baseline_pct;
+
+        // Production sizing seams, exactly as the observe cycle resolves them:
+        // nonzero session burn data exists (stale per-window EMA, stale fleet
+        // aggregate) but 0 workers pin the fleet rate to 0 and sizing bootstraps
+        // from the baseline.
+        let fleet_pct_hr = effective_fleet_pct_rate(
+            current_total,
+            7, // EMA samples written while workers were last running
+            12.0,
+            9.0,
+            3.33, // learned usd-per-pct ratio, as persisted per window
+            baseline_usd_per_pct,
+        );
+        assert_eq!(fleet_pct_hr, 0.0, "0 workers pin the fleet rate to 0");
+        let pct_per_worker = per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
+        assert_eq!(
+            pct_per_worker, baseline_pct,
+            "sizing bootstraps from the baseline at 0 workers"
+        );
+
+        // Binding window with REAL headroom: 28% remaining over 28.8h, behind the
+        // flat-spend pace line (90 * 28.8/168 = 15.4%).
+        let seven_day = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            62.0,
+            90.0,
+            28.8,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::Calibrated,
+        );
+        assert_eq!(
+            seven_day.safe_worker_count,
+            Some(1),
+            "real headroom at 0 workers must size Some(1) — the Some the decision must not lose"
+        );
+        assert!(!seven_day.cutoff_risk);
+
+        // The other two windows are genuinely spent/ahead of pace: Some(0) there
+        // is the pace gate working, not a sizing failure.
+        let five_hour = generate_window_forecast(
+            "five_hour",
+            fleet_pct_hr,
+            85.0,
+            90.0,
+            4.0,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::Calibrated,
+        );
+        let weekly_scoped = generate_window_forecast(
+            "weekly_scoped",
+            fleet_pct_hr,
+            60.0,
+            90.0,
+            100.0,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::Calibrated,
+        );
+        assert_eq!(five_hour.safe_worker_count, Some(0));
+        assert_eq!(weekly_scoped.safe_worker_count, Some(0));
+
+        let mut state = state::GovernorState::new();
+        // min: 0 is load-bearing — see the doc comment.
+        state.workers.insert(
+            "pool".to_string(),
+            state::WorkerState {
+                current: 0,
+                target: 0,
+                min: 0,
+                max: 4,
+            },
+        );
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour,
+            seven_day,
+            weekly_scoped,
+            binding_window: WINDOW_SEVEN_DAY.to_string(),
+            ..Default::default()
+        };
+
+        // Composite enabled is the interesting seam: at 0 workers
+        // compute_composite_safe_workers returns None unconditionally, and the
+        // cycle must fall through to the binding forecast's Some(1) — not
+        // convert that None into hold-at-0.
+        let composite_on = CompositeRiskConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let composite_off = CompositeRiskConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            compute_target_workers(&state, 90.0, &composite_on, &ConeScalingConfig::default()),
+            1,
+            "composite None at 0 workers must fall through to the bootstrapped Some(1)"
+        );
+        assert_eq!(
+            compute_target_workers(&state, 90.0, &composite_off, &ConeScalingConfig::default()),
+            1,
+            "the disabled-composite path must authorise the same start"
+        );
+    }
+
+    /// Regression half at the decision layer (claudego-c1bab86b): with workers
+    /// running, sizing comes from the measured fleet rate divided by the fleet
+    /// size — not from the zero-worker baseline bootstrap — through both the
+    /// composite and disabled-composite seams. The measured 0.8%/hr per-worker
+    /// rate affords 2 whole continuous workers on seven_day; the 1.5%/hr
+    /// baseline would afford 1, so the equality against 2 fails if the
+    /// bootstrap leaks into the workers-present path.
+    #[test]
+    fn workers_present_target_sizes_from_the_measured_rate_unchanged() {
+        use crate::state::EstimateQuality;
+
+        let current_total = 2;
+        let baseline_pct = 1.5;
+        let baseline_usd_per_pct = 5.0 / baseline_pct;
+
+        // Measured EMA: the fleet burns 1.6%/hr across its 2 workers.
+        let fleet_pct_hr = effective_fleet_pct_rate(
+            current_total,
+            7,
+            1.6,
+            0.0,
+            3.33,
+            baseline_usd_per_pct,
+        );
+        assert!(
+            (fleet_pct_hr - 1.6).abs() < 1e-9,
+            "measured EMA must be used verbatim with workers running, got {}",
+            fleet_pct_hr
+        );
+        let pct_per_worker = per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
+        assert!(
+            (pct_per_worker - 0.8).abs() < 1e-9,
+            "sizing must divide the measured fleet rate, got {}",
+            pct_per_worker
+        );
+
+        // Binding window: 55% remaining over 28.8h at 0.8%/hr per worker affords
+        // 2 whole workers. std 0 keeps the cone narrow so the p50 count is the
+        // one selected.
+        let seven_day = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            35.0,
+            90.0,
+            28.8,
+            pct_per_worker,
+            0.0,
+            EstimateQuality::Calibrated,
+        );
+        assert_eq!(seven_day.safe_worker_count, Some(2));
+
+        // five_hour: a REAL cutoff risk with workers present (exhaustion in
+        // 3.125h against 4h left) — its negative cost must not lift the
+        // composite above the binding count.
+        let five_hour = generate_window_forecast(
+            "five_hour",
+            fleet_pct_hr,
+            85.0,
+            90.0,
+            4.0,
+            pct_per_worker,
+            0.0,
+            EstimateQuality::Calibrated,
+        );
+        assert!(five_hour.cutoff_risk);
+        let weekly_scoped = generate_window_forecast(
+            "weekly_scoped",
+            fleet_pct_hr,
+            60.0,
+            90.0,
+            100.0,
+            pct_per_worker,
+            0.0,
+            EstimateQuality::Calibrated,
+        );
+
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "pool".to_string(),
+            state::WorkerState {
+                current: 2,
+                target: 2,
+                min: 0,
+                max: 4,
+            },
+        );
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour,
+            seven_day,
+            weekly_scoped,
+            binding_window: WINDOW_SEVEN_DAY.to_string(),
+            ..Default::default()
+        };
+
+        // Both seams agree with the pre-guard behaviour: the binding window's
+        // measured count is the target. Composite finds no improvement over the
+        // binding count and returns None through its no-improvement arm, not
+        // its 0-worker arm.
+        let composite_on = CompositeRiskConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let composite_off = CompositeRiskConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_target_workers(&state, 90.0, &composite_on, &ConeScalingConfig::default()),
+            2,
+            "composite no-improvement must keep the measured binding count"
+        );
+        assert_eq!(
+            compute_target_workers(&state, 90.0, &composite_off, &ConeScalingConfig::default()),
+            2,
+            "the disabled-composite path must keep the same measured count"
+        );
+    }
+
     /// Comprehensive test for cold-start production path behavior.
     ///
     /// This test verifies that a window with 0 prior samples (cold-start) produces
