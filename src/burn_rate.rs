@@ -3091,6 +3091,202 @@ mod tests {
         );
     }
 
+    /// claudego-1942b4ea: at zero workers, session burn is by definition not
+    /// fleet burn. The incident this pins (2026-09-07): the operator's Opus
+    /// session burned 11.9-14.4%/hr account-wide with NO workers running, and
+    /// the forecast charged all of it to the fleet — every window CUTOFF_RISK,
+    /// hard-limit margins -26h to -28h — against near-full real headroom.
+    ///
+    /// This session's burn must therefore NOT:
+    ///   - raise fleet CUTOFF_RISK on any window,
+    ///   - drive the reported fleet burn above zero,
+    ///   - produce a finite/negative hard-limit margin,
+    /// and where a window's real headroom supports a worker, the pool must
+    /// still be authorising one (the claudego-d64682d5 bootstrap must survive
+    /// this guard).
+    #[test]
+    fn zero_workers_session_burn_cannot_raise_cutoff_risk() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // One operator session burning hard (12-14%/hr per window), fleet idle.
+        // Geometry chosen so that IF the session burn were attributed to the
+        // fleet, every window would sit at CUTOFF_RISK: five_hour would exhaust
+        // in 5/14 = 0.36h of the 4.0h remaining, seven_day in 28/12 = 2.33h of
+        // 28.8h, weekly_scoped in 30/13 = 2.31h of 100h.
+        let instances = vec![multi_window_record(
+            "operator-session",
+            "claude-opus-5",
+            26.10,
+            500_000,
+            Some(14.0),
+            Some(12.0),
+            Some(13.0),
+            85.0,
+            71.0,
+            62.0,
+            50.0,
+            60.0,
+            47.0,
+        )];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 85.0);
+        utilization.insert("seven_day".to_string(), 62.0);
+        utilization.insert("weekly_scoped".to_string(), 60.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 4.0);
+        hrs_left.insert("seven_day".to_string(), 28.8);
+        hrs_left.insert("weekly_scoped".to_string(), 100.0);
+
+        let (_estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            0,
+            0,
+            &mut ema,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        for (name, window) in [
+            ("five_hour", &forecast.five_hour),
+            ("seven_day", &forecast.seven_day),
+            ("weekly_scoped", &forecast.weekly_scoped),
+        ] {
+            assert!(
+                !window.cutoff_risk,
+                "{name}: session burn at zero workers must not raise fleet CUTOFF_RISK"
+            );
+            assert_eq!(
+                window.fleet_pct_per_hour, 0.0,
+                "{name}: reported fleet burn must be 0 with no fleet running"
+            );
+            assert!(
+                window.hard_limit_margin_hrs.is_infinite() && window.hard_limit_margin_hrs > 0.0,
+                "{name}: hard-limit margin must read as unbounded, got {}",
+                window.hard_limit_margin_hrs
+            );
+            assert!(
+                window.predicted_exhaustion_hours.is_infinite(),
+                "{name}: exhaustion must read as never, got {}",
+                window.predicted_exhaustion_hours
+            );
+        }
+
+        // seven_day has real headroom (28% remaining over 28.8h, behind the
+        // flat-spend pace line), so the pool must still be sizeable from zero:
+        // the sizing question is hypothetical and needs no running worker.
+        assert!(
+            forecast.seven_day.safe_worker_count.unwrap_or(0) >= 1,
+            "real headroom at zero workers must still authorise a worker, got {:?}",
+            forecast.seven_day.safe_worker_count
+        );
+        // five_hour is genuinely spent (5% remaining, ahead of its pace line),
+        // so 0 there is the pace gate working, not the bootstrap failing.
+        assert_eq!(forecast.five_hour.safe_worker_count, Some(0));
+    }
+
+    /// claudego-1942b4ea regression pin: with workers actually running, the
+    /// zero-worker guard must not dampen anything — measured fleet burn is
+    /// reported as measured, cutoff risk is raised when burn really does
+    /// outrun a window, and per-window fleet stats stay per-worker-honest.
+    #[test]
+    fn workers_present_burn_behavior_is_unchanged() {
+        let baseline = BaselineBurnRates::default();
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+
+        // Two workers burning 12-14%/hr per window (fleet means 13 and 12).
+        let instances = vec![
+            multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                26.10,
+                500_000,
+                Some(14.0),
+                Some(12.0),
+                Some(1.0),
+                85.0,
+                71.0,
+                62.0,
+                50.0,
+                60.0,
+                59.0,
+            ),
+            multi_window_record(
+                "w2",
+                "claude-sonnet-4-20250514",
+                22.0,
+                450_000,
+                Some(12.0),
+                Some(12.0),
+                Some(1.0),
+                85.0,
+                71.0,
+                62.0,
+                50.0,
+                60.0,
+                59.0,
+            ),
+        ];
+
+        let mut utilization = HashMap::new();
+        utilization.insert("five_hour".to_string(), 85.0);
+        utilization.insert("seven_day".to_string(), 62.0);
+        utilization.insert("weekly_scoped".to_string(), 60.0);
+        let mut hrs_left = HashMap::new();
+        hrs_left.insert("five_hour".to_string(), 4.0);
+        hrs_left.insert("seven_day".to_string(), 28.8);
+        hrs_left.insert("weekly_scoped".to_string(), 100.0);
+
+        let (estimate, forecast) = estimate_burn_rates(
+            &instances,
+            1.0,
+            2,
+            2,
+            &mut ema,
+            &baseline,
+            &utilization,
+            90.0,
+            &hrs_left,
+        );
+
+        // Fleet stats unchanged: per-session mean over 2 workers.
+        let five = estimate.fleet_stats.get("five_hour").unwrap();
+        assert!(
+            (five.mean_pct_hr - 13.0).abs() < 1e-9,
+            "got {}",
+            five.mean_pct_hr
+        );
+        assert_eq!(five.worker_count, 2);
+
+        // five_hour: 5% headroom over 4.0h against 13%/hr fleet burn — a REAL
+        // cutoff risk, unlike the zero-worker case above.
+        assert!(
+            forecast.five_hour.cutoff_risk,
+            "real fleet burn outrunning five_hour must raise CUTOFF_RISK"
+        );
+        assert!(
+            (forecast.five_hour.fleet_pct_per_hour - 13.0).abs() < 1e-9,
+            "fleet burn must be reported as measured, got {}",
+            forecast.five_hour.fleet_pct_per_hour
+        );
+        assert!(forecast.five_hour.hard_limit_margin_hrs < 0.0);
+        assert!(forecast.five_hour.hard_limit_margin_hrs.is_finite());
+
+        // seven_day: burn outruns the window too, and the pace line still
+        // duty-cycles one worker (remaining 28% over 28.8h is behind the line).
+        assert!(forecast.seven_day.cutoff_risk);
+        assert!(
+            (forecast.seven_day.fleet_pct_per_hour - 12.0).abs() < 1e-9,
+            "got {}",
+            forecast.seven_day.fleet_pct_per_hour
+        );
+        assert_eq!(forecast.seven_day.safe_worker_count, Some(1));
+    }
+
     /// The core defect: exogenous burn must not be charged to the pool's workers.
     /// A single worker alongside a heavy operator session previously read as if
     /// that one worker were burning the operator's rate.
