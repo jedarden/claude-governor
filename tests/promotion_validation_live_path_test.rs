@@ -54,7 +54,7 @@ use claude_governor::config::{
     PricingConfig, SprintConfig,
 };
 use claude_governor::db;
-use claude_governor::governor::{run_governor_cycle, CyclePaths};
+use claude_governor::governor::{effective_fleet_pct_rate, run_governor_cycle, CyclePaths};
 use claude_governor::poller::{UsageData, UsagePoller};
 use claude_governor::schedule::Promotion;
 use claude_governor::state::{self, GovernorState, PrevUsageSnapshot};
@@ -536,13 +536,55 @@ fn two_real_cycles_unblock_empirical_promotion_validation() {
 // 5: nothing changes when annotation data is absent
 // ---------------------------------------------------------------------------
 
+/// The fleet-rate EMA state a previous, worker-running life left behind.
+///
+/// de7e840 (claudego-8c7890ab) pins the fleet rate to 0 while no workers run
+/// and skips the fleet EMA update entirely — with an empty fleet the API
+/// reading is account-wide, so observed burn is not fleet burn. What the
+/// cycle must preserve is whatever the state carried in: `fleet_pct_hr_ema`
+/// persists across restarts, and the restart-with-stale-EMA shape below is
+/// exactly what flagged every window CUTOFF_RISK against near-full real
+/// headroom on 2026-09-07. Seeding it makes every comparison in
+/// `the_api_delta_ema_is_unaffected_by_annotation_data` meaningful —
+/// equal-but-zero could pass without exercising anything.
+const SEEDED_PCT_HR_EMA: (f64, f64, f64) = (12.0, 9.0, 4.0);
+/// Same story for the learned dollars-per-percent EMAs.
+const SEEDED_USD_PER_PCT_EMA: (f64, f64, f64) = (1.5, 1.25, 1.1);
+/// EMA samples written by that earlier life. The cycle at 0 workers must not
+/// advance this either — a fresh API delta exists (PCT_0 → PCT_1 over the
+/// seeded span), so an advancing count would mean the skip was lost.
+const SEEDED_EMA_SAMPLES: u32 = 7;
+
+/// A plausible fleet dollar rate for the pin assertion, derived from the
+/// fixture's own fleet row (`p75-usd-hr: 5.0` × `workers: BATCH`).
+const SEEDED_FLEET_USD_HR: f64 = 5.0 * BATCH as f64;
+
+/// Any positive baseline ratio. The zero-worker pin dominates all four
+/// resolution strategies, so the value is irrelevant — it only has to be
+/// alive enough that a pin regression cannot hide behind an early 0.0 arm.
+const PIN_BASELINE_USD_PER_PCT: f64 = 3.0;
+
+/// Seed the stale-worker-life EMA state (see the `SEEDED_*` constants) into
+/// the state file the cycle is about to read.
+fn seed_fleet_ema(state_path: &Path) {
+    let mut seeded = state::load_state(state_path).expect("failed to load state");
+    seeded.burn_rate.fleet_pct_hr_ema.five_hour = SEEDED_PCT_HR_EMA.0;
+    seeded.burn_rate.fleet_pct_hr_ema.seven_day = SEEDED_PCT_HR_EMA.1;
+    seeded.burn_rate.fleet_pct_hr_ema.weekly_scoped = SEEDED_PCT_HR_EMA.2;
+    seeded.burn_rate.usd_per_pct_ema_five_hour = SEEDED_USD_PER_PCT_EMA.0;
+    seeded.burn_rate.usd_per_pct_ema_seven_day = SEEDED_USD_PER_PCT_EMA.1;
+    seeded.burn_rate.usd_per_pct_ema_weekly_scoped = SEEDED_USD_PER_PCT_EMA.2;
+    seeded.burn_rate.fleet_pct_ema_samples = SEEDED_EMA_SAMPLES;
+    state::save_state(&seeded, state_path).expect("failed to seed the state file");
+}
+
 /// Run one cycle against two mirrors that differ only in whether their rows are
 /// annotated, and return each run's persisted state.
 ///
-/// Both runs get the same seeded rows, the same snapshot, the same reading and
-/// the same promotion. The only difference is the `annotated` argument to
-/// `seed_pass`, so any divergence in the result is attributable to annotation
-/// data and nothing else.
+/// Both runs get the same seeded rows, the same snapshot, the same reading,
+/// the same promotion and the same stale-worker-life EMA state. The only
+/// difference is the `annotated` argument to `seed_pass`, so any divergence in
+/// the result is attributable to annotation data and nothing else.
 fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
     let mut states = Vec::new();
 
@@ -573,6 +615,7 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
             );
         }
         seed_snapshot(&state_path, PCT_0, base - ChronoDuration::seconds(300));
+        seed_fleet_ema(&state_path);
         drive_cycle(PCT_1, &state_path, &cycle_paths, &[active_promotion(base)]);
 
         states.push(state::load_state(&state_path).expect("failed to read the cycle's state"));
@@ -583,23 +626,29 @@ fn cycle_with_and_without_annotation() -> (GovernorState, GovernorState) {
     (bare, annotated)
 }
 
-/// Relative tolerance for comparing time-normalized EMAs across the two runs
-/// of `cycle_with_and_without_annotation`.
+/// Assert a persisted EMA survived the cycle bit-identically in both runs.
 ///
-/// Each run seeds its previous snapshot at `base - 300s` and the cycle polls
-/// at the real current instant, so every pct/hr (and usd/pct) EMA divides by
-/// a span that includes the wall-clock time between that run's `base` and its
-/// poll — fsync and scheduling jitter of a second or two on a loaded host.
-/// That jitter moves both runs equally (~0.3% per second on the 300s span)
-/// and is not what this test is about; a divergence beyond 1% would be.
-const SPAN_JITTER_TOLERANCE: f64 = 0.01;
-
-/// Assert two time-normalized EMA readings agree within wall-clock span
-/// jitter (see [`SPAN_JITTER_TOLERANCE`]).
-fn assert_ema_close(label: &str, bare: f64, annotated: f64) {
+/// Exact, not a relative tolerance: the values compared here were written by
+/// [`seed_fleet_ema`], not time-normalized by the cycle (the zero-worker pin
+/// skips the EMA update outright), so there is no span jitter left to absorb —
+/// and the old helper's relative-error form `(bare - annotated) / annotated`
+/// turned the pin into `0/0 = NaN`, failing every comparison with the
+/// unreadable message "bare 0 vs annotated 0" that filed this bead. Comparing
+/// against the seeded baseline names the regression instead: only the
+/// annotated run moving means annotation leaked into the EMA; both moving
+/// means the zero-worker skip was lost.
+fn assert_ema_untouched(label: &str, seeded: f64, bare: f64, annotated: f64) {
     assert!(
-        ((bare - annotated) / annotated).abs() < SPAN_JITTER_TOLERANCE,
-        "{label}: bare {bare} vs annotated {annotated} diverged beyond span jitter"
+        seeded.is_finite() && seeded != 0.0,
+        "{label}: the seeded baseline must be nonzero for this comparison to mean anything"
+    );
+    assert_eq!(
+        bare, seeded,
+        "{label}: the bare run's EMA moved — the zero-worker EMA skip was lost"
+    );
+    assert_eq!(
+        annotated, seeded,
+        "{label}: the annotated run's EMA moved off the seeded baseline — annotation leaked into the EMA"
     );
 }
 
@@ -611,58 +660,103 @@ fn assert_ema_close(label: &str, bare: f64, annotated: f64) {
 /// future change could quietly break by sourcing pct/hr from the annotated
 /// columns, which look like a more direct measurement than they are. (They are
 /// the same API deltas, apportioned; feeding them back would close a loop.)
+///
+/// Since de7e840 the cycle at 0 workers skips the EMA update outright — the
+/// API reading is account-wide, not fleet burn — so the property is asserted
+/// against the stale EMA a worker-running life left in the state file (see
+/// [`seed_fleet_ema`]): both runs must persist it bit-identically, and
+/// neither may advance the sample count, even though the seeded span carries
+/// a fresh API delta that a pre-pin cycle would have fed in. The rate
+/// scaling actually resolves from the surviving state is then asserted
+/// pinned to 0, the contract that guard exists to enforce.
 #[test]
 fn the_api_delta_ema_is_unaffected_by_annotation_data() {
     let (bare, annotated) = cycle_with_and_without_annotation();
 
     // `WindowPctDeltas` is not `PartialEq`, so compare it field by field —
     // spelling the windows out also names which one drifted on failure.
-    assert_ema_close(
+    assert_ema_untouched(
         "five_hour pct/hr EMA",
+        SEEDED_PCT_HR_EMA.0,
         bare.burn_rate.fleet_pct_hr_ema.five_hour,
         annotated.burn_rate.fleet_pct_hr_ema.five_hour,
     );
-    assert_ema_close(
+    assert_ema_untouched(
         "seven_day pct/hr EMA",
+        SEEDED_PCT_HR_EMA.1,
         bare.burn_rate.fleet_pct_hr_ema.seven_day,
         annotated.burn_rate.fleet_pct_hr_ema.seven_day,
     );
-    assert_ema_close(
+    assert_ema_untouched(
         "weekly_scoped pct/hr EMA",
+        SEEDED_PCT_HR_EMA.2,
         bare.burn_rate.fleet_pct_hr_ema.weekly_scoped,
         annotated.burn_rate.fleet_pct_hr_ema.weekly_scoped,
     );
-    assert_ema_close(
+    assert_ema_untouched(
         "five_hour usd/pct EMA",
+        SEEDED_USD_PER_PCT_EMA.0,
         bare.burn_rate.usd_per_pct_ema_five_hour,
         annotated.burn_rate.usd_per_pct_ema_five_hour,
     );
-    assert_ema_close(
+    assert_ema_untouched(
         "seven_day usd/pct EMA",
+        SEEDED_USD_PER_PCT_EMA.1,
         bare.burn_rate.usd_per_pct_ema_seven_day,
         annotated.burn_rate.usd_per_pct_ema_seven_day,
     );
-    assert_ema_close(
+    assert_ema_untouched(
         "weekly_scoped usd/pct EMA",
+        SEEDED_USD_PER_PCT_EMA.2,
         bare.burn_rate.usd_per_pct_ema_weekly_scoped,
         annotated.burn_rate.usd_per_pct_ema_weekly_scoped,
     );
+    // At 0 workers there is no fleet burn to sample, so neither run may feed
+    // the EMA — the old premise ("the cycle should have fed the EMA a
+    // sample") was the pre-pin contract.
     assert_eq!(
-        bare.burn_rate.fleet_pct_ema_samples, annotated.burn_rate.fleet_pct_ema_samples,
-        "the EMA sample count should not depend on annotation data"
+        bare.burn_rate.fleet_pct_ema_samples, SEEDED_EMA_SAMPLES,
+        "the bare run advanced the EMA sample count at 0 workers"
     );
-    // The EMA is only meaningful if it actually moved; equal-but-zero would
-    // satisfy every assertion above without exercising anything.
-    assert!(
-        bare.burn_rate.fleet_pct_ema_samples > 0,
-        "the cycle should have fed the EMA a sample"
+    assert_eq!(
+        annotated.burn_rate.fleet_pct_ema_samples, SEEDED_EMA_SAMPLES,
+        "the annotated run advanced the EMA sample count at 0 workers"
     );
-    // And the jitter allowance must not be masking a real signal: the seeded
-    // span is 300s, so both EMAs should be far from zero.
-    assert!(
-        bare.burn_rate.fleet_pct_hr_ema.five_hour > 0.0,
-        "the bare run's pct/hr EMA should carry the seeded delta"
-    );
+    // And the fleet rate scaling actually resolves from this surviving state
+    // is pinned to 0 while no workers run — asserted against the annotated
+    // run's persisted inputs, with every other source alive (stale EMA,
+    // learned ratio, live dollar rate): the exact shape that flagged every
+    // window CUTOFF_RISK on 2026-09-07.
+    for (window, ema, usd_per_pct) in [
+        (
+            "five_hour",
+            annotated.burn_rate.fleet_pct_hr_ema.five_hour,
+            annotated.burn_rate.usd_per_pct_ema_five_hour,
+        ),
+        (
+            "seven_day",
+            annotated.burn_rate.fleet_pct_hr_ema.seven_day,
+            annotated.burn_rate.usd_per_pct_ema_seven_day,
+        ),
+        (
+            "weekly_scoped",
+            annotated.burn_rate.fleet_pct_hr_ema.weekly_scoped,
+            annotated.burn_rate.usd_per_pct_ema_weekly_scoped,
+        ),
+    ] {
+        assert_eq!(
+            effective_fleet_pct_rate(
+                0,
+                SEEDED_EMA_SAMPLES,
+                ema,
+                SEEDED_FLEET_USD_HR,
+                usd_per_pct,
+                PIN_BASELINE_USD_PER_PCT,
+            ),
+            0.0,
+            "{window}: the fleet rate must be pinned to 0 at 0 workers"
+        );
+    }
 }
 
 /// An unannotated mirror still produces exactly the old conservative fallback.
