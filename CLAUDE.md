@@ -153,9 +153,18 @@ reserve it for genuinely mechanical sweeps and watch it.
 ## 4. The polish queue & meta-beads
 
 The queue (`~/cgov-polish-queue`) is a git repo with its own `.beads` that contains
-**only** generation meta-beads. This is a load-bearing safety property: a worker
-pointed here can never churn a real repo's beads — worst case it finds nothing and
-idles. Create it once:
+**only** generation meta-beads. The safety property — a worker pointed here can
+never churn a real repo's beads; worst case it finds nothing and idles — is real,
+but it does **not** come from the queue repo, and `--workspace` does not provide it.
+`needle run --workspace` only sets the worker's home store; the Explore strand still
+roams every workspace in the host's global `strands.explore.workspaces` roster (71
+repos on codinghome; the queue is not among them) and claims ordinary beads there —
+editing, committing and pushing real code. The property holds only because the
+pool's `launch_cmd` sets `NEEDLE_STRANDS__EXPLORE__ENABLED=false`, which disables
+the Explore strand entirely (NEEDLE's `explore.rs` returns `NoWork` before any
+cross-workspace scan; the worker then works only its home store — the queue — and
+idles when it is empty). This bit for real on 2026-09-07: bead `claudego-4e869d28`.
+Any launch_cmd for this pool must carry that env prefix. Create it once:
 
 ```bash
 mkdir -p ~/cgov-polish-queue && cd ~/cgov-polish-queue
@@ -195,17 +204,26 @@ the queue. The seeder writes these; see `scripts/polish-seeder.sh`.
 
 See `deploy/polish-opus-agent.yaml`. **This flavor governs subscription-billed
 *generator* pools only** — cgov-driven claude-print runners that **produce beads**
-(never change code); the beads are worked by a separate, normal NEEDLE fleet.
+(never change code — conditional on the launch_cmd's Explore kill switch, see §4);
+the beads are worked by a separate, normal NEEDLE fleet.
 
 ```yaml
   polish-opus:
-    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    # env prefix is LOAD-BEARING: without it the worker roams the host's 71-workspace
+    # explore roster and edits real code (claudego-4e869d28). Do not drop it.
+    launch_cmd: "env NEEDLE_STRANDS__EXPLORE__ENABLED=false needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
     session_pattern: "needle-claude-print-opus-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0        # genuinely allowed to idle at 0
     max_workers: 4        # headroom to scale up and burn spare capacity when windows have room
     subscription: true    # billed against the subscription pool, not the SDK credit pool
 ```
+
+> ⚠️ **Live status (2026-09-13): the pool is disabled in `governor.yaml`**
+> (`max_workers: 0`, operator directive 2026-09-07 — Opus competes with the
+> human's premium `weekly_scoped` window, an objective conflict independent of
+> the roaming bug). Re-enabling means restoring `max_workers` only; the
+> confinement env prefix is already in the launch_cmd.
 
 > ⚠️ **No fixed `--identifier`**: cgov runs the launch command once per scale-up step,
 > so a fixed identifier collides (`worker X already running`) and caps the pool at 1.

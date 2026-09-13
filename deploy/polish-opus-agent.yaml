@@ -22,7 +22,15 @@ agents:
     # NO fixed --identifier: cgov launches one worker per scale-up step, so a fixed
     # identifier collides ("worker X already running") and caps the pool at 1. Let
     # needle NATO-name each worker; the glob below tracks them all.
-    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    #
+    # The env prefix is LOAD-BEARING (claudego-4e869d28): --workspace is the worker's
+    # home store, NOT a scope — without NEEDLE_STRANDS__EXPLORE__ENABLED=false the
+    # Explore strand roams the host's strands.explore.workspaces roster (71 repos on
+    # codinghome; the queue is not among them) claiming ordinary beads and editing
+    # real code. With it, the worker works only the queue and idles when it is empty
+    # (same mechanism as the needle-sonnet executor pool; NEEDLE unit-tests the
+    # override as env_override_explore_enabled). Do not drop the env prefix.
+    launch_cmd: "env NEEDLE_STRANDS__EXPLORE__ENABLED=false needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
     session_pattern: "needle-claude-print-opus-*"
     heartbeat_dir: "~/.needle/state/heartbeats"
     min_workers: 0
