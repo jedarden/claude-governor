@@ -897,9 +897,21 @@ fn daemon_status_string() -> String {
         || (tmux_available() && tmux_session_exists(OBSERVE_SESSION));
     let act_running = (systemd_user_available() && systemd_service_is_active(ACT_SERVICE))
         || (tmux_available() && tmux_session_exists(ACT_SESSION));
+    // A combined `_daemon` unit runs BOTH halves in one process, so it stands
+    // in for either dedicated unit that is absent. Without this the monolith
+    // topology renders "observe ✗ stopped, act ✓ running (monolith ...)" —
+    // contradictory, and inviting an operator to start a second observe loop.
+    let monolith = doctor::enforcing_monolith_service();
+    let observe_status = if observe_running {
+        "✓ running".to_string()
+    } else if let Some(unit) = monolith {
+        format!("✓ running (monolith {})", unit)
+    } else {
+        "✗ stopped".to_string()
+    };
     let act_status = if act_running {
         "✓ running".to_string()
-    } else if let Some(unit) = doctor::enforcing_monolith_service() {
+    } else if let Some(unit) = monolith {
         format!("✓ running (monolith {})", unit)
     } else {
         "⚠ paused".to_string()
@@ -914,13 +926,7 @@ fn daemon_status_string() -> String {
 
     format!(
         "observe {}{}, act {}",
-        if observe_running {
-            "✓ running"
-        } else {
-            "✗ stopped"
-        },
-        freshness,
-        act_status
+        observe_status, freshness, act_status
     )
 }
 

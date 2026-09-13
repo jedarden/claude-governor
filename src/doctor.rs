@@ -2136,6 +2136,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_exec_start_argv_extracts_the_command_line() {
+        // Verbatim `systemctl --user show -p ExecStart --value
+        // claude-governor.service` dump from codinghome, where the monolith
+        // runs `cgov _daemon`.
+        let dump = "{ path=/home/coding/.local/bin/cgov ; argv[]=/home/coding/.local/bin/cgov _daemon ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+        assert_eq!(
+            parse_exec_start_argv(dump),
+            Some(vec![
+                "/home/coding/.local/bin/cgov".to_string(),
+                "_daemon".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_exec_start_argv_rejects_unparseable_output() {
+        // `systemctl show --value` prints an empty line for a non-existent
+        // unit; a dump without the argv[] field is equally unusable.
+        assert_eq!(parse_exec_start_argv(""), None);
+        assert_eq!(
+            parse_exec_start_argv("{ path=foo ; ignore_errors=no }"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_enforcing_daemon_argv_distinguishes_the_postures() {
+        let argv = |args: &[&str]| -> Vec<String> { args.iter().map(|s| s.to_string()).collect() };
+
+        // The codinghome topology: `cgov _daemon` with no --dry-run enforces.
+        assert!(is_enforcing_daemon_argv(&argv(&[
+            "/home/coding/.local/bin/cgov",
+            "_daemon"
+        ])));
+        // --dry-run leaves act non-enforcing: doctor must keep reporting
+        // paused for it, exactly as for a genuine observe-only monolith.
+        assert!(!is_enforcing_daemon_argv(&argv(&[
+            "/home/coding/.local/bin/cgov",
+            "_daemon",
+            "--dry-run"
+        ])));
+        assert!(!is_enforcing_daemon_argv(&argv(&[
+            "/home/coding/.local/bin/cgov",
+            "_daemon",
+            "--dry-run=true"
+        ])));
+        // A split-half unit running only _observe never executes act.
+        assert!(!is_enforcing_daemon_argv(&argv(&[
+            "/home/coding/.local/bin/cgov",
+            "_observe"
+        ])));
+        // "_daemon" must match as a whole argument, not as a substring of a
+        // coincidental flag value.
+        assert!(!is_enforcing_daemon_argv(&argv(&[
+            "/usr/bin/journalctl",
+            "--unit=cgov-_daemon"
+        ])));
+    }
+
+    #[test]
     fn alert_fp_progress_reports_samples_rate_and_remaining_samples() {
         let mut telemetry = crate::state::AlertFpTelemetry::default();
         telemetry.record("cutoff_imminent", true);
