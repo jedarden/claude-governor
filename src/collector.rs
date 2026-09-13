@@ -632,7 +632,10 @@ pub fn dow(t: DateTime<Utc>) -> u8 {
 /// All token types appear as columns on the same row. Since each session runs
 /// one model, columns are not model-prefixed; the `model` field carries the identity.
 /// `p5h`, `p7d`, `p7ds` are `null` at write time; the governor annotates them later.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` is derived (with `default` on the omittable fields) so history
+/// lines written before a field existed — including `worker` — still parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceRecord {
     /// Record type discriminator (always `"i"`)
     #[serde(rename = "r")]
@@ -650,13 +653,24 @@ pub struct InstanceRecord {
     #[serde(rename = "t1")]
     pub t1: DateTime<Utc>,
 
-    /// Worker session name (e.g., tmux session name)
+    /// Claude Code session UUID (the transcript file stem). Despite what an
+    /// earlier doc comment claimed, this is NOT a worker/tmux session name —
+    /// needle worker identity travels in [`InstanceRecord::worker`] instead
+    /// (claudego-a542d686). Shape unchanged: history keeps parsing.
     #[serde(rename = "sess")]
     pub sess: String,
 
     /// Session ID (short hash / stem from the JSONL file path)
     #[serde(rename = "sid")]
     pub sid: String,
+
+    /// Needle worker session name the session was dispatched by, in the
+    /// `needle-{agent}-{worker_id}` space the agent `session_pattern` globs
+    /// match (e.g. `needle-claude-print-cgov-sonnet-0`). Resolved from the
+    /// live process tree at collection time; `None` for operator sessions
+    /// and for sessions whose worker process exited before the pass.
+    #[serde(rename = "worker", default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 
     /// Model identifier (e.g., `"claude-sonnet-4-20250514"`)
     #[serde(rename = "model")]
@@ -724,15 +738,15 @@ pub struct InstanceRecord {
     pub cache_eff: f64,
 
     /// 5-hour window utilization % delta — `null` until governor annotates
-    #[serde(rename = "p5h", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "p5h", default, skip_serializing_if = "Option::is_none")]
     pub p5h: Option<f64>,
 
     /// 7-day window utilization % delta — `null` until governor annotates
-    #[serde(rename = "p7d", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "p7d", default, skip_serializing_if = "Option::is_none")]
     pub p7d: Option<f64>,
 
     /// 7-day Sonnet window utilization % delta — `null` until governor annotates
-    #[serde(rename = "p7ds", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "p7ds", default, skip_serializing_if = "Option::is_none")]
     pub p7ds: Option<f64>,
 
     /// Session entry point (cli=subscription, sdk-cli=credits)
@@ -742,6 +756,13 @@ pub struct InstanceRecord {
 
 impl InstanceRecord {
     /// Create a new InstanceRecord from a UsageRecord and DollarBreakdown.
+    ///
+    /// `worker` is the needle worker session name the CC session was
+    /// dispatched by, or `None` when the session is not attributable (operator
+    /// session, or the worker's process exited before this pass scanned /proc).
+    // Row-shaped record constructor; the arity mirrors the JSONL column set,
+    // so the long parameter list is deliberate.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ts: DateTime<Utc>,
         t0: DateTime<Utc>,
@@ -752,6 +773,7 @@ impl InstanceRecord {
         usage: &UsageRecord,
         dollars: &crate::pricing::DollarBreakdown,
         entrypoint: String,
+        worker: Option<String>,
     ) -> Self {
         let total_input = usage.input_tokens + usage.cache_read_tokens;
         let cache_eff = if total_input > 0 {
@@ -766,6 +788,7 @@ impl InstanceRecord {
             t1,
             sess: session,
             sid,
+            worker,
             model,
             pk: if is_peak(t0) { 1 } else { 0 },
             hr_et: hr_et(t0),
@@ -1182,6 +1205,17 @@ pub struct CollectionPaths {
     pub cursor_path: PathBuf,
     /// Base directory scanned for Claude Code session JSONL files
     pub session_base: PathBuf,
+    /// procfs root the worker-attribution scan reads (`/proc` in production).
+    /// Not part of the on-disk state layout: tests point it at a synthetic
+    /// process tree, or at a path that does not exist so the scan yields an
+    /// empty index and every record is written unattributed.
+    pub proc_root: PathBuf,
+    /// Needle heartbeat directory the worker-attribution scan reads
+    /// (`~/.needle/state/heartbeats` in production). Like `proc_root`, not
+    /// part of the on-disk state layout: `under()` points it at a path that
+    /// does not exist in a test root, so tests get an empty worker registry
+    /// unless they lay one down.
+    pub heartbeat_dir: PathBuf,
 }
 
 impl Default for CollectionPaths {
@@ -1191,6 +1225,8 @@ impl Default for CollectionPaths {
             db_path: default_db_path(),
             cursor_path: default_cursor_path(),
             session_base: default_session_base(),
+            proc_root: PathBuf::from(crate::worker_attribution::DEFAULT_PROC_ROOT),
+            heartbeat_dir: crate::worker_attribution::default_heartbeat_dir(),
         }
     }
 }
@@ -1202,6 +1238,13 @@ impl CollectionPaths {
     /// `root/.claude/projects`) so a temp directory can stand in for the home
     /// directory. An absent session base simply means the pass finds no JSONL
     /// files and returns without writing anything.
+    ///
+    /// `proc_root` deliberately deviates: production reads the OS `/proc`,
+    /// but a test's temp root is not a home directory and must never scan the
+    /// real host process tree. `root/proc` does not exist in a fresh temp
+    /// root, so tests get an empty attribution index by default and can lay a
+    /// synthetic process tree at that path when they want to exercise one.
+    /// `heartbeat_dir` follows the same rule at `root/.needle/state/heartbeats`.
     pub fn under(root: &Path) -> Self {
         let state_dir = root.join(".needle").join("state");
         Self {
@@ -1209,6 +1252,8 @@ impl CollectionPaths {
             db_path: state_dir.join("token-history.db"),
             cursor_path: state_dir.join("collector-cursors.json"),
             session_base: root.join(".claude").join("projects"),
+            proc_root: root.join("proc"),
+            heartbeat_dir: state_dir.join("heartbeats"),
         }
     }
 }
@@ -1368,6 +1413,14 @@ pub fn run_collection_pass_at(paths: &CollectionPaths) -> anyhow::Result<Collect
     let mut jsonl_records: Vec<serde_json::Value> = Vec::new();
     let mut total_usd = 0.0;
 
+    // Attribute each live session to the needle worker dispatching it
+    // (best-effort: an unreadable /proc or empty heartbeat dir just leaves
+    // every record unattributed — never fails the pass).
+    let attribution = crate::worker_attribution::WorkerAttribution::scan_at(
+        &paths.proc_root,
+        &paths.heartbeat_dir,
+    );
+
     for ((session, model), usage) in &session_usage {
         let dollars = pricing_engine.compute_dollars(usage);
         total_usd += dollars.total_usd;
@@ -1382,6 +1435,7 @@ pub fn run_collection_pass_at(paths: &CollectionPaths) -> anyhow::Result<Collect
             usage,
             &dollars,
             usage.session_entrypoint.clone(),
+            attribution.resolve(session).map(str::to_owned),
         );
 
         let json = serde_json::to_value(&rec)?;
@@ -2526,6 +2580,7 @@ mod tests {
                 t1: t0 + Duration::minutes(5),
                 sess: sess.to_string(),
                 sid: sess.to_string(),
+                worker: None,
                 model: model.to_string(),
                 pk: if is_peak(t0) { 1 } else { 0 },
                 hr_et: hr_et(t0),
@@ -2598,6 +2653,54 @@ mod tests {
             assert!(!obj.contains_key("p7ds"));
         }
 
+        /// claudego-a542d686: `worker` is omitted on unattributed records and
+        /// round-trips on attributed ones; history lines written before the
+        /// field existed — all pre-attribution history — still parse (serde
+        /// default), so no migration is needed.
+        #[test]
+        fn worker_field_is_optional_and_backwards_compatible() {
+            let t0 = ts("2026-03-18T14:00:00Z");
+            let rec = make_instance(
+                "sess-1",
+                "claude-sonnet-4-20250514",
+                1000,
+                500,
+                200,
+                100,
+                50,
+                0.05,
+                t0,
+            );
+
+            // Operator session: no "worker" key on the wire ...
+            let json = serde_json::to_value(&rec).unwrap();
+            assert!(!json.as_object().unwrap().contains_key("worker"));
+
+            // ... and a line without it parses back as None.
+            let old_line = serde_json::to_string(&rec).unwrap();
+            let parsed: InstanceRecord = serde_json::from_str(&old_line).unwrap();
+            assert_eq!(parsed.sess, "sess-1");
+            assert!(parsed.worker.is_none());
+            assert!((parsed.total_usd - rec.total_usd).abs() < 1e-9);
+
+            // Fleet-dispatched session: the field carries the worker session
+            // name (the same string space session_pattern globs match) and
+            // round-trips through a JSONL line.
+            let mut dispatched = rec.clone();
+            dispatched.worker = Some("needle-claude-print-cgov-sonnet-0".to_string());
+            let json = serde_json::to_value(&dispatched).unwrap();
+            assert_eq!(
+                json.get("worker").unwrap().as_str(),
+                Some("needle-claude-print-cgov-sonnet-0")
+            );
+            let line = serde_json::to_string(&dispatched).unwrap();
+            let parsed: InstanceRecord = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                parsed.worker.as_deref(),
+                Some("needle-claude-print-cgov-sonnet-0")
+            );
+        }
+
         #[test]
         fn new_from_usage_and_dollars() {
             let t0 = ts("2026-03-18T14:00:00Z");
@@ -2630,12 +2733,17 @@ mod tests {
                 &usage,
                 &dollars,
                 "cli".to_string(),
+                Some("needle-claude-print-cgov-sonnet-0".to_string()),
             );
 
             assert_eq!(rec.r, "i");
             assert_eq!(rec.input_n, 1000);
             assert_eq!(rec.output_n, 500);
             assert_eq!(rec.total_usd, 11.235);
+            assert_eq!(
+                rec.worker.as_deref(),
+                Some("needle-claude-print-cgov-sonnet-0")
+            );
             assert_eq!(rec.pk, 1); // 10am ET Wednesday = peak
         }
     }
@@ -2664,6 +2772,7 @@ mod tests {
                 t1: t0 + Duration::minutes(5),
                 sess: sess.to_string(),
                 sid: sess.to_string(),
+                worker: None,
                 model: model.to_string(),
                 pk: if is_peak(t0) { 1 } else { 0 },
                 hr_et: hr_et(t0),

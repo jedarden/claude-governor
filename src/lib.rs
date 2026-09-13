@@ -20,3 +20,5 @@ pub mod snapshot_fixtures;
 pub mod state;
 pub mod status_display;
 pub mod worker;
+/// Session→worker attribution for collected usage records (claudego-a542d686).
+pub mod worker_attribution;
