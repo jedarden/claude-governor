@@ -8626,6 +8626,15 @@ mod tests {
             0.0,
             "0 workers must report 0 fleet burn regardless of fleet_usd_hr"
         );
+
+        // And with NO EMA at all (fresh state, e.g. rebuilt from scratch) a
+        // stale aggregate must not fall through to strategies (B)/(C) either:
+        // the pin is unconditional, not an EMA-only check. claudego-6f45312e.
+        assert_eq!(
+            effective_fleet_pct_rate(0, 0, 0.0, stale_ema, 3.33, baseline_usd_per_pct),
+            0.0,
+            "0 workers with an empty EMA must not resurrect a rate from the aggregate"
+        );
     }
 
     /// With workers running, the rate resolution order is exactly as before the
@@ -8677,54 +8686,97 @@ mod tests {
     }
 
     /// End-to-end over the seams the observe cycle actually calls, with the
-    /// incident's numbers: stale 14%/hr EMA, zero workers, a window with real
-    /// headroom. The forecast the cycle would build and `cgov forecast` would
-    /// print must report no fleet burn, no CUTOFF_RISK, an unbounded hard-limit
-    /// margin — and still authorise a worker, because sizing is hypothetical.
+    /// incident's numbers: stale per-window EMAs, zero workers, and each
+    /// window's own geometry. The production cycle resolves the fleet rate
+    /// per window from that window's persisted EMA and learned dollars-per-pct
+    /// ratio (`state.burn_rate.fleet_pct_hr_ema.{five_hour,seven_day,
+    /// weekly_scoped}` + `usd_per_pct_ema_*`), so the guard is asserted per
+    /// window — not only on seven_day, where the incident happened to be
+    /// visible. On every window the forecast the cycle builds and `cgov
+    /// forecast` prints must report no fleet burn, no CUTOFF_RISK, and an
+    /// unbounded hard-limit margin; windows behind their flat-spend pace line
+    /// must still authorise a worker, because sizing is hypothetical.
     #[test]
     fn zero_worker_production_forecast_reports_no_fleet_burn() {
         use crate::state::EstimateQuality;
 
         let current_total = 0;
-        let stale_ema = 14.0;
+        let samples = 7; // EMA written while workers were last running
         let baseline_pct = 1.5;
         let baseline_usd_per_pct = 5.0 / baseline_pct;
 
-        let fleet_pct_hr =
-            effective_fleet_pct_rate(current_total, 7, stale_ema, 0.0, 3.33, baseline_usd_per_pct);
-        let pct_per_worker = per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
+        // A stale `last_fleet_aggregate` (nonzero fleet_usd_hr) must not
+        // resurrect a rate through strategies (B)/(C) any more than the stale
+        // EMA does through (A).
+        let stale_fleet_usd_hr = 9.0;
 
-        // seven_day: 28% remaining over 28.8h — real headroom, behind the
-        // flat-spend pace line.
-        let forecast = generate_window_forecast(
-            "seven_day",
-            fleet_pct_hr,
-            62.0,
-            90.0,
-            28.8,
-            pct_per_worker,
-            0.0,
-            EstimateQuality::Calibrated,
-        );
+        // (window, stale EMA %/hr, util %, ceiling %, hrs left, expected
+        // safe_worker_count). five_hour is genuinely spent (5% left, ahead of
+        // its pace line) so Some(0) there is the pace gate working; seven_day
+        // has 28% remaining behind its pace line so the bootstrap must still
+        // authorise one; weekly_scoped is ahead of its line.
+        let cases = [
+            ("five_hour", 14.0, 85.0, 90.0, 4.0, Some(0)),
+            ("seven_day", 12.0, 62.0, 90.0, 28.8, Some(1)),
+            ("weekly_scoped", 13.0, 60.0, 90.0, 100.0, Some(0)),
+        ];
 
-        assert_eq!(
-            forecast.fleet_pct_per_hour, 0.0,
-            "cgov forecast must not report the operator's session as fleet burn"
-        );
-        assert!(
-            !forecast.cutoff_risk,
-            "no window may sit at CUTOFF_RISK on burn no fleet worker produced"
-        );
-        assert!(
-            forecast.hard_limit_margin_hrs.is_infinite() && forecast.hard_limit_margin_hrs > 0.0,
-            "hard-limit margin must be unbounded, got {} (incident showed -26h)",
-            forecast.hard_limit_margin_hrs
-        );
-        assert!(
-            forecast.safe_worker_count.unwrap_or(0) >= 1,
-            "real headroom must still authorise a worker at 0 running, got {:?}",
-            forecast.safe_worker_count
-        );
+        for (window, stale_ema, util, ceiling, hrs_left, expected_safe) in cases {
+            let fleet_pct_hr = effective_fleet_pct_rate(
+                current_total,
+                samples,
+                stale_ema,
+                stale_fleet_usd_hr,
+                3.33, // learned usd-per-pct ratio, as persisted per window
+                baseline_usd_per_pct,
+            );
+            let pct_per_worker =
+                per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
+
+            // Calibrated, as the cycle labels a window whose EMA holds samples
+            // and a positive value — the exact incident shape. The nonzero std
+            // must not conjure risk out of a pinned-zero rate.
+            let forecast = generate_window_forecast(
+                window,
+                fleet_pct_hr,
+                util,
+                ceiling,
+                hrs_left,
+                pct_per_worker,
+                1.2,
+                EstimateQuality::Calibrated,
+            );
+
+            assert_eq!(
+                fleet_pct_hr, 0.0,
+                "{window}: 0 workers must pin the fleet rate to 0"
+            );
+            assert_eq!(
+                forecast.fleet_pct_per_hour, 0.0,
+                "{window}: cgov forecast must not report the operator's session as fleet burn"
+            );
+            assert!(
+                !forecast.cutoff_risk,
+                "{window}: no window may sit at CUTOFF_RISK on burn no fleet worker produced"
+            );
+            assert!(
+                forecast.hard_limit_margin_hrs.is_infinite()
+                    && forecast.hard_limit_margin_hrs > 0.0,
+                "{window}: hard-limit margin must be unbounded, got {} (incident showed -26h)",
+                forecast.hard_limit_margin_hrs
+            );
+            assert!(
+                forecast.predicted_exhaustion_hours.is_infinite(),
+                "{window}: exhaustion must read as never, got {}",
+                forecast.predicted_exhaustion_hours
+            );
+            assert_eq!(
+                forecast.safe_worker_count, expected_safe,
+                "{window}: sizing is hypothetical at 0 workers — Some proves the bootstrap \
+                 still answers, and the 0s are the flat-spend pace gate, not the pool being \
+                 unable to start"
+            );
+        }
     }
 
     /// Comprehensive test for cold-start production path behavior.

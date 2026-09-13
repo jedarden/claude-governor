@@ -3495,6 +3495,9 @@ mod tests {
         assert!(f.pace_delta_pct.is_none());
     }
 
+    // Audit finding (claudego-6f45312e): this body was committed without its
+    // #[test] attribute (original estimator commit, docs-ord) and so never ran.
+    #[test]
     fn binding_window_is_most_constrained() {
         let baseline = BaselineBurnRates::default();
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
@@ -4045,6 +4048,34 @@ mod tests {
         assert!((stats.p75_pct_hr - 2.0).abs() < 1e-9);
         assert!((stats.mean_usd_hr - 5.0).abs() < 1e-9);
         assert!((stats.std_pct_hr - 0.0).abs() < 1e-9);
+    }
+
+    /// claudego-6f45312e audit: direct pin on the zero-worker arm itself. The
+    /// guard (`total_workers == 0` → all fleet stats zero) previously had only
+    /// indirect coverage through estimate_burn_rates compositions; this pins
+    /// the unit: even with a hard-burning session record in hand (the
+    /// 2026-09-07 operator Opus session, ~14%/hr at $26.10/hr), an idle fleet
+    /// reports zero mean/p75/std/usd — the session is someone else's spend and
+    /// must never become fleet burn.
+    #[test]
+    fn compute_fleet_stats_zero_workers_pins_all_stats_to_zero() {
+        let rate = InstanceBurnRate {
+            session: "operator-session".to_string(),
+            model: "claude-opus-5".to_string(),
+            window: "seven_day".to_string(),
+            dollar_per_hour: 26.10,
+            pct_per_hour: 14.0,
+            elapsed_hours: 1.0,
+        };
+        let stats = compute_fleet_stats("seven_day", &[&rate], 0);
+        assert_eq!(stats.worker_count, 0);
+        assert_eq!(
+            stats.mean_pct_hr, 0.0,
+            "session burn must not become the fleet mean"
+        );
+        assert_eq!(stats.p75_pct_hr, 0.0);
+        assert_eq!(stats.std_pct_hr, 0.0);
+        assert_eq!(stats.mean_usd_hr, 0.0);
     }
 
     #[test]

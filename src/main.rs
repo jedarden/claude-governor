@@ -2314,6 +2314,84 @@ mod tests {
         assert_eq!(parsed["stale"], false);
     }
 
+    /// claudego-1942b4ea (reporting invariant): what `cgov forecast` PRINTS at
+    /// zero workers while the operator's interactive session burns the account.
+    /// The command renders `state.capacity_forecast` verbatim, and that struct
+    /// is what the observe cycle builds through effective_fleet_pct_rate →
+    /// per_worker_pct_for_sizing → generate_window_forecast. Building the
+    /// forecast through those exact seams — stale per-window EMAs persisted
+    /// from the last active period, the 2026-09-07 incident geometry — the
+    /// rendered output must show 0.00%/hr fleet burn in every window pane, no
+    /// CUTOFF RISK flag, and no negative margin anywhere.
+    #[test]
+    fn forecast_output_at_zero_workers_shows_no_fleet_burn_or_cutoff_risk() {
+        use claude_governor::burn_rate::generate_window_forecast;
+        use claude_governor::governor::{effective_fleet_pct_rate, per_worker_pct_for_sizing};
+        use claude_governor::state::CapacityForecast;
+
+        let current_total = 0;
+        let baseline_pct = 1.5;
+        let baseline_usd_per_pct = 5.0 / baseline_pct;
+
+        let forecast_for =
+            |window: &str, stale_ema: f64, util: f64, ceiling: f64, hrs_left: f64| {
+                let fleet_pct_hr = effective_fleet_pct_rate(
+                    current_total,
+                    7,
+                    stale_ema,
+                    9.0, // stale fleet aggregate must not resurrect a rate
+                    3.33,
+                    baseline_usd_per_pct,
+                );
+                let pct_per_worker =
+                    per_worker_pct_for_sizing(current_total, fleet_pct_hr, baseline_pct);
+                generate_window_forecast(
+                    window,
+                    fleet_pct_hr,
+                    util,
+                    ceiling,
+                    hrs_left,
+                    pct_per_worker,
+                    1.2,
+                    claude_governor::state::EstimateQuality::Calibrated,
+                )
+            };
+
+        let mut state = GovernorState::new();
+        state.capacity_forecast = CapacityForecast {
+            five_hour: forecast_for("five_hour", 14.0, 85.0, 90.0, 4.0),
+            seven_day: forecast_for("seven_day", 12.0, 62.0, 90.0, 28.8),
+            weekly_scoped: forecast_for("weekly_scoped", 13.0, 60.0, 90.0, 100.0),
+            binding_window: String::new(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let output = format_forecast_human(&state);
+
+        assert_eq!(
+            output.matches("Burn Rate: 0.00%/hr").count(),
+            3,
+            "every window pane must print 0.00%/hr fleet burn, got:\n{output}"
+        );
+        assert!(
+            !output.contains("CUTOFF RISK"),
+            "no window pane may carry the CUTOFF RISK flag, got:\n{output}"
+        );
+        assert!(
+            !output.contains("Margin: -"),
+            "no window pane may render a negative margin (incident showed -26h), got:\n{output}"
+        );
+        // Exhaustion must render as never on every window — the human-readable
+        // twin of the struct-level predicted_exhaustion_hours == inf pins.
+        // claudego-6f45312e.
+        assert_eq!(
+            output.matches("Exhaustion: inf").count(),
+            3,
+            "every window pane must render exhaustion as never, got:\n{output}"
+        );
+    }
+
     /// Test that verifies the warning log message appears when cgov scale is used during safe mode.
     ///
     /// This test creates a temporary state file with safe mode active, executes a scale operation,

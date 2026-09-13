@@ -881,6 +881,80 @@ mod tests {
         assert!(output.contains("Samples"));
     }
 
+    /// claudego-1942b4ea: the dashboard must not dress an idle-hour operator
+    /// session up as fleet risk. With zero workers running and stale per-window
+    /// EMAs persisted from the last active period, the forecast fields built
+    /// through the production seams (effective_fleet_pct_rate →
+    /// per_worker_pct_for_sizing → generate_window_forecast) must render with
+    /// no CUTOFF label in the window table and no emergency banner — the
+    /// 2026-09-07 incident shape, which previously showed every window at
+    /// CUTOFF with -26h margins against near-full real headroom.
+    #[test]
+    fn zero_worker_dashboard_shows_no_cutoff_risk() {
+        use crate::burn_rate::generate_window_forecast;
+        use crate::governor::{effective_fleet_pct_rate, per_worker_pct_for_sizing};
+
+        let mut state = make_test_state();
+
+        // The idle-fleet shape: no workers running anywhere.
+        for worker in state.workers.values_mut() {
+            worker.current = 0;
+            worker.target = 0;
+        }
+        state.last_fleet_aggregate.sonnet_workers = 0;
+
+        let baseline_pct = 1.5;
+        let baseline_usd_per_pct = 5.0 / baseline_pct;
+        let forecast_for =
+            |window: &str, stale_ema: f64, util: f64, ceiling: f64, hrs_left: f64| {
+                let fleet_pct_hr = effective_fleet_pct_rate(
+                    0,
+                    7,
+                    stale_ema,
+                    9.0, // stale fleet aggregate must not resurrect a rate
+                    3.33,
+                    baseline_usd_per_pct,
+                );
+                let pct_per_worker = per_worker_pct_for_sizing(0, fleet_pct_hr, baseline_pct);
+                generate_window_forecast(
+                    window,
+                    fleet_pct_hr,
+                    util,
+                    ceiling,
+                    hrs_left,
+                    pct_per_worker,
+                    1.2,
+                    crate::state::EstimateQuality::Calibrated,
+                )
+            };
+
+        state.capacity_forecast = CapacityForecast {
+            five_hour: forecast_for("five_hour", 14.0, 85.0, 90.0, 4.0),
+            seven_day: forecast_for("seven_day", 12.0, 62.0, 90.0, 28.8),
+            weekly_scoped: forecast_for("weekly_scoped", 13.0, 60.0, 90.0, 100.0),
+            binding_window: String::new(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(
+            !output.contains("CUTOFF"),
+            "zero-worker session burn must not raise CUTOFF anywhere in the dashboard:\n{output}"
+        );
+        // The panes still render — the guard suppresses the risk label, not
+        // the window table itself, so every row keeps its real utilization.
+        // claudego-6f45312e.
+        assert!(output.contains("Window Capacity"));
+        for used in ["85.0", "62.0", "60.0"] {
+            assert!(
+                output.contains(used),
+                "window table must keep rendering utilization ({used}%):\n{output}"
+            );
+        }
+    }
+
     #[test]
     fn format_dashboard_shows_promo_status() {
         let state = make_test_state();
