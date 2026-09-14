@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude Governor Observe - usage polling + state writer for governor-state consumers (no worker actions)
+Documentation=https://github.com/anthropics/claude-governor
+After=network-online.target claude-token-collector.service
+Wants=network-online.target claude-token-collector.service
+
+[Service]
+Type=simple
+# WHY THIS EXISTS: claude-governor.service (the acting daemon) was stopped and
+# disabled by operator decision on 2026-09-13, leaving governor-state.json
+# unwritten. Its consumers hard-fail on staleness --
+# /home/coding/bin/needle-glm-quota-controller exits 1 when the state's
+# updated_at exceeds 15 min (MAX_QUOTA_AGE_SECS) -- so the measurement stream
+# had to be restored WITHOUT restoring the daemon's act paths (launch/scale/
+# kill). `cgov _observe` is the purpose-built observe-only pipeline (ADR-001):
+# it polls usage, computes burn-rate/forecast, and writes only the
+# observe-owned subtree of governor-state.json (updated_at included). It never
+# launches or kills workers and never fires alerts. Safe if the daemon is
+# re-enabled later: observe and act cycles merge onto the freshest on-disk
+# state under a file lock (state::merge_observe_owned / with_state_lock).
+# -i 300 keeps samples ~<=7 min old against the 15-min bound; one observe
+# cycle takes ~100s because it gathers fleet usage through the token
+# collector (hence Wants/After=claude-token-collector.service).
+ExecStart=/home/coding/.local/bin/cgov _observe -i 300
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=25%
+
+[Install]
+WantedBy=default.target
