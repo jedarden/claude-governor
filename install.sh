@@ -156,6 +156,7 @@ else
     (cd "${WORK_DIR}" && sha256sum -c "${ARTIFACT}.sha256") \
         || fail "Checksum verification FAILED for ${ARTIFACT} — refusing to install.
 Nothing was written to ${INSTALL_DIR}."
+    echo "Checksum OK (published sidecar): $(awk '{print $1}' "${ARTIFACT_PATH}.sha256")"
 fi
 echo ""
 
