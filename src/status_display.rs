@@ -679,6 +679,7 @@ mod tests {
         );
 
         GovernorState {
+            manual_override: None,
             updated_at: Utc::now() - chrono::Duration::minutes(5),
             usage: UsageState {
                 sonnet_pct: 63.5,

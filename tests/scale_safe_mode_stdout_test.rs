@@ -1,8 +1,10 @@
 //! Integration test for the safe-mode stdout notification emitted by `cgov scale`.
 //!
-//! When an operator manually scales the fleet while the governor is in safe mode, the
-//! scale still applies, but the governor will recompute (and likely override) the target
-//! on its next cycle. `run_scale_command` therefore prints a notification to stdout:
+//! When an operator pins the fleet with a manual scale override while the governor is in
+//! safe mode, the write still succeeds. Today the computed target rules the next cycle
+//! regardless (the override does not yet enter `run_act_cycle`), and under the documented
+//! contract it is an engaged emergency brake — never safe mode alone — that suspends a
+//! stored pin. The operator is warned on stdout either way:
 //!
 //! ```text
 //! NOTE: Safe mode remains active and will reassert its target on the next cycle
@@ -125,7 +127,7 @@ fn scale_during_safe_mode_prints_stdout_notification() {
     let (_temp, output) = run_cgov(&make_state(true), &["scale", "4"]);
     let stdout = stdout_of(&output);
 
-    let confirmation = "Target worker count set to 4";
+    let confirmation = "Manual override stored: fleet target 4";
     assert!(
         stdout.contains(confirmation),
         "expected the scale confirmation on stdout, got:\n{stdout}"
@@ -145,7 +147,7 @@ fn scale_during_safe_mode_prints_stdout_notification() {
 }
 
 /// The notification must describe reality: safe mode is still active in the persisted state
-/// after the manual scale, and the requested target was actually written.
+/// after the manual scale, and the requested override was actually stored.
 ///
 /// Without this, the first test could pass against a build that prints the notice while
 /// silently clearing safe mode — making the message a lie.
@@ -161,9 +163,17 @@ fn scale_during_safe_mode_keeps_safe_mode_active_and_applies_target() {
         reloaded.safe_mode.active,
         "safe mode should still be active after a manual scale"
     );
+    let stored = reloaded
+        .manual_override
+        .expect("the manual override should have been persisted");
     assert_eq!(
-        reloaded.workers["test-agent"].target, 4,
-        "the manual scale target should have been persisted"
+        stored.target, 4,
+        "the requested count is stored raw (pre-clamp)"
+    );
+    assert_eq!(stored.source, "cli");
+    assert!(
+        stored.expires_at.is_some(),
+        "the default TTL binds the override until it expires"
     );
 }
 
@@ -177,7 +187,7 @@ fn scale_without_safe_mode_prints_no_notification() {
     let stdout = stdout_of(&output);
 
     assert!(
-        stdout.contains("Target worker count set to 3"),
+        stdout.contains("Manual override stored: fleet target 3"),
         "expected the scale confirmation on stdout, got:\n{stdout}"
     );
     assert!(

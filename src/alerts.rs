@@ -1416,6 +1416,8 @@ mod tests {
 
     fn make_state_with_forecast(forecast: CapacityForecast) -> GovernorState {
         GovernorState {
+            // no stored pin: alert episode handling is orthogonal to `cgov scale`
+            manual_override: None,
             updated_at: base_now(),
             usage: UsageState::default(),
             last_fleet_aggregate: FleetAggregate {

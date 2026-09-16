@@ -267,6 +267,8 @@ mod tests {
     /// Create a minimal governor state for testing
     fn make_state(forecast: CapacityForecast) -> GovernorState {
         GovernorState {
+            // no stored pin: summary/exit codes are orthogonal to `cgov scale`
+            manual_override: None,
             capacity_forecast: forecast,
             usage: UsageState::default(),
             last_fleet_aggregate: FleetAggregate::default(),

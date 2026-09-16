@@ -17,7 +17,7 @@
 //! - version: Print version and component status
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use log::LevelFilter;
 use std::env;
@@ -226,10 +226,20 @@ enum Commands {
         json: bool,
     },
 
-    /// Manually override target worker count for one cycle
+    /// Manually pin the fleet's aggregate worker target (see README
+    /// "Manual scale override")
     Scale {
-        /// Target worker count
-        count: u32,
+        /// Fleet target worker count (omit when using --clear)
+        count: Option<u32>,
+
+        /// Hours the override stays binding before computed targets resume;
+        /// 0 holds until `cgov scale --clear`
+        #[arg(long)]
+        ttl: Option<u64>,
+
+        /// Remove the stored manual override (idempotent)
+        #[arg(long)]
+        clear: bool,
 
         /// Show what would happen without acting
         #[arg(long)]
@@ -753,60 +763,163 @@ fn run_workers_command(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_scale_command(count: u32, dry_run: bool) -> Result<()> {
-    let state_path = default_state_path();
-    let mut state = state::load_state(&state_path)?;
+/// `source` stamped on overrides written by this CLI.
+const SCALE_SOURCE_CLI: &str = "cli";
 
-    // Load config for log rotation settings
-    let config = GovernorConfig::load()?;
+/// Build the manual-override record a `cgov scale N` write stores.
+///
+/// `ttl_hours == 0` means hold until `cgov scale --clear` (`expires_at:
+/// None`); anything else binds for that many hours from `now`. The requested
+/// count is stored raw — reconciliation clamps it to the fleet's aggregate
+/// bounds on every act cycle, so raising an agent's `max_workers` later
+/// un-clamps a stored pin.
+fn manual_override_record(count: u32, ttl_hours: u64, now: DateTime<Utc>) -> state::ManualOverride {
+    state::ManualOverride {
+        target: count,
+        set_at: now,
+        expires_at: if ttl_hours == 0 {
+            None
+        } else {
+            Some(now + chrono::Duration::hours(ttl_hours as i64))
+        },
+        source: SCALE_SOURCE_CLI.to_string(),
+    }
+}
 
-    // Track safe mode status for user messaging
-    let safe_mode_was_active = state.safe_mode.active;
-
-    // Check if safe mode is active
-    if state.safe_mode.active {
-        log::warn!("[governor] WARN: manual scale override during safe mode");
-
-        // Also write directly to log file for persistence (with rotation support)
-        let log_line = format!(
-            "{} [governor] WARN: manual scale override during safe mode\n",
-            Utc::now().to_rfc3339()
+/// Validate a requested fleet total against the aggregate worker bounds —
+/// the same min-of-mins / max-of-maxes envelope [`governor::aggregate_worker_bounds`]
+/// clamps the override against on every reconcile, so what set-time
+/// validation rejects is exactly what could never bind.
+///
+/// The override is a fleet TOTAL, not a per-agent count: allocation within
+/// the total respects each agent's own floor and max. The envelope — not the
+/// sum of per-agent bounds — is the bound, because it is what
+/// `compute_target_workers` has always clamped the fleet total against.
+/// Returns the bounds for messaging.
+fn validate_scale_count(state: &state::GovernorState, count: u32) -> Result<(u32, u32)> {
+    let (lo, hi) = governor::aggregate_worker_bounds(state).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No agents are configured in state; cannot validate a worker count to scale to"
+        )
+    })?;
+    if count < lo || count > hi {
+        anyhow::bail!(
+            "Worker count {} is outside the fleet's aggregate bounds ({} - {}) — \
+             the smallest agent min_workers and the largest agent max_workers",
+            count,
+            lo,
+            hi
         );
-        let _ = append_to_governor_log(&log_line, &config);
     }
+    Ok((lo, hi))
+}
 
-    // Validate count against worker limits
-    for (agent_id, worker) in &state.workers {
-        if count < worker.min || count > worker.max {
-            anyhow::bail!(
-                "Worker count {} is outside allowed range for agent {} ({} - {})",
-                count,
-                agent_id,
-                worker.min,
-                worker.max
-            );
+fn run_scale_command(
+    count: Option<u32>,
+    ttl_hours: Option<u64>,
+    clear: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let state_path = default_state_path();
+
+    // --clear: remove the stored override (idempotent). Locked like the set
+    // path so it cannot interleave with a daemon cycle's merge.
+    if clear {
+        if count.is_some() {
+            anyhow::bail!("cgov scale --clear takes no COUNT");
         }
-    }
-
-    if dry_run {
-        println!("DRY RUN: Would set target worker count to {}", count);
-        for (agent_id, worker) in &state.workers {
-            println!("  Agent {}: {} -> {}", agent_id, worker.target, count);
+        let previous = state::with_state_lock(&state_path, || -> anyhow::Result<_> {
+            let mut state = state::load_state(&state_path)?;
+            let previous = state.manual_override.take();
+            if previous.is_some() && !dry_run {
+                state::save_state(&state, &state_path)?;
+            }
+            Ok(previous)
+        })?;
+        match previous {
+            Some(ov) => {
+                if dry_run {
+                    println!(
+                        "DRY RUN: Would clear the manual override (target {}, set {})",
+                        ov.target,
+                        ov.set_at.to_rfc3339()
+                    );
+                } else {
+                    println!(
+                        "Manual override cleared (target {}, set {}). Computed targets resume on the next act cycle.",
+                        ov.target,
+                        ov.set_at.to_rfc3339()
+                    );
+                }
+            }
+            None => println!("No manual override stored; nothing to clear."),
         }
         return Ok(());
     }
 
-    // Apply the scale command
-    for worker in state.workers.values_mut() {
-        worker.target = count;
+    let count = count.ok_or_else(|| {
+        anyhow::anyhow!("cgov scale requires a COUNT (or --clear to remove a stored override)")
+    })?;
+    let ttl_hours = ttl_hours.unwrap_or(governor::MANUAL_OVERRIDE_DEFAULT_TTL_HOURS);
+
+    // One locked load/validate/save transaction: observe and act merge under
+    // the same lock, so a scale write can neither interleave with nor be
+    // reverted by a concurrent cycle save (state::merge_act_owned copies
+    // manual_override only when the act cycle itself changed it;
+    // merge_observe_owned never touches it).
+    let (record, bounds, safe_mode_was_active) = state::with_state_lock(
+        &state_path,
+        || -> anyhow::Result<_> {
+        let mut state = state::load_state(&state_path)?;
+        let bounds = validate_scale_count(&state, count)?;
+        let safe_mode_was_active = state.safe_mode.active;
+
+        // Safe mode does not block the write — while the emergency brake is
+        // engaged it wins over the pin regardless — but the operator must
+        // know the pin will not take effect until it clears.
+        if safe_mode_was_active {
+            log::warn!("[governor] WARN: manual scale override during safe mode");
+
+            // Also write directly to log file for persistence (with rotation support)
+            let config = GovernorConfig::load()?;
+            let log_line = format!(
+                "{} [governor] WARN: manual scale override during safe mode\n",
+                Utc::now().to_rfc3339()
+            );
+            let _ = append_to_governor_log(&log_line, &config);
+        }
+
+        let record = manual_override_record(count, ttl_hours, Utc::now());
+        if !dry_run {
+            state.manual_override = Some(record.clone());
+            // updated_at is deliberately NOT bumped: it tracks when the
+            // observe pipeline last ran (doctor's freshness checks and the
+            // quota controller measure it), and a CLI write must not make
+            // stale observations look fresh.
+            state::save_state(&state, &state_path)?;
+        }
+        Ok((record, bounds, safe_mode_was_active))
+        },
+    )?;
+
+    let expiry_text = match record.expires_at {
+        Some(e) => format!("binding until {}", e.to_rfc3339()),
+        None => "binding until `cgov scale --clear`".to_string(),
+    };
+    if dry_run {
+        println!(
+            "DRY RUN: Would store manual override: fleet target {} (aggregate bounds {} - {}), {}",
+            record.target, bounds.0, bounds.1, expiry_text
+        );
+    } else {
+        println!(
+            "Manual override stored: fleet target {} (aggregate bounds {} - {}), {}",
+            record.target, bounds.0, bounds.1, expiry_text
+        );
+        println!("Source: {}", record.source);
     }
 
-    state.updated_at = Utc::now();
-    state::save_state(&state, &state_path)?;
-
-    println!("Target worker count set to {} for all agents", count);
-
-    // Warn user that safe mode will reassert on next cycle
+    // Warn user that the brake still wins while safe mode is engaged
     if safe_mode_was_active {
         println!("NOTE: Safe mode remains active and will reassert its target on the next cycle");
     }
@@ -1191,8 +1304,13 @@ fn main() -> Result<()> {
         Commands::Workers { json } => {
             run_workers_command(json)?;
         }
-        Commands::Scale { count, dry_run } => {
-            run_scale_command(count, dry_run)?;
+        Commands::Scale {
+            count,
+            ttl,
+            clear,
+            dry_run,
+        } => {
+            run_scale_command(count, ttl, clear, dry_run)?;
         }
         Commands::Logs { follow, lines } => {
             run_logs_command(follow, lines)?;
@@ -3098,5 +3216,82 @@ mod tests {
                 "must tell the operator what restarts the daemon here: {err}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // cgov scale — manual override record + set-time validation
+    // -----------------------------------------------------------------------
+
+    fn scale_test_state() -> state::GovernorState {
+        // Two pools: envelope bounds [0, 4] (min-of-mins 0, max-of-maxes 4).
+        let mut st = GovernorState::new();
+        st.workers.insert(
+            "sonnet".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 1,
+                min: 0,
+                max: 4,
+            },
+        );
+        st.workers.insert(
+            "opus".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 1,
+                min: 1,
+                max: 2,
+            },
+        );
+        st
+    }
+
+    #[test]
+    fn manual_override_record_default_ttl_binds_two_hours() {
+        let now = Utc::now();
+        let rec = manual_override_record(4, governor::MANUAL_OVERRIDE_DEFAULT_TTL_HOURS, now);
+
+        assert_eq!(rec.target, 4, "the requested count is stored raw (pre-clamp)");
+        assert_eq!(rec.source, "cli");
+        assert_eq!(
+            rec.expires_at,
+            Some(now + chrono::Duration::hours(2)),
+            "the documented default TTL is 2 hours"
+        );
+    }
+
+    #[test]
+    fn manual_override_record_zero_ttl_holds_until_clear() {
+        let now = Utc::now();
+        let rec = manual_override_record(4, 0, now);
+
+        assert_eq!(
+            rec.expires_at, None,
+            "--ttl 0 must store no expiry: the pin holds until cgov scale --clear"
+        );
+        assert_eq!(rec.set_at, now);
+    }
+
+    #[test]
+    fn validate_scale_count_rejects_outside_the_aggregate_envelope() {
+        let st = scale_test_state();
+
+        // Above the envelope max (max-of-maxes 4): rejected up front — it is
+        // exactly the count reconcile-time clamping could never bind.
+        assert!(validate_scale_count(&st, 5).is_err());
+        // Inside the envelope, including the floor (min-of-mins 0): accepted.
+        assert!(validate_scale_count(&st, 4).is_ok());
+        assert!(validate_scale_count(&st, 0).is_ok());
+    }
+
+    #[test]
+    fn validate_scale_count_without_agents_is_an_error() {
+        let st = GovernorState::new();
+        let err = validate_scale_count(&st, 1).expect_err("no agents configured");
+
+        assert!(
+            err.to_string().contains("No agents are configured"),
+            "must say why the request cannot be validated: {err}"
+        );
     }
 }

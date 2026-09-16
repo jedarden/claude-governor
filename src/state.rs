@@ -667,6 +667,38 @@ impl Default for SafeModeState {
     }
 }
 
+/// Manual fleet-wide target override, set by `cgov scale`.
+///
+/// While present and unexpired this replaces the act cycle's computed target
+/// as the aggregate goal (see README "Manual scale override" for the full
+/// precedence rules). The stored `target` is the raw requested count; it is
+/// clamped to the fleet's aggregate `[min, max]` bounds at application time,
+/// so raising an agent's `max_workers` later un-clamps a stored pin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ManualOverride {
+    /// Manually requested total fleet worker count (pre-clamp).
+    pub target: u32,
+    /// When the override was set.
+    pub set_at: DateTime<Utc>,
+    /// When the override stops binding. `None` = hold until explicitly
+    /// cleared with `cgov scale --clear`.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// What set it (currently always "cli").
+    pub source: String,
+}
+
+impl Default for ManualOverride {
+    fn default() -> Self {
+        Self {
+            target: 0,
+            set_at: Utc::now(),
+            expires_at: None,
+            source: "cli".to_string(),
+        }
+    }
+}
+
 /// Baseline burn rates from configuration (fallback when collector is offline or EMA not ready)
 ///
 /// These values are loaded from agent config's `baseline_burn_rate` settings and stored
@@ -918,6 +950,12 @@ pub struct GovernorState {
     /// ever changes.
     #[serde(default)]
     pub consecutive_absent_polls: HashMap<String, u32>,
+    /// Manual fleet-wide target override set by `cgov scale`. CLI/act-owned
+    /// under the ADR-001 split: `merge_act_owned` copies it (so the act
+    /// cycle's expiry-clear persists), `merge_observe_owned` never touches it
+    /// (so a concurrent observe save cannot revert a write the CLI just made).
+    #[serde(default)]
+    pub manual_override: Option<ManualOverride>,
 }
 
 impl Default for GovernorState {
@@ -945,6 +983,7 @@ impl Default for GovernorState {
             p7ds_delta: None,
             baseline_burn_rates: HashMap::new(),
             consecutive_absent_polls: HashMap::new(),
+            manual_override: None,
         }
     }
 }
@@ -1219,13 +1258,19 @@ pub fn save_state(state: &GovernorState, path: &Path) -> Result<()> {
 /// processes. `save_state` remains usable on its own for callers that only
 /// need a single atomic snapshot; the split daemons use this helper whenever
 /// they merge one ownership subtree onto the other process's latest state.
-pub fn with_state_lock<T, F>(path: &Path, update: F) -> Result<T>
+///
+/// The closure picks the error type `E` it wants to fail with (the daemons'
+/// closures use `StateError`; the `cgov scale` path uses `anyhow::Error`
+/// because its validation can fail for non-state reasons). Lock acquisition
+/// failures surface as `StateError`, converted into `E`.
+pub fn with_state_lock<T, E, F>(path: &Path, update: F) -> std::result::Result<T, E>
 where
-    F: FnOnce() -> Result<T>,
+    F: FnOnce() -> std::result::Result<T, E>,
+    E: From<StateError>,
 {
     let lock_path = path.with_extension("json.lock");
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| StateError::Io(e).into())?;
     }
 
     let started = Instant::now();
@@ -1241,12 +1286,12 @@ where
                 if let Err(error) = writeln!(file, "{}", std::process::id()) {
                     drop(file);
                     let _ = fs::remove_file(&lock_path);
-                    return Err(StateError::Io(error));
+                    return Err(StateError::Io(error).into());
                 }
                 if let Err(error) = file.flush() {
                     drop(file);
                     let _ = fs::remove_file(&lock_path);
-                    return Err(StateError::Io(error));
+                    return Err(StateError::Io(error).into());
                 }
                 break file;
             }
@@ -1262,11 +1307,12 @@ where
                     return Err(StateError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("timed out waiting for state lock {}", lock_path.display()),
-                    )));
+                    ))
+                    .into());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => return Err(StateError::Io(error)),
+            Err(error) => return Err(StateError::Io(error).into()),
         }
     };
 
@@ -1280,7 +1326,7 @@ where
     match (result, remove_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(StateError::Io(error)),
+        (Ok(_), Err(error)) => Err(StateError::Io(error).into()),
         (Err(error), Err(_)) => Err(error),
     }
 }
@@ -1324,8 +1370,9 @@ pub const EMERGENCY_BRAKE_TRIGGER: &str = "emergency_brake";
 /// in-memory copy; `safe_mode_at_load` is what `src` was loaded from at the
 /// start of the cycle (see below). Everything the observe process owns is
 /// copied wholesale. Everything the act process owns (`workers.*.target`,
-/// `alert_cooldown`, `open_alert_beads`, `alerts`, `alert_fp_telemetry`) is
-/// left at `dst`'s value so a concurrent `_act` write is never reverted.
+/// `alert_cooldown`, `open_alert_beads`, `alerts`, `alert_fp_telemetry`,
+/// `manual_override`) is left at `dst`'s value so a concurrent `_act` write
+/// (or a `cgov scale` write from the CLI) is never reverted.
 ///
 /// `workers` is merged per-key: observe owns `current`/`min`/`max` (it performs
 /// the census), act owns `target`.
@@ -1397,16 +1444,36 @@ pub fn merge_observe_owned(
 /// `updated_at` is deliberately NOT copied: it tracks when the observe
 /// pipeline last ran (what `cgov doctor`'s state-freshness checks measure),
 /// and an act write must not make stale observations look fresh.
+///
+/// `manual_override` is copied only when the act cycle itself changed it
+/// (compared against `manual_override_at_load`), so the cycle's expiry-clear
+/// persists while a `cgov scale` write that landed mid-cycle survives; observe
+/// never copies the field, so the CLI is the only concurrent writer racing
+/// act for it.
 pub fn merge_act_owned(
     dst: &mut GovernorState,
     src: &GovernorState,
     safe_mode_at_load: &SafeModeState,
+    manual_override_at_load: &Option<ManualOverride>,
 ) {
     dst.workers = src.workers.clone();
     dst.alert_cooldown = src.alert_cooldown.clone();
     dst.open_alert_beads = src.open_alert_beads.clone();
     dst.alert_fp_telemetry = src.alert_fp_telemetry.clone();
     dst.alerts = src.alerts.clone();
+
+    // Three-way merge, same shape as `safe_mode` below: copy the act cycle's
+    // value only when the cycle itself changed it (the expiry drop from
+    // `resolve_manual_override`, and any future act-side transition). A
+    // `cgov scale` write that landed while this cycle was in flight sits in
+    // `dst` and must survive this save — copying `src` wholesale would erase
+    // the operator's pin with the cycle's stale load-time snapshot. Residual
+    // race: a NEW override written mid-cycle while an older one expires in
+    // the same window still loses to the drop; the window is one act cycle
+    // long and the operator can simply re-run the command.
+    if src.manual_override != *manual_override_at_load {
+        dst.manual_override = src.manual_override.clone();
+    }
 
     let brake_engaged_this_cycle = src.safe_mode.active
         && src.safe_mode.trigger.as_deref() == Some(EMERGENCY_BRAKE_TRIGGER)
@@ -1681,6 +1748,12 @@ mod tests {
             p7ds_delta: None,
             baseline_burn_rates: HashMap::new(),
             consecutive_absent_polls: HashMap::new(),
+            manual_override: Some(ManualOverride {
+                target: 3,
+                set_at: "2026-03-18T12:00:00Z".parse().unwrap(),
+                expires_at: Some("2026-03-18T14:00:00Z".parse().unwrap()),
+                source: "cli".to_string(),
+            }),
         }
     }
 
@@ -1711,6 +1784,11 @@ mod tests {
         assert_eq!(
             loaded.capacity_forecast.weekly_scoped.safe_worker_count,
             Some(2)
+        );
+        assert_eq!(
+            loaded.manual_override,
+            full_state().manual_override,
+            "manual override must round-trip intact"
         );
     }
 
@@ -3056,7 +3134,12 @@ mod ownership_merge_test {
         acting.alerts.push(serde_json::json!({"source": "act"}));
 
         let observed_updated_at = disk.updated_at;
-        merge_act_owned(&mut disk, &acting, &SafeModeState::default());
+        merge_act_owned(
+            &mut disk,
+            &acting,
+            &SafeModeState::default(),
+            &acting.manual_override.clone(),
+        );
 
         assert_eq!(disk.usage.five_hour_pct, 42.0);
         assert_eq!(disk.capacity_forecast.binding_window, "five_hour");
@@ -3075,7 +3158,7 @@ mod ownership_merge_test {
         acting.safe_mode.trigger = Some(EMERGENCY_BRAKE_TRIGGER.to_string());
         acting.safe_mode.entered_at = Some(Utc::now());
 
-        merge_act_owned(&mut disk, &acting, &safe_mode_at_load);
+        merge_act_owned(&mut disk, &acting, &safe_mode_at_load, &None);
         assert!(disk.safe_mode.active);
         assert_eq!(
             disk.safe_mode.trigger.as_deref(),
@@ -3088,6 +3171,64 @@ mod ownership_merge_test {
         assert_eq!(
             disk.safe_mode.trigger.as_deref(),
             Some(EMERGENCY_BRAKE_TRIGGER)
+        );
+    }
+
+    /// The record `cgov scale` stores (source "cli", 2h TTL — the exact shape
+    /// does not matter to the merge, only identity across load and save).
+    fn cli_override(target: u32) -> ManualOverride {
+        ManualOverride {
+            target,
+            set_at: Utc::now(),
+            expires_at: Some(Utc::now() + ChronoDuration::hours(2)),
+            source: "cli".to_string(),
+        }
+    }
+
+    #[test]
+    fn act_save_preserves_a_mid_cycle_cli_scale_write() {
+        // The act cycle loaded no override; the CLI wrote one while the cycle
+        // was in flight. The cycle's in-memory copy still holds the stale
+        // load-time None, and the save must keep the operator's pin.
+        let manual_override_at_load: Option<ManualOverride> = None;
+        let mut disk = GovernorState::default();
+        disk.manual_override = Some(cli_override(3));
+        let acting = GovernorState::default();
+
+        merge_act_owned(
+            &mut disk,
+            &acting,
+            &SafeModeState::default(),
+            &manual_override_at_load,
+        );
+
+        assert_eq!(
+            disk.manual_override.as_ref().map(|ov| ov.target),
+            Some(3),
+            "a cgov scale write landing mid-cycle must survive the act-owned save"
+        );
+    }
+
+    #[test]
+    fn act_save_persists_the_act_side_expiry_clear() {
+        // The override expired during the act cycle and resolve_manual_override
+        // dropped it; the save must carry that drop to disk even though the
+        // on-disk copy (written after the cycle loaded) still has it.
+        let manual_override_at_load = Some(cli_override(3));
+        let mut disk = GovernorState::default();
+        disk.manual_override = manual_override_at_load.clone();
+        let acting = GovernorState::default();
+
+        merge_act_owned(
+            &mut disk,
+            &acting,
+            &SafeModeState::default(),
+            &manual_override_at_load,
+        );
+
+        assert!(
+            disk.manual_override.is_none(),
+            "the act cycle's expiry drop must reach disk"
         );
     }
 }

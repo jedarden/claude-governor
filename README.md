@@ -266,31 +266,43 @@ marked *(not yet wired)*.
   carrying `target`, `set_at`, `expires_at`, `source`) — persisted to
   `~/.config/claude-governor/governor-state.json`, so it survives a daemon
   restart. It is act-owned in the ADR-001 merge split (`docs/plan/plan.md`):
-  `merge_act_owned` copies it and `merge_observe_owned` never touches it, so no
-  loop-side save can revert a CLI write.
+  `merge_act_owned` copies it and `merge_observe_owned` never touches it.
+  `merge_act_owned` copies the field only when the act cycle itself changed it
+  (the expiry drop — the same three-way rule `safe_mode` uses), so no loop-side
+  save can revert a CLI write, including one that lands while an act cycle is
+  in flight.
 - **Expiry / clear.** TTL, not hold-forever: an override binds for a default of
   2 hours (`MANUAL_OVERRIDE_DEFAULT_TTL_HOURS` in `src/governor.rs`), and
   `cgov scale --ttl 0` extends it until an explicit `cgov scale --clear`. The
   choice is deliberate — long enough to serve as a real pin, short enough that a
   forgotten override cannot hold the fleet at a stale size indefinitely.
   `resolve_manual_override` (`src/governor.rs`) drops the field once
-  `expires_at` passes, and computed targets resume. *(Not yet wired: the
-  `--ttl` and `--clear` flags do not exist in the CLI yet; only the resolution
-  side is implemented.)*
+  `expires_at` passes, and computed targets resume. The `--ttl` and `--clear`
+  flags are implemented in the CLI (`run_scale_command` in `src/main.rs`, which
+  also supports `--dry-run`); what is not yet wired is the act cycle *applying*
+  the stored override — see Precedence below.
 - **Clamping.** The requested count is stored raw (`ManualOverride.target` is
   pre-clamp) and clamped to the fleet's aggregate `[min, max]` on every
-  reconcile — `aggregate_worker_bounds` inside `resolve_manual_override` — so
-  raising an agent's `max_workers` later un-clamps a stored pin. Set-time
-  validation still rejects a count outside every agent's bounds up front.
-  Per-agent bounds keep working underneath the total: allocation within the
-  manual total respects each agent's own floor
+  reconcile — `aggregate_worker_bounds` inside `resolve_manual_override`. The
+  aggregate bound is the envelope (min of mins, max of maxes) that
+  `compute_target_workers` has always clamped the fleet total against — not the
+  sum of per-agent bounds — so set-time validation (`validate_scale_count`,
+  which rejects a count outside the same envelope up front) and reconcile-time
+  clamping name and use the identical range, and a count that binds at all
+  binds at the same bound the computed target does. Because the raw count is
+  stored, raising an agent's `max_workers` later un-clamps a stored pin without
+  re-running `cgov scale`. Per-agent bounds keep working underneath the total:
+  allocation within the manual total respects each agent's own floor
   (`distribute_workers_by_cost_priority`) and max.
 - **Precedence.** While applied, the manual total replaces the computed target
   as the act cycle's aggregate goal. It deliberately does not enter
   `compute_target_workers`; the cycle applies it after that function returns,
   so per-agent distribution (cost priority, floors, caps) is unchanged within
   the manual total. *(Not yet wired: `resolve_manual_override` has no call site
-  in `run_act_cycle` yet.)*
+  in `run_act_cycle` yet. When landing the wiring, also decide whether
+  `apply_underutilization_sprint` may boost past a binding pin or the pin
+  suspends the sprint — nothing today observes the question, since neither is
+  wired.)*
 - **Emergency brake wins; hysteresis never blocks.** Any usage window at or
   above 98% utilization (`EMERGENCY_BRAKE_THRESHOLD`, found by
   `first_brake_window`) suspends the override: the fleet brakes to 0, the
@@ -310,15 +322,20 @@ marked *(not yet wired)*.
 
 ### Status today
 
-Until the wiring above lands, `cgov scale N` behaves as a one-shot per-agent
-target write: `run_scale_command` (`src/main.rs`) validates `N` against every
-agent's `[min, max]`, writes `workers.*.target` for all agents, and the next
-act cycle recomputes and overwrites it — under safe mode it warns that safe
-mode reasserts its own target on the next cycle. The state layer behind the
-contract (`ManualOverride`, `resolve_manual_override`) is implemented in
-`src/` but not yet driven by either the CLI or the act cycle; landing that
-wiring is what turns this section from contract into behavior, and this
-section should be updated in the same change.
+`cgov scale N` now stores the persistent override this section describes:
+`run_scale_command` (`src/main.rs`) validates `N` against the aggregate
+envelope, writes `GovernorState.manual_override` under the state lock (with
+`--ttl`, `--clear`, `--dry-run`), survives restarts, and warns — without
+refusing — when safe mode is active. The warning describes today's unwired
+reality (the computed target rules every cycle) and stays true under the
+contract above: what suspends a stored pin is an engaged emergency brake,
+never safe mode alone. What is still missing is the act-cycle wiring that
+makes the override *govern*: `resolve_manual_override` has no call site in
+`run_act_cycle` yet, so computed targets still rule every cycle, and the
+hysteresis bypass and decision-source stamping land with that wiring. Until
+then a stored pin is honored in state and in tests but does not yet move the
+fleet; landing the precedence wiring is what turns this section from contract
+into behavior, and this section should be updated in the same change.
 
 ## Usage Windows
 

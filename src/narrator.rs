@@ -563,6 +563,8 @@ mod tests {
         };
 
         GovernorState {
+            // no stored pin: decision narration reads the computed target, not `cgov scale`
+            manual_override: None,
             updated_at: Utc::now(),
             usage: UsageState::default(),
             last_fleet_aggregate: FleetAggregate::default(),

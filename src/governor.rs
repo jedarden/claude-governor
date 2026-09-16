@@ -38,7 +38,11 @@ use crate::state;
 use crate::worker::{self, WorkerConfig};
 
 /// Emergency brake threshold (98%)
-const EMERGENCY_BRAKE_THRESHOLD: f64 = 98.0;
+/// Utilization at or above which any usage window triggers the emergency
+/// brake — and suspends a stored manual override (`cgov scale`), which stays
+/// stored and resumes when the brake clears. Named in the README's
+/// "Manual scale override" contract.
+pub const EMERGENCY_BRAKE_THRESHOLD: f64 = 98.0;
 
 /// Safe mode: enter when median absolute error (pct points) exceeds this
 const SAFE_MODE_ENTRY_ERROR_THRESHOLD: f64 = 15.0;
@@ -4742,6 +4746,125 @@ fn distribute_workers_by_cost_priority(
     result
 }
 
+/// The first usage window at/above the emergency-brake threshold, if any.
+///
+/// Shared by [`compute_target_workers`] (which forces the target to 0) and the
+/// act cycle's manual-override resolution (which must know when the brake —
+/// not an override — is deciding the target).
+fn first_brake_window(forecast: &state::CapacityForecast) -> Option<(&'static str, f64)> {
+    let windows = [
+        (WINDOW_FIVE_HOUR, forecast.five_hour.current_utilization),
+        (WINDOW_SEVEN_DAY, forecast.seven_day.current_utilization),
+        (
+            WINDOW_WEEKLY_SCOPED,
+            forecast.weekly_scoped.current_utilization,
+        ),
+    ];
+    windows
+        .into_iter()
+        .find(|(_, util)| *util >= EMERGENCY_BRAKE_THRESHOLD)
+}
+
+/// Aggregate `[min, max]` bounds across configured agents — the same
+/// aggregation `compute_target_workers` clamps against (min of mins, max of
+/// maxes). `None` when no agents are configured.
+///
+/// `pub` because `cgov scale` validates a requested total against these same
+/// bounds at write time — set-time rejection and reconcile-time clamping
+/// must name and use the identical range.
+pub fn aggregate_worker_bounds(state: &state::GovernorState) -> Option<(u32, u32)> {
+    let mut global_min = u32::MAX;
+    let mut global_max: u32 = 0;
+    for ws in state.workers.values() {
+        global_min = global_min.min(ws.min);
+        global_max = global_max.max(ws.max);
+    }
+    if global_min == u32::MAX {
+        None
+    } else {
+        Some((global_min, global_max))
+    }
+}
+
+/// Default time a manual `cgov scale` override binds before the governor
+/// returns to computed targets.
+///
+/// Long enough to be useful as a deliberate pin, short enough that a
+/// forgotten override cannot hold the fleet at a stale size indefinitely.
+/// `cgov scale --ttl 0` opts out entirely (hold until `--clear`).
+pub const MANUAL_OVERRIDE_DEFAULT_TTL_HOURS: u64 = 2;
+
+/// What the act cycle decided to do with the stored manual override.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManualOverrideResolution {
+    /// Override is binding: `applied_target` is the clamped target the cycle
+    /// acts on.
+    Applied { applied_target: u32 },
+    /// An emergency brake window forced target 0; the override stays stored
+    /// and resumes when the brake clears.
+    SuspendedByBrake,
+    /// The override passed its `expires_at` this cycle (or was absent). It is
+    /// cleared from state; the computed target rules.
+    ExpiredOrAbsent,
+}
+
+/// Resolve the stored manual override against the current forecast and clock.
+///
+/// Returns [`ManualOverrideResolution::Applied`] with the override target
+/// clamped to the fleet's aggregate `[min, max]` bounds; the raw stored
+/// target is preserved in state (only expiry clears it). An expired override
+/// is removed from `state` here; the caller persists that as part of the
+/// act-owned save.
+pub fn resolve_manual_override(
+    state: &mut state::GovernorState,
+    now: DateTime<Utc>,
+) -> ManualOverrideResolution {
+    let Some(ov) = state.manual_override.as_ref() else {
+        return ManualOverrideResolution::ExpiredOrAbsent;
+    };
+
+    if ov.expires_at.map_or(false, |e| e <= now) {
+        log::info!(
+            "[governor] manual override (target {}, set {}) expired at {}; returning to computed targets",
+            ov.target,
+            ov.set_at.to_rfc3339(),
+            ov.expires_at.unwrap().to_rfc3339()
+        );
+        state.manual_override = None;
+        return ManualOverrideResolution::ExpiredOrAbsent;
+    }
+
+    if first_brake_window(&state.capacity_forecast).is_some() {
+        log::warn!(
+            "[governor] manual override (target {}) suspended: emergency brake engaged — the override stays stored and resumes when the brake clears",
+            ov.target
+        );
+        return ManualOverrideResolution::SuspendedByBrake;
+    }
+
+    let (lo, hi) = aggregate_worker_bounds(state).unwrap_or((0, ov.target));
+    let clamped = ov.target.min(hi).max(lo);
+    if clamped != ov.target {
+        log::info!(
+            "[governor] manual override target {} clamped to fleet bounds [{}, {}] -> {}",
+            ov.target,
+            lo,
+            hi,
+            clamped
+        );
+    }
+    log::info!(
+        "[governor] manual override active: target {} (set {}, expires {}) replaces the computed target",
+        clamped,
+        ov.set_at.to_rfc3339(),
+        ov.expires_at
+            .map(|e| e.to_rfc3339())
+            .unwrap_or_else(|| "never (cleared with `cgov scale --clear`)".to_string())
+    );
+    ManualOverrideResolution::Applied {
+        applied_target: clamped,
+    }
+}
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
@@ -4765,47 +4888,33 @@ fn distribute_workers_by_cost_priority(
 /// 5. Otherwise use cone-selected safe worker count from binding window
 /// 6. Apply sprint boost if active
 /// 7. Clamp to [min, max] from worker state
+///
+/// A manual `cgov scale` override does NOT enter here — the act cycle applies
+/// it after this function, so the brake check inside always wins.
 pub fn compute_target_workers(
     state: &state::GovernorState,
     _target_ceiling: f64,
     composite_risk_config: &CompositeRiskConfig,
     cone_scaling_config: &ConeScalingConfig,
 ) -> u32 {
-    // Aggregate min/max across all configured agents
-    let mut global_min = u32::MAX;
-    let mut global_max: u32 = 0;
-    let mut current_total: u32 = 0;
-
-    for ws in state.workers.values() {
-        global_min = global_min.min(ws.min);
-        global_max = global_max.max(ws.max);
-        current_total += ws.current;
-    }
-
     // No workers configured — return 0
-    if global_min == u32::MAX {
-        return 0;
-    }
+    let (global_min, global_max) = match aggregate_worker_bounds(state) {
+        Some(bounds) => bounds,
+        None => return 0,
+    };
+    let current_total: u32 = state.workers.values().map(|ws| ws.current).sum();
 
     let forecast = &state.capacity_forecast;
 
     // Check emergency brake: any window >= 98%
-    let windows = [
-        (&WINDOW_FIVE_HOUR, &forecast.five_hour),
-        (&WINDOW_SEVEN_DAY, &forecast.seven_day),
-        (&WINDOW_WEEKLY_SCOPED, &forecast.weekly_scoped),
-    ];
-
-    for (_name, win) in &windows {
-        if win.current_utilization >= EMERGENCY_BRAKE_THRESHOLD {
-            log::warn!(
-                "[governor] EMERGENCY BRAKE: {} at {:.1}% >= {:.0}%",
-                _name,
-                win.current_utilization,
-                EMERGENCY_BRAKE_THRESHOLD
-            );
-            return 0;
-        }
+    if let Some((name, util)) = first_brake_window(forecast) {
+        log::warn!(
+            "[governor] EMERGENCY BRAKE: {} at {:.1}% >= {:.0}%",
+            name,
+            util,
+            EMERGENCY_BRAKE_THRESHOLD
+        );
+        return 0;
     }
 
     // Get binding window index
@@ -6660,8 +6769,11 @@ pub fn run_act_cycle(
     // Remember the safe_mode we loaded so the act-owned save at the end of this
     // cycle can tell "_act engaged the emergency brake this cycle" apart from
     // "observe updated safe_mode while this cycle was in flight" (see
-    // state::merge_act_owned).
+    // state::merge_act_owned). The manual override is remembered for the same
+    // reason: a `cgov scale` write landing mid-cycle must survive the save,
+    // while this cycle's own expiry drop must persist.
     let safe_mode_at_load = state.safe_mode.clone();
+    let manual_override_at_load = state.manual_override.clone();
 
     // 2. Count current workers (heartbeat files + tmux). The census is
     // re-derived here (not trusted from state) because act is the half that
@@ -7340,7 +7452,12 @@ pub fn run_act_cycle(
     // reflects the observe pipeline.
     state::with_state_lock(state_path, || {
         let mut disk = state::load_state(state_path)?;
-        state::merge_act_owned(&mut disk, &state, &safe_mode_at_load);
+        state::merge_act_owned(
+            &mut disk,
+            &state,
+            &safe_mode_at_load,
+            &manual_override_at_load,
+        );
         state::save_state(&disk, state_path)
     })?;
 
@@ -9689,6 +9806,167 @@ mod tests {
         assert_eq!(
             target, 0,
             "expected no workers launched at fresh restart with no burn-rate data"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual override resolution (cgov scale)
+    // -----------------------------------------------------------------------
+
+    use state::ManualOverride;
+
+    /// Two pools, aggregate envelope bounds [0, 4] (min-of-mins 0,
+    /// max-of-maxes 4) — the same envelope `compute_target_workers` has always
+    /// clamped the fleet total against — with a stored override of the
+    /// requested `target`.
+    fn override_state(target: u32, expires_at: Option<DateTime<Utc>>) -> state::GovernorState {
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "sonnet".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 1,
+                min: 0,
+                max: 4,
+            },
+        );
+        state.workers.insert(
+            "opus".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 1,
+                min: 0,
+                max: 2,
+            },
+        );
+        state.manual_override = Some(ManualOverride {
+            target,
+            set_at: Utc::now(),
+            expires_at,
+            source: "cli".to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn manual_override_applies_clamped_to_aggregate_bounds() {
+        // 9 exceeds the aggregate envelope max of 4 (max-of-maxes: sonnet 4,
+        // opus 2): bind at 4, but keep the raw 9 in state — raising an agent's
+        // max_workers later un-clamps the pin.
+        let mut state = override_state(9, Some(Utc::now() + chrono::Duration::hours(1)));
+        let now = Utc::now();
+
+        let resolution = resolve_manual_override(&mut state, now);
+
+        assert_eq!(
+            resolution,
+            ManualOverrideResolution::Applied {
+                applied_target: 4
+            },
+            "override must bind at the aggregate envelope max — the identical \
+             bound the computed target clamps against — not the raw request"
+        );
+        assert_eq!(
+            state.manual_override.expect("stored").target, 9,
+            "the stored target must stay raw (pre-clamp)"
+        );
+    }
+
+    #[test]
+    fn manual_override_unclamps_when_bounds_rise() {
+        // Same stored raw 9, but opus's max_workers rises from 2 to 8 after
+        // the pin was set: the envelope max becomes 8 and the pin binds there
+        // without anyone re-running cgov scale.
+        let mut state = override_state(9, Some(Utc::now() + chrono::Duration::hours(1)));
+        state
+            .workers
+            .get_mut("opus")
+            .expect("opus pool")
+            .max = 8;
+
+        let resolution = resolve_manual_override(&mut state, Utc::now());
+
+        assert_eq!(
+            resolution,
+            ManualOverrideResolution::Applied {
+                applied_target: 8
+            },
+            "raising an agent's max_workers must un-clamp the stored raw pin"
+        );
+        assert_eq!(state.manual_override.expect("stored").target, 9);
+    }
+
+    #[test]
+    fn manual_override_without_expiry_binds_until_cleared() {
+        let mut state = override_state(3, None);
+
+        // Well past any plausible session: no expires_at means --clear, not
+        // the clock, ends it.
+        let resolution = resolve_manual_override(&mut state, Utc::now() + chrono::Duration::days(30));
+
+        assert_eq!(
+            resolution,
+            ManualOverrideResolution::Applied {
+                applied_target: 3
+            }
+        );
+        assert!(state.manual_override.is_some(), "must stay stored");
+    }
+
+    #[test]
+    fn manual_override_expired_is_dropped_from_state() {
+        let mut state = override_state(3, Some(Utc::now() - chrono::Duration::hours(1)));
+
+        let resolution = resolve_manual_override(&mut state, Utc::now());
+
+        assert_eq!(resolution, ManualOverrideResolution::ExpiredOrAbsent);
+        assert!(
+            state.manual_override.is_none(),
+            "expiry must clear the field so the act-owned save persists the drop"
+        );
+    }
+
+    #[test]
+    fn manual_override_absent_resolves_expired_or_absent() {
+        let mut state = override_state(3, None);
+        state.manual_override = None;
+
+        let resolution = resolve_manual_override(&mut state, Utc::now());
+
+        assert_eq!(resolution, ManualOverrideResolution::ExpiredOrAbsent);
+        assert!(state.manual_override.is_none());
+    }
+
+    #[test]
+    fn manual_override_suspended_by_brake_stays_stored() {
+        let mut state = override_state(3, Some(Utc::now() + chrono::Duration::hours(1)));
+        // Any window at/above the emergency-brake threshold suspends the pin.
+        state.capacity_forecast.five_hour.current_utilization = EMERGENCY_BRAKE_THRESHOLD;
+
+        let resolution = resolve_manual_override(&mut state, Utc::now());
+
+        assert_eq!(resolution, ManualOverrideResolution::SuspendedByBrake);
+        assert!(
+            state.manual_override.is_some(),
+            "the brake suspends the override, it does not consume it — the pin resumes when the brake clears"
+        );
+    }
+
+    #[test]
+    fn manual_override_clamps_up_to_the_aggregate_floor() {
+        let mut state = override_state(0, Some(Utc::now() + chrono::Duration::hours(1)));
+        for ws in state.workers.values_mut() {
+            ws.min = 1; // aggregate floor: min-of-mins = 1
+        }
+
+        let resolution = resolve_manual_override(&mut state, Utc::now());
+
+        assert_eq!(
+            resolution,
+            ManualOverrideResolution::Applied {
+                applied_target: 1
+            },
+            "a pin below the aggregate floor binds at the floor"
         );
     }
 
