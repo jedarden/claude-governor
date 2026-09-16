@@ -20,19 +20,86 @@ This system replaces the fragile `capacity-governor.sh` (TUI screen-scraping, st
 
 ## Installation
 
+**Provenance.** The source of truth for this repo is Forgejo
+(`git.ardenone.com/jedarden/claude-governor`); GitHub is a read-only mirror and
+can lag it. Release binaries are built by the `cgov-ci` Argo Workflow in the
+`iad-ci` cluster from a fresh Forgejo clone — the `v<VERSION>` tag is pushed to
+Forgejo before the release is cut — and published to GitHub Releases with one
+`sha256` sidecar per binary. Forgejo itself is private, so `install.sh` fetches
+the artifact from the public GitHub release and **verifies the sidecar digest
+before anything is installed**; a given `vX.Y.Z` asset and its digest are
+immutable once published, so mirror lag can never swap contents under a pinned
+version. Nothing is written to the install dir until verification passes.
+
 ### Option 1: Pre-built binary (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh | bash
+curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh | bash
 ```
 
-### Option 2: Build from source
+(Forgejo requires authentication; on a box with Forgejo credentials in the git
+credential store, the above just works. The GitHub-mirror equivalent is
+`https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh` —
+same script, possibly lagging `main`; the *binary* digest check below is what
+guards integrity either way.)
+
+The installer downloads the binary plus its published `.sha256` sidecar and
+refuses to install on any mismatch.
+
+### Option 1a: Pinned version
+
+Reproducible installs should pin the release tag:
 
 ```bash
+curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
+  | CGOV_VERSION=v0.1.1 bash
+```
+
+`CGOV_VERSION` (or `--version v0.1.1`) selects the release; a bare `0.1.1` is
+normalized to `v0.1.1`.
+
+### Option 1b: Digest-pinned (strongest)
+
+Pin the exact binary digest so even a compromised release page cannot serve
+you different bytes:
+
+```bash
+# Obtain the published digest for your platform and release, e.g.:
+curl -fsSL "https://github.com/jedarden/claude-governor/releases/download/v0.1.1/cgov-linux-amd64.sha256"
+
+curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
+  | CGOV_VERSION=v0.1.1 CGOV_SHA256=<64-hex-digest> bash
+```
+
+A non-matching `CGOV_SHA256` aborts the install before anything is written.
+
+### Option 1c: Manual, no pipe-to-bash
+
+```bash
+cd "$(mktemp -d)"
+curl -fsSLO "https://github.com/jedarden/claude-governor/releases/latest/download/cgov-linux-amd64"
+curl -fsSLO "https://github.com/jedarden/claude-governor/releases/latest/download/cgov-linux-amd64.sha256"
+sha256sum -c cgov-linux-amd64.sha256        # must print: cgov-linux-amd64: OK
+install -m 0755 cgov-linux-amd64 ~/.local/bin/cgov
+```
+
+### Option 2: Build from source (Forgejo)
+
+```bash
+git clone https://git.ardenone.com/jedarden/claude-governor.git
+cd claude-governor
 cargo build --release
 cp target/release/cgov ~/.local/bin/
 chmod +x ~/.local/bin/cgov
 ```
+
+### Installer smoke test
+
+The installer itself is exercised end-to-end (latest via pipe, pinned version,
+and a must-fail bad-digest run, all in a clean `env -i` environment) by the
+`cgov-install-smoke` WorkflowTemplate in
+[`declarative-config/k8s/iad-ci/argo-workflows/`](https://git.ardenone.com/jedarden/declarative-config)
+(Argo Workflows in `iad-ci` — CI never runs on GitHub Actions).
 
 ## Quickstart
 
