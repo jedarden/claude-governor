@@ -108,7 +108,7 @@ ARTIFACT="${BINARY_NAME}-${PLATFORM}"
 RESOLVED_TAG=""
 if [ -z "${VERSION}" ]; then
     LOCATION="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "${ASSET_BASE}/${ARTIFACT}" 2>/dev/null || true)"
-    RESOLVED_TAG="$(printf '%s' "${LOCATION}" | sed -n 's#.*/tag/\(v[0-9A-Za-z.-]*\)/.*#\1#p')"
+    RESOLVED_TAG="$(printf '%s' "${LOCATION}" | sed -n 's#.*/releases/[a-z]*/\(v[0-9A-Za-z.-]*\)/.*#\1#p')"
 fi
 
 info "Claude Governor Installer"
