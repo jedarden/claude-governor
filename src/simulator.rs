@@ -460,6 +460,11 @@ pub fn simulate(
     // Track if a window reset happened (to detect events)
     let mut last_reset_check: HashMap<String, DateTime<Utc>> = HashMap::new();
 
+    // Exhaustion/reset crossings since the last recorded point. A crossing can
+    // land between sample points; carry it forward so the printed trajectory
+    // never drops one.
+    let mut pending_events: Vec<String> = Vec::new();
+
     // Simulate minute by minute
     for minute in 0..=total_minutes {
         let hours_offset = minute as f64 / 60.0;
@@ -477,9 +482,6 @@ pub fn simulate(
             .map(|w| ctx.promo_multiplier_at(current_time, w))
             .fold(1.0_f64, f64::max);
 
-        // Track events for this step
-        let mut events = Vec::new();
-
         // Update each window
         for window in &WINDOWS {
             // Check for window reset
@@ -489,7 +491,7 @@ pub fn simulate(
                 // If we crossed the reset time, utilization drops to 0
                 if last_check < reset_time && current_time >= reset_time {
                     current_utilization.insert(window.to_string(), 0.0);
-                    events.push(format!("window_reset:{}", window));
+                    pending_events.push(format!("window_reset:{}", window));
                 }
 
                 last_reset_check.insert(window.to_string(), current_time);
@@ -516,7 +518,7 @@ pub fn simulate(
                             ceiling,
                         });
                         breach_detected.insert(window.to_string(), true);
-                        events.push(format!("ceiling_breach:{}", window));
+                        pending_events.push(format!("ceiling_breach:{}", window));
                     }
                 }
             }
@@ -530,8 +532,16 @@ pub fn simulate(
                 windows: current_utilization.clone(),
                 promo_multiplier: display_promo_multiplier,
                 workers,
-                events,
+                events: std::mem::take(&mut pending_events),
             });
+        }
+    }
+
+    // Flush any crossings that landed in the final partial interval onto the
+    // last point rather than dropping them.
+    if !pending_events.is_empty() {
+        if let Some(last) = points.last_mut() {
+            last.events.extend(pending_events);
         }
     }
 
@@ -690,6 +700,7 @@ pub fn format_ascii_table(trajectory: &Trajectory) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_fixtures::{baseline_snapshot, high_utilization_snapshot};
     use crate::state::{BurnRateState, CapacityForecast, ScheduleState, UsageState};
 
     fn make_test_state() -> GovernorState {
@@ -1281,6 +1292,349 @@ mod tests {
         assert_eq!(
             state.burn_rate.usd_per_pct_ema_weekly_scoped, 0.0,
             "Post-simulation: weekly_scoped USD EMA should remain 0"
+        );
+    }
+
+    // --- Trajectory math: worker-count scaling and window reset boundaries ---
+
+    /// Build a state from a recorded snapshot's actual values (see
+    /// `snapshot_fixtures` for the recorded poll data), with burn rate and
+    /// ceilings matching `make_test_state`.
+    fn recorded_state(
+        taken_at: chrono::DateTime<Utc>,
+        five_hour_pct: f64,
+        seven_day_pct: f64,
+        weekly_scoped_pct: f64,
+        five_hour_resets_at: &str,
+        sonnet_resets_at: &str,
+    ) -> GovernorState {
+        let mut state = GovernorState::default();
+
+        state.usage = UsageState {
+            weekly_scoped_pct,
+            sonnet_pct: weekly_scoped_pct,
+            all_models_pct: seven_day_pct,
+            five_hour_pct,
+            sonnet_resets_at: sonnet_resets_at.to_string(),
+            seven_day_resets_at: sonnet_resets_at.to_string(),
+            five_hour_resets_at: five_hour_resets_at.to_string(),
+            stale: false,
+            weekly_scoped_model: None,
+        };
+
+        state.capacity_forecast = CapacityForecast {
+            five_hour: crate::state::WindowForecast {
+                target_ceiling: 85.0,
+                current_utilization: five_hour_pct,
+                ..Default::default()
+            },
+            seven_day: crate::state::WindowForecast {
+                target_ceiling: 90.0,
+                current_utilization: seven_day_pct,
+                ..Default::default()
+            },
+            weekly_scoped: crate::state::WindowForecast {
+                target_ceiling: 90.0,
+                current_utilization: weekly_scoped_pct,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        state.burn_rate = BurnRateState {
+            by_model: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "claude-sonnet-4-20250514".to_string(),
+                    crate::state::ModelBurnRate {
+                        pct_per_worker_per_hour: 2.0,
+                        dollars_per_worker_per_hour: 5.0,
+                        samples: 10,
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+
+        state.updated_at = taken_at;
+        state
+    }
+
+    #[test]
+    fn worker_count_scales_utilization_linearly() {
+        // Recorded baseline poll (2026-03-18T10:00:00Z: 5h=12.5, 7d=45.2,
+        // weekly_scoped=38.7) with resets pushed beyond the horizon so the
+        // only thing differentiating the runs is worker count.
+        let state_1 = recorded_state(
+            "2026-03-18T10:00:00Z".parse().unwrap(),
+            12.5,
+            45.2,
+            38.7,
+            "2026-04-30T10:00:00Z", // beyond horizon: no reset fires
+            "2026-04-30T10:00:00Z",
+        );
+        let state_4 = state_1.clone();
+
+        let traj_1 = simulate(&state_1, &SimConfig::fixed(1, 3.0), vec![]).unwrap();
+        let traj_4 = simulate(&state_4, &SimConfig::fixed(4, 3.0), vec![]).unwrap();
+
+        let final_1 = traj_1.points.last().unwrap();
+        let final_4 = traj_4.points.last().unwrap();
+
+        // 2%/worker/hour for 3 hours: 1 worker adds 6pts, 4 workers add 24pts
+        let growth_1 = final_1.windows["five_hour"] - 12.5;
+        let growth_4 = final_4.windows["five_hour"] - 12.5;
+        assert!(
+            (growth_1 - 6.0).abs() < 0.2,
+            "1 worker should add ~6pts over 3h, got {}",
+            growth_1
+        );
+        assert!(
+            (growth_4 - 24.0).abs() < 0.8,
+            "4 workers should add ~24pts over 3h, got {}",
+            growth_4
+        );
+        assert!(
+            (growth_4 / growth_1 - 4.0).abs() < 0.05,
+            "Growth must scale with worker count: 4w/1w = {}",
+            growth_4 / growth_1
+        );
+
+        // Same linear scaling on the weekly_scoped window
+        let growth_ws_1 = final_1.windows["weekly_scoped"] - 38.7;
+        let growth_ws_4 = final_4.windows["weekly_scoped"] - 38.7;
+        assert!((growth_ws_1 - 6.0).abs() < 0.2);
+        assert!((growth_ws_4 - 24.0).abs() < 0.8);
+    }
+
+    #[test]
+    fn window_reset_event_lands_on_exact_boundary_point() {
+        // make_test_state: five_hour resets at 2026-03-20T10:00:00Z, exactly
+        // 2h after the 08:00 start — on a sampled minute at 15min resolution.
+        let state = make_test_state();
+        let config = SimConfig::fixed(1, 3.0);
+
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        let at_reset = trajectory
+            .points
+            .iter()
+            .find(|p| (p.hours_offset - 2.0).abs() < 0.01)
+            .expect("Point at the reset boundary");
+        assert!(
+            at_reset
+                .events
+                .iter()
+                .any(|e| e == "window_reset:five_hour"),
+            "Reset exactly on a sample point must be reported there: {:?}",
+            at_reset.events
+        );
+        // Dropped to 0 and re-burned one minute: 2%/h / 60 ≈ 0.033
+        let util_at = at_reset.windows["five_hour"];
+        assert!(
+            util_at < 0.5,
+            "five_hour should be ~0 right at its reset, got {}",
+            util_at
+        );
+
+        let before = trajectory
+            .points
+            .iter()
+            .find(|p| (p.hours_offset - 1.75).abs() < 0.01)
+            .unwrap();
+        assert!(
+            before.windows["five_hour"] > 30.0,
+            "five_hour should still be climbing pre-reset, got {}",
+            before.windows["five_hour"]
+        );
+    }
+
+    #[test]
+    fn window_reset_between_sample_points_still_reported() {
+        // Reset at 09:47 — minute 107 from the 08:00 start, which is NOT a
+        // sampled minute at 15min resolution (points land on 105 and 120).
+        let mut state = make_test_state();
+        state.usage.five_hour_resets_at = "2026-03-20T09:47:00Z".to_string();
+
+        let config = SimConfig::fixed(1, 3.0);
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        let reset_points: Vec<&TrajectoryPoint> = trajectory
+            .points
+            .iter()
+            .filter(|p| p.events.iter().any(|e| e == "window_reset:five_hour"))
+            .collect();
+        assert_eq!(
+            reset_points.len(),
+            1,
+            "A reset landing between sample points must still be reported exactly once"
+        );
+        // Carried forward to the next sampled point after minute 107
+        assert!(
+            (reset_points[0].hours_offset - 2.0).abs() < 0.01,
+            "Event should attach to the next point after the crossing, got {}h",
+            reset_points[0].hours_offset
+        );
+
+        // Utilization regrows from ~0 after the crossing
+        let after = trajectory
+            .points
+            .iter()
+            .find(|p| (p.hours_offset - 2.25).abs() < 0.01)
+            .unwrap();
+        assert!(
+            after.windows["five_hour"] < 1.0,
+            "five_hour should restart from ~0 after an off-grid reset, got {}",
+            after.windows["five_hour"]
+        );
+    }
+
+    #[test]
+    fn resets_across_windows_both_reported_in_long_horizon() {
+        // five_hour resets 3h in, weekly_scoped/seven_day 5h in: two distinct
+        // reset boundaries inside one 12h trajectory.
+        let mut state = make_test_state();
+        state.usage.five_hour_resets_at = "2026-03-20T11:00:00Z".to_string(); // +3h
+        state.usage.sonnet_resets_at = "2026-03-20T13:00:00Z".to_string(); // +5h
+
+        let config = SimConfig::fixed(2, 12.0);
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        let five_hour_resets = trajectory
+            .points
+            .iter()
+            .filter(|p| p.events.iter().any(|e| e == "window_reset:five_hour"))
+            .count();
+        let weekly_resets = trajectory
+            .points
+            .iter()
+            .filter(|p| {
+                p.events
+                    .iter()
+                    .any(|e| e == "window_reset:weekly_scoped" || e == "window_reset:seven_day")
+            })
+            .count();
+        assert_eq!(five_hour_resets, 1, "five_hour reset boundary not reported");
+        assert!(weekly_resets >= 1, "weekly reset boundary not reported");
+
+        // After its +5h reset, weekly_scoped regrows from 0 for the remaining
+        // 7h at 2 workers x 2%/h = 28pts — well below its pre-reset ~60pts.
+        let last = trajectory.points.last().unwrap();
+        let ws_after = last.windows["weekly_scoped"];
+        assert!(
+            ws_after < 35.0 && ws_after > 20.0,
+            "weekly_scoped should be mid-regrowth (~28pts) after reset, got {}",
+            ws_after
+        );
+    }
+
+    // --- Trajectory math against recorded usage fixtures ---
+
+    #[test]
+    fn recorded_baseline_fixture_projects_forward_from_current_burn() {
+        // Recorded baseline poll: 2026-03-18T10:00:00Z, 5h=12.5 / 7d=45.2 /
+        // weekly_scoped=38.7. Project 2 workers x 5h at 2%/worker/h.
+        let state = recorded_state(
+            baseline_snapshot().taken_at,
+            baseline_snapshot().five_hour_pct,
+            baseline_snapshot().seven_day_pct,
+            baseline_snapshot().weekly_scoped_pct,
+            "2026-04-30T10:00:00Z",
+            "2026-04-30T10:00:00Z",
+        );
+
+        let config = SimConfig::fixed(2, 5.0);
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        // The trajectory starts from the recorded values (t=0 has one minute
+        // of burn applied: 2*2/60 ≈ 0.067)
+        let first = &trajectory.points[0];
+        assert!((first.windows["five_hour"] - 12.5).abs() < 0.1);
+        assert!((first.windows["weekly_scoped"] - 38.7).abs() < 0.1);
+
+        // Each window advances by workers x rate x hours = 2x2x5 = 20pts
+        let last = trajectory.points.last().unwrap();
+        assert!(
+            (last.windows["five_hour"] - 32.5).abs() < 0.3,
+            "five_hour: 12.5 + 20 = 32.5, got {}",
+            last.windows["five_hour"]
+        );
+        assert!(
+            (last.windows["seven_day"] - 65.2).abs() < 0.3,
+            "seven_day: 45.2 + 20 = 65.2, got {}",
+            last.windows["seven_day"]
+        );
+        assert!(
+            (last.windows["weekly_scoped"] - 58.7).abs() < 0.3,
+            "weekly_scoped: 38.7 + 20 = 58.7, got {}",
+            last.windows["weekly_scoped"]
+        );
+
+        // None of these cross their ceilings (85/90/90)
+        assert!(
+            trajectory.breaches.is_empty(),
+            "Baseline projection should stay under its ceilings: {:?}",
+            trajectory.breaches
+        );
+    }
+
+    #[test]
+    fn recorded_high_utilization_fixture_reports_exhaustion_crossing() {
+        // Recorded high-utilization poll: 2026-03-20T18:00:00Z,
+        // 5h=82.4 / 7d=91.7 / weekly_scoped=94.2 — seven_day and
+        // weekly_scoped are already over their 90% ceiling, five_hour
+        // exhausts at (85-82.4)/(2 workers x 2%/h) = 0.65h.
+        let snap = high_utilization_snapshot();
+        let state = recorded_state(
+            snap.taken_at,
+            snap.five_hour_pct,
+            snap.seven_day_pct,
+            snap.weekly_scoped_pct,
+            "2026-04-30T18:00:00Z",
+            "2026-04-30T18:00:00Z",
+        );
+
+        let config = SimConfig::fixed(2, 2.0);
+        let trajectory = simulate(&state, &config, vec![]).unwrap();
+
+        // Already-over-ceiling windows breach at the first point
+        for window in ["seven_day", "weekly_scoped"] {
+            let breach = trajectory
+                .breaches
+                .iter()
+                .find(|b| b.window == window)
+                .unwrap_or_else(|| panic!("{} should breach immediately", window));
+            assert!(
+                breach.hours_offset < 0.01,
+                "{} breach should be at offset 0, got {}h",
+                window,
+                breach.hours_offset
+            );
+        }
+
+        // five_hour crosses 85% between the 0.5h and 0.75h sample points
+        let five_hour_breach = trajectory
+            .breaches
+            .iter()
+            .find(|b| b.window == "five_hour")
+            .expect("five_hour exhaustion crossing should be recorded");
+        assert!(
+            five_hour_breach.hours_offset > 0.5 && five_hour_breach.hours_offset < 1.0,
+            "five_hour should exhaust between 0.5h and 1.0h, got {}h",
+            five_hour_breach.hours_offset
+        );
+        assert!(five_hour_breach.utilization >= 85.0);
+
+        // ... and the crossing must surface on a sampled point's events
+        let five_hour_breach_events = trajectory
+            .points
+            .iter()
+            .filter(|p| p.events.iter().any(|e| e == "ceiling_breach:five_hour"))
+            .count();
+        assert_eq!(
+            five_hour_breach_events, 1,
+            "The five_hour exhaustion crossing must appear on exactly one printed point"
         );
     }
 }
