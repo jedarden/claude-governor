@@ -11,7 +11,7 @@ use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -164,54 +164,83 @@ pub struct CursorStore {
 impl CursorStore {
     /// Load cursor store from a JSON file
     ///
-    /// Returns an empty CursorStore if the file doesn't exist OR if it fails to
-    /// parse. A corrupt cursor file (e.g. from the concurrent-writer race that
-    /// `save()` now avoids — see ADR-002) must never take down usage tracking
+    /// Returns an empty CursorStore if the file doesn't exist. A corrupt cursor
+    /// file (e.g. from the concurrent-writer race that `save()` now avoids — see
+    /// ADR-002, or a crash mid-write) must never take down usage tracking
     /// indefinitely: cursors are just "how far we've read" bookkeeping, not the
-    /// usage data itself, so resetting them costs at most a bit of re-reading, not
-    /// data loss. Previously a parse error here hard-failed every collection pass
-    /// (and the governor's burn-rate polling with it) until someone noticed and
-    /// manually repaired the file.
+    /// usage data itself, so rebuilding them costs at most a bit of re-reading,
+    /// not data loss. Previously a parse error here hard-failed every collection
+    /// pass (and the governor's burn-rate polling with it) until someone noticed
+    /// and manually repaired the file.
     ///
-    /// On corrupt JSON, backs up the file with a `.corrupt-<timestamp>` suffix
-    /// so the original is available for forensics, then returns an empty store.
+    /// Recovery from corrupt JSON:
+    ///
+    /// 1. Quarantine — the corrupt file is renamed to a `.corrupt-<timestamp>`
+    ///    suffix so the original stays available for forensics.
+    /// 2. Rebuild — entries that survived the corruption intact are salvaged
+    ///    ([`salvage_cursor_entries`]), so each file resumes from its last good
+    ///    offset instead of byte 0. Only files whose entry was lost re-read from
+    ///    byte 0, which inflates that one interval's token deltas once (already
+    ///    collected data gets re-counted one time — re-count, never data loss).
+    /// 3. Persist + log — the rebuilt store is saved back immediately so the
+    ///    recovery survives even if this pass aborts before its next `save()`,
+    ///    and a `cursor recovery` event is logged with the salvage counts.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
-        match serde_json::from_reader(reader) {
+        let bytes = fs::read(path)?;
+        match serde_json::from_slice(&bytes) {
             Ok(store) => Ok(store),
             Err(e) => {
-                // Back up the corrupt file with a timestamp for forensic analysis
+                // Quarantine the corrupt file with a timestamp for forensic analysis
                 let timestamp = chrono::Utc::now().timestamp();
                 let backup_path = path.with_extension(format!("corrupt-{}", timestamp));
 
-                // Rename the corrupt file to the backup path
-                if let Err(rename_err) = fs::rename(path, &backup_path) {
+                let quarantined_to = match fs::rename(path, &backup_path) {
+                    Ok(()) => Some(backup_path.clone()),
+                    Err(rename_err) => {
+                        log::warn!(
+                            "[collector] cursor file {} is corrupt ({}); failed to back up (rename to {} failed: {})",
+                            path.display(),
+                            e,
+                            backup_path.display(),
+                            rename_err
+                        );
+                        None
+                    }
+                };
+
+                // Rebuild from the last good offsets that survived the corruption
+                let salvaged = salvage_cursor_entries(&bytes);
+                let salvaged_count = salvaged.len();
+                let rebuilt = Self { cursors: salvaged };
+
+                // Persist the rebuilt store now: the corrupt file is already gone,
+                // so if this pass later aborts before its own save(), the next
+                // pass would otherwise find no cursor file at all and re-read
+                // everything from byte 0 again.
+                if let Err(save_err) = rebuilt.save(path) {
                     log::warn!(
-                        "[collector] cursor file {} is corrupt ({}); failed to back up (rename to {} failed: {}); starting with empty cursors",
+                        "[collector] cursor recovery could not persist rebuilt store to {} ({}); the next pass may re-read files from byte 0 once",
                         path.display(),
-                        e,
-                        backup_path.display(),
-                        rename_err
-                    );
-                } else {
-                    log::warn!(
-                        "[collector] cursor file {} is corrupt ({}); backed up to {}; starting with empty cursors instead of failing the collection pass",
-                        path.display(),
-                        e,
-                        backup_path.display()
+                        save_err
                     );
                 }
 
-                // Tradeoff: resetting to empty means every known JSONL file will be
-                // re-read from byte 0 on the next pass, which will inflate that one
-                // interval's token deltas once (already-collected data gets re-counted
-                // one time). Full byte-exact recovery is out of scope for this fix.
-                Ok(Self::default())
+                log::warn!(
+                    "[collector] cursor recovery: {} was corrupt ({}); quarantined to {}; rebuilt {} cursor(s) from the last good offsets in the corrupt file; file(s) without a rebuilt cursor re-read from byte 0 once (re-count, not data loss)",
+                    path.display(),
+                    e,
+                    quarantined_to
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<rename failed; file left in place>".to_string()),
+                    salvaged_count
+                );
+
+                Ok(rebuilt)
             }
         }
     }
@@ -270,6 +299,55 @@ impl CursorStore {
     pub fn set_offset(&mut self, file: PathBuf, offset: u64) {
         self.cursors.insert(file, offset);
     }
+}
+
+/// Best-effort salvage of `"<path>": <offset>` pairs from a corrupt cursor file.
+///
+/// A cursor file is only ever written by [`CursorStore::save`] as a
+/// pretty-printed `{"cursors": { "<path>": <offset>, ... }}` object, so each
+/// entry occupies exactly one line. When the whole object fails to parse
+/// (truncated tail, interleaved pre-fix writers), the entries before the
+/// corruption point are still intact — this scans line by line and keeps every
+/// well-formed entry, rebuilding as much of the store as possible. Entries that
+/// are simply absent are the ones that re-read from byte 0.
+///
+/// Deliberately conservative per line: an entry is kept only when the key is a
+/// backslash-free quoted path (Linux session paths never carry escapes, and a
+/// half-decoded escape could turn into a wrong-but-plausible offset) and the
+/// value parses fully as a u64. A rejected line loses at most a bounded re-read;
+/// a mis-accepted one could skip unread data. Duplicate keys keep the last
+/// occurrence, matching `serde_json`'s own duplicate-key behavior.
+fn salvage_cursor_entries(bytes: &[u8]) -> HashMap<PathBuf, u64> {
+    let mut salvaged = HashMap::new();
+    let text = String::from_utf8_lossy(bytes);
+
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('"') else {
+            continue;
+        };
+        let Some(key_end) = rest.find('"') else {
+            continue;
+        };
+        let raw_key = &rest[..key_end];
+        if raw_key.is_empty() || raw_key.contains('\\') {
+            continue;
+        }
+        let Some(value_part) = rest[key_end + 1..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Ok(offset) = value_part
+            .trim()
+            .trim_end_matches(',')
+            .trim()
+            .parse::<u64>()
+        else {
+            continue;
+        };
+        salvaged.insert(PathBuf::from(raw_key), offset);
+    }
+
+    salvaged
 }
 
 /// Extract model identifier from a message JSON object
@@ -1698,13 +1776,15 @@ mod tests {
     }
 
     #[test]
-    fn cursor_load_corrupt_json_returns_empty_and_creates_backup() {
+    fn cursor_load_corrupt_json_recovers_and_creates_backup() {
         // ADR-002: a corrupt cursor file (e.g. from the pre-fix concurrent-write
         // race) must not take down usage tracking indefinitely. Cursors are just
         // read-position bookkeeping, not the usage data itself — recovering by
         // resetting them costs a bit of re-reading, never data loss. The corrupt
         // file must be backed up with a .corrupt-<timestamp> suffix for forensic
-        // analysis, and load() must return an empty store instead of erroring.
+        // analysis, and load() must return a rebuilt store instead of erroring.
+        // This content has no salvageable entry lines, so the rebuilt store is
+        // empty and everything re-reads from byte 0 once.
         let temp_dir = TempDir::new().unwrap();
         let cursor_path = temp_dir.path().join("cursors.json");
         let corrupt_json = r#"{"cursors":{"/a/b.jsonl": 5841": 98899,}}"#;
@@ -1729,16 +1809,99 @@ mod tests {
             backup_files
         );
 
-        // Verify the original corrupt file no longer exists at its original path
-        assert!(
-            !cursor_path.exists(),
-            "original corrupt file should be renamed to backup"
-        );
+        // The rebuilt store is persisted immediately, so the recovery survives
+        // even if the pass aborts before its next save(): the cursor path is a
+        // valid store again (empty here), not missing.
+        let reparsed = CursorStore::load(&cursor_path).expect("rebuilt store must parse");
+        assert_eq!(reparsed.get_offset(Path::new("/a/b.jsonl")), 0);
 
         // Verify the backup contains the original corrupt content
         let backup_path = backup_files[0].path();
         let backup_content = fs::read_to_string(&backup_path).unwrap();
         assert_eq!(backup_content, corrupt_json);
+    }
+
+    #[test]
+    fn cursor_load_truncated_file_salvages_surviving_entries() {
+        // claudego-dddaf7fb: a crash mid-write leaves a truncated tail — the
+        // entries before the truncation point are intact and must be rebuilt
+        // into the store (resume from last good offset) instead of dropping
+        // every cursor and re-reading every session file from byte 0.
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("cursors.json");
+        // Truncated mid-way: valid entries, no closing braces.
+        let corrupt_json = format!(
+            "{{\n  \"cursors\": {{\n    \"{}\": {},\n    \"{}\": {}",
+            "/sessions/a.jsonl", 1234, "/sessions/b.jsonl", 5678
+        );
+        fs::write(&cursor_path, &corrupt_json).unwrap();
+
+        let loaded = CursorStore::load(&cursor_path).expect("truncated file must not error");
+        assert_eq!(loaded.get_offset(Path::new("/sessions/a.jsonl")), 1234);
+        assert_eq!(loaded.get_offset(Path::new("/sessions/b.jsonl")), 5678);
+        assert_eq!(loaded.cursors.len(), 2);
+
+        // The backup preserves the exact truncated bytes for forensics.
+        let backups: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), corrupt_json);
+
+        // And the rebuilt store was persisted: reloading yields the same offsets.
+        let reloaded = CursorStore::load(&cursor_path).unwrap();
+        assert_eq!(reloaded.get_offset(Path::new("/sessions/a.jsonl")), 1234);
+    }
+
+    #[test]
+    fn salvage_rejects_malformed_lines_and_keeps_well_formed_ones() {
+        // Unit coverage for the line scanner itself: only complete
+        // `"<path>": <u64>` entries are kept; anything ambiguous is dropped
+        // (a lost entry costs a bounded re-read; a mis-accepted one could
+        // skip unread data).
+        let input = concat!(
+            "{\n",
+            "  \"cursors\": {\n",            // container lines: skipped
+            "    \"/ok/one.jsonl\": 100,\n", // well-formed, trailing comma
+            "    \"/ok/two.jsonl\": 200\n",  // well-formed, last entry
+            "    \"/garbage.jsonl\": 5841\": 98899,\n", // spliced garbage: skipped
+            "    \"/float.jsonl\": 12.5,\n", // non-u64 offset: skipped
+            "    \"\\\\escape.jsonl\": 300,\n", // escaped key: skipped
+            "    \"\": 400,\n",              // empty path: skipped
+            "    \"/dup.jsonl\": 1,\n",      // duplicate: last occurrence wins
+            "    \"/dup.jsonl\": 2,\n",
+            "  }\n",
+            "}\n",
+        );
+
+        let salvaged = salvage_cursor_entries(input.as_bytes());
+        assert_eq!(salvaged.get(Path::new("/ok/one.jsonl")), Some(&100));
+        assert_eq!(salvaged.get(Path::new("/ok/two.jsonl")), Some(&200));
+        assert!(!salvaged.contains_key(Path::new("/garbage.jsonl")));
+        assert!(!salvaged.contains_key(Path::new("/float.jsonl")));
+        assert!(!salvaged.contains_key(Path::new("/escape.jsonl")));
+        assert_eq!(salvaged.get(Path::new("/dup.jsonl")), Some(&2));
+        assert_eq!(salvaged.len(), 3);
+    }
+
+    #[test]
+    fn salvage_of_valid_store_bytes_matches_parsed_store() {
+        // Salvage must agree with a real parse for intact content — the scanner
+        // is a lenient fallback, not a divergent decoder.
+        let temp_dir = TempDir::new().unwrap();
+        let cursor_path = temp_dir.path().join("cursors.json");
+        let mut store = CursorStore::default();
+        store.set_offset(PathBuf::from("/s/x.jsonl"), 42);
+        store.set_offset(PathBuf::from("/s/y.jsonl"), 999);
+        store.save(&cursor_path).unwrap();
+
+        let bytes = fs::read(&cursor_path).unwrap();
+        let salvaged = salvage_cursor_entries(&bytes);
+        assert_eq!(salvaged.len(), 2);
+        assert_eq!(salvaged.get(Path::new("/s/x.jsonl")), Some(&42));
+        assert_eq!(salvaged.get(Path::new("/s/y.jsonl")), Some(&999));
     }
 
     #[test]

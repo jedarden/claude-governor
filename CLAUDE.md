@@ -173,7 +173,13 @@ treating configured agents as fungible.
 
 ## 5. Known warts
 
-- Token collector cursor file can corrupt (`collector pass failed: Failed to load
-  cursors`) — a non-fatal WARN; scaling is unaffected.
+- Token collector cursor file corruption is auto-recovered (hardened 2026-09-16,
+  claudego-dddaf7fb): a corrupt `collector-cursors.json` is quarantined to
+  `.corrupt-<timestamp>`, the surviving per-file offsets are rebuilt so those
+  files resume from their last good offset, the rebuilt store is persisted
+  immediately, and a `cursor recovery` WARN is logged. The pass completes; only
+  files whose cursor was lost re-read from byte 0 once (a re-count, not data
+  loss). Scaling is unaffected. Cursor saves are atomic (unique temp file +
+  rename), so new corruption should be rare.
 - `cargo test` offloads to iad-ci when the tree is clean; runs locally (cgroup-limited)
   with uncommitted changes. `cargo build` always runs locally.
