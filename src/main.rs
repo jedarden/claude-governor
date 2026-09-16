@@ -410,6 +410,11 @@ enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+
+        /// Skip the live claude-print adapter probe (one trivial dispatch per
+        /// adapter); the env-scrub check still runs
+        #[arg(long)]
+        skip_live: bool,
     },
 
     /// Internal: Run the governor daemon (called by systemd)
@@ -998,8 +1003,10 @@ fn run_explain_command(last: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_doctor_command(json: bool) -> Result<()> {
-    let report = doctor::run_doctor();
+fn run_doctor_command(json: bool, skip_live: bool) -> Result<()> {
+    let report = doctor::run_doctor_with_options(doctor::DoctorOptions {
+        live_dispatch: !skip_live,
+    });
 
     if json {
         println!("{}", doctor::format_doctor_json(&report));
@@ -1303,8 +1310,8 @@ fn main() -> Result<()> {
         Commands::Explain { last, json } => {
             run_explain_command(last, json)?;
         }
-        Commands::Doctor { json } => {
-            run_doctor_command(json)?;
+        Commands::Doctor { json, skip_live } => {
+            run_doctor_command(json, skip_live)?;
         }
         Commands::_Daemon {
             dry_run,

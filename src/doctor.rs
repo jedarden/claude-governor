@@ -1915,6 +1915,99 @@ fn check_claude_print_installed() -> CheckResult {
     }
 }
 
+/// Check the installed claude-print NEEDLE adapters the way dispatch actually
+/// runs them.
+///
+/// [`check_claude_print_installed`] above only proves a binary answers
+/// `--version`; dispatch runs each adapter's `invoke_template`, and both
+/// historically severe failure classes live there — a template naming a
+/// missing binary reports READY while every dispatch dies at exit 127
+/// (needle-adef2ccd), and a template that stops unsetting the rule-3 IDE env
+/// or the rule-5 API-routing env hangs or misroutes 46% of dispatches launched
+/// from an interactive shell. This check is `needle test-agent`'s missing
+/// counterpart: a static scrub check of both variable sets, plus (when
+/// `live_dispatch`) a trivial-prompt run of the template requiring exit 0 —
+/// one trivial subscription call per adapter.
+fn check_claude_print_adapters(live_dispatch: bool) -> CheckResult {
+    check_claude_print_adapters_in(&crate::adapter_verify::default_adapters_dir(), live_dispatch)
+}
+
+fn check_claude_print_adapters_in(dir: &std::path::Path, live_dispatch: bool) -> CheckResult {
+    let adapters = match crate::adapter_verify::load_installed_adapters(dir) {
+        Ok(adapters) => adapters,
+        Err(e) => {
+            return CheckResult::warn(
+                "claude_print_adapters",
+                format!("no adapters verified ({})", e),
+                "Install the adapters: deploy/install-claude-print-adapters.sh",
+            );
+        }
+    };
+
+    if adapters.is_empty() {
+        return CheckResult::warn(
+            "claude_print_adapters",
+            format!("no claude-print-*.yaml adapters in {}", dir.display()),
+            "Install the adapters: deploy/install-claude-print-adapters.sh",
+        );
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut verified: Vec<String> = Vec::new();
+
+    for adapter in &adapters {
+        let missing = crate::adapter_verify::missing_scrub_vars(&adapter.adapter.invoke_template);
+        if !missing.is_empty() {
+            let listed = missing
+                .iter()
+                .map(|(class, var)| format!("{} ({})", var, class))
+                .collect::<Vec<_>>()
+                .join(", ");
+            problems.push(format!(
+                "{}: invoke_template stops unsetting {} — dispatch would inherit it",
+                adapter.adapter.name, listed
+            ));
+            continue;
+        }
+
+        if !live_dispatch {
+            verified.push(format!("{} (scrub only)", adapter.adapter.name));
+            continue;
+        }
+
+        match crate::adapter_verify::live_probe(adapter) {
+            Ok(duration) => verified.push(format!(
+                "{} (scrub + live exit-0 in {:.1}s)",
+                adapter.adapter.name,
+                duration.as_secs_f64()
+            )),
+            Err(e) => problems.push(format!(
+                "{}: live invoke_template failed: {}",
+                adapter.adapter.name, e
+            )),
+        }
+    }
+
+    if problems.is_empty() {
+        CheckResult::pass(
+            "claude_print_adapters",
+            format!(
+                "{} adapter(s) in {}: {}",
+                adapters.len(),
+                dir.display(),
+                verified.join("; ")
+            ),
+        )
+    } else {
+        CheckResult::fail(
+            "claude_print_adapters",
+            problems.join("; "),
+            "Fix the templates in deploy/needle-adapters and reinstall: \
+             deploy/install-claude-print-adapters.sh",
+        )
+    }
+}
+
 /// Check subscription session presence - verify cli-entrypoint JSONL sessions exist
 ///
 /// This check ensures that subscription-flagged agents are actually using subscription
@@ -2052,8 +2145,30 @@ fn check_subscription_session_presence() -> CheckResult {
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// Options for a doctor run.
+#[derive(Debug, Clone, Copy)]
+pub struct DoctorOptions {
+    /// Run each installed claude-print adapter's `invoke_template` with a
+    /// trivial prompt and require exit 0 (one trivial subscription call per
+    /// adapter). Off leaves the adapter check to the static env-scrub lookup.
+    pub live_dispatch: bool,
+}
+
+impl Default for DoctorOptions {
+    fn default() -> Self {
+        Self {
+            live_dispatch: true,
+        }
+    }
+}
+
 /// Run all health checks and return a report
 pub fn run_doctor() -> DoctorReport {
+    run_doctor_with_options(DoctorOptions::default())
+}
+
+/// Run all health checks with explicit options
+pub fn run_doctor_with_options(options: DoctorOptions) -> DoctorReport {
     let checks = vec![
         // Plan Component 19 core checks (ordered per spec)
         check_oauth_token_validity(),
@@ -2080,6 +2195,7 @@ pub fn run_doctor() -> DoctorReport {
         check_disk_space(),
         check_claude_binary_installed(),
         check_claude_print_installed(),
+        check_claude_print_adapters(options.live_dispatch),
         check_subscription_session_presence(),
     ];
 
@@ -2425,5 +2541,104 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains(&canonical.display().to_string()));
         assert!(result.message.contains(&legacy.display().to_string()));
+    }
+
+    // -- claude_print_adapters ------------------------------------------------
+
+    /// A template that scrubs every rule-3 and rule-5 variable.
+    const SCRUB_ALL: &str = concat!(
+        "CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE ",
+        "VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS ",
+        "VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD ",
+        "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL ",
+        "ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ",
+        "CLAUDE_CODE_SUBAGENT_MODEL"
+    );
+
+    fn write_adapter(dir: &std::path::Path, name: &str, invoke_template: &str) {
+        fs::write(
+            dir.join(format!("claude-print-{}.yaml", name)),
+            format!(
+                "name: claude-print-{}\ninvoke_template: \"{}\"\nmodel: opus\ntimeout_secs: 60\n",
+                name, invoke_template
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn adapter_check_warns_when_no_adapters_are_installed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let result = check_claude_print_adapters_in(&tmp.path().join("absent"), false);
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.remediation.unwrap().contains("install-claude-print-adapters.sh"));
+    }
+
+    #[test]
+    fn adapter_check_fails_a_template_that_dropped_the_rule5_unsets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The recorded rule-5 regression: IDE unsets kept, API-routing unsets gone.
+        write_adapter(
+            tmp.path(),
+            "regressed",
+            "cd {workspace} && unset CLAUDECODE VSCODE_PID VSCODE_CWD && /bin/claude-print < {prompt_file}",
+        );
+
+        let result = check_claude_print_adapters_in(tmp.path(), false);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("ANTHROPIC_BASE_URL"));
+        assert!(result.message.contains("API-routing"));
+    }
+
+    #[test]
+    fn adapter_check_passes_scrub_only_when_live_is_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_adapter(
+            tmp.path(),
+            "opus",
+            format!(
+                "cd {{workspace}} && unset {} && /bin/claude-print < {{prompt_file}}",
+                SCRUB_ALL
+            )
+            .as_str(),
+        );
+
+        let result = check_claude_print_adapters_in(tmp.path(), false);
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("scrub only"));
+    }
+
+    #[test]
+    fn adapter_check_runs_the_live_probe_when_asked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let stub = tmp.path().join("stub-answer.sh");
+        fs::write(&stub, "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"result\"}'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&stub, perms).unwrap();
+        }
+        write_adapter(
+            workspace.path(),
+            "stub",
+            format!(
+                "cd {{workspace}} && unset {} && {} < {{prompt_file}}",
+                SCRUB_ALL,
+                stub.display()
+            )
+            .as_str(),
+        );
+
+        let result = check_claude_print_adapters_in(workspace.path(), true);
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("live exit-0"), "msg: {}", result.message);
     }
 }

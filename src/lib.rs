@@ -2,6 +2,9 @@
 //!
 //! Automated capacity governor for Claude Code subscription usage.
 
+/// Authoritative claude-print adapter verification (claudego-b03e5c39):
+/// invoke_template exit-0 probe + rule-3/rule-5 env-scrub check.
+pub mod adapter_verify;
 pub mod alerts;
 pub mod burn_rate;
 pub mod calibrator;

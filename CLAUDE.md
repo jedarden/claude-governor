@@ -43,8 +43,16 @@ binary path back out of the installed templates, links it to whichever real
 > resolves `agent_cli` through PATH, while dispatch runs `invoke_template`. When
 > the template names a binary that does not exist, test-agent still reports
 > `Status: READY` and every dispatch dies at exit 127 (NEEDLE bead
-> `needle-adef2ccd`). The installer's own check is the authoritative one; to
-> confirm by hand, run the `invoke_template` verbatim and require exit 0.
+> `needle-adef2ccd`). The authoritative checks are automated in two places
+> (claudego-b03e5c39): the installer and `cgov doctor` (check
+> `claude_print_adapters`) both statically verify each template still unsets
+> the rule-3 and rule-5 variable sets, and both run the `invoke_template`
+> verbatim with a trivial prompt against a poisoned rule-3/rule-5
+> environment, requiring exit 0 with output (one trivial subscription call
+> per adapter; `--skip-live` on the installer, `cgov doctor --skip-live` on
+> the doctor, skip the static-only case). The logic lives in
+> `src/adapter_verify.rs`, mirrored in bash inside the installer — keep the
+> variable lists in sync.
 
 Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
