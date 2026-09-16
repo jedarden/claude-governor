@@ -352,7 +352,14 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 
 ### 3. State Store
 
-**File:** `~/.needle/state/governor-state.json`
+**File:** `~/.config/claude-governor/governor-state.json`
+
+> **Path note (2026-09-16, claudego-68c1dc97):** this plan originally placed the state
+> file under `~/.needle/state/`. The implementation resolves it from the platform
+> config directory (`dirs::config_dir()/claude-governor/governor-state.json`) and that
+> is the authoritative location; `~/.needle/state/` holds only the collector,
+> calibrator, and heartbeat state. `cgov doctor`'s `state_file_location` check reports
+> the live path and its age, so a consumer reading the wrong path is diagnosable.
 
 **Note:** The sample below is illustrative, with values drawn from the historical March 2026 Off-Peak 2x promotion window (hence `"is_promo_active": true` and `"promo_multiplier": 2.0`). Under the shipped configuration — `config/promotions.json` containing an empty array `[]` — `is_promo_active` is `false` and `promo_multiplier` is `1.0`.
 
@@ -465,7 +472,7 @@ cgov token-history --rebuild-db       # reconstruct SQLite from JSONL
 }
 ```
 
-**Previous state file** (`~/.needle/state/governor-state.prev.json`) is atomically written before each update, enabling burn rate calculation from `delta_pct / delta_time`.
+**Previous state file** (`~/.config/claude-governor/governor-state.prev.json`, alongside the main state file) is atomically written before each update, enabling burn rate calculation from `delta_pct / delta_time`.
 
 ---
 
@@ -1181,6 +1188,7 @@ The governor does not automatically act on cache efficiency (causes are too vari
 | API reachability | 200 OK in <2s | Slow (>2s) | Unreachable or auth error |
 | Token collector | Running, cursors advancing | Cursors stale >10min | Not running |
 | State file freshness | Updated <2× interval | Stale 2–10× interval | Missing or stale >10× interval |
+| State file location | Live path reported, file present (age shown) | Only a legacy `~/.needle/state/` copy found | No state file at the live path |
 | Heartbeat consistency | Worker count matches tmux sessions | Minor mismatch | Major mismatch or corruption |
 | Burn rate samples | ≥5 per window | 3–4 samples | <3 (using baseline fallback) |
 | Pricing config | All detected models have entries | — | Unknown model in token records |
@@ -1359,7 +1367,9 @@ log_file: ~/.local/share/claude-governor/governor.log
 log_level: INFO             # DEBUG, INFO, WARN, ERROR
 log_max_bytes: 104857600    # 100 MB — rotate when exceeded
 log_backup_count: 3         # keep 3 rotated log files (.1, .2, .3)
-state_file: ~/.needle/state/governor-state.json
+# NOTE: there is no `state_file` config key — the path is not configurable.
+# The daemon always writes ~/.config/claude-governor/governor-state.json
+# (dirs::config_dir()); see the State Store path note above.
 
 # Target utilization — governs how much of each window the fleet is allowed to consume.
 # 1.0 = use all available capacity; 0.9 = reserve 10%; 0.8 = reserve 20%.
@@ -2024,18 +2034,18 @@ remove when encountered; they are not current source artifacts.
 
 **Build output:** `cargo build --release` produces a single statically-linked binary `target/release/cgov` (~5–10 MB). This is the only artifact that needs to be deployed.
 
-**Runtime state files** (written to `~/.needle/state/`):
+**Runtime state files** (written to `~/.config/claude-governor/` and `~/.needle/state/` as listed):
 
-| File | Written by | Purpose |
-|---|---|---|
-| `governor-state.json` | governor | Current scaling state, burn rates, capacity estimate |
-| `governor-state.prev.json` | governor | Previous cycle snapshot for delta calculation |
-| `token-history.jsonl` | token-collector | Append-only per-interval token delta records |
-| `token-history.db` | token-collector | SQLite mirror for fast queries |
-| `collector-cursors.json` | token-collector | File byte offsets to avoid re-processing |
-| `prediction-accuracy.jsonl` | calibrator | Scored prediction vs actual for self-tuning |
-| `governor-decisions.jsonl` | narrator | Plain-English scaling decision audit log |
-| `heartbeats/{session}.json` | NEEDLE workers | Per-worker status (idle/executing), refreshed every 30s |
+| File | Location | Written by | Purpose |
+|---|---|---|---|
+| `governor-state.json` | `~/.config/claude-governor/` | governor | Current scaling state, burn rates, capacity estimate |
+| `governor-state.prev.json` | `~/.config/claude-governor/` | governor | Previous cycle snapshot for delta calculation |
+| `token-history.jsonl` | `~/.needle/state/` | token-collector | Append-only per-interval token delta records |
+| `token-history.db` | `~/.needle/state/` | token-collector | SQLite mirror for fast queries |
+| `collector-cursors.json` | `~/.needle/state/` | token-collector | File byte offsets to avoid re-processing |
+| `prediction-accuracy.jsonl` | `~/.needle/state/` | calibrator | Scored prediction vs actual for self-tuning |
+| `governor-decisions.jsonl` | `~/.needle/state/` | narrator | Plain-English scaling decision audit log |
+| `heartbeats/{session}.json` | `~/.needle/state/` | NEEDLE workers | Per-worker status (idle/executing), refreshed every 30s |
 
 ---
 

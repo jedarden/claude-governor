@@ -142,6 +142,19 @@ fn default_state_path() -> PathBuf {
         .join("governor-state.json")
 }
 
+/// Legacy state-file location the docs once claimed (`~/.needle/state/`).
+///
+/// The daemon has never written there, but the plan and one deployment note
+/// said it did, so a consumer following those docs reads a missing (or, if a
+/// file was ever moved there, permanently stale) state file.
+fn legacy_state_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".needle")
+        .join("state")
+        .join("governor-state.json")
+}
+
 fn default_config_path() -> PathBuf {
     if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
         PathBuf::from(xdg_config).join("claude-governor/governor.yaml")
@@ -723,6 +736,69 @@ fn check_state_file_freshness() -> CheckResult {
             "Check file permissions",
         ),
     }
+}
+
+/// Age of a file's last modification in seconds, or `None` if unreadable/absent.
+fn file_age_secs(path: &std::path::Path) -> Option<i64> {
+    let modified: DateTime<Utc> = fs::metadata(path).ok()?.modified().ok()?.into();
+    Some((Utc::now() - modified).num_seconds().abs())
+}
+
+/// Check that the state file exists at the location the daemon actually writes.
+///
+/// Unlike `state_freshness` (which owns the staleness verdict), this check is
+/// about *location*: it names the live path, reports its age, and flags a copy
+/// left at the legacy `~/.needle/state/` path the docs once claimed — the
+/// situation where a consumer reading the wrong path sees a missing or
+/// permanently stale file.
+fn check_state_file_location_at(
+    canonical: &std::path::Path,
+    legacy: &std::path::Path,
+) -> CheckResult {
+    let canonical_display = canonical.display().to_string();
+    let legacy_display = legacy.display().to_string();
+
+    match (
+        file_age_secs(canonical),
+        file_age_secs(legacy),
+    ) {
+        (Some(age), legacy_age) => {
+            let mut message = format!("{}, updated {}s ago", canonical_display, age);
+            if let Some(legacy_age) = legacy_age {
+                message.push_str(&format!(
+                    " (stale copy at {} is {}s old and ignored)",
+                    legacy_display, legacy_age
+                ));
+            }
+            CheckResult::pass("state_file_location", message)
+        }
+        (None, Some(legacy_age)) => CheckResult::warn(
+            "state_file_location",
+            format!(
+                "no state file at {}; a copy sits at {} ({}s old) — consumers of the legacy path read a permanently stale file",
+                canonical_display, legacy_display, legacy_age
+            ),
+            format!(
+                "Point consumers at {} (the path the daemon writes) or start the governor: cgov restart",
+                canonical_display
+            ),
+        ),
+        (None, None) => CheckResult::fail(
+            "state_file_location",
+            format!(
+                "no state file at {} (or legacy {})",
+                canonical_display, legacy_display
+            ),
+            format!(
+                "State lives at {} — start the governor to create it: cgov restart",
+                canonical_display
+            ),
+        ),
+    }
+}
+
+fn check_state_file_location() -> CheckResult {
+    check_state_file_location_at(&default_state_path(), &legacy_state_path())
 }
 
 /// Check OAuth token validity
@@ -1996,6 +2072,7 @@ pub fn run_doctor() -> DoctorReport {
         check_prediction_accuracy(),
         check_alert_fp_telemetry(),
         // Additional operational checks
+        check_state_file_location(),
         check_state_file_freshness(),
         check_heartbeat_consistency(),
         check_tmux_available(),
@@ -2286,5 +2363,67 @@ mod tests {
         // Compact JSON format has no space after colon
         assert!(json.contains("\"passed\":1"));
         assert!(json.contains("\"overall\":\"pass\""));
+    }
+
+    #[test]
+    fn test_state_file_location_pass_names_live_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().join("governor-state.json");
+        fs::write(&canonical, "{}").unwrap();
+        let legacy = tmp.path().join("legacy").join("governor-state.json");
+
+        let result = check_state_file_location_at(&canonical, &legacy);
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.check, "state_file_location");
+        assert!(result.message.contains(&canonical.display().to_string()));
+        assert!(result.message.contains("updated"));
+    }
+
+    #[test]
+    fn test_state_file_location_pass_notes_ignored_legacy_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().join("governor-state.json");
+        fs::write(&canonical, "{}").unwrap();
+        let legacy = tmp.path().join("legacy").join("governor-state.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "{}").unwrap();
+
+        let result = check_state_file_location_at(&canonical, &legacy);
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("ignored"));
+        assert!(result.message.contains(&legacy.display().to_string()));
+    }
+
+    #[test]
+    fn test_state_file_location_warns_on_legacy_only_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().join("governor-state.json");
+        let legacy = tmp.path().join("legacy").join("governor-state.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "{}").unwrap();
+
+        let result = check_state_file_location_at(&canonical, &legacy);
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("permanently stale"));
+        assert!(result
+            .remediation
+            .unwrap()
+            .contains(&canonical.display().to_string()));
+    }
+
+    #[test]
+    fn test_state_file_location_fails_when_missing_everywhere() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().join("governor-state.json");
+        let legacy = tmp.path().join("legacy").join("governor-state.json");
+
+        let result = check_state_file_location_at(&canonical, &legacy);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains(&canonical.display().to_string()));
+        assert!(result.message.contains(&legacy.display().to_string()));
     }
 }

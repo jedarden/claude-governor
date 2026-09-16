@@ -52,16 +52,24 @@ cgov enable
 
 ## Directory Structure
 
+The governor's state file lives under the config directory, **not** under
+`~/.needle/state/` — that path holds only the collector and heartbeat state.
+`cgov doctor`'s `state_file_location` check reports the live path and its age.
+
 ```
 ~/.config/claude-governor/
-├── governor.yaml        # Main configuration file
+├── governor.yaml             # Main configuration file
+├── governor-state.json       # Governor state (usage, forecasts, burn rates — written by the daemon)
+└── governor-state.prev.json  # Previous-cycle snapshot (delta calculation)
 ~/.local/share/claude-governor/
-├── governor.log         # Governor daemon logs
-└── collector.log        # Token collector logs
+├── governor.log              # Governor daemon logs
+└── collector.log             # Token collector logs
 ~/.needle/state/
-├── heartbeats/          # Worker heartbeat files (managed by NEEDLE)
+├── heartbeats/               # Worker heartbeat files (managed by NEEDLE)
 ├── governor-decisions.jsonl  # Scaling-decision audit log (read by `cgov explain`)
-└── ...                  # Other state files
+├── token-history.jsonl       # Append-only token delta records (collector)
+├── token-history.db          # SQLite mirror of token-history.jsonl
+└── collector-cursors.json    # Collector read-position bookkeeping
 ```
 
 ## Configuration

@@ -22,7 +22,7 @@ The governor is deployed using the recommended systemd user service mode (Phase 
 
 **Configuration:** `~/.config/claude-governor/governor.yaml`
 
-**State:** `~/.needle/state/governor-state.json` (actively updating)
+**State:** `~/.config/claude-governor/governor-state.json` (actively updating) *(path corrected 2026-09-16 — see [Correction](#correction-2026-09-16--claudego-68c1dc97) below)*
 
 ### System Health (cgov doctor)
 
@@ -56,7 +56,7 @@ None. The deployment follows Phase 6.2 Mode A exactly:
 - systemd user services for both daemon and token collector
 - Binary in `~/.local/bin/cgov`
 - Config in `~/.config/claude-governor/`
-- State in `~/.needle/state/`
+- State in `~/.config/claude-governor/` *(corrected 2026-09-16 — originally recorded as `~/.needle/state/`; see below)*
 
 ## Acceptance Criteria Status
 
@@ -75,3 +75,13 @@ None. The deployment follows Phase 6.2 Mode A exactly:
 - Token collector started at 00:04:00 EDT
 - Governor daemon started at 00:07:18 EDT
 - Both services are healthy and operational
+
+## Correction (2026-09-16 — claudego-68c1dc97)
+
+The state-file path originally recorded above (`~/.needle/state/governor-state.json`)
+was wrong. The implementation has always written `governor-state.json` to the config
+directory (`~/.config/claude-governor/governor-state.json`, via `dirs::config_dir()`),
+and no such file has ever existed under `~/.needle/state/` on this host —
+`docs/notes/bf-hjage.md` flagged the same discrepancy. The lines above have been
+corrected in place. `cgov doctor`'s `state_file_location` check now reports the live
+state-file path and its age, and warns when only a legacy-path copy is found.
