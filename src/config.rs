@@ -199,6 +199,18 @@ pub struct DaemonConfig {
     #[serde(default = "default_max_scale_down_per_cycle")]
     pub max_scale_down_per_cycle: u32,
 
+    /// Progressive scaling: widen the per-cycle scale caps with the remaining
+    /// gap (default: false)
+    ///
+    /// When true, a cycle far from target may move more than
+    /// `max_scale_up_per_cycle`/`max_scale_down_per_cycle` workers — 3x the cap
+    /// when the gap exceeds 5, 2x when it exceeds 3, 1x otherwise — always
+    /// clamped to the gap itself so a decision never overshoots the target.
+    /// The configured caps remain the base rate and still bound every move.
+    /// See `docs/hysteresis-and-smooth-scaling.md`.
+    #[serde(default)]
+    pub progressive_scaling: bool,
+
     /// Minimum time between scale operations in seconds (default: 60)
     #[serde(default = "default_min_scale_interval_secs")]
     pub min_scale_interval_secs: u64,
@@ -284,6 +296,7 @@ impl Default for DaemonConfig {
             hysteresis_band: default_hysteresis_band(),
             max_scale_up_per_cycle: default_max_scale_up_per_cycle(),
             max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
+            progressive_scaling: false,
             min_scale_interval_secs: default_min_scale_interval_secs(),
             target_ceiling: default_target_ceiling(),
             mode: DaemonMode::Auto,

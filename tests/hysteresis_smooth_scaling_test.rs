@@ -1,15 +1,19 @@
 //! Comprehensive tests for hysteresis behavior and smooth scaling transitions
 //!
 //! This test suite validates:
-//! - Hysteresis band behavior (edge cases, thresholds)
-//! - Large gap scaling (progressive vs binary)
+//! - Hysteresis band behavior (asymmetric: damps scale-down only, edge cases)
+//! - Convergence: every deficit closes — the fleet reaches target, never
+//!   stranding one worker short (claudego-44b1f4f5)
+//! - Large gap scaling (progressive per-cycle caps via `progressive_scale_cap`)
 //! - Smooth scaling transitions (no oscillation)
 //! - Exponential approach convergence
 //! - Adaptive timing scenarios
 //! - Emergency brake override of hysteresis
 
 use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
-use claude_governor::governor::{apply_scaling, compute_target_workers, ScalingDecision};
+use claude_governor::governor::{
+    apply_scaling, compute_target_workers, progressive_scale_cap, ScalingDecision,
+};
 use claude_governor::state;
 
 // ---------------------------------------------------------------------------
@@ -18,12 +22,29 @@ use claude_governor::state;
 
 #[test]
 fn test_hysteresis_exact_threshold() {
-    // When |target - current| == hysteresis_band, should return NoChange
+    // The band is asymmetric. Scale-UP: a deficit of exactly the band is
+    // still closed — this is the convergence fix; the old symmetric band
+    // swallowed a 1-worker deficit forever and stranded the fleet one short
+    // of target.
     let decision = apply_scaling(6, 5, 1.0, 3, 2);
 
-    assert!(
-        matches!(decision, ScalingDecision::NoChange),
-        "Should return NoChange when delta equals hysteresis band"
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleUp(1),
+        "A deficit equal to the band must still close (no up-side dead zone)"
+    );
+}
+
+#[test]
+fn test_hysteresis_exact_threshold_scale_down() {
+    // Scale-DOWN keeps the band: a target exactly `hysteresis_band` below
+    // current holds, so a one-worker forecast dip does not shed workers.
+    let decision = apply_scaling(4, 5, 1.0, 3, 2);
+
+    assert_eq!(
+        decision,
+        ScalingDecision::NoChange,
+        "A surplus equal to the band is the intended down-side cushion"
     );
 }
 
@@ -62,12 +83,21 @@ fn test_hysteresis_zero_band() {
 
 #[test]
 fn test_hysteresis_wide_band() {
-    // Wide hysteresis band (e.g., safe mode 2.0x multiplier)
-    let decision = apply_scaling(7, 5, 2.0, 3, 2);
+    // Wide hysteresis band (e.g., safe mode 2.0x multiplier). The band damps
+    // scale-DOWN only — a deficit still closes, at the per-cycle cap.
+    let up = apply_scaling(7, 5, 2.0, 3, 2);
+    assert_eq!(
+        up,
+        ScalingDecision::ScaleUp(2),
+        "Wide band must not strand a deficit: the gap-2 deficit closes (min(2, cap 3))"
+    );
 
-    assert!(
-        matches!(decision, ScalingDecision::NoChange),
-        "Wide hysteresis band should prevent scaling on moderate delta"
+    // The same wide band does hold a surplus of 2 (gap <= band, damped).
+    let down = apply_scaling(3, 5, 2.0, 3, 2);
+    assert_eq!(
+        down,
+        ScalingDecision::NoChange,
+        "Wide band damps a scale-down whose gap is within the band"
     );
 }
 
@@ -126,12 +156,14 @@ fn test_rate_limit_scale_down() {
 
 #[test]
 fn test_rate_limit_no_limit_when_delta_small() {
-    // When delta is small, rate limit should not be reached
+    // When delta is small, rate limit should not be reached — and the gap-1
+    // deficit still closes (it used to be swallowed by the symmetric band).
     let decision = apply_scaling(6, 5, 1.0, 10, 10);
 
-    assert!(
-        matches!(decision, ScalingDecision::NoChange),
-        "Small delta within hysteresis should return NoChange regardless of rate limit"
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleUp(1),
+        "Small deficit closes without hitting the rate limit"
     );
 }
 
@@ -198,40 +230,111 @@ fn test_large_gap_binary_scaling() {
 }
 
 #[test]
-#[ignore = "conceptual test for future progressive scaling: current apply_scaling is binary (max_up_per_cycle cap only) and hysteresis suppresses a gap of 1"]
 fn test_large_gap_progressive_scaling_simulation() {
-    // Simulate progressive scaling: larger gaps allow more workers per cycle
-    // This is a conceptual test for future implementation. Split out with
-    // #[ignore]: its assertions do not hold against the current binary
-    // scaling (a gap of 1 returns NoChange under the hysteresis band, and a
-    // gap of 3 scales by the full max_up_per_cycle rather than the gap's
-    // band). It is kept compiling as the spec for that future work.
-
+    // Progressive scaling is real now (`progressive_scaling: true` widens the
+    // per-cycle caps through `progressive_scale_cap`): larger gaps allow more
+    // workers per cycle, clamped to the gap itself so a cycle never overshoots
+    // the target. With base max_scale_up_per_cycle = 3:
     let scenarios = vec![
-        ((5, 6), 1),  // Gap of 1: scale 1
-        ((5, 7), 2),  // Gap of 2: scale 2
-        ((5, 8), 2),  // Gap of 3: scale 2
-        ((5, 10), 3), // Gap of 5: scale 3
-        ((5, 15), 3), // Gap of 10: scale 3 (max)
+        ((5, 6), 1),  // Gap 1:  1x tier -> min(3, 1) = 1
+        ((5, 7), 2),  // Gap 2:  1x tier -> min(3, 2) = 2
+        ((5, 8), 3),  // Gap 3:  1x tier -> min(3, 3) = 3
+        ((5, 10), 5), // Gap 5:  2x tier -> min(6, 5) = 5 (gap clamp)
+        ((5, 15), 9), // Gap 10: 3x tier -> min(9, 10) = 9 (cap clamp)
     ];
 
     for ((current, target), expected_scale) in scenarios {
-        // With progressive max_scale_up_per_cycle = 3
-        let decision = apply_scaling(target, current, 1.0, 3, 2);
+        let gap = target - current;
+        assert_eq!(
+            progressive_scale_cap(3, gap),
+            expected_scale,
+            "Progressive cap for gap of {}",
+            gap
+        );
 
-        match decision {
-            ScalingDecision::ScaleUp(n) => {
-                // Current implementation: limited by hysteresis-exceeded delta
-                // Future implementation: adaptive based on gap size
-                assert!(
-                    n <= expected_scale,
-                    "Progressive scaling should not exceed expected scale for gap {}",
-                    target - current
-                );
-            }
-            _ => panic!("Expected ScaleUp for gap of {}", target - current),
-        }
+        // The decision function itself honours the widened cap.
+        let decision = apply_scaling(target, current, 1.0, expected_scale, 2);
+        assert_eq!(
+            decision,
+            ScalingDecision::ScaleUp(expected_scale),
+            "Progressive scaling should move {} workers for gap {}",
+            expected_scale,
+            gap
+        );
     }
+}
+
+#[test]
+fn test_progressive_scale_cap_tiers_and_clamps() {
+    // Tier boundaries (base cap 1): 3x beyond a gap of 5, 2x beyond 3, 1x else.
+    assert_eq!(progressive_scale_cap(1, 3), 1, "gap 3: 1x tier");
+    assert_eq!(progressive_scale_cap(1, 4), 2, "gap 4: 2x tier");
+    assert_eq!(progressive_scale_cap(1, 5), 2, "gap 5: still the 2x tier");
+    assert_eq!(progressive_scale_cap(1, 6), 3, "gap 6: 3x tier");
+
+    // Never overshoots: the gap itself always wins over the widened cap.
+    assert_eq!(
+        progressive_scale_cap(3, 5),
+        5,
+        "2x of 3 = 6, clamped to gap 5"
+    );
+    assert_eq!(
+        progressive_scale_cap(2, 1),
+        1,
+        "1x of 2 = 2, clamped to gap 1"
+    );
+
+    // A disabled cap stays disabled.
+    assert_eq!(
+        progressive_scale_cap(0, 8),
+        0,
+        "0 workers per cycle stays 0"
+    );
+
+    // The operator's cap is the base rate, not an afterthought: a big gap
+    // widens it by at most 3x.
+    assert_eq!(progressive_scale_cap(1, 100), 3, "huge gap: at most 3x");
+}
+
+#[test]
+fn test_progressive_scaling_converges_faster_and_exactly() {
+    // 5 -> 10 with progressive base cap 3: gap 5 lands in the 2x tier,
+    // min(3*2, 5) = 5, so the whole deficit closes in ONE cycle.
+    let decision = apply_scaling(10, 5, 1.0, progressive_scale_cap(3, 5), 3);
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleUp(5),
+        "Progressive: 5 -> 10 in a single cycle"
+    );
+
+    // 5 -> 15 (gap 10, 3x tier): min(3*3, 10) = 9, then the residual gap of 1.
+    let mut current = 5u32;
+    let target = 15u32;
+    let mut sequence = vec![current];
+    for _ in 0..10 {
+        let step = match apply_scaling(
+            target,
+            current,
+            1.0,
+            progressive_scale_cap(3, target - current),
+            3,
+        ) {
+            ScalingDecision::ScaleUp(n) => n,
+            ScalingDecision::NoChange => break,
+            other => panic!("Unexpected decision: {:?}", other),
+        };
+        current += step;
+        sequence.push(current);
+    }
+    assert_eq!(
+        sequence,
+        vec![5, 14, 15],
+        "Progressive sequence closes a 10-gap in 2 cycles (binary needs 10)"
+    );
+    assert_eq!(
+        current, target,
+        "Progressive scaling must end exactly at target"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +363,7 @@ fn test_smooth_scale_up_sequence() {
                 sequence.push(current);
             }
             ScalingDecision::NoChange => {
-                // Hysteresis band reached
+                // At target — converged
                 break;
             }
             _ => panic!("Unexpected decision: {:?}", decision),
@@ -269,11 +372,27 @@ fn test_smooth_scale_up_sequence() {
         cycles += 1;
     }
 
-    // Binary scaling: should reach 9 (stop at hysteresis band)
+    // The band no longer strands the fleet one short: the sequence must end
+    // AT the target (claudego-44b1f4f5 — it used to stop at 9 forever).
     assert_eq!(
         sequence,
-        vec![5, 6, 7, 8, 9],
-        "Binary scaling should stair-step to hysteresis band"
+        vec![5, 6, 7, 8, 9, 10],
+        "Binary scaling must converge exactly to target"
+    );
+    assert_eq!(current, target, "Fleet reached target");
+}
+
+#[test]
+fn test_scale_up_converges_from_one_short() {
+    // The regression in one line: target 10, current 9, band 1.0. The old
+    // symmetric band read |10 - 9| = 1 <= 1 and held there FOREVER — the
+    // documented example ended "stops at 9 due to hysteresis".
+    let decision = apply_scaling(10, 9, 1.0, 1, 1);
+
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleUp(1),
+        "A one-worker deficit must close, not strand one short of target"
     );
 }
 
@@ -303,33 +422,42 @@ fn test_smooth_scale_down_sequence() {
         }
     }
 
-    // Binary scaling: should reach 3 (stop at hysteresis band)
+    // Scale-down keeps the band, so the sequence rests one worker ABOVE the
+    // soft target: the final 1-worker surplus is the intended down-side
+    // cushion (forecast noise must not shed workers), and the hard
+    // protections still override it if the window really runs out.
     assert_eq!(
         sequence,
         vec![10, 9, 8, 7, 6, 5, 4, 3],
-        "Binary scaling should stair-step down to hysteresis band"
+        "Binary scale-down stair-steps to the band above target and holds"
     );
 }
 
 #[test]
 fn test_hysteresis_prevents_oscillation() {
-    // Simulate fluctuating target around current to verify hysteresis prevents oscillation
-    let current = 5;
+    // A target jittering ±1 around the fleet must not produce churn. Track
+    // the fleet as it moves instead of holding `current` fixed: the first
+    // deficit closes (up to 6), after which the down-side band absorbs the
+    // jitter — the fleet never sheds a worker back toward 5.
     let hysteresis = 1.0;
-
-    // Targets that oscillate around 5 without exceeding hysteresis
     let targets = vec![5, 6, 5, 6, 5, 6];
+    let mut current = 5u32;
+    let mut downs = 0;
 
     for target in targets {
-        let decision = apply_scaling(target, current, hysteresis, 3, 2);
-
-        assert!(
-            matches!(decision, ScalingDecision::NoChange),
-            "Hysteresis should prevent oscillation for target={}, current={}",
-            target,
-            current
-        );
+        match apply_scaling(target, current, hysteresis, 3, 2) {
+            ScalingDecision::ScaleUp(n) => current += n,
+            ScalingDecision::ScaleDown(n) => {
+                downs += 1;
+                current -= n;
+            }
+            ScalingDecision::NoChange => {}
+            ScalingDecision::EmergencyBrake => panic!("Brake not expected here"),
+        }
     }
+
+    assert_eq!(current, 6, "Fleet converged to the top of the jitter band");
+    assert_eq!(downs, 0, "Down-band damping absorbed the jitter: no churn");
 }
 
 #[test]
@@ -406,12 +534,22 @@ fn test_fractional_hysteresis_band() {
 
 #[test]
 fn test_very_large_hysteresis_band() {
-    // Very large hysteresis band should prevent most scaling
-    let decision = apply_scaling(10, 5, 10.0, 3, 2);
+    // Very large hysteresis band damps scale-DOWN only — a deficit still
+    // closes (at the per-cycle cap), because no band may strand the fleet
+    // below target.
+    let up = apply_scaling(10, 5, 10.0, 3, 2);
+    assert_eq!(
+        up,
+        ScalingDecision::ScaleUp(3),
+        "Even a huge band must not hold a deficit: closes at max_up_per_cycle"
+    );
 
-    assert!(
-        matches!(decision, ScalingDecision::NoChange),
-        "Very large hysteresis band should prevent scaling"
+    // The same huge band does hold an equally large surplus (gap <= band).
+    let down = apply_scaling(2, 12, 10.0, 3, 2);
+    assert_eq!(
+        down,
+        ScalingDecision::NoChange,
+        "Very large hysteresis band damps a scale-down within the band"
     );
 }
 
@@ -480,26 +618,20 @@ fn test_target_computation_with_hysteresis() {
 
 #[test]
 fn test_progressive_scaling_concept_large_gap() {
-    // Conceptual test for future progressive scaling implementation
-    // This documents expected behavior for large gaps
-
+    // Now implemented (daemon.progressive_scaling + progressive_scale_cap):
+    // a gap > 5 widens the per-cycle cap 3x, a gap > 3 2x, otherwise 1x —
+    // always clamped to the remaining gap. Binary 5 -> 15 stair-steps +1 per
+    // cycle (50 minutes at the 5-minute loop interval); progressive with base
+    // cap 3 closes it in 2 cycles (see
+    // test_progressive_scaling_converges_faster_and_exactly).
     let current = 5;
     let target = 15; // Gap of 10
 
-    // With binary scaling: takes 10 cycles (50 minutes)
-    // With progressive scaling: could take 3-4 cycles (15-20 minutes)
-    // Gap > 5: scale 3 workers per cycle
-    // Gap > 3: scale 2 workers per cycle
-    // Gap <= 3: scale 1 worker per cycle (or apply hysteresis)
-
-    // Expected progressive sequence: 5 → 8 → 11 → 14 → 15 (4 cycles)
-    // Current binary sequence: 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 (11 cycles)
-
     let gap = target - current;
-    assert!(
-        gap > 5,
-        "Large gap scenario: gap of {} should qualify for aggressive scaling",
-        gap
+    assert_eq!(
+        progressive_scale_cap(3, gap),
+        9,
+        "3x tier, clamped to gap 10"
     );
 }
 

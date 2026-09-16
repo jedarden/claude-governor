@@ -4891,12 +4891,24 @@ pub fn compute_target_workers(
     target
 }
 
-/// Apply scaling decision with hysteresis band.
+/// Apply scaling decision with an **asymmetric** hysteresis band.
 ///
-/// Returns the scaling action to take:
-/// - `NoChange` if |target - current| <= hysteresis_band
-/// - `ScaleUp(n)` if target > current + hysteresis (limited by max_scale_up_per_cycle)
-/// - `ScaleDown(n)` if target < current - hysteresis (limited by max_scale_down_per_cycle)
+/// The band damps scale-DOWN only. Returns the scaling action to take:
+/// - `NoChange` when already at target, or when the target sits within
+///   `hysteresis_band` BELOW current — the down-side cushion that keeps a
+///   one-worker forecast dip from shedding workers
+/// - `ScaleUp(n)` for ANY deficit (target > current), limited by
+///   `max_scale_up_per_cycle` — a deficit is always closed, including the
+///   1-worker deficit the old symmetric band swallowed forever, which left the
+///   fleet permanently one worker short of target (claudego-44b1f4f5)
+/// - `ScaleDown(n)` when target < current - hysteresis (limited by
+///   `max_scale_down_per_cycle`)
+///
+/// The asymmetry is deliberate for a use-or-lose subscription governor:
+/// capacity below target is capacity that resets unused, so any deficit closes
+/// immediately; surplus above the soft target is tolerated up to the band
+/// because the forecast jitters, and the hard protections (emergency brake,
+/// `safe_worker_count = Some(0)`) still force their way through regardless.
 ///
 /// Emergency brake bypasses hysteresis entirely.
 pub fn apply_scaling(
@@ -4913,39 +4925,64 @@ pub fn apply_scaling(
     }
 
     let delta = target as i32 - current as i32;
-    let hysteresis = hysteresis_band as i32;
 
-    if delta.abs() <= hysteresis {
-        log::debug!(
-            "[governor] hysteresis: |{} - {}| = {} <= {:.1}, no change",
-            target,
-            current,
-            delta.abs(),
-            hysteresis_band
-        );
+    // At target — nothing to do.
+    if delta == 0 {
         return ScalingDecision::NoChange;
     }
 
-    if delta > 0 {
-        let scale = (delta as u32).min(max_up_per_cycle);
+    if delta < 0 {
+        let hysteresis = hysteresis_band as i32;
+
+        // The band applies here and only here: a target within the band below
+        // current holds, so forecast noise cannot shed workers.
+        if delta.abs() <= hysteresis {
+            log::debug!(
+                "[governor] hysteresis: target {} is within {:.1} below current {}, no change",
+                target,
+                hysteresis_band,
+                current
+            );
+            return ScalingDecision::NoChange;
+        }
+
+        let scale = delta.unsigned_abs().min(max_down_per_cycle);
         log::info!(
-            "[governor] scale UP: {} -> {} (+{})",
+            "[governor] scale DOWN: {} -> {} (-{})",
             current,
-            current + scale,
+            current - scale,
             scale
         );
-        return ScalingDecision::ScaleUp(scale);
+        return ScalingDecision::ScaleDown(scale);
     }
 
-    // delta < 0
-    let scale = (delta.abs() as u32).min(max_down_per_cycle);
+    // delta > 0: a deficit of any size closes — the band never damps scale-up.
+    let scale = (delta as u32).min(max_up_per_cycle);
     log::info!(
-        "[governor] scale DOWN: {} -> {} (-{})",
+        "[governor] scale UP: {} -> {} (+{})",
         current,
-        current - scale,
+        current + scale,
         scale
     );
-    ScalingDecision::ScaleDown(scale)
+    ScalingDecision::ScaleUp(scale)
+}
+
+/// Widen a per-cycle scale cap for progressive scaling: the further the fleet
+/// is from target, the more workers a single cycle may move (claudego-44b1f4f5).
+///
+/// Tiers on the remaining gap — 3x the cap beyond a gap of 5, 2x beyond 3, 1x
+/// otherwise — clamped to the gap itself so a cycle never overshoots the
+/// target. The configured cap remains the base rate, so the operator's
+/// throttle still bounds every move; a disabled cap (0) stays 0.
+pub fn progressive_scale_cap(max_per_cycle: u32, gap: u32) -> u32 {
+    let factor = if gap > 5 {
+        3
+    } else if gap > 3 {
+        2
+    } else {
+        1
+    };
+    max_per_cycle.saturating_mul(factor).min(gap)
 }
 
 // ---------------------------------------------------------------------------
@@ -6787,12 +6824,28 @@ pub fn run_act_cycle(
     let effective_target = pre_scale.unwrap_or(target);
 
     // 5. Apply scaling decision
+    //
+    // Progressive scaling (daemon.progressive_scaling) widens the per-cycle
+    // caps with the remaining gap, so a large correction doesn't crawl one
+    // worker per 5-minute cycle. The configured caps still bound every move
+    // and the gap clamp in progressive_scale_cap means the decision never
+    // overshoots the target. The decision log below records these effective
+    // caps, not the configured base rate.
+    let gap = effective_target.abs_diff(current_total);
+    let (eff_max_up, eff_max_down) = if pricing_config.daemon.progressive_scaling {
+        (
+            progressive_scale_cap(max_up_per_cycle, gap),
+            progressive_scale_cap(max_down_per_cycle, gap),
+        )
+    } else {
+        (max_up_per_cycle, max_down_per_cycle)
+    };
     let decision = apply_scaling(
         effective_target,
         current_total,
         effective_hysteresis,
-        max_up_per_cycle,
-        max_down_per_cycle,
+        eff_max_up,
+        eff_max_down,
     );
 
     // 6. Execute scaling (unless dry-run or no change)
@@ -7061,13 +7114,16 @@ pub fn run_act_cycle(
             ScalingDecision::NoChange => current_total,
         };
         let trigger = match &decision {
+            // A NoChange hold is only ever recorded when a wanted change was
+            // suppressed, and only scale-down is suppressible now — so the
+            // hold names the scale-down band specifically.
             ScalingDecision::NoChange => format!(
-                "hysteresis: target {} within ±{:.0} of current {}",
+                "hysteresis: target {} within the {:.0}-worker scale-down band of current {}",
                 effective_target, effective_hysteresis, current_total
             ),
             ScalingDecision::ScaleUp(_) => format!(
-                "target {} > current {} beyond hysteresis {:.0}",
-                effective_target, current_total, effective_hysteresis
+                "target {} > current {} (deficits are never band-damped)",
+                effective_target, current_total
             ),
             ScalingDecision::ScaleDown(_) => format!(
                 "target {} < current {} beyond hysteresis {:.0}",
@@ -7097,8 +7153,9 @@ pub fn run_act_cycle(
             "computed_target": effective_target,
             "wanted_delta": wanted_delta,
             "hysteresis_band": effective_hysteresis,
-            "max_up_per_cycle": max_up_per_cycle,
-            "max_down_per_cycle": max_down_per_cycle,
+            "max_up_per_cycle": eff_max_up,
+            "max_down_per_cycle": eff_max_down,
+            "progressive_scaling": pricing_config.daemon.progressive_scaling,
             "actual_launched": actual_launched,
             "actual_removed": actual_removed,
             "allocation_reconciled": allocation_reconciled,
@@ -10681,16 +10738,18 @@ mod tests {
 
         // 6. A single snapshot has exactly one right answer, so assert it rather
         //    than accepting whatever came back: the binding window is
-        //    weekly_scoped, whose safe_worker_count is 7, and 7 is within the
-        //    2.0 hysteresis band of the current 5, so nothing moves.
+        //    weekly_scoped, whose safe_worker_count is 7. Current is 5, so the
+        //    deficit is 2 — and the hysteresis band damps scale-DOWN only, so
+        //    the deficit closes at the per-cycle cap (min(2, max_up 3) = 2).
         assert_eq!(
             target, 7,
             "target should be the binding (weekly_scoped) window's safe_worker_count"
         );
-        assert!(
-            matches!(decision, ScalingDecision::NoChange),
-            "target {} vs current {} is inside the 2.0 hysteresis band, so the \
-             decision should be NoChange, got {:?}",
+        assert_eq!(
+            decision,
+            ScalingDecision::ScaleUp(2),
+            "target {} is 2 above current {}; the asymmetric band damps scale-down \
+             only, so the deficit closes (bounded by max_up_per_cycle), got {:?}",
             target,
             current_total,
             decision

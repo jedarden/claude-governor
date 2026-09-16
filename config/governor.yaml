@@ -228,6 +228,7 @@ daemon:
   hysteresis_band: 1.0              # Scaling hysteresis band
   max_scale_up_per_cycle: 1         # Max workers to scale up per cycle
   max_scale_down_per_cycle: 1       # Max workers to scale down per cycle
+  progressive_scaling: false        # Widen per-cycle caps with the gap (3x when gap>5, 2x when gap>3, never past target) — see docs/hysteresis-and-smooth-scaling.md
   min_scale_interval_secs: 60       # Minimum time between scale operations
   target_ceiling: 90.0              # Global default ceiling (used for any window not listed below)
   # Per-window target utilization (fraction 0-1). The live API exposes

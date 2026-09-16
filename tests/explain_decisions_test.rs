@@ -544,10 +544,11 @@ fn act_cycle_appends_scale_up_decision_with_computed_vs_actual_context() {
 }
 
 #[test]
-fn act_cycle_records_hysteresis_suppressed_hold() {
+fn act_cycle_closes_one_worker_deficit_despite_band() {
     // Target 1, current 0, band 2.0: the wanted change is smaller than the
-    // band, so the cycle holds — and that suppressed hold IS a decision the
-    // log must show ("wanted 1, stayed at 0").
+    // band. This used to hold forever ("wanted 1, stayed at 0") — the exact
+    // strand claudego-44b1f4f5 removes. The band damps scale-DOWN only, so
+    // the deficit now closes: ScaleUp(1), recorded as a decision.
     let mut s = state::GovernorState::new();
     s.capacity_forecast = state::CapacityForecast {
         weekly_scoped: state::WindowForecast {
@@ -575,25 +576,69 @@ fn act_cycle_records_hysteresis_suppressed_hold() {
     let temp = TempDir::new().unwrap();
     let (decision, decisions_path) = run_dry_act_cycle(temp.path(), &s, 2.0);
 
-    assert!(
-        matches!(decision, ScalingDecision::NoChange),
-        "delta 1 within band 2.0 must hold, got {:?}",
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleUp(1),
+        "delta 1 must close even inside band 2.0, got {:?}",
         decision
     );
 
     let entries = read_last_decisions_from_path(10, &decisions_path).unwrap();
-    assert_eq!(entries.len(), 1, "hysteresis-suppressed hold is recorded");
-    assert_eq!(entries[0].action, ScaleAction::Hold);
+    assert_eq!(entries.len(), 1, "the convergence is recorded");
+    assert_eq!(entries[0].action, ScaleAction::ScaleUp);
     assert_eq!(entries[0].from, 0);
-    assert_eq!(entries[0].to, 0);
+    assert_eq!(entries[0].to, 1);
     assert!(
-        entries[0].trigger.contains("hysteresis"),
-        "hold trigger names the band: {}",
+        entries[0].trigger.contains("target 1 > current 0"),
+        "trigger carries the computed-vs-current rationale: {}",
         entries[0].trigger
     );
     let ctx = entries[0].context.as_ref().unwrap();
     assert_eq!(ctx["computed_target"], serde_json::json!(1));
     assert_eq!(ctx["wanted_delta"], serde_json::json!(1));
+    assert_eq!(ctx["hysteresis_band"], serde_json::json!(2.0));
+}
+
+#[test]
+fn act_cycle_at_target_records_nothing() {
+    // Target 0, current 0: the fleet is already at target. At-target holds
+    // are suppressed (the steady state would drown the log in no-op lines),
+    // so the decisions log must stay empty.
+    let mut s = state::GovernorState::new();
+    s.capacity_forecast = state::CapacityForecast {
+        weekly_scoped: state::WindowForecast {
+            current_utilization: 0.0,
+            margin_hrs: 120.0,
+            hours_remaining: 120.0,
+            safe_worker_count: Some(0),
+            safe_worker_count_p75: Some(0),
+            binding: true,
+            ..Default::default()
+        },
+        binding_window: "weekly_scoped".to_string(),
+        ..Default::default()
+    };
+    s.workers.insert(
+        "test-agent".to_string(),
+        state::WorkerState {
+            current: 0,
+            target: 0,
+            min: 0,
+            max: 8,
+        },
+    );
+
+    let temp = TempDir::new().unwrap();
+    let (decision, decisions_path) = run_dry_act_cycle(temp.path(), &s, 2.0);
+
+    assert_eq!(decision, ScalingDecision::NoChange, "already at target");
+
+    let entries = read_last_decisions_from_path(10, &decisions_path).unwrap();
+    assert!(
+        entries.is_empty(),
+        "at-target hold must not be recorded, got {:?}",
+        entries
+    );
 }
 
 #[test]
