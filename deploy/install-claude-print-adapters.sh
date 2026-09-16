@@ -14,15 +14,18 @@
 # Beyond the --version check, this script now runs the two authoritative
 # verifications CLAUDE.md prescribes (claudego-b03e5c39), because
 # `needle test-agent` cannot catch either failure class:
-#   4. a static check that each template still unsets the rule-3 (inherited
+#   1. a static check that each template still unsets the rule-3 (inherited
 #      IDE env) and rule-5 (inherited API-routing env) variable sets
-#   5. a live run of each template's invoke_template verbatim with a trivial
+#   2. a live run of each template's invoke_template verbatim with a trivial
 #      prompt and a poisoned scrub env, requiring exit 0 — one trivial
 #      subscription call per adapter
 # Use --skip-live to run only the static checks (offline, or conserving
 # subscription quota). The Rust twin of these checks lives in
 # src/adapter_verify.rs and runs as `cgov doctor`'s claude_print_adapters
-# check; keep the variable lists in the two files in sync.
+# check. Its rule-3/rule-5 variable lists are mirrored in bash below, and the
+# mirror is enforced, not manual: this script cross-checks the Rust constants
+# (section 4) before trusting its own lists, and a cargo-test parse of this
+# file fails on the same drift — add new variables to both copies.
 
 set -euo pipefail
 
@@ -36,7 +39,7 @@ for arg in "$@"; do
     case "${arg}" in
         --skip-live) SKIP_LIVE=1 ;;
         -h|--help)
-            sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -51,9 +54,11 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADAPTER_SRC="${REPO_DIR}/deploy/needle-adapters"
 ADAPTER_DST="${HOME}/.config/needle/adapters"
 
-# Rule-3 and rule-5 variable sets that every template must unset. Keep in
-# sync with IDE_ENV_VARS / API_ROUTING_ENV_VARS in src/adapter_verify.rs and
-# the adapter rules in the repo CLAUDE.md.
+# Rule-3 and rule-5 variable sets that every template must unset — the bash
+# mirror of IDE_ENV_VARS / API_ROUTING_ENV_VARS in src/adapter_verify.rs (the
+# canonical copy). The sync check in section 4 fails this install if the two
+# copies diverge, and a cargo-test parse of this file fails the same way, so
+# drift cannot go silent: add new variables to BOTH lists.
 RULE3_IDE_VARS=(CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD)
 RULE5_API_VARS=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL)
 
@@ -175,7 +180,56 @@ scrub_missing() {  # scrub_missing <invoke_template>
         <(printf '%s' "${1}" | template_unset_vars | sort -u)
 }
 
-# ── 4. Static scrub check (rules 3 and 5) ───────────────────────────────────
+# ── variable-list sync helpers ──────────────────────────────────────────────
+# The arrays above are a bash mirror of the canonical Rust constants; nothing
+# used to fail when they drifted, and a drifted list silently makes this
+# script's scrub check cover a different variable set than `cgov doctor`'s.
+# rust_rule_vars reads the constants straight out of the Rust source so this
+# script can fail its own install on divergence.
+
+rust_rule_vars() {  # rust_rule_vars <const-name> — one var per line, sorted
+    sed -n "/pub const ${1}:/,/^\];$/p" "${REPO_DIR}/src/adapter_verify.rs" \
+        | grep -oE '"[^"]+"' | tr -d '"' | sort -u
+}
+
+bash_rule_vars() {  # bash_rule_vars <array-name> — one var per line, sorted
+    local -n array_ref="${1}"
+    printf '%s\n' "${array_ref[@]}" | sort -u
+}
+
+check_var_list_sync() {
+    local rust_src="${REPO_DIR}/src/adapter_verify.rs"
+    if [ ! -f "${rust_src}" ]; then
+        echo -e "  ${RED}✗ ${rust_src} not found — cannot cross-check the rule-3/rule-5 lists${NC}"
+        return 1
+    fi
+    local sync_fail=0 pair rust_name bash_name drift
+    for pair in "IDE_ENV_VARS RULE3_IDE_VARS" "API_ROUTING_ENV_VARS RULE5_API_VARS"; do
+        rust_name="${pair%% *}"
+        bash_name="${pair##* }"
+        drift="$(diff <(rust_rule_vars "${rust_name}") <(bash_rule_vars "${bash_name}") || true)"
+        if [ -n "${drift}" ]; then
+            echo -e "  ${RED}✗ variable-list drift: ${bash_name} (this script) vs ${rust_name} (src/adapter_verify.rs)${NC}"
+            sed 's/^/      /' <<<"${drift}"
+            sync_fail=1
+        fi
+    done
+    return "${sync_fail}"
+}
+
+# ── 4. Variable-list sync check (this script vs src/adapter_verify.rs) ──────
+# The scrub check below is only as good as the lists it checks against; fail
+# the install rather than verify against a set nobody else enforces.
+echo ""
+echo "Variable-list sync check (installer arrays vs src/adapter_verify.rs):"
+sync_fail=0
+if ! check_var_list_sync; then
+    sync_fail=1
+else
+    echo -e "  ${GREEN}✓${NC} rule-3 (RULE3_IDE_VARS) and rule-5 (RULE5_API_VARS) match the Rust constants"
+fi
+
+# ── 5. Static scrub check (rules 3 and 5) ───────────────────────────────────
 # A template that stops unsetting the IDE env (rule 3) or the API-routing env
 # (rule 5) hangs or misroutes dispatches launched from interactive shells —
 # 46% of the fleet's dispatch volume at the time rule 3 was written down.
@@ -206,7 +260,7 @@ for yaml_file in "${ADAPTER_DST}"/claude-print-*.yaml; do
     PROBE_NAMES+=("${name}")
 done
 
-# ── 5. Live invoke_template probe ───────────────────────────────────────────
+# ── 6. Live invoke_template probe ───────────────────────────────────────────
 # The exit-0 bar CLAUDE.md prescribes, run against the installed template
 # verbatim. The probe poisons every rule-3/rule-5 variable in the child env:
 # if the template scrubs properly the call reaches the real subscription
@@ -274,7 +328,7 @@ else
     done
 fi
 
-if [ "${fail}" -ne 0 ] || [ "${scrub_fail}" -ne 0 ] || [ "${live_fail}" -ne 0 ]; then
+if [ "${fail}" -ne 0 ] || [ "${scrub_fail}" -ne 0 ] || [ "${live_fail}" -ne 0 ] || [ "${sync_fail}" -ne 0 ]; then
     echo -e "${RED}Install incomplete.${NC}"
     exit 1
 fi

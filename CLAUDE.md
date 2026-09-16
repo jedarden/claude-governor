@@ -51,8 +51,12 @@ binary path back out of the installed templates, links it to whichever real
 > environment, requiring exit 0 with output (one trivial subscription call
 > per adapter; `--skip-live` on the installer, `cgov doctor --skip-live` on
 > the doctor, skip the static-only case). The logic lives in
-> `src/adapter_verify.rs`, mirrored in bash inside the installer — keep the
-> variable lists in sync.
+> `src/adapter_verify.rs`, mirrored in bash inside the installer; the mirror
+> is enforced, not manual — a cargo-test parse of the installer's arrays
+> (`installer_bash_variable_lists_match_the_rust_constants`) fails on
+> divergence from the Rust constants, and the installer cross-checks those
+> constants at run time. Add new variables to **both** copies; both checks
+> fail until you do.
 
 Three rules make these work under NEEDLE dispatch (all learned the hard way):
 

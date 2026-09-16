@@ -22,6 +22,14 @@
 //! trivial prompt, requiring exit 0. Shared by `cgov doctor` (check
 //! `claude_print_adapters`) and `deploy/install-claude-print-adapters.sh`,
 //! which mirrors the same variable lists in bash.
+//!
+//! The bash mirror is enforced, not trusted: a `cargo test` parse of the
+//! installer's two arrays fails on divergence from the constants below
+//! (`installer_bash_variable_lists_match_the_rust_constants`), and the
+//! installer cross-checks these same constants at run time. A variable added
+//! to one copy without the other therefore fails loudly in both places,
+//! instead of silently shrinking the check to exactly the variables that
+//! caused the incidents. New variables go into both lists together.
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -204,6 +212,48 @@ pub fn missing_scrub_vars(invoke_template: &str) -> Vec<(EnvClass, &'static str)
         .chain(API_ROUTING_ENV_VARS.iter().map(|v| (EnvClass::ApiRouting, *v)))
         .filter(|(_, var)| !scrubbed.contains(*var))
         .collect()
+}
+
+/// One bash array's elements out of an installer-source text, in declaration
+/// order.
+///
+/// The installer declares the rule-3/rule-5 lists as flat arrays of bare
+/// env-var names (`RULE3_IDE_VARS=(CLAUDECODE …)`). The parse anchors on a
+/// declaration line — the name at the start of a line (leading whitespace
+/// allowed), immediately followed by `=(` — so a comment that merely mentions
+/// the array cannot satisfy it, and reads to the first `)`, which is exact
+/// for bare-element arrays across wrapped lines. Quoting is stripped but not
+/// interpreted: an element that stops being a bare identifier is precisely
+/// the drift the sync checks exist to flag.
+#[cfg(test)]
+fn bash_array_vars(installer_src: &str, array_name: &str) -> Result<Vec<String>, String> {
+    let marker = format!("{}=(", array_name);
+    let mut search_from = 0usize;
+    let decl_start = loop {
+        let rel = installer_src[search_from..]
+            .find(&marker)
+            .ok_or_else(|| format!("no {}=( declaration found", array_name))?;
+        let abs = search_from + rel;
+        let line_start = installer_src[..abs].rfind('\n').map_or(0, |i| i + 1);
+        if installer_src[line_start..abs].trim().is_empty() {
+            break abs;
+        }
+        search_from = abs + marker.len();
+    };
+
+    let body = &installer_src[decl_start + marker.len()..];
+    let close = body
+        .find(')')
+        .ok_or_else(|| format!("{} is never closed", array_name))?;
+    let vars: Vec<String> = body[..close]
+        .split_whitespace()
+        .map(|token| token.trim_matches('"').trim_matches('\'').to_string())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if vars.is_empty() {
+        return Err(format!("{} declares no variables", array_name));
+    }
+    Ok(vars)
 }
 
 /// Values planted in the probe child's environment for every rule-3/rule-5
@@ -423,8 +473,7 @@ pub fn live_probe_in(adapter: &InstalledAdapter, workspace: &Path) -> Result<Dur
             .adapter
             .timeout_secs
             .unwrap_or(LIVE_PROBE_TIMEOUT_SECS)
-            .min(LIVE_PROBE_TIMEOUT_SECS)
-            .max(30),
+            .clamp(30, LIVE_PROBE_TIMEOUT_SECS),
     );
     run_probe(&rendered, timeout)?.into_result()
 }
@@ -445,15 +494,29 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
-    const ALL_REQUIRED: &str = concat!(
-        "CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE ",
-        "VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS ",
-        "VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD ",
-        "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL ",
-        "ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ",
-        "CLAUDE_CODE_SUBAGENT_MODEL"
-    );
+    fn installer_source() -> String {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/install-claude-print-adapters.sh");
+        fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {}",
+                path.display(),
+                e
+            )
+        })
+    }
+
+    /// Space-joined rule-3 + rule-5 sets, derived from the constants rather
+    /// than retyped — a hand-copied list inside this very test module is
+    /// exactly the drift this module polices elsewhere.
+    fn all_required_vars() -> String {
+        IDE_ENV_VARS
+            .iter()
+            .chain(API_ROUTING_ENV_VARS.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     #[test]
     fn committed_adapter_templates_scrub_both_variable_sets() {
@@ -608,7 +671,7 @@ mod tests {
 
         let yaml = format!(
             "name: stub-probe\ninvoke_template: \"cd {{workspace}} && unset {} && {} < {{prompt_file}}\"\nmodel: opus\ntimeout_secs: 60\n",
-            ALL_REQUIRED,
+            all_required_vars(),
             stub.display()
         );
         let dir = tempfile::TempDir::new().unwrap();
@@ -633,7 +696,7 @@ mod tests {
 
         let yaml = format!(
             "name: stub-fail\ninvoke_template: \"cd {{workspace}} && unset {} && {} < {{prompt_file}}\"\ntimeout_secs: 60\n",
-            ALL_REQUIRED,
+            all_required_vars(),
             stub.display()
         );
         let dir = tempfile::TempDir::new().unwrap();
@@ -656,5 +719,74 @@ mod tests {
 
         let err = load_installed_adapters(dir.path()).expect_err("empty template must fail loudly");
         assert!(err.contains("invoke_template"), "err: {}", err);
+    }
+
+    #[test]
+    fn bash_array_parses_declarations_not_comments() {
+        // A comment naming the array must not satisfy the parse; the
+        // declaration line must, including across wrapped lines.
+        let src = "# RULE3_IDE_VARS=(NOT A REAL DECL)\nRULE3_IDE_VARS=(A B\n    C)\n";
+        assert_eq!(
+            bash_array_vars(src, "RULE3_IDE_VARS").expect("parses"),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        // Indented declarations count; mid-line mentions do not.
+        let indented = "  RULE5_API_VARS=(X Y)\n";
+        assert_eq!(
+            bash_array_vars(indented, "RULE5_API_VARS").expect("parses"),
+            vec!["X".to_string(), "Y".to_string()]
+        );
+        let mid_line = "echo the RULE5_API_VARS=(is not a decl here)\n";
+        assert!(bash_array_vars(mid_line, "RULE5_API_VARS").is_err());
+        assert!(
+            bash_array_vars("nothing here", "RULE5_API_VARS")
+                .err()
+                .unwrap()
+                .contains("no RULE5_API_VARS=(")
+        );
+    }
+
+    /// The installer's bash mirror of the rule-3/rule-5 constants must stay
+    /// set-identical. Without this, a variable added to one copy silently
+    /// shrank the check in exactly the places that verify the other — the
+    /// installer's scrub check and `cgov doctor`'s would disagree about what
+    /// "scrubbed" means, and neither would fail. The installer cross-checks
+    /// these same constants at run time; this test catches the drift for
+    /// every `cargo test` run, before anyone installs anything.
+    #[test]
+    fn installer_bash_variable_lists_match_the_rust_constants() {
+        let installer = installer_source();
+        for (rust_vars, bash_vars, rust_name, bash_name) in [
+            (
+                IDE_ENV_VARS.to_vec(),
+                bash_array_vars(&installer, "RULE3_IDE_VARS")
+                    .expect("RULE3_IDE_VARS must be declared in the installer"),
+                "IDE_ENV_VARS",
+                "RULE3_IDE_VARS",
+            ),
+            (
+                API_ROUTING_ENV_VARS.to_vec(),
+                bash_array_vars(&installer, "RULE5_API_VARS")
+                    .expect("RULE5_API_VARS must be declared in the installer"),
+                "API_ROUTING_ENV_VARS",
+                "RULE5_API_VARS",
+            ),
+        ] {
+            let rust_set: BTreeSet<_> = rust_vars.into_iter().collect();
+            let bash_set: BTreeSet<_> = bash_vars.iter().map(String::as_str).collect();
+            let missing: Vec<_> = rust_set.difference(&bash_set).collect();
+            let extra: Vec<_> = bash_set.difference(&rust_set).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "{} in deploy/install-claude-print-adapters.sh diverges from {} in \
+                 src/adapter_verify.rs — the bash list is missing {:?} and carries \
+                 unlisted {:?}. Update both copies together; the installer's own \
+                 sync check fails the install on the same drift.",
+                bash_name,
+                rust_name,
+                missing,
+                extra
+            );
+        }
     }
 }
