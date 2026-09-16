@@ -60,6 +60,7 @@ cgov enable
 └── collector.log        # Token collector logs
 ~/.needle/state/
 ├── heartbeats/          # Worker heartbeat files (managed by NEEDLE)
+├── governor-decisions.jsonl  # Scaling-decision audit log (read by `cgov explain`)
 └── ...                  # Other state files
 ```
 
@@ -115,6 +116,13 @@ cgov simulate --workers 4 --hours 24
 
 # View recent scaling decisions
 cgov explain
+cgov explain --last 20          # more history
+cgov explain --json             # machine-readable
+
+# Decisions are appended by every act cycle (scale up/down, hysteresis holds,
+# emergency brake) to ~/.needle/state/governor-decisions.jsonl — each entry
+# carries the binding window, worker transition, trigger, and a computed-vs-
+# actual context block. Set CGOV_DECISIONS_PATH to relocate the log.
 
 # Tail governor logs
 cgov logs --follow

@@ -6756,7 +6756,11 @@ pub fn run_act_cycle(
     // 4b. Underutilization sprint: burn spare use-or-lose capacity by boosting a
     // subscription generator toward its max when a window is under-used and resets
     // soon — but only while it has queued generation work, so the boost is productive.
+    let pre_sprint_target = target;
     let target = apply_underutilization_sprint(&state, &pricing_config.sprint, agents, target, now);
+    // A boost that actually moved the target is decision-log context: the resulting
+    // scale-up was driven by underutilization, not by cutoff risk.
+    let sprint_boosted = target > pre_sprint_target;
 
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
     //
@@ -6796,6 +6800,13 @@ pub fn run_act_cycle(
     // Use priority-based distribution when scaling multiple agents:
     // - Scale down: reduce highest-cost agents first (Opus -> Sonnet -> Haiku)
     // - Scale up: add to lowest-cost agents first with capacity
+    //
+    // Actual outcomes are captured here so the decision log can record
+    // computed-vs-actual: the executor may launch fewer workers than the
+    // decision requested (pool at max, launcher failure).
+    let mut actual_launched: u32 = 0;
+    let mut actual_removed: u32 = 0;
+    let mut allocation_reconciled = false;
     match &decision {
         ScalingDecision::NoChange => {
             // The aggregate total is unchanged, but the per-agent allocation can
@@ -6869,6 +6880,7 @@ pub fn run_act_cycle(
                 } else {
                     log::info!("[governor] no scaling action this cycle");
                 }
+                allocation_reconciled = reconciled;
             } else {
                 log::info!("[governor] no scaling action this cycle (dry-run)");
             }
@@ -6925,6 +6937,7 @@ pub fn run_act_cycle(
                     }
                 }
                 log::info!("[governor] total workers launched: {}", total_launched);
+                actual_launched = total_launched as u32;
             } else {
                 log::info!("[governor] DRY RUN: would scale up by {}", n);
             }
@@ -6990,6 +7003,7 @@ pub fn run_act_cycle(
                     total_graceful,
                     total_forced
                 );
+                actual_removed = (total_graceful + total_forced) as u32;
             } else {
                 log::info!("[governor] DRY RUN: would scale down by {}", n);
             }
@@ -7004,6 +7018,7 @@ pub fn run_act_cycle(
                         .output();
                 }
                 log::warn!("[governor] killed {} worker sessions", all_sessions.len());
+                actual_removed = current_total;
 
                 // Update state
                 for ws in state.workers.values_mut() {
@@ -7016,6 +7031,83 @@ pub fn run_act_cycle(
             } else {
                 log::warn!("[governor] DRY RUN: would emergency brake");
             }
+        }
+    }
+
+    // 6b. Record the decision in the JSONL audit log that `cgov explain` reads.
+    //
+    // Computed-vs-actual in one entry: the cycle *computed* a target from the
+    // binding window, *requested* a hysteresis- and cap-bounded delta, and the
+    // executor above *actually* launched/removed that many workers (possibly
+    // fewer — pool at max, launcher failure). All three land in `context`.
+    //
+    // At-target Holds are not recorded: the daemon acts every loop interval and
+    // the steady state would drown real decisions in no-op lines. A Hold IS
+    // recorded when hysteresis suppressed a wanted change — that is a decision
+    // ("wanted 3, stayed at 1") — and carries the band in `context`.
+    let wanted_delta = effective_target as i64 - current_total as i64;
+    let at_target_hold = matches!(decision, ScalingDecision::NoChange) && wanted_delta == 0;
+    if !at_target_hold {
+        let action = match &decision {
+            ScalingDecision::NoChange => crate::narrator::ScaleAction::Hold,
+            ScalingDecision::ScaleUp(_) => crate::narrator::ScaleAction::ScaleUp,
+            ScalingDecision::ScaleDown(_) => crate::narrator::ScaleAction::ScaleDown,
+            ScalingDecision::EmergencyBrake => crate::narrator::ScaleAction::EmergencyBrakeEngage,
+        };
+        let workers_after = match &decision {
+            ScalingDecision::ScaleUp(n) => current_total.saturating_add(*n),
+            ScalingDecision::ScaleDown(n) => current_total.saturating_sub(*n),
+            ScalingDecision::EmergencyBrake => 0,
+            ScalingDecision::NoChange => current_total,
+        };
+        let trigger = match &decision {
+            ScalingDecision::NoChange => format!(
+                "hysteresis: target {} within ±{:.0} of current {}",
+                effective_target, effective_hysteresis, current_total
+            ),
+            ScalingDecision::ScaleUp(_) => format!(
+                "target {} > current {} beyond hysteresis {:.0}",
+                effective_target, current_total, effective_hysteresis
+            ),
+            ScalingDecision::ScaleDown(_) => format!(
+                "target {} < current {} beyond hysteresis {:.0}",
+                effective_target, current_total, effective_hysteresis
+            ),
+            ScalingDecision::EmergencyBrake => format!(
+                "binding window '{}' at/above cutoff threshold; target forced to 0",
+                state.capacity_forecast.binding_window
+            ),
+        };
+        // The decision does not move the forecast (observe owns it), so before
+        // and after are the same state — margins are the binding window's as
+        // measured this cycle.
+        let mut entry = crate::narrator::narrate_decision(&crate::narrator::DecisionContext {
+            before: &state,
+            after: &state,
+            action,
+            trigger,
+            agent_id: None,
+            workers_before: current_total,
+            workers_after,
+        });
+        // Stamp the cycle time rather than wall-clock-now so log timestamps
+        // line up with the cycle's own log lines.
+        entry.ts = now;
+        entry.context = Some(serde_json::json!({
+            "computed_target": effective_target,
+            "wanted_delta": wanted_delta,
+            "hysteresis_band": effective_hysteresis,
+            "max_up_per_cycle": max_up_per_cycle,
+            "max_down_per_cycle": max_down_per_cycle,
+            "actual_launched": actual_launched,
+            "actual_removed": actual_removed,
+            "allocation_reconciled": allocation_reconciled,
+            "sprint_boost": sprint_boosted,
+            "dry_run": dry_run,
+            "safe_mode": state.safe_mode.active,
+        }));
+        if let Err(e) = crate::narrator::append_decision(&entry) {
+            log::warn!("[governor] could not append to decision log: {}", e);
         }
     }
 

@@ -360,7 +360,16 @@ fn generate_reason(
 // ---------------------------------------------------------------------------
 
 /// Default path for the decisions audit log
+///
+/// Honors `CGOV_DECISIONS_PATH` so tests and alternate deployments can
+/// redirect the log; without it the log lives at
+/// `~/.needle/state/governor-decisions.jsonl`.
 pub fn default_decisions_path() -> PathBuf {
+    if let Ok(path) = std::env::var("CGOV_DECISIONS_PATH") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".needle")
