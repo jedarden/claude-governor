@@ -50,9 +50,26 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             cache_eff REAL NOT NULL DEFAULT 0.0,
             p5h       REAL,
             p7d       REAL,
-            p7ds      REAL
+            p7ds      REAL,
+            worker    TEXT
         );",
     )?;
+
+    // claudego-a542d686 landed `worker` on the collector record; claudego-
+    // 892a82b1 persists it so fleet/exogenous classification can read it.
+    // CREATE TABLE IF NOT EXISTS never touches an existing database, so
+    // pre-attribution installs are migrated in place — the collector runs
+    // create_schema on every pass, which keeps this self-healing.
+    let has_worker: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('i') WHERE name = 'worker'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )
+        .unwrap_or(false);
+    if !has_worker {
+        conn.execute_batch("ALTER TABLE i ADD COLUMN worker TEXT;")?;
+    }
 
     // Table f: fleet records
     conn.execute_batch(
@@ -172,9 +189,11 @@ pub fn insert_instance(conn: &Connection, record: &serde_json::Value) -> Result<
         "INSERT INTO i (r, ts, t0, t1, sess, sid, model, pk, hr_et, dow,
                         input_n, input_usd, output_n, output_usd,
                         r_cache_n, r_cache_usd, w_cache_n, w_cache_usd,
-                        w_cache_1h_n, w_cache_1h_usd, total_usd, cache_eff, p5h, p7d, p7ds)
+                        w_cache_1h_n, w_cache_1h_usd, total_usd, cache_eff, p5h, p7d, p7ds,
+                        worker)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                 ?26)",
         params![
             record.get("r").and_then(|v| v.as_str()).unwrap_or("i"),
             record.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
@@ -231,6 +250,9 @@ pub fn insert_instance(conn: &Connection, record: &serde_json::Value) -> Result<
             record.get("p5h").and_then(|v| v.as_f64()),
             record.get("p7d").and_then(|v| v.as_f64()),
             record.get("p7ds").and_then(|v| v.as_f64()),
+            // Omitted on unattributed records (operator sessions), matching
+            // the collector's skip_serializing_if on the JSONL field.
+            record.get("worker").and_then(|v| v.as_str()),
         ],
     )?;
     Ok(())
@@ -485,6 +507,10 @@ pub fn query_last_fleets(conn: &Connection, n: usize) -> Result<Vec<serde_json::
 pub struct DbInstanceRecord {
     /// Session identifier
     pub session: String,
+    /// Needle worker session name the session was dispatched by, or `None`
+    /// when unattributed (operator session / exited worker). Drives the
+    /// fleet-vs-exogenous classification in the burn model.
+    pub worker: Option<String>,
     /// Model identifier
     pub model: String,
     /// Total USD cost for this interval
@@ -524,7 +550,7 @@ pub struct DbInstanceRecord {
 pub fn query_instance_records_for_burn_rate(conn: &Connection) -> Result<Vec<DbInstanceRecord>> {
     let mut stmt = conn.prepare(
         "SELECT sess, model, total_usd, input_n, output_n, r_cache_n, w_cache_n, w_cache_1h_n,
-                p5h, p7d, p7ds
+                p5h, p7d, p7ds, worker
          FROM i
          WHERE p5h IS NOT NULL OR p7d IS NOT NULL OR p7ds IS NOT NULL
          ORDER BY t1 DESC
@@ -555,6 +581,7 @@ pub fn query_instance_records_for_burn_rate(conn: &Connection) -> Result<Vec<DbI
 
         Ok(DbInstanceRecord {
             session: row.get(0)?,
+            worker: row.get(11)?,
             model: row.get(1)?,
             total_usd: row.get(2)?,
             total_tokens,
@@ -2125,7 +2152,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(annotated, 2, "both instance rows should have been annotated");
+        assert_eq!(
+            annotated, 2,
+            "both instance rows should have been annotated"
+        );
 
         let after_bytes = fs::read(&jsonl_path).unwrap();
         assert_eq!(
@@ -2143,11 +2173,9 @@ mod tests {
         rebuild_from_jsonl(&jsonl_path, &db_path).unwrap();
         let conn = open_db(&db_path).unwrap();
         let still_annotated: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM i WHERE p7ds IS NOT NULL", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
             still_annotated, 0,

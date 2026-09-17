@@ -89,6 +89,7 @@ impl From<crate::db::DbInstanceRecord> for InstanceRecord {
 
         InstanceRecord {
             session: db_rec.session,
+            worker: db_rec.worker,
             model: db_rec.model,
             total_usd: db_rec.total_usd,
             total_tokens: db_rec.total_tokens,
@@ -102,6 +103,14 @@ impl From<crate::db::DbInstanceRecord> for InstanceRecord {
 pub struct InstanceRecord {
     /// Session identifier
     pub session: String,
+
+    /// Needle worker session name the CC session was dispatched by, in the
+    /// `needle-{agent}-{worker_id}` space the agent `session_pattern` globs
+    /// match, or `None` when the session is not attributable to any worker
+    /// (operator session, or the worker's process exited before the pass
+    /// scanned /proc). Fleet-vs-exogenous classification reads this field;
+    /// `None` is always exogenous.
+    pub worker: Option<String>,
 
     /// Model identifier
     pub model: String,
@@ -121,6 +130,12 @@ pub struct InstanceRecord {
 pub struct InstanceBurnRate {
     /// Session identifier
     pub session: String,
+
+    /// Whether this rate is fleet-attributable: the record's worker identity
+    /// matched one of the agents' `session_pattern` globs. Everything else —
+    /// operator sessions, other fleets, unattributed records — is exogenous
+    /// and must never be read as per-worker fleet burn (claudego-892a82b1).
+    pub fleet: bool,
 
     /// Model identifier
     pub model: String,
@@ -150,11 +165,14 @@ const MIN_ELAPSED_MINUTES: f64 = 2.0;
 /// per-worker rate read as ~12%/hr instead of the measured ~0.48%/hr, so the
 /// affordable worker count collapsed to 1 and never recovered (claudego-0ccbae3c).
 ///
-/// The baseline needs no session-to-worker mapping, which the collector cannot
-/// currently provide (`sess` is a Claude session UUID and `entry` is always
-/// "unknown"). Instead it uses the one moment attribution is unambiguous: when
-/// the pool is at ZERO workers, every observed percent is exogenous by
-/// definition. cgov scales to zero routinely, so this re-calibrates on its own.
+/// Since claudego-a542d686 the collector stamps each record with the needle
+/// worker that dispatched the session, so the baseline is measured directly
+/// from records classified exogenous by [`record_is_fleet`]. The zero-worker
+/// moment remains the fallback that keeps the baseline calibrated whenever
+/// attribution is unavailable: at ZERO workers every observed percent is
+/// still exogenous by definition, and every record then carries `worker:
+/// None`, so the classified measurement covers it unchanged. cgov scales to
+/// zero routinely, so this re-calibrates on its own.
 const EXOGENOUS_MODEL_KEY: &str = "<exogenous>";
 
 /// Utilization drop threshold for window reset detection (1 percentage point)
@@ -164,6 +182,34 @@ const WINDOW_RESET_THRESHOLD: f64 = 1.0;
 #[allow(dead_code)]
 const MIN_SAMPLES_FOR_EMA: u32 = 3;
 
+/// Classify a record's worker identity as fleet-attributable or exogenous.
+///
+/// A record is FLEET only when its `worker` field — the
+/// `needle-{agent}-{worker_id}` session name the collector resolves
+/// (claudego-a542d686) — matches one of the agents' `session_pattern` globs
+/// from governor.yaml. Everything else is EXOGENOUS, most importantly the
+/// `None` case: an unattributed record is by definition not one of this
+/// pool's workers, whether it is the operator's interactive session or a
+/// worker whose process exited before the attribution scan. An unmatched
+/// name (a needle worker belonging to some *other* governor instance) is
+/// exogenous for the same reason — its burn is real but it is not ours to
+/// scale.
+///
+/// An unparsable pattern never matches, so a config typo degrades to
+/// "everything is exogenous" (under-scaling) rather than adopting foreign
+/// burn as fleet burn (over-scaling).
+pub fn record_is_fleet(worker: Option<&str>, fleet_session_patterns: &[String]) -> bool {
+    let name = match worker {
+        Some(n) => n,
+        None => return false,
+    };
+    fleet_session_patterns.iter().any(|pattern| {
+        glob::Pattern::new(pattern)
+            .map(|p| p.matches(name))
+            .unwrap_or(false)
+    })
+}
+
 /// Compute per-instance per-window burn rates from an interval record
 ///
 /// Returns a burn rate entry for each window that passes all guard conditions:
@@ -171,7 +217,14 @@ const MIN_SAMPLES_FOR_EMA: u32 = 3;
 /// - Window pct_delta is not null
 /// - Window pct_delta is not zero when tokens > 0 (API rounding artifact)
 /// - No window reset detected (utilization drop > 1pp)
-pub fn compute_instance_burn(record: &InstanceRecord, elapsed_hours: f64) -> Vec<InstanceBurnRate> {
+///
+/// Each entry carries the fleet/exogenous classification of its record, made
+/// against `fleet_session_patterns`.
+pub fn compute_instance_burn(
+    record: &InstanceRecord,
+    elapsed_hours: f64,
+    fleet_session_patterns: &[String],
+) -> Vec<InstanceBurnRate> {
     let mut results = Vec::new();
 
     // Guard: skip if elapsed < 2 minutes
@@ -201,6 +254,7 @@ pub fn compute_instance_burn(record: &InstanceRecord, elapsed_hours: f64) -> Vec
 
         results.push(InstanceBurnRate {
             session: record.session.clone(),
+            fleet: record_is_fleet(record.worker.as_deref(), fleet_session_patterns),
             model: record.model.clone(),
             window: win.window.clone(),
             dollar_per_hour,
@@ -1341,6 +1395,11 @@ pub fn duty_cycle_safe_workers(
 ///   rate_p75 = fleet_pct_hr + 0.675 * std_pct_hr  (fast burn → fewer hours → p25 of hours)
 ///
 /// When std_pct_hr is zero (no spread data), p25/p50/p75 all equal the p50 estimate.
+///
+/// Convenience wrapper for a window with no exogenous burn: every caller that
+/// has not (yet) measured a non-fleet baseline keeps today's math exactly —
+/// `generate_window_forecast_with_exogenous` with an offset of 0.0 is
+/// behaviourally identical to what this always was.
 pub fn generate_window_forecast(
     window: &str,
     fleet_pct_hr: f64,
@@ -1351,7 +1410,70 @@ pub fn generate_window_forecast(
     std_pct_hr: f64,
     estimate_quality: crate::state::EstimateQuality,
 ) -> crate::state::WindowForecast {
-    let remaining_pct = (target_ceiling - current_utilization).max(0.0);
+    generate_window_forecast_with_exogenous(
+        window,
+        fleet_pct_hr,
+        current_utilization,
+        target_ceiling,
+        hours_remaining,
+        mean_rate_per_worker,
+        std_pct_hr,
+        estimate_quality,
+        0.0,
+    )
+}
+
+/// [`generate_window_forecast`] with the exogenous burn offset.
+///
+/// `fleet_pct_hr` must be the FLEET-ONLY rate — burn attributable to this
+/// pool's workers, which scales with `safe_worker_count`. `exogenous_pct_hr`
+/// is the measured rate of everything else on the account (operator
+/// sessions, foreign fleets): burn that shares the same windows but does not
+/// scale with any worker count (claudego-892a82b1).
+///
+/// The offset enters as a CONSTANT BUDGET RESERVATION, not as fleet burn:
+/// over `hours_remaining` the exogenous sources are expected to consume
+/// `exogenous_pct_hr * hours_remaining` percent, so that share is treated as
+/// already spent before the fleet's budget is computed. Concretely, with
+/// `effective_utilization = current_utilization + reserve`:
+///
+/// - `remaining_pct` (the fleet's usable budget) shrinks by the reserve —
+///   an operator-only account therefore shows reduced remaining budget while
+///   `fleet_pct_per_hour` stays 0 and `cutoff_risk` stays false: there is no
+///   fleet burn to govern, so the fleet can pose no cutoff risk.
+/// - `predicted_exhaustion_hours` / `margin_hrs` / `cutoff_risk` are driven
+///   by the FLEET rate against the net budget. Exhaustion at the hands of
+///   the operator alone is not fleet exhaustion and must not scale the pool
+///   (claudego-0ccbae3c: operator burn flagged every window CUTOFF_RISK).
+/// - `safe_worker_count` sizes against the net budget, so the fleet absorbs
+///   only what the operator will not consume.
+/// - `hard_limit_*` fields net the reserve out the same way.
+///
+/// The reported `current_utilization` stays the measured value: it is a
+/// fact about the account, not a budget.
+pub fn generate_window_forecast_with_exogenous(
+    window: &str,
+    fleet_pct_hr: f64,
+    current_utilization: f64,
+    target_ceiling: f64,
+    hours_remaining: f64,
+    mean_rate_per_worker: f64,
+    std_pct_hr: f64,
+    estimate_quality: crate::state::EstimateQuality,
+    exogenous_pct_hr: f64,
+) -> crate::state::WindowForecast {
+    // The exogenous reservation. `0.0 * Inf` is NaN in IEEE, so the finite
+    // guard is load-bearing even though hours_remaining is finite everywhere
+    // in practice (window reset times always exist; the absent-window
+    // sentinel is 0.0).
+    let exogenous_reserve_pct = if exogenous_pct_hr > 0.0 && hours_remaining.is_finite() {
+        (exogenous_pct_hr * hours_remaining).max(0.0)
+    } else {
+        0.0
+    };
+    let effective_utilization = current_utilization + exogenous_reserve_pct;
+
+    let remaining_pct = (target_ceiling - effective_utilization).max(0.0);
 
     let predicted_exhaustion_hours = if fleet_pct_hr > 0.0 {
         remaining_pct / fleet_pct_hr
@@ -1449,9 +1571,9 @@ pub fn generate_window_forecast(
         pace_target_pct: flat_spend_pace_target(window, hours_remaining, target_ceiling),
         pace_delta_pct: flat_spend_pace_target(window, hours_remaining, target_ceiling)
             .map(|ideal| remaining_pct - ideal),
-        hard_limit_remaining_pct: (100.0 - current_utilization).max(0.0),
+        hard_limit_remaining_pct: (100.0 - effective_utilization).max(0.0),
         hard_limit_margin_hrs: if fleet_pct_hr > 0.0 {
-            (100.0 - current_utilization).max(0.0) / fleet_pct_hr - hours_remaining
+            (100.0 - effective_utilization).max(0.0) / fleet_pct_hr - hours_remaining
         } else {
             f64::INFINITY
         },
@@ -1468,6 +1590,7 @@ pub fn generate_window_forecast(
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_burn_rates(
     instance_records: &[InstanceRecord],
+    fleet_session_patterns: &[String],
     elapsed_hours: f64,
     current_workers: u32,
     prev_workers: u32,
@@ -1521,7 +1644,7 @@ pub fn estimate_burn_rates(
 
     let mut all_instance_rates: Vec<InstanceBurnRate> = Vec::new();
     for record in instance_records {
-        let rates = compute_instance_burn(record, elapsed_hours);
+        let rates = compute_instance_burn(record, elapsed_hours, fleet_session_patterns);
         all_instance_rates.extend(rates);
     }
 
@@ -1536,19 +1659,28 @@ pub fn estimate_burn_rates(
         );
     }
 
-    // Group instance rates by window
-    let mut rates_by_window: HashMap<String, Vec<&InstanceBurnRate>> = HashMap::new();
+    // Split instance rates by window AND by attribution. The two buckets feed
+    // two different models (claudego-892a82b1): fleet rates size and risk the
+    // pool, exogenous rates become a constant budget offset that must never
+    // multiply into a per-worker figure.
+    let mut fleet_rates_by_window: HashMap<String, Vec<&InstanceBurnRate>> = HashMap::new();
+    let mut exogenous_rates_by_window: HashMap<String, Vec<&InstanceBurnRate>> = HashMap::new();
     for rate in &all_instance_rates {
-        rates_by_window
-            .entry(rate.window.clone())
-            .or_default()
-            .push(rate);
+        let bucket = if rate.fleet {
+            &mut fleet_rates_by_window
+        } else {
+            &mut exogenous_rates_by_window
+        };
+        bucket.entry(rate.window.clone()).or_default().push(rate);
     }
 
-    // Compute fleet stats per window
+    // Compute fleet stats per window — from FLEET-attributable records only.
+    // (Before attribution this read every session on the account, so an
+    // operator burning 12%/hr sat inside `mean_pct_hr` and rode into the
+    // forecast as if the pool were burning it — claudego-0ccbae3c.)
     let mut fleet_stats: HashMap<String, FleetWorkerStats> = HashMap::new();
     for window in WINDOWS {
-        let rates = rates_by_window
+        let rates = fleet_rates_by_window
             .get(*window)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
@@ -1558,8 +1690,14 @@ pub fn estimate_burn_rates(
         );
     }
 
-    // Update EMA state per (model, window)
+    // Update EMA state per (model, window) — fleet records only. These EMAs
+    // feed `by_model` → `pct_per_worker_per_hour`, a PER-WORKER figure; an
+    // operator session's rate divided by the pool's worker count is exactly
+    // the category error this split exists to remove.
     for rate in &all_instance_rates {
+        if !rate.fleet {
+            continue;
+        }
         let key = (rate.model.clone(), rate.window.clone());
         let pct_per_worker = if current_workers > 0 {
             rate.pct_per_hour / current_workers as f64
@@ -1590,34 +1728,41 @@ pub fn estimate_burn_rates(
                 mean_usd_hr: 0.0,
             });
 
-        // Total observed burn for the window. This stays TOTAL on purpose:
-        // exhaustion and cutoff risk must account for every percent leaving the
-        // window, whoever spent it.
+        // Fleet-attributable burn for the window, from fleet records only.
+        // Exogenous burn is handled separately below, as a constant budget
+        // offset — it must never be read as per-worker fleet burn, and it
+        // must not scale with `safe_worker_count`.
         let mut fleet_pct_hr = stats.mean_pct_hr;
 
-        // Exogenous baseline: burn not attributable to this pool.
+        // Exogenous baseline: burn not attributable to this pool, measured
+        // directly from the records classified exogenous by `record_is_fleet`
+        // (operator sessions, foreign workers, unattributed tail usage).
         //
-        // With no workers running, whatever is burning is by definition not
-        // ours, so record it. With workers running, subtract it before deriving
-        // a PER-WORKER rate — otherwise the operator's own consumption is
-        // charged to the pool and divided by its worker count.
-        // Measured from the raw per-instance rates, NOT from `stats`:
-        // compute_fleet_stats returns all zeros when total_workers == 0, because
-        // it assumes every observed percent belongs to the fleet and therefore
-        // that an empty fleet burns nothing. That assumption is the defect this
-        // baseline exists to correct, so reading `stats` here would record a
-        // permanent zero and silently disable attribution.
+        // SUMMED, not averaged, and deliberately so: each record carries its
+        // spend-weighted share of the window's delta, so the exogenous
+        // records' rates sum to the total non-fleet burn on the account — and
+        // the offset must reserve ALL of it, whoever produced it. (The fleet
+        // side keeps its per-session mean; that semantic is pinned by the
+        // fleet-only-is-unchanged criterion and by the existing stats tests.)
+        //
+        // This replaces the previous zero-workers-only measurement, which
+        // could only calibrate while the pool was idle. At zero workers every
+        // record still classifies exogenous (`worker` is None — there is no
+        // needle process to resolve to), so the old behaviour is preserved
+        // exactly; what is new is that an operator burning ALONGSIDE the
+        // fleet is now measured too, instead of being silently charged to the
+        // pool's per-worker rate (claudego-0ccbae3c). An interval with no
+        // positive exogenous observation leaves the baseline holding — an
+        // idle operator must not decay a baseline that the attribution scan
+        // simply had nothing to say about this pass.
         let exo_key = (EXOGENOUS_MODEL_KEY.to_string(), (*window).to_string());
-        if current_workers == 0 {
-            if let Some(rates) = rates_by_window.get(*window) {
-                if !rates.is_empty() {
-                    let n = rates.len() as f64;
-                    let observed_pct = rates.iter().map(|r| r.pct_per_hour).sum::<f64>() / n;
-                    let observed_usd = rates.iter().map(|r| r.dollar_per_hour).sum::<f64>() / n;
-                    if observed_pct > 0.0 {
-                        let exo = ema_state.entry(exo_key.clone()).or_default();
-                        update_ema(exo, observed_pct, observed_usd);
-                    }
+        if let Some(rates) = exogenous_rates_by_window.get(*window) {
+            if !rates.is_empty() {
+                let observed_pct = rates.iter().map(|r| r.pct_per_hour).sum::<f64>();
+                let observed_usd = rates.iter().map(|r| r.dollar_per_hour).sum::<f64>();
+                if observed_pct > 0.0 {
+                    let exo = ema_state.entry(exo_key.clone()).or_default();
+                    update_ema(exo, observed_pct, observed_usd);
                 }
             }
         }
@@ -1627,13 +1772,13 @@ pub fn estimate_burn_rates(
             .map(|e| e.ema_pct)
             .unwrap_or(0.0);
 
-        // Get p75 per-worker rate for safe worker computation, net of exogenous
-        // burn. Clamped at 0: a noisy interval can put the baseline above the
-        // instantaneous total, which must read as "no fleet burn observed", not
-        // a negative rate.
+        // Get p75 per-worker rate for safe worker computation. `stats` is
+        // already fleet-only, so no exogenous subtraction happens here any
+        // more — the offset enters the forecast downstream as a budget
+        // reservation and must never be divided into a per-worker figure
+        // (claudego-892a82b1).
         let mut p75_per_worker = if current_workers > 0 {
-            let fleet_only = (stats.p75_pct_hr - exogenous_pct_hr).max(0.0);
-            fleet_only / current_workers as f64
+            stats.p75_pct_hr / current_workers as f64
         } else {
             0.0
         };
@@ -1683,7 +1828,11 @@ pub fn estimate_burn_rates(
         // real scaling constraint from its very first cycle. Calibrated windows
         // (>= MIN_SAMPLES_FOR_EMA, or any window with a fresh rate this interval)
         // are entirely unaffected.
-        let has_fresh_rate = rates_by_window
+        // "Fresh rate" is a FLEET observation: an operator-only interval says
+        // nothing about how fast this pool burns, so it must not mark the
+        // window calibrated (an operator-only account stays cold-start from
+        // the fleet's point of view).
+        let has_fresh_rate = fleet_rates_by_window
             .get(*window)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
@@ -1761,7 +1910,7 @@ pub fn estimate_burn_rates(
 
         forecasts.insert(
             window.to_string(),
-            generate_window_forecast(
+            generate_window_forecast_with_exogenous(
                 window,
                 fleet_pct_hr,
                 util,
@@ -1770,6 +1919,7 @@ pub fn estimate_burn_rates(
                 p75_per_worker,
                 std_pct_hr,
                 estimate_quality,
+                exogenous_pct_hr,
             ),
         );
     }
@@ -2054,6 +2204,7 @@ mod tests {
     /// Helper: build a basic InstanceRecord with one window
     fn basic_record(pct_delta: Option<f64>) -> InstanceRecord {
         InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2069,7 +2220,7 @@ mod tests {
         let record = basic_record(Some(2.0));
         let elapsed = 0.5; // 30 minutes
 
-        let rates = compute_instance_burn(&record, elapsed);
+        let rates = compute_instance_burn(&record, elapsed, &[]);
 
         assert_eq!(rates.len(), 1);
         let r = &rates[0];
@@ -2099,14 +2250,14 @@ mod tests {
     fn guard_skip_short_interval() {
         let record = basic_record(Some(2.0));
         // 1 minute = 1/60 hours, which is < 2/60
-        let rates = compute_instance_burn(&record, 1.0 / 60.0);
+        let rates = compute_instance_burn(&record, 1.0 / 60.0, &[]);
         assert!(rates.is_empty());
     }
 
     #[test]
     fn guard_exact_two_minutes_passes() {
         let record = basic_record(Some(2.0));
-        let rates = compute_instance_burn(&record, 2.0 / 60.0);
+        let rates = compute_instance_burn(&record, 2.0 / 60.0, &[]);
         assert_eq!(rates.len(), 1);
     }
 
@@ -2114,7 +2265,7 @@ mod tests {
     fn guard_under_two_minutes_rejects() {
         let record = basic_record(Some(2.0));
         // 1.999 minutes
-        let rates = compute_instance_burn(&record, 1.999 / 60.0);
+        let rates = compute_instance_burn(&record, 1.999 / 60.0, &[]);
         assert!(rates.is_empty());
     }
 
@@ -2123,13 +2274,14 @@ mod tests {
     #[test]
     fn guard_skip_null_pct_delta() {
         let record = basic_record(None);
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert!(rates.is_empty());
     }
 
     #[test]
     fn guard_mixed_null_and_valid_windows() {
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2141,7 +2293,7 @@ mod tests {
             ],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].window, "seven_day");
     }
@@ -2153,7 +2305,7 @@ mod tests {
         let record = basic_record(Some(0.0));
         assert!(record.total_tokens > 0);
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert!(rates.is_empty());
     }
 
@@ -2163,7 +2315,7 @@ mod tests {
         record.total_tokens = 0;
 
         // Zero pct_delta with zero tokens is not a rounding artifact — allow it
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
         assert!(
             rates[0].pct_per_hour == 0.0,
@@ -2178,6 +2330,7 @@ mod tests {
     fn window_reset_discards_affected_window() {
         // current=38, previous=40 -> drop of 2pp > 1pp threshold -> reset detected
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2185,13 +2338,14 @@ mod tests {
             windows: vec![win("five_hour", Some(2.0), 38.0, 40.0)],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert!(rates.is_empty());
     }
 
     #[test]
     fn window_reset_discards_only_affected_window() {
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2202,7 +2356,7 @@ mod tests {
             ],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].window, "seven_day");
     }
@@ -2211,6 +2365,7 @@ mod tests {
     fn window_reset_boundary_1pp_drop_is_ok() {
         // current=39.0, previous=40.0 -> drop of exactly 1.0pp, which is NOT > 1.0
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2218,7 +2373,7 @@ mod tests {
             windows: vec![win("five_hour", Some(1.0), 39.0, 40.0)],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
     }
 
@@ -2226,6 +2381,7 @@ mod tests {
     fn window_reset_slight_increase_is_ok() {
         // current=40.5, previous=40.0 -> no reset
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2233,7 +2389,7 @@ mod tests {
             windows: vec![win("five_hour", Some(0.5), 40.5, 40.0)],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
     }
 
@@ -2242,6 +2398,7 @@ mod tests {
     #[test]
     fn multi_window_each_computed_independently() {
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 2.40,
@@ -2254,7 +2411,7 @@ mod tests {
         };
 
         let elapsed = 2.0; // 2 hours
-        let rates = compute_instance_burn(&record, elapsed);
+        let rates = compute_instance_burn(&record, elapsed, &[]);
 
         assert_eq!(rates.len(), 3);
 
@@ -2295,6 +2452,7 @@ mod tests {
     fn multi_window_partial_guards() {
         // One window null, one zero pct_delta with tokens, one valid
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.0,
@@ -2306,7 +2464,7 @@ mod tests {
             ],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].window, "weekly_scoped");
     }
@@ -2314,6 +2472,7 @@ mod tests {
     #[test]
     fn empty_windows_returns_empty() {
         let record = InstanceRecord {
+            worker: None,
             session: "sess-abc".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 1.50,
@@ -2321,7 +2480,7 @@ mod tests {
             windows: vec![],
         };
 
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
         assert!(rates.is_empty());
     }
 
@@ -2706,6 +2865,12 @@ mod tests {
         seven_ds_prev: f64,
     ) -> InstanceRecord {
         InstanceRecord {
+            // A needle worker session name in the same space the collector
+            // stamps (claudego-a542d686): matches [`fleet_patterns`], so
+            // records built here classify FLEET under those globs. Tests that
+            // mean operator / unattributable burn pass the record through
+            // [`unattributed`] or match it with empty patterns.
+            worker: Some(format!("needle-cgov-{session}")),
             session: session.to_string(),
             model: model.to_string(),
             total_usd,
@@ -2721,6 +2886,21 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    /// Strip attribution: the record stands for an operator's interactive
+    /// session (or any other burn this pool does not own) and must classify
+    /// exogenous whatever patterns it is matched against.
+    fn unattributed(mut record: InstanceRecord) -> InstanceRecord {
+        record.worker = None;
+        record
+    }
+
+    /// The agent `session_pattern` globs (as governor.yaml carries them) that
+    /// [`multi_window_record`]'s worker names match — the fleet attribution
+    /// these tests simulate.
+    fn fleet_patterns() -> Vec<String> {
+        vec!["needle-cgov-*".to_string()]
     }
 
     #[test]
@@ -2775,6 +2955,7 @@ mod tests {
 
         let (estimate, _forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             elapsed,
             current_workers,
             prev_workers,
@@ -2823,6 +3004,7 @@ mod tests {
 
         let (estimate, _forecast) = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             2, // current
             3, // previous (changed!)
@@ -2861,6 +3043,7 @@ mod tests {
 
         let (estimate, forecast) = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             1,
             1,
@@ -2889,22 +3072,25 @@ mod tests {
         let mut ema_state: HashMap<(String, String), ModelWindowEma> = HashMap::new();
 
         // One record standing in for an operator session: real burn, but the
-        // FLEET is idle (current_workers = 0).
-        let instances = vec![multi_window_record(
+        // FLEET is idle (current_workers = 0). The burn is gentle on purpose —
+        // the exogenous offset reserves operator burn against the windows'
+        // budgets, so a heavy operator here (the old 1%/hr on seven_day ate all
+        // 28% of headroom over 28.8h) would legitimately authorise nothing.
+        let instances = vec![unattributed(multi_window_record(
             "operator-session",
             "claude-opus-5",
             26.10,
             500_000,
             Some(2.0),
-            Some(1.0),
+            Some(0.3),
             Some(1.0),
             4.0,
             2.0,
             62.0,
-            61.0,
+            61.7,
             76.0,
             75.0,
-        )];
+        ))];
 
         let mut utilization = HashMap::new();
         utilization.insert("five_hour".to_string(), 4.0);
@@ -2917,6 +3103,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             0, // current_workers: the fleet is idle
             0,
@@ -2927,16 +3114,23 @@ mod tests {
             &hrs_left,
         );
 
-        // seven_day: 28% remaining over 28.8h against a pace line of
-        // 90 * (28.8/168) = 15.43% — behind the line, so a worker is authorised.
-        // That is what the bootstrap fix must deliver: a usable per-worker rate
-        // with zero workers running.
+        // seven_day: 28% gross remaining, minus the operator's 0.3%/hr * 28.8h
+        // = 8.64% reservation, leaves 19.36% net — still behind the pace line
+        // of 90 * (28.8/168) = 15.43%, so a worker is authorised. That is what
+        // the bootstrap fix must deliver: a usable per-worker rate with zero
+        // workers running, even once the operator's share is reserved.
         assert!(
             forecast.seven_day.safe_worker_count.unwrap_or(0) >= 1,
             "seven_day is behind the pace line ({}% over {}h); got {:?}",
             forecast.seven_day.remaining_pct,
             forecast.seven_day.hours_remaining,
             forecast.seven_day.safe_worker_count,
+        );
+        // The reservation is visible on the budget itself: 28 gross − 8.64.
+        assert!(
+            (forecast.seven_day.remaining_pct - (28.0 - 0.3 * 28.8)).abs() < 1e-9,
+            "net budget must be gross minus the exogenous reservation, got {}",
+            forecast.seven_day.remaining_pct
         );
 
         // weekly_scoped has only 14% left against that same line, i.e. already
@@ -2998,6 +3192,7 @@ mod tests {
 
         let _ = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             1,
             1,
@@ -3063,7 +3258,7 @@ mod tests {
         let baseline = BaselineBurnRates::default();
         let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
         let (util, hrs) = util_maps();
-        let instances = vec![multi_window_record(
+        let instances = vec![unattributed(multi_window_record(
             "operator",
             "claude-opus-5",
             26.0,
@@ -3077,9 +3272,18 @@ mod tests {
             14.0,
             20.0,
             14.0,
-        )];
+        ))];
         let _ = estimate_burn_rates(
-            &instances, 1.0, 0, 0, &mut ema, &baseline, &util, 90.0, &hrs,
+            &instances,
+            &[],
+            1.0,
+            0,
+            0,
+            &mut ema,
+            &baseline,
+            &util,
+            90.0,
+            &hrs,
         );
         let recorded = ema
             .iter()
@@ -3114,7 +3318,7 @@ mod tests {
         // fleet, every window would sit at CUTOFF_RISK: five_hour would exhaust
         // in 5/14 = 0.36h of the 4.0h remaining, seven_day in 28/12 = 2.33h of
         // 28.8h, weekly_scoped in 30/13 = 2.31h of 100h.
-        let instances = vec![multi_window_record(
+        let instances = vec![unattributed(multi_window_record(
             "operator-session",
             "claude-opus-5",
             26.10,
@@ -3128,7 +3332,7 @@ mod tests {
             50.0,
             60.0,
             47.0,
-        )];
+        ))];
 
         let mut utilization = HashMap::new();
         utilization.insert("five_hour".to_string(), 85.0);
@@ -3141,6 +3345,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             0,
             0,
@@ -3176,12 +3381,18 @@ mod tests {
             );
         }
 
-        // seven_day has real headroom (28% remaining over 28.8h, behind the
-        // flat-spend pace line), so the pool must still be sizeable from zero:
-        // the sizing question is hypothetical and needs no running worker.
-        assert!(
-            forecast.seven_day.safe_worker_count.unwrap_or(0) >= 1,
-            "real headroom at zero workers must still authorise a worker, got {:?}",
+        // seven_day has real GROSS headroom (28% remaining over 28.8h), but the
+        // operator's measured 12%/hr is reserved against it first: 12 * 28.8h
+        // consumes the entire window budget, so the net headroom the fleet may
+        // size against is zero and Some(0) is the CORRECT authorisation. The
+        // bootstrap (a pool can be sized from zero workers) is pinned separately
+        // by zero_workers_still_authorises_from_the_baseline, where the
+        // operator leaves net headroom.
+        assert_eq!(
+            forecast.seven_day.safe_worker_count,
+            Some(0),
+            "an operator who will consume the whole window leaves the fleet no \
+             net budget: got {:?}",
             forecast.seven_day.safe_worker_count
         );
         // five_hour is genuinely spent (5% remaining, ahead of its pace line),
@@ -3243,6 +3454,7 @@ mod tests {
 
         let (estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             2,
             2,
@@ -3297,7 +3509,7 @@ mod tests {
 
         // Calibrate: 6%/hr of burn observed with NO workers running.
         let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
-        let operator_only = vec![multi_window_record(
+        let operator_only = vec![unattributed(multi_window_record(
             "operator",
             "claude-opus-5",
             26.0,
@@ -3311,9 +3523,10 @@ mod tests {
             14.0,
             20.0,
             14.0,
-        )];
+        ))];
         let _ = estimate_burn_rates(
             &operator_only,
+            &[],
             1.0,
             0,
             0,
@@ -3324,24 +3537,43 @@ mod tests {
             &hrs,
         );
 
-        // Now one worker runs and total burn rises only slightly.
-        let with_worker = vec![multi_window_record(
-            "operator",
-            "claude-opus-5",
-            27.0,
-            520_000,
-            Some(6.5),
-            Some(6.5),
-            Some(6.5),
-            16.5,
-            10.0,
-            26.5,
-            20.0,
-            26.5,
-            20.0,
-        )];
-        let (_est, forecast) = estimate_burn_rates(
+        // Now one FLEET worker runs (attributed: its needle-cgov-* name
+        // matches the agent session_pattern globs) alongside the operator.
+        let with_worker = vec![
+            multi_window_record(
+                "w1",
+                "claude-sonnet-4-20250514",
+                1.0,
+                200_000,
+                Some(0.5),
+                Some(0.5),
+                Some(0.5),
+                12.0,
+                11.5,
+                21.0,
+                20.5,
+                21.0,
+                20.5,
+            ),
+            unattributed(multi_window_record(
+                "operator",
+                "claude-opus-5",
+                27.0,
+                520_000,
+                Some(6.0),
+                Some(6.0),
+                Some(6.0),
+                18.0,
+                12.0,
+                27.0,
+                21.0,
+                27.0,
+                21.0,
+            )),
+        ];
+        let (estimate, forecast) = estimate_burn_rates(
             &with_worker,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -3363,6 +3595,21 @@ mod tests {
             "exogenous burn must be netted out before dividing by worker count; \
              got {safe}, which is the un-netted answer"
         );
+
+        // pct_per_worker_per_hour is a FLEET figure: the operator's session
+        // must never enter the per-worker EMA, and the worker's own rate
+        // (0.5%/hr over 1 worker) must.
+        assert!(
+            !estimate
+                .ema_state
+                .contains_key(&("claude-opus-5".to_string(), "five_hour".to_string())),
+            "operator burn must never feed the per-worker EMA"
+        );
+        let worker_ema = estimate
+            .ema_state
+            .get(&("claude-sonnet-4-20250514".to_string(), "five_hour".to_string()))
+            .unwrap();
+        assert!((worker_ema.ema_pct - 0.5).abs() < 1e-9);
     }
 
     /// The reserved key is bookkeeping, not a model, and must never surface as one.
@@ -3396,6 +3643,163 @@ mod tests {
             state.by_model.keys().collect::<Vec<_>>()
         );
         assert!(state.by_model.contains_key("claude-sonnet-5"));
+    }
+
+    /// Acceptance criterion (claudego-892a82b1): operator-only burn must
+    /// produce NO fleet CUTOFF_RISK anywhere — there is no fleet burn to
+    /// govern, and exhaustion at the hands of the operator does not scale the
+    /// pool — while the budget every fleet decision plans against IS reduced
+    /// by the exogenous rate.
+    #[test]
+    fn operator_only_burn_never_flags_cutoff_risk_but_reduces_the_budget() {
+        let baseline = BaselineBurnRates::default();
+        let (util, hrs) = util_maps();
+        let operator = vec![unattributed(multi_window_record(
+            "operator",
+            "claude-opus-5",
+            26.0,
+            500_000,
+            Some(6.0),
+            Some(6.0),
+            Some(6.0),
+            10.0,
+            4.0,
+            20.0,
+            14.0,
+            20.0,
+            14.0,
+        ))];
+
+        // Cycle 1 primes the exogenous baseline at the observed 6%/hr per
+        // window; cycle 2 forecasts with that reservation armed.
+        let mut ema: HashMap<(String, String), ModelWindowEma> = HashMap::new();
+        let _ = estimate_burn_rates(
+            &operator,
+            &[],
+            1.0,
+            0,
+            0,
+            &mut ema,
+            &baseline,
+            &util,
+            90.0,
+            &hrs,
+        );
+        let (_estimate, forecast) =
+            estimate_burn_rates(&operator, &[], 1.0, 0, 0, &mut ema, &baseline, &util, 90.0, &hrs);
+
+        let gross: HashMap<&str, f64> = HashMap::from([
+            ("five_hour", 80.0),
+            ("seven_day", 70.0),
+            ("weekly_scoped", 70.0),
+        ]);
+        for (name, window) in [
+            ("five_hour", &forecast.five_hour),
+            ("seven_day", &forecast.seven_day),
+            ("weekly_scoped", &forecast.weekly_scoped),
+        ] {
+            assert!(
+                !window.cutoff_risk,
+                "{name}: operator-only burn must not flag fleet CUTOFF_RISK"
+            );
+            assert_eq!(
+                window.fleet_pct_per_hour, 0.0,
+                "{name}: there is no fleet burn to report"
+            );
+            assert!(
+                window.predicted_exhaustion_hours.is_infinite(),
+                "{name}: the fleet cannot exhaust a window it is not burning"
+            );
+            assert!(
+                window.hard_limit_margin_hrs.is_infinite() && window.hard_limit_margin_hrs > 0.0,
+                "{name}: hard-limit margin must read unbounded, got {}",
+                window.hard_limit_margin_hrs
+            );
+            assert!(
+                window.remaining_pct < gross[name] - 1.0,
+                "{name}: the exogenous rate must reduce the budget below the gross \
+                 headroom, got {} (gross {})",
+                window.remaining_pct,
+                gross[name]
+            );
+            assert!(
+                (window.current_utilization - util[name]).abs() < 1e-9,
+                "{name}: reported utilization stays the measured account fact"
+            );
+        }
+
+        // Exact reservation arithmetic on five_hour: 80 gross − 6%/hr * 4h = 56.
+        assert!(
+            (forecast.five_hour.remaining_pct - 56.0).abs() < 1e-9,
+            "got {}",
+            forecast.five_hour.remaining_pct
+        );
+        // seven_day/weekly reserves (6%/hr * 100h) dwarf the headroom and floor
+        // the net budget at zero — without ever flagging CUTOFF_RISK.
+        assert_eq!(forecast.seven_day.remaining_pct, 0.0);
+        assert_eq!(forecast.weekly_scoped.remaining_pct, 0.0);
+    }
+
+    /// The exogenous rate is a CONSTANT BUDGET OFFSET (claudego-892a82b1):
+    /// against the same fleet-only forecast it shrinks the budget — and with
+    /// it exhaustion, margin and the authorised worker count — but never
+    /// multiplies into pct_per_worker_per_hour, never changes the reported
+    /// fleet rate, and therefore never scales with worker count.
+    #[test]
+    fn exogenous_offset_shrinks_budget_but_not_the_per_worker_rate() {
+        use crate::state::EstimateQuality;
+
+        // 10%/hr fleet burn, 50% utilized against a 90 ceiling (40 gross), 2h
+        // to reset, 10%/hr per worker.
+        let fleet_only = generate_window_forecast(
+            "five_hour",
+            10.0,
+            50.0,
+            90.0,
+            2.0,
+            10.0,
+            0.0,
+            EstimateQuality::Calibrated,
+        );
+        // 5%/hr exogenous → reserve 5 * 2h = 10% → net 30.
+        let with_exo = generate_window_forecast_with_exogenous(
+            "five_hour",
+            10.0,
+            50.0,
+            90.0,
+            2.0,
+            10.0,
+            0.0,
+            EstimateQuality::Calibrated,
+            5.0,
+        );
+
+        assert!((fleet_only.remaining_pct - 40.0).abs() < 1e-9);
+        assert!((with_exo.remaining_pct - 30.0).abs() < 1e-9);
+        assert_eq!(
+            with_exo.fleet_pct_per_hour, fleet_only.fleet_pct_per_hour,
+            "the offset must not change the fleet rate"
+        );
+        assert!(
+            (fleet_only.predicted_exhaustion_hours - 4.0).abs() < 1e-9,
+            "got {}",
+            fleet_only.predicted_exhaustion_hours
+        );
+        assert!(
+            (with_exo.predicted_exhaustion_hours - 3.0).abs() < 1e-9,
+            "exhaustion runs faster against the net budget, got {}",
+            with_exo.predicted_exhaustion_hours
+        );
+        assert!(
+            (with_exo.hard_limit_margin_hrs - (fleet_only.hard_limit_margin_hrs - 1.0)).abs()
+                < 1e-9,
+            "margin shrinks by exactly one hour of reserve, {} vs {}",
+            with_exo.hard_limit_margin_hrs,
+            fleet_only.hard_limit_margin_hrs
+        );
+        // 40/(10*2) = 2 whole workers vs 30/(10*2) = 1.5 → duty-cycled to 1.
+        assert_eq!(fleet_only.safe_worker_count, Some(2));
+        assert_eq!(with_exo.safe_worker_count, Some(1));
     }
 
     /// The sawtooth: a fractional ideal is served by alternating 1 and 0, and
@@ -3529,6 +3933,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &[],
             1.0,
             1,
             1,
@@ -3606,6 +4011,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -3712,6 +4118,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -3787,6 +4194,7 @@ mod tests {
         // Cycle 1: first sample, EMA initializes directly
         estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -3826,6 +4234,7 @@ mod tests {
 
         estimate_burn_rates(
             &instances2,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -3884,6 +4293,7 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
+                &fleet_patterns(),
                 1.0,
                 1,
                 1,
@@ -3946,6 +4356,7 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
+                &fleet_patterns(),
                 1.0,
                 1,
                 1,
@@ -4001,6 +4412,7 @@ mod tests {
 
         estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -4042,6 +4454,7 @@ mod tests {
             dollar_per_hour: 5.0,
             pct_per_hour: 2.0,
             elapsed_hours: 1.0,
+            fleet: true,
         };
         let stats = compute_fleet_stats("five_hour", &[&rate], 1);
         assert!((stats.mean_pct_hr - 2.0).abs() < 1e-9);
@@ -4066,6 +4479,7 @@ mod tests {
             dollar_per_hour: 26.10,
             pct_per_hour: 14.0,
             elapsed_hours: 1.0,
+            fleet: true,
         };
         let stats = compute_fleet_stats("seven_day", &[&rate], 0);
         assert_eq!(stats.worker_count, 0);
@@ -5052,6 +5466,7 @@ mod tests {
     fn scaling_unaffected_by_missing_annotation_data() {
         // Create instance records with null pct_delta (simulating data before annotation)
         let record = InstanceRecord {
+            worker: None,
             session: "test-session".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 5.0,
@@ -5079,7 +5494,7 @@ mod tests {
         };
 
         // Burn rate computation should skip windows with null pct_delta
-        let rates = compute_instance_burn(&record, 1.0);
+        let rates = compute_instance_burn(&record, 1.0, &[]);
 
         // Should return empty vector since all windows have null pct_delta
         assert!(
@@ -5089,6 +5504,7 @@ mod tests {
 
         // Verify that with a mix of null and valid, only valid windows are used
         let record_mixed = InstanceRecord {
+            worker: None,
             session: "test-session-mixed".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             total_usd: 5.0,
@@ -5115,7 +5531,7 @@ mod tests {
             ],
         };
 
-        let rates_mixed = compute_instance_burn(&record_mixed, 1.0);
+        let rates_mixed = compute_instance_burn(&record_mixed, 1.0, &[]);
 
         // Should have exactly one rate (from the valid seven_day window)
         assert_eq!(
@@ -5490,6 +5906,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0, // 1 hour elapsed
             2,   // 2 workers running
             2,   // no worker count change
@@ -5566,6 +5983,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -5635,6 +6053,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             3, // 3 workers
             3,
@@ -5715,6 +6134,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -5786,6 +6206,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -5863,6 +6284,7 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
+                &fleet_patterns(),
                 1.0,
                 1,
                 1,
@@ -5913,6 +6335,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -6000,6 +6423,7 @@ mod tests {
 
             estimate_burn_rates(
                 &instances,
+                &fleet_patterns(),
                 1.0,
                 1,
                 1,
@@ -6041,6 +6465,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
@@ -6113,6 +6538,7 @@ mod tests {
 
         let (_estimate, forecast) = estimate_burn_rates(
             &instances,
+            &fleet_patterns(),
             1.0,
             1,
             1,
