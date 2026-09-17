@@ -5,7 +5,7 @@
 //! collects nothing, which silently stalls the adaptive p75-EMA burn-rate
 //! learning the README lists as a key feature.
 //!
-//! These tests drive REAL collection passes ([`run_collection_pass_at`]) over
+//! These tests drive REAL collection passes ([`run_collection_pass_with_engine`]) over
 //! seeded session transcripts in a temp home, corrupt the cursor file between
 //! passes, and assert the next pass:
 //!
@@ -19,13 +19,32 @@
 //! - leaves a valid cursor file behind, so the pass after that resumes
 //!   incrementally again.
 
-use claude_governor::collector::{run_collection_pass_at, CollectionPaths, CursorStore};
+use claude_governor::collector::{
+    run_collection_pass_with_engine, CollectionPaths, CollectionResult, CursorStore,
+};
+use claude_governor::pricing::PricingEngine;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
 use tempfile::TempDir;
+
+/// Engine built from the repo's config template. These collection passes must not
+/// depend on the machine's live governor.yaml — that file is operator-owned,
+/// and since the 2026-09-16 retirement validation it can legitimately fail to
+/// load (a retired pool in it is a hard error by design). The template is
+/// committed, always validation-clean (pinned by
+/// `test_retired_reference_default_template_is_clean` in `src/config.rs`),
+/// and prices every model these tests seed.
+fn template_engine() -> PricingEngine {
+    PricingEngine::from_config_path(Path::new("config/governor.yaml"))
+        .expect("repo config template must load")
+}
+
+fn run_pass(paths: &CollectionPaths) -> anyhow::Result<CollectionResult> {
+    run_collection_pass_with_engine(paths, &template_engine())
+}
 
 // --- log capture: the recovery event is the observable "recovery logged" ---
 
@@ -141,7 +160,7 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
     );
 
     // Pass 1: first sight of both files — one instance row each, cursors at EOF.
-    let pass1 = run_collection_pass_at(&paths).expect("pass 1 should complete");
+    let pass1 = run_pass(&paths).expect("pass 1 should complete");
     assert_eq!(pass1.instance_records, 2);
     assert_eq!(pass1.fleet_records, 1);
 
@@ -169,7 +188,7 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
     // The headline assertion: the pass after the corruption COMPLETES. The
     // pre-hardening behaviour was `collector pass failed: Failed to load
     // cursors` — nothing collected until someone repaired the file by hand.
-    let pass2 = run_collection_pass_at(&paths)
+    let pass2 = run_pass(&paths)
         .expect("a corrupt cursor file must never fail the collection pass");
     assert_eq!(pass2.instance_records, 2);
 
@@ -214,7 +233,7 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
     // The pass after recovery is incremental again for BOTH files.
     append_session(&sess_a, &[usage_line(40, 4)]);
     append_session(&sess_b, &[usage_line(400, 40)]);
-    let pass3 = run_collection_pass_at(&paths).expect("pass 3 should complete");
+    let pass3 = run_pass(&paths).expect("pass 3 should complete");
     assert_eq!(pass3.instance_records, 2);
     let rows_a = instance_rows(&paths, "sess-a");
     let rows_b = instance_rows(&paths, "sess-b");
@@ -236,7 +255,7 @@ fn garbage_cursor_fails_over_to_full_reread_then_resumes_incrementally() {
         &[usage_line(100, 10), usage_line(200, 20)],
     );
 
-    let pass1 = run_collection_pass_at(&paths).expect("pass 1 should complete");
+    let pass1 = run_pass(&paths).expect("pass 1 should complete");
     assert_eq!(pass1.instance_records, 1);
 
     // Corrupt beyond salvage: no recoverable entry at all.
@@ -246,7 +265,7 @@ fn garbage_cursor_fails_over_to_full_reread_then_resumes_incrementally() {
     append_session(&sess, &[usage_line(400, 40)]);
 
     // The pass completes; with nothing salvageable every file re-reads once.
-    let pass2 = run_collection_pass_at(&paths)
+    let pass2 = run_pass(&paths)
         .expect("an unsalvageable cursor file must still not fail the pass");
     assert_eq!(pass2.instance_records, 1);
 
@@ -267,7 +286,7 @@ fn garbage_cursor_fails_over_to_full_reread_then_resumes_incrementally() {
 
     // The following pass resumes incrementally — the re-count happened once.
     append_session(&sess, &[usage_line(800, 80)]);
-    let pass3 = run_collection_pass_at(&paths).expect("pass 3 should complete");
+    let pass3 = run_pass(&paths).expect("pass 3 should complete");
     assert_eq!(pass3.instance_records, 1);
     let rows = instance_rows(&paths, "sess-only");
     assert_eq!(rows.len(), 3);

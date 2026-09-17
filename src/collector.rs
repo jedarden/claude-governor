@@ -1369,14 +1369,27 @@ pub fn run_collection_pass() -> anyhow::Result<CollectionResult> {
 /// cycle tests can point the collector at a temp directory instead of the
 /// machine's real `~/.needle` state.
 pub fn run_collection_pass_at(paths: &CollectionPaths) -> anyhow::Result<CollectionResult> {
-    use crate::pricing::PricingEngine;
+    let pricing_engine = crate::pricing::PricingEngine::new()?;
+    run_collection_pass_with_engine(paths, &pricing_engine)
+}
 
+/// [`run_collection_pass_at`] with an explicit pricing engine.
+///
+/// The default engine loads the machine's live governor.yaml (through
+/// `GovernorConfig::load`), which a sandboxed test must not depend on: that
+/// file is operator-owned, and since the 2026-09-16 retirement validation it
+/// can legitimately fail to load. Tests inject an engine built from the
+/// repo's config template so collection behaves identically regardless of
+/// what the host's live config contains, keeping integration tests hermetic.
+pub fn run_collection_pass_with_engine(
+    paths: &CollectionPaths,
+    pricing_engine: &crate::pricing::PricingEngine,
+) -> anyhow::Result<CollectionResult> {
     let history_path = &paths.history_path;
     let db_path = &paths.db_path;
     let cursor_path = &paths.cursor_path;
     let session_base = &paths.session_base;
 
-    let pricing_engine = PricingEngine::new()?;
     let config = pricing_engine.config();
 
     // Collect all configured model names
