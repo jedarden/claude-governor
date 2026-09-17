@@ -229,3 +229,105 @@ fn scale_default_ttl_binds_two_hours() {
         "the default binding must be MANUAL_OVERRIDE_DEFAULT_TTL_HOURS (2h)"
     );
 }
+
+/// `cgov scale --clear` is idempotent. A clear with nothing stored — never
+/// had an override, or after a previous clear — still exits 0 and prints
+/// exactly "No manual override stored; nothing to clear.", because an
+/// operator's retry loop must never treat the second pass as a failure.
+/// Driven through the real binary: the exit code and the exact message are
+/// the contract, and `manual_override_lifecycle.rs` can only mirror the
+/// take(), not the print.
+#[test]
+fn clear_is_idempotent_and_a_second_pass_reports_nothing_to_clear() {
+    // Empty state from the start.
+    let root = new_env_root();
+    write_state(root.path(), &make_state());
+
+    let stdout = stdout_of(run_cgov_in(root.path(), &["scale", "--clear"]));
+    assert_eq!(
+        stdout.trim(),
+        "No manual override stored; nothing to clear.",
+        "a clear with nothing stored must report exactly this, got:\n{stdout}"
+    );
+
+    // And the same no-op after a real pin was stored and cleared.
+    stdout_of(run_cgov_in(root.path(), &["scale", "4"]));
+    let stdout = stdout_of(run_cgov_in(root.path(), &["scale", "--clear"]));
+    assert!(
+        stdout.contains("Manual override cleared (target 4, set "),
+        "the first clear must report the record it removed, got:\n{stdout}"
+    );
+
+    let stdout = stdout_of(run_cgov_in(root.path(), &["scale", "--clear"]));
+    assert_eq!(
+        stdout.trim(),
+        "No manual override stored; nothing to clear.",
+        "the second clear must be the same no-op, got:\n{stdout}"
+    );
+    assert!(
+        state::load_state(&state_path_in(root.path()))
+            .unwrap()
+            .manual_override
+            .is_none(),
+        "the idempotent pass must leave state without an override"
+    );
+}
+
+/// `cgov scale --clear` takes no COUNT. A count alongside the flag is a
+/// rejection naming that rule — in either argument order — and the stored
+/// pin survives it: the guard short-circuits before the take, so a mistyped
+/// retry must not silently consume the operator's override.
+#[test]
+fn clear_with_a_count_is_rejected_and_consumes_nothing() {
+    let root = new_env_root();
+    write_state(root.path(), &make_state());
+    stdout_of(run_cgov_in(root.path(), &["scale", "4"]));
+
+    for args in [["scale", "--clear", "4"], ["scale", "4", "--clear"]] {
+        let output = run_cgov_in(root.path(), &args);
+        assert!(
+            !output.status.success(),
+            "cgov scale with --clear and a COUNT ({args:?}) must be rejected\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cgov scale --clear takes no COUNT"),
+            "the rejection must name the rule, got stderr:\n{stderr}"
+        );
+        let stored = state::load_state(&state_path_in(root.path()))
+            .unwrap()
+            .manual_override
+            .expect("the rejected clear must not consume the stored pin");
+        assert_eq!(stored.target, 4, "the stored pin must be untouched");
+    }
+}
+
+/// `--dry-run` on the clear path prints the intent — naming the stored
+/// record it would remove — and mutates nothing: the pin is still stored
+/// afterwards and a real clear still finds and removes it.
+#[test]
+fn clear_dry_run_prints_intent_without_mutating_state() {
+    let root = new_env_root();
+    write_state(root.path(), &make_state());
+    stdout_of(run_cgov_in(root.path(), &["scale", "4"]));
+
+    let stdout = stdout_of(run_cgov_in(root.path(), &["scale", "--clear", "--dry-run"]));
+    assert!(
+        stdout.contains("DRY RUN: Would clear the manual override (target 4, set "),
+        "the dry run must print the intent naming the stored record, got:\n{stdout}"
+    );
+
+    let still_stored = state::load_state(&state_path_in(root.path()))
+        .unwrap()
+        .manual_override
+        .expect("a dry-run clear must not remove the stored override");
+    assert_eq!(still_stored.target, 4, "the stored pin must be untouched");
+
+    // The real clear still finds the record the dry run left alone.
+    let stdout = stdout_of(run_cgov_in(root.path(), &["scale", "--clear"]));
+    assert!(
+        stdout.contains("Manual override cleared (target 4, set "),
+        "the real clear after the dry run must remove the record, got:\n{stdout}"
+    );
+}
