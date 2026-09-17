@@ -50,7 +50,7 @@ The `--ready` predicate is evaluated by bead-rs before Pluck receives any
 records. It requires an open, unassigned, non-manually-blocked issue with no
 unfinished `blocks` dependency. Results are ordered deterministically by
 `priority ASC`, `created_at ASC`, and `id ASC`. Labels are not an inclusion
-filter: Pluck configures no required labels, and a label such as `polish` or
+filter: Pluck configures no required labels, and a label such as `rust` or
 `documentation` does not make a bead ready by itself.
 
 After parsing the JSONL, Pluck removes records with an excluded label and
@@ -83,8 +83,8 @@ candidates.
 
 ## Overview
 
-Pluck query results are the foundation of NEEDLE's bead claiming system, cgov's
-capacity calculations, and the polish loop's generation pipeline. The
+Pluck query results are the foundation of NEEDLE's bead claiming system and
+cgov's capacity calculations. The
 historical material that follows describes the older `br`/bead-forge model;
 use the current contract above for bead-rs output.
 
@@ -423,13 +423,18 @@ The cgov daemon uses query results to check if a pool has real work before scali
 
 ```bash
 # In governor.rs (simplified)
-ready_count = bf ready --workspace /home/coding/cgov-polish-queue | wc -l
+ready_count = bf ready --workspace /home/coding/<pool-workspace> | wc -l
 if ready_count > running_workers {
     boost_subscription_workers()  # Only boost if real backlog exists
 }
 ```
 
 ### 3. Polish Queue Seeder
+
+> **Retired 2026-09-16:** the polish queue, its seeder, and the
+> `cgov-polish-queue` workspace no longer exist — NEEDLE's native Weave/Explore
+> strands replaced them (see CLAUDE.md, "Retired 2026-09-16"). This section is
+> kept as a record of how the retired pipeline consumed these queries.
 
 The seeder script checks query results before creating new meta-beads:
 
@@ -677,7 +682,7 @@ Pluck query results are the foundation of the entire NEEDLE/cgov workflow:
 4. **Result formats** — Human-readable, JSON, JSONL, compact
 5. **Performance** — Indexed on `status`, `assignee`, `updated_at`, and label fields
 6. **Testing** — Comprehensive test coverage validates database integrity and query correctness
-7. **Integration** — Used by NEEDLE workers, cgov daemon, polish seeder, and interactive development
+7. **Integration** — Used by NEEDLE workers, cgov daemon, and interactive development
 
 The test suite in `tests/pluck_db_test.rs` validates that queries work correctly and return expected results, ensuring that the bead discovery system remains reliable as the codebase evolves.
 

@@ -40,7 +40,9 @@ info() { echo -e "${GREEN}$*${NC}"; }
 fail() { echo -e "${RED}$*${NC}" >&2; exit 1; }
 
 usage() {
-    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+    # Lines 2-26 are the header comment block; anything later is code and
+    # must not leak into --help output.
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 

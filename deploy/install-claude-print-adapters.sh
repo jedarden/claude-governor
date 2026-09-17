@@ -8,7 +8,7 @@
 # produces silent empty output. But nothing established that path. On
 # codinghome it was simply absent (the working binary lives at
 # ~/.cargo/bin/claude-print, where `cargo install` puts it), so every
-# polish-opus dispatch died at exit 127 while `needle test-agent` still
+# dispatched strand died at exit 127 while `needle test-agent` still
 # reported READY.
 #
 # Beyond the --version check, this script now runs the two authoritative

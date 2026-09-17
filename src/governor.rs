@@ -1171,9 +1171,9 @@ fn count_ready_beads(workspace: &str) -> u32 {
     }
 }
 
-/// Underutilization sprint: when a subscription generator pool is sprint-eligible (a
+/// Underutilization sprint: when a subscription pool is sprint-eligible (a
 /// window is under-used, resets soon, nothing at cutoff risk, not in safe mode) AND
-/// there is more queued generation work than running workers, boost the target toward
+/// there is more queued work in the pool's workspace than running workers, boost the target toward
 /// that pool's max so spare use-or-lose capacity is burned *productively* rather than
 /// left to reset unused. The backlog gate is what keeps "never leave the subscription
 /// empty" from meaning "spin up idle runners". Returns the (possibly boosted) target.
@@ -4658,7 +4658,7 @@ fn distribute_workers_by_cost_priority(
     // Base distribution: start from the current allocation and adjust gently by the
     // delta (minimising churn) — scale down sheds the most expensive workers first,
     // scale up adds to the cheapest agent first. A second pass then enforces each
-    // agent's min_workers floor so a dedicated pool (e.g. an Opus polish strand with
+    // agent's min_workers floor so a dedicated pool (e.g. an Opus strand with
     // max_workers=1) actually launches — the pure cost sort would otherwise always
     // fill the cheap, high-max agent (glm, max 8) first and never give it a slot.
     let mut result: HashMap<String, u32> = HashMap::new();
@@ -7067,7 +7067,7 @@ pub fn run_act_cycle(
     match &decision {
         ScalingDecision::NoChange => {
             // The aggregate total is unchanged, but the per-agent allocation can
-            // still violate a pool's min_workers (e.g. a dedicated polish pool that
+            // still violate a pool's min_workers (e.g. a dedicated pool that
             // must always run 1 worker). Reconcile the distribution so such a pool
             // launches even at a steady total — moving a worker off an over-allocated
             // agent — instead of only ever acting on aggregate deltas.
@@ -9840,9 +9840,9 @@ mod tests {
     fn workspace_from_launch_cmd_parses_flag() {
         assert_eq!(
             workspace_from_launch_cmd(
-                "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
+                "needle run --agent claude-print-opus --workspace /home/coding/example-workspace --identifier cgov-example"
             ),
-            Some("/home/coding/cgov-polish-queue".to_string())
+            Some("/home/coding/example-workspace".to_string())
         );
         assert_eq!(workspace_from_launch_cmd("needle run --agent x"), None);
     }
@@ -11011,7 +11011,7 @@ mod tests {
 
         // A newly configured pool with no prior entry is upserted.
         agents.insert(
-            "polish-opus".to_string(),
+            "needle-opus".to_string(),
             AgentConfig {
                 launch_cmd: "needle run --agent claude-print-opus".to_string(),
                 heartbeat_dir: "/tmp/heartbeats".to_string(),
@@ -11024,7 +11024,7 @@ mod tests {
         );
         sync_workers_to_agents(&mut state, &agents);
         assert_eq!(state.workers.len(), 2);
-        assert_eq!(state.workers["polish-opus"].max, 0);
+        assert_eq!(state.workers["needle-opus"].max, 0);
 
         // With no configured agents at all the map is left alone — a
         // config-parse failure must not wipe worker tracking.

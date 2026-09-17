@@ -66,7 +66,7 @@ bf list --assignee worker-1
 
 ```bash
 # Beads with specific label (inclusive)
-bf list --labels polish
+bf list --labels documentation
 bf list --labels rust,documentation  # Must have BOTH labels
 
 # Override default exclusions
@@ -79,8 +79,8 @@ bf list --exclude-labels ''  # Don't exclude any labels
 # Open priority 3 beads
 bf list --state open --priority 3
 
-# High-priority polish beads
-bf list --labels polish --priority 3,4
+# High-priority documentation beads
+bf list --labels documentation --priority 3,4
 
 # Documentation beads ready to claim
 bf ready --labels documentation
@@ -117,7 +117,7 @@ LIMIT 1;
 SELECT DISTINCT i.id, i.title
 FROM issues i
 JOIN labels l ON i.id = l.issue_id
-WHERE l.label = 'polish' AND i.status = 'open';
+WHERE l.label = 'documentation' AND i.status = 'open';
 
 -- Beads WITHOUT excluded labels
 SELECT i.id, i.title
