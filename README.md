@@ -34,14 +34,15 @@ version. Nothing is written to the install dir until verification passes.
 ### Option 1: Pre-built binary (recommended)
 
 ```bash
-curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh | bash
+curl --netrc -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh | bash
 ```
 
-(Forgejo requires authentication; on a box with Forgejo credentials in the git
-credential store, the above just works. The GitHub-mirror equivalent is
+(Forgejo requires authentication; configure curl's netrc support for the
+canonical host before using this form. Curl does not read Git credential
+helpers. For an anonymous install, use the GitHub-mirror equivalent,
 `https://raw.githubusercontent.com/jedarden/claude-governor/main/install.sh` —
-same script, possibly lagging `main`; the *binary* digest check below is what
-guards integrity either way.)
+the mirror may lag `main`, but the *binary* digest check below guards the
+artifact either way.)
 
 The installer downloads the binary plus its published `.sha256` sidecar and
 refuses to install on any mismatch.
@@ -51,7 +52,7 @@ refuses to install on any mismatch.
 Reproducible installs should pin the release tag:
 
 ```bash
-curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
+curl --netrc -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
   | CGOV_VERSION=v0.1.1 bash
 ```
 
@@ -67,7 +68,7 @@ you different bytes:
 # Obtain the published digest for your platform and release, e.g.:
 curl -fsSL "https://github.com/jedarden/claude-governor/releases/download/v0.1.1/cgov-linux-amd64.sha256"
 
-curl -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
+curl --netrc -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
   | CGOV_VERSION=v0.1.1 CGOV_SHA256=<64-hex-digest> bash
 ```
 
