@@ -724,4 +724,398 @@ mod tests {
         );
         assert_eq!(t.minutes_until, 30); // 30 minutes until 14:00
     }
+
+    // --- Timezone boundaries: peak window pinned in UTC, both DST sides ---
+    //
+    // The peak window is defined in ET wall-clock; its UTC position moves with
+    // DST (08:00 ET = 12:00 UTC in EDT, 13:00 UTC in EST). Every earlier test
+    // constructs times via et_to_utc, which would pass even if the conversion
+    // were pinned to a fixed UTC-4 offset — these pin the actual UTC instants.
+
+    #[test]
+    fn peak_boundaries_pinned_in_utc_during_edt() {
+        // Monday March 16, 2026 (EDT = UTC-4): peak is 12:00-18:00 UTC
+        assert!(
+            !is_peak_at(utc_at(2026, 3, 16, 11, 59)),
+            "11:59 UTC = 7:59 ET, off-peak"
+        );
+        assert!(
+            is_peak_at(utc_at(2026, 3, 16, 12, 0)),
+            "12:00 UTC = 8:00 ET, peak"
+        );
+        assert!(
+            is_peak_at(utc_at(2026, 3, 16, 17, 59)),
+            "17:59 UTC = 1:59 PM ET, peak"
+        );
+        assert!(
+            !is_peak_at(utc_at(2026, 3, 16, 18, 0)),
+            "18:00 UTC = 2:00 PM ET, off-peak"
+        );
+    }
+
+    #[test]
+    fn peak_boundaries_pinned_in_utc_during_est() {
+        // Monday January 5, 2026 (EST = UTC-5): peak is 13:00-19:00 UTC
+        // If the ET conversion were fixed at UTC-4, the 13:00Z instant would
+        // read as 9:00 AM ET (peak) instead of 8:00 AM ET — same thing here,
+        // but 12:59Z would read 8:59 AM ET (peak) instead of 7:59 AM (off-peak).
+        assert!(
+            !is_peak_at(utc_at(2026, 1, 5, 12, 59)),
+            "12:59 UTC = 7:59 AM EST, off-peak"
+        );
+        assert!(
+            is_peak_at(utc_at(2026, 1, 5, 13, 0)),
+            "13:00 UTC = 8:00 AM EST, peak"
+        );
+        assert!(
+            is_peak_at(utc_at(2026, 1, 5, 18, 59)),
+            "18:59 UTC = 1:59 PM EST, peak"
+        );
+        assert!(
+            !is_peak_at(utc_at(2026, 1, 5, 19, 0)),
+            "19:00 UTC = 2:00 PM EST, off-peak"
+        );
+    }
+
+    #[test]
+    fn dst_transition_sundays_are_off_peak_all_day() {
+        // DST transitions land on Sundays (weekends are 2x all day, no peak
+        // window), so the schedule never consults an ambiguous or nonexistent
+        // local hour. Pin both 2026 transition days via unambiguous UTC times.
+
+        // Spring forward: Sunday March 8, 2026, 23-hour day.
+        // 06:00Z = 1:00 AM EST (exists); 07:00Z = 3:00 AM EDT (2 AM does not);
+        // 12:00Z = 8:00 AM EDT — would be peak if this were a weekday.
+        for (label, t) in [
+            ("1:00 AM EST", utc_at(2026, 3, 8, 6, 0)),
+            ("3:00 AM EDT", utc_at(2026, 3, 8, 7, 0)),
+            ("8:00 AM EDT", utc_at(2026, 3, 8, 12, 0)),
+        ] {
+            assert!(is_weekend(t), "March 8 should be a weekend day");
+            assert!(
+                !is_peak_at(t),
+                "{} on spring-forward Sunday should be off-peak",
+                label
+            );
+        }
+
+        // Fall back: Sunday November 1, 2026, 25-hour day.
+        // 09:00Z = 5:00 AM EDT; 10:30Z = 6:30 AM EST — either side of the
+        // repeated 1-2 AM hour, both off-peak.
+        for (label, t) in [
+            ("5:00 AM EDT", utc_at(2026, 11, 1, 9, 0)),
+            ("6:30 AM EST", utc_at(2026, 11, 1, 10, 30)),
+        ] {
+            assert!(is_weekend(t), "November 1 should be a weekend day");
+            assert!(
+                !is_peak_at(t),
+                "{} on fall-back Sunday should be off-peak",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn weekend_to_weekday_is_one_continuous_offpeak_stretch() {
+        // Friday 14:00 ET through Monday 08:00 ET is a single off-peak span:
+        // Friday afternoon/evening + all weekend + Monday pre-8AM. No part of
+        // it should register a peak hour or an internal multiplier transition.
+        let friday_2pm = et_to_utc(2026, 3, 20, 14, 0);
+        let monday_noon = et_to_utc(2026, 3, 23, 12, 0);
+
+        for hour in (0..42).step_by(3) {
+            let t = friday_2pm + Duration::hours(hour);
+            assert!(
+                !is_peak_at(t),
+                "{} ET in the Fri 2pm -> Mon stretch should be off-peak",
+                to_eastern(t)
+            );
+        }
+
+        // The whole stretch carries one constant multiplier, so the next
+        // transition is Monday 08:00 ET — nothing inside the weekend itself.
+        let promos = vec![test_promo()];
+        let sat_start = et_to_utc(2026, 3, 21, 0, 0);
+        let sun_end = et_to_utc(2026, 3, 22, 23, 0);
+        assert!(
+            find_next_transition(sat_start, sun_end, &promos, "weekly_scoped").is_none(),
+            "Saturday -> Sunday should have no transitions at all"
+        );
+
+        let (t, before, after) = find_next_transition(
+            et_to_utc(2026, 3, 22, 12, 0),
+            et_to_utc(2026, 3, 23, 10, 0),
+            &promos,
+            "weekly_scoped",
+        )
+        .expect("Monday 08:00 ET should be the first transition after the weekend");
+        let t_et = to_eastern(t);
+        assert_eq!(
+            (t_et.weekday(), t_et.hour(), t_et.minute()),
+            (chrono::Weekday::Mon, 8, 0)
+        );
+        assert!((before - 2.0).abs() < 1e-9, "weekend carries the 2x bonus");
+        assert!((after - 1.0).abs() < 1e-9, "Monday 8 AM returns to peak 1x");
+        assert_eq!(monday_noon.weekday(), chrono::Weekday::Mon); // guard on the anchor
+    }
+
+    // --- Window transitions at the promotion date boundaries ---
+
+    #[test]
+    fn find_transition_detects_promo_end_at_midnight_et() {
+        let promos = vec![test_promo()]; // ends 2026-03-25 (exclusive)
+
+        // Tuesday 2026-03-24 20:00 ET (off-peak, 2x) -> Wednesday 08:00 ET.
+        // The multiplier drops 2x -> 1x at 2026-03-25 00:00 ET even though the
+        // clock never enters peak hours — the promo end is itself a transition.
+        let (t, before, after) = find_next_transition(
+            et_to_utc(2026, 3, 24, 20, 0),
+            et_to_utc(2026, 3, 25, 8, 0),
+            &promos,
+            "weekly_scoped",
+        )
+        .expect("promo end at midnight ET should surface as a transition");
+        let t_et = to_eastern(t);
+        assert_eq!(
+            (t_et.hour(), t_et.minute()),
+            (0, 0),
+            "promo ends at 00:00 ET"
+        );
+        assert_eq!(t_et.date_naive().to_string(), "2026-03-25");
+        assert!((before - 2.0).abs() < 1e-9);
+        assert!((after - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn find_transition_detects_promo_start_at_midnight_et() {
+        let promos = vec![test_promo()]; // starts 2026-03-15 (inclusive)
+
+        // Saturday 2026-03-14 22:00 ET (off-peak, 1x) -> Sunday 02:00 ET.
+        // The bonus appears at midnight with no peak-window involvement.
+        let (t, before, after) = find_next_transition(
+            et_to_utc(2026, 3, 14, 22, 0),
+            et_to_utc(2026, 3, 15, 2, 0),
+            &promos,
+            "weekly_scoped",
+        )
+        .expect("promo start at midnight ET should surface as a transition");
+        let t_et = to_eastern(t);
+        assert_eq!((t_et.hour(), t_et.minute()), (0, 0));
+        assert_eq!(t_et.date_naive().to_string(), "2026-03-15");
+        assert!((before - 1.0).abs() < 1e-9);
+        assert!((after - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn promo_date_boundaries_are_start_inclusive_end_exclusive() {
+        let promos = vec![test_promo()]; // 2026-03-15 ..< 2026-03-25
+
+        // All four instants are off-peak, so the multiplier isolates the date logic.
+        assert!(
+            (get_multiplier_at(et_to_utc(2026, 3, 14, 23, 59), &promos, "weekly_scoped") - 1.0)
+                .abs()
+                < 1e-9,
+            "23:59 the day before start is outside the promo"
+        );
+        assert!(
+            (get_multiplier_at(et_to_utc(2026, 3, 15, 0, 0), &promos, "weekly_scoped") - 2.0).abs()
+                < 1e-9,
+            "00:00 on the start date is the first active minute"
+        );
+        assert!(
+            (get_multiplier_at(et_to_utc(2026, 3, 24, 23, 59), &promos, "weekly_scoped") - 2.0)
+                .abs()
+                < 1e-9,
+            "23:59 the day before end is still inside the promo"
+        );
+        assert!(
+            (get_multiplier_at(et_to_utc(2026, 3, 25, 0, 0), &promos, "weekly_scoped") - 1.0).abs()
+                < 1e-9,
+            "00:00 on the end date is already past the promo (end exclusive)"
+        );
+    }
+
+    #[test]
+    fn find_transition_none_when_deadline_not_after_start() {
+        let promos = vec![test_promo()];
+        let now = et_to_utc(2026, 3, 16, 13, 0); // peak ends at 14:00
+
+        assert!(find_next_transition(now, now, &promos, "weekly_scoped").is_none());
+        assert!(
+            find_next_transition(now, now - Duration::hours(1), &promos, "weekly_scoped").is_none()
+        );
+    }
+
+    // --- Missing / malformed schedules degrade to the 1x flat model ---
+
+    #[test]
+    fn empty_promotion_list_yields_flat_1x() {
+        let promos: Vec<Promotion> = vec![];
+        // Monday 2026-03-16 06:00 ET: off-peak, would be 2x if a promo applied.
+        let t = et_to_utc(2026, 3, 16, 6, 0);
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn malformed_dates_inside_valid_json_fall_back_to_1x() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("promotions.json");
+        // Parses as JSON and every field is present — but the dates are
+        // unparseable. is_promo_active_at must warn and return false rather
+        // than panic, degrading to the documented 1x flat model.
+        let json = r#"[
+            {
+                "name": "Broken Promo",
+                "start_date": "2026-13-45",
+                "end_date": "not-a-date",
+                "offpeak_multiplier": 2.0,
+                "applies_to": ["weekly_scoped"]
+            }
+        ]"#;
+        std::fs::write(&path, json).unwrap();
+
+        let promos = load_promotions(&path);
+        assert_eq!(promos.len(), 1, "file itself is valid JSON and must load");
+
+        let t = et_to_utc(2026, 3, 16, 6, 0); // off-peak
+        assert!(!is_promo_active_at(t, &promos[0]));
+        assert!((get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9);
+
+        // The forecast sees no bonus: effective hours equal raw hours.
+        let reset = t + Duration::hours(12);
+        let effective = effective_hours_remaining_from(t, reset, &promos, "weekly_scoped");
+        assert!(
+            (effective - 12.0).abs() < 0.1,
+            "malformed dates must forecast as 1x, got {}",
+            effective
+        );
+    }
+
+    #[test]
+    fn empty_applies_to_never_matches_any_window() {
+        let promo = Promotion {
+            applies_to: vec![],
+            ..test_promo()
+        };
+        let promos = vec![promo];
+        let t = et_to_utc(2026, 3, 16, 6, 0); // off-peak, inside the promo range
+
+        for window in ["weekly_scoped", "five_hour", "seven_day"] {
+            assert!(
+                (get_multiplier_at(t, &promos, window) - 1.0).abs() < 1e-9,
+                "window {} must stay 1x with an empty applies_to",
+                window
+            );
+            assert!(find_next_transition(t, t + Duration::hours(2), &promos, window).is_none());
+        }
+    }
+
+    #[test]
+    fn load_promotions_from_empty_array_and_from_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, "[]").unwrap();
+        assert!(load_promotions(&empty).is_empty());
+
+        // A directory at the configured path fails fs::read_to_string — the
+        // warn-and-empty path, not a panic.
+        assert!(load_promotions(dir.path()).is_empty());
+    }
+
+    // --- Deterministic forecasts: exact effective-hour values ---
+
+    #[test]
+    fn forecast_doc_example_40h_with_12h_peak_is_exactly_68() {
+        let promos = vec![test_promo()];
+
+        // Monday 2026-03-16 08:00 ET + 40h -> Wednesday 00:00 ET.
+        // Peak: Mon 08-14 (6h) + Tue 08-14 (6h) = 12h; off-peak: 28h.
+        // 28 * 2.0 + 12 * 1.0 = 68.0 effective hours.
+        let start = et_to_utc(2026, 3, 16, 8, 0);
+        let reset = start + Duration::hours(40);
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
+        assert!(
+            (effective - 68.0).abs() < 1e-6,
+            "expected exactly 68.0 effective hours, got {:.6}",
+            effective
+        );
+
+        // A window the promo does not apply to sees the raw 40h.
+        let unboosted = effective_hours_remaining_from(start, reset, &promos, "five_hour");
+        assert!((unboosted - 40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn forecast_across_promo_end_is_exactly_16_over_12_wall_hours() {
+        let promos = vec![test_promo()];
+
+        // Tuesday 2026-03-24 20:00 ET -> Wednesday 08:00 ET (12 wall hours).
+        // Tue 20:00-00:00: 4h off-peak at 2x = 8.0
+        // Wed 00:00-08:00: 8h off-peak at 1x (promo expired) = 8.0
+        let start = et_to_utc(2026, 3, 24, 20, 0);
+        let reset = et_to_utc(2026, 3, 25, 8, 0);
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
+        assert!(
+            (effective - 16.0).abs() < 1e-6,
+            "expected exactly 16.0 effective hours across the promo end, got {:.6}",
+            effective
+        );
+
+        // The same span a week earlier — promo still active throughout —
+        // is 4h at 2x + 8h at 2x = 24.0, isolating the expiry effect.
+        let start_pre = et_to_utc(2026, 3, 17, 20, 0);
+        let reset_pre = et_to_utc(2026, 3, 18, 8, 0);
+        let effective_pre =
+            effective_hours_remaining_from(start_pre, reset_pre, &promos, "weekly_scoped");
+        assert!(
+            (effective_pre - 24.0).abs() < 1e-6,
+            "expected exactly 24.0 while the promo holds, got {:.6}",
+            effective_pre
+        );
+    }
+
+    #[test]
+    fn forecast_24h_from_mid_afternoon_is_exactly_42() {
+        let promos = vec![test_promo()];
+
+        // Monday 2026-03-16 16:00 ET + 24h -> Tuesday 16:00 ET.
+        // Off-peak: Mon 16:00-Tue 08:00 (16h) + Tue 14:00-16:00 (2h) = 18h.
+        // Peak: Tue 08:00-14:00 = 6h. 18 * 2.0 + 6 * 1.0 = 42.0.
+        let start = et_to_utc(2026, 3, 16, 16, 0);
+        let reset = start + Duration::hours(24);
+        let effective = effective_hours_remaining_from(start, reset, &promos, "weekly_scoped");
+        assert!(
+            (effective - 42.0).abs() < 1e-6,
+            "expected exactly 42.0 effective hours, got {:.6}",
+            effective
+        );
+    }
+
+    #[test]
+    fn forecast_is_zero_when_reset_is_not_after_start() {
+        let promos = vec![test_promo()];
+        let start = et_to_utc(2026, 3, 16, 6, 0);
+
+        assert_eq!(
+            effective_hours_remaining_from(start, start, &promos, "weekly_scoped"),
+            0.0
+        );
+        assert_eq!(
+            effective_hours_remaining_from(
+                start,
+                start - Duration::hours(1),
+                &promos,
+                "weekly_scoped"
+            ),
+            0.0
+        );
+    }
+
+    // --- Helper for pinning UTC instants (DST tests) ---
+
+    fn utc_at(year: i32, month: u32, day: u32, hour: u32, min: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, 0)
+            .unwrap()
+    }
 }
