@@ -420,7 +420,9 @@ def conservative_hold(now: float, state: dict, sample_age: float | None) -> int:
     lab_pool = [unit for unit in LAB_ELASTIC if unit not in masked_lab]
     active_lab = active_on_lab(lab_pool)
     throttles = throttle_count()
-    since_scale = now - float(state.get("last_scale_at", 0.0))
+    # `or 0.0` so a null in the controller's own state degrades to "never
+    # scaled" instead of raising -- the hold must survive odd state shapes.
+    since_scale = now - float(state.get("last_scale_at") or 0.0)
 
     systemctl(None, "enable", LOCAL_BASE)
     systemctl(None, "start", LOCAL_BASE)
@@ -467,7 +469,10 @@ def main() -> int:
     quota, sample_age = load_quota_sample(now)
     percent = reset_at = None
     if quota is not None:
-        usage = quota["usage"]
+        # `.get or {}` (not subscript): a fresh sample with no usage subtree
+        # is the same upstream failure class as a stale one and must fall
+        # through to the self-sample, never raise out of main (exit 1).
+        usage = quota.get("usage") or {}
         try:
             percent = float(usage["five_hour_pct"])
             reset_at = parse_time(usage["five_hour_resets_at"])
@@ -503,7 +508,7 @@ def main() -> int:
     lab_pool = [unit for unit in LAB_ELASTIC if unit not in masked_lab]
     active_lab = active_on_lab(lab_pool)
     throttles = throttle_count()
-    since_scale = now - float(state.get("last_scale_at", 0.0))
+    since_scale = now - float(state.get("last_scale_at") or 0.0)
     action = "hold"
 
     if percent >= TARGET_PERCENT:
