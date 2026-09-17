@@ -1563,6 +1563,17 @@ const COMBINED_SERVICE: &str = "claude-governor.service";
 /// installs remove both.
 const LEGACY_GOVERNOR_SERVICES: &[&str] = &["cgov.service", COMBINED_SERVICE];
 
+/// Units belonging to the standalone polish loop retired 2026-09-16.
+///
+/// Unlike [`LEGACY_GOVERNOR_SERVICES`] these are not superseded by anything
+/// cgov installs — NEEDLE's native Weave/Explore strands replaced the loop
+/// (see CLAUDE.md, "Retired 2026-09-16") — so the install sweep removes them
+/// with a do-not-recreate message rather than the observe-split "superseded"
+/// one. The timer is the dangerous half: while it stays enabled it keeps
+/// launching the seeder on schedule against a queue nothing maintains.
+const RETIRED_POLISH_UNITS: &[&str] =
+    &["claude-polish-seeder.service", "claude-polish-seeder.timer"];
+
 /// Run a systemctl --user command without letting it write to our stdout/stderr.
 ///
 /// Used for probing (`is-active`, `is-enabled`) and best-effort cleanup, where the
@@ -1576,7 +1587,8 @@ fn systemctl_user_quiet(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Stop, disable, and delete any obsolete governor units left by an older install.
+/// Stop, disable, and delete any obsolete governor units and retired polish
+/// units left by an older install.
 ///
 /// Returns one unprefixed sentence per unit actually removed — empty, and silent,
 /// when there is nothing to clean up. A removal that fails is warned about on
@@ -1607,6 +1619,35 @@ fn remove_legacy_governor_units(user_dir: &Path) -> Vec<String> {
             )),
             Err(e) => eprintln!(
                 "warning: could not remove obsolete unit {}: {}",
+                path.display(),
+                e
+            ),
+        }
+    }
+
+    // The retired polish loop's units are not superseded by anything this
+    // install provides, so their message says why they must not come back
+    // rather than pointing at a replacement.
+    for unit in RETIRED_POLISH_UNITS {
+        let path = user_dir.join(unit);
+        if !path.exists() {
+            continue;
+        }
+
+        if systemctl_user_quiet(&["is-active", unit]) {
+            systemctl_user_quiet(&["stop", unit]);
+        }
+        if systemctl_user_quiet(&["is-enabled", unit]) {
+            systemctl_user_quiet(&["disable", unit]);
+        }
+
+        match fs::remove_file(&path) {
+            Ok(()) => actions.push(format!(
+                "Removed retired polish unit {} (the polish loop retired 2026-09-16; do not recreate it — NEEDLE's Weave/Explore strands replaced it)",
+                path.display()
+            )),
+            Err(e) => eprintln!(
+                "warning: could not remove retired polish unit {}: {}",
                 path.display(),
                 e
             ),
@@ -3037,6 +3078,84 @@ mod tests {
             assert_ne!(*svc, OBSERVE_SERVICE);
             assert_ne!(*svc, ACT_SERVICE);
             assert_ne!(*svc, COLLECTOR_SERVICE);
+        }
+    }
+
+    #[test]
+    fn test_retired_polish_unit_list_excludes_canonical_units() {
+        // Same guard as the legacy list: the retired-polish sweep must never
+        // name a unit the install path writes.
+        for unit in RETIRED_POLISH_UNITS {
+            assert_ne!(*unit, OBSERVE_SERVICE);
+            assert_ne!(*unit, ACT_SERVICE);
+            assert_ne!(*unit, COLLECTOR_SERVICE);
+        }
+    }
+
+    #[test]
+    fn test_remove_legacy_units_sweeps_retired_polish_units() {
+        // An install from before the 2026-09-16 polish-loop retirement still
+        // carries the seeder service and its enabled timer. Init/enable must
+        // sweep both, and the action text must say not to recreate them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seeder = dir.path().join("claude-polish-seeder.service");
+        let timer = dir.path().join("claude-polish-seeder.timer");
+        let observe = dir.path().join(OBSERVE_SERVICE);
+        fs::write(&seeder, "[Service]\nExecStart=polish-seeder\n").expect("write seeder");
+        fs::write(&timer, "[Timer]\nOnCalendar=hourly\n").expect("write timer");
+        fs::write(&observe, "[Service]\nExecStart=cgov _observe\n").expect("write observe");
+
+        let actions = remove_legacy_governor_units(dir.path());
+
+        assert!(!seeder.exists(), "retired seeder unit should be removed");
+        assert!(!timer.exists(), "retired seeder timer should be removed");
+        assert!(observe.exists(), "observe unit must survive");
+        assert_eq!(
+            actions.len(),
+            2,
+            "both retired units should be reported: {actions:?}"
+        );
+        for action in &actions {
+            assert!(
+                action.contains("retired polish unit") && action.contains("do not recreate"),
+                "action must mark the unit retired and bar recreation: {action}"
+            );
+            assert!(
+                !action.contains(OBSERVE_SERVICE),
+                "retired units are not superseded by a replacement: {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_embedded_templates_have_no_retired_references() {
+        // `cgov init` writes exactly these files, so their contents are what
+        // "init emits no retired-component setup" means in practice. Scan
+        // them with the same markers the config validator rejects on.
+        let templates = [
+            ("governor.yaml", include_str!("../config/governor.yaml")),
+            (
+                "claude-governor-observe.service",
+                include_str!("../config/claude-governor-observe.service"),
+            ),
+            (
+                "claude-governor-act.service",
+                include_str!("../config/claude-governor-act.service"),
+            ),
+            (
+                "claude-token-collector.service",
+                include_str!("../config/claude-token-collector.service"),
+            ),
+        ];
+
+        for (name, contents) in templates {
+            let lowered = contents.to_lowercase();
+            for marker in claude_governor::config::RETIRED_REFERENCE_MARKERS {
+                assert!(
+                    !lowered.contains(marker),
+                    "init template {name} references a component retired 2026-09-16 (matched \"{marker}\")"
+                );
+            }
         }
     }
 

@@ -1111,6 +1111,68 @@ fn check_retired_component_refs() -> CheckResult {
     check_retired_component_refs_at(&default_config_path())
 }
 
+/// Unit files belonging to the standalone polish loop retired 2026-09-16 (the
+/// seeder service and its timer — see CLAUDE.md, "Retired 2026-09-16"). An
+/// install that predates the retirement can still carry them; the timer keeps
+/// launching the seeder on schedule even though nothing in the current tree
+/// maintains the queue it fed. `cgov init` sweeps these files; this check
+/// catches hosts that have not re-run it. Mirrors `RETIRED_POLISH_UNITS` in
+/// main.rs (the unit lists are already duplicated between the two crates, as
+/// the service-name constants above are).
+const RETIRED_POLISH_UNITS: &[&str] =
+    &["claude-polish-seeder.service", "claude-polish-seeder.timer"];
+
+/// Check that no unit file from a retired component is still installed in the
+/// systemd user unit directory. Filesystem-only on purpose: it must behave
+/// identically on hosts without a usable systemd session, where the stale
+/// files are exactly the ones that will activate the moment a session comes
+/// back.
+fn check_retired_component_units_at(unit_dir: &std::path::Path) -> CheckResult {
+    if !unit_dir.exists() {
+        return CheckResult::pass(
+            "retired_component_units",
+            "No retired units installed (no systemd user unit directory)",
+        );
+    }
+
+    let installed: Vec<&str> = RETIRED_POLISH_UNITS
+        .iter()
+        .copied()
+        .filter(|unit| unit_dir.join(unit).exists())
+        .collect();
+
+    if installed.is_empty() {
+        CheckResult::pass(
+            "retired_component_units",
+            "No retired polish units installed",
+        )
+    } else {
+        CheckResult::fail(
+            "retired_component_units",
+            format!(
+                "Retired polish units still installed in {}: {}",
+                unit_dir.display(),
+                installed.join(", ")
+            ),
+            "Remove them — `cgov init` sweeps retired units on install, or by hand: \
+             systemctl --user disable --now <unit> && rm <unit file>, then \
+             systemctl --user daemon-reload. Do not recreate or re-enable them; \
+             the polish loop retired 2026-09-16 (see CLAUDE.md)",
+        )
+    }
+}
+
+fn check_retired_component_units() -> CheckResult {
+    match dirs::config_dir().map(|p| p.join("systemd/user")) {
+        Some(dir) => check_retired_component_units_at(&dir),
+        None => CheckResult::warn(
+            "retired_component_units",
+            "Could not determine systemd user directory",
+            "Check XDG_CONFIG_HOME — retired polish units cannot be located without it",
+        ),
+    }
+}
+
 /// Check tmux availability
 fn check_tmux_available() -> CheckResult {
     match Command::new("tmux").arg("-V").output() {
@@ -2237,6 +2299,7 @@ pub fn run_doctor_with_options(options: DoctorOptions) -> DoctorReport {
         check_burn_rate_samples(),
         check_config_parseable(),
         check_retired_component_refs(),
+        check_retired_component_units(),
         check_model_generation(),
         check_pricing_coverage(),
         check_promotion_dates(),
@@ -2377,6 +2440,94 @@ agents:
         let tmp = tempfile::tempdir().unwrap();
         let result = check_retired_component_refs_at(&tmp.path().join("absent.yaml"));
         assert_eq!(result.status, CheckStatus::Warn, "{:?}", result.message);
+    }
+
+    // -- retired_component_units ------------------------------------------------
+
+    #[test]
+    fn test_retired_component_units_passes_when_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("claude-governor-observe.service"),
+            "[Service]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("claude-token-collector.service"),
+            "[Service]\n",
+        )
+        .unwrap();
+
+        let result = check_retired_component_units_at(tmp.path());
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.message);
+        assert!(result.remediation.is_none());
+    }
+
+    #[test]
+    fn test_retired_component_units_passes_without_unit_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = check_retired_component_units_at(&tmp.path().join("absent"));
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.message);
+    }
+
+    #[test]
+    fn test_retired_component_units_fails_on_installed_seeder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("claude-polish-seeder.service"),
+            "[Service]\nExecStart=polish-seeder\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("claude-polish-seeder.timer"),
+            "[Timer]\nOnCalendar=hourly\n",
+        )
+        .unwrap();
+
+        let result = check_retired_component_units_at(tmp.path());
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("claude-polish-seeder.service")
+                && result.message.contains("claude-polish-seeder.timer"),
+            "must name every installed retired unit: {:?}",
+            result.message
+        );
+        let remediation = result
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            remediation.contains("remove them") && remediation.contains("do not recreate"),
+            "remediation must direct removal and bar recreation: {:?}",
+            result.remediation
+        );
+        // The acceptance bar for doctor: it must never point the operator at
+        // installing or recreating a retired unit.
+        assert!(
+            !remediation.contains("install claude-polish"),
+            "remediation must not suggest installing a retired unit: {:?}",
+            result.remediation
+        );
+    }
+
+    #[test]
+    fn test_retired_component_units_names_only_what_is_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("claude-polish-seeder.timer"),
+            "[Timer]\nOnCalendar=hourly\n",
+        )
+        .unwrap();
+
+        let result = check_retired_component_units_at(tmp.path());
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("claude-polish-seeder.timer")
+                && !result.message.contains("claude-polish-seeder.service"),
+            "must list exactly the installed units: {:?}",
+            result.message
+        );
     }
 
     fn counts(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
