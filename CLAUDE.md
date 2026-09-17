@@ -52,11 +52,14 @@ binary path back out of the installed templates, links it to whichever real
 > per adapter; `--skip-live` on the installer, `cgov doctor --skip-live` on
 > the doctor, skip the static-only case). The logic lives in
 > `src/adapter_verify.rs`, mirrored in bash inside the installer; the mirror
-> is enforced, not manual — a cargo-test parse of the installer's arrays
-> (`installer_bash_variable_lists_match_the_rust_constants`) fails on
-> divergence from the Rust constants, and the installer cross-checks those
-> constants at run time. Add new variables to **both** copies; both checks
-> fail until you do.
+> is enforced by two gates, not maintained manually. The cargo test
+> `installer_bash_variable_lists_match_the_rust_constants` in
+> `src/adapter_verify.rs` and installer section 4's `check_var_list_sync` in
+> `deploy/install-claude-print-adapters.sh` both compare the rule-3 pair
+> (`IDE_ENV_VARS` ↔ `RULE3_IDE_VARS`) and the rule-5 pair
+> (`API_ROUTING_ENV_VARS` ↔ `RULE5_API_VARS`) in both directions, catching
+> variables missing from either copy or extra in either copy. Add new variables
+> to **both** copies; both gates fail until you do.
 
 Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
