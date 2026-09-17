@@ -331,6 +331,16 @@ pub struct Poller {
     credentials_path: PathBuf,
     agent: Agent,
     last_usage: Option<UsageData>,
+    /// Base URL the usage endpoint is fetched from. Defaults to [`API_BASE`];
+    /// contract tests point this at a local mock server instead.
+    api_base: String,
+    /// Full URL of the OAuth token refresh endpoint. Defaults to
+    /// [`TOKEN_ENDPOINT`]; contract tests point this at a local mock server.
+    token_endpoint: String,
+    /// Delay between token-refresh retry attempts. Defaults to
+    /// [`REFRESH_RETRY_DELAY_SECS`]; contract tests set zero so retry paths
+    /// don't sleep.
+    refresh_retry_delay: std::time::Duration,
 }
 
 impl Poller {
@@ -372,6 +382,9 @@ impl Poller {
             credentials_path,
             agent,
             last_usage: None,
+            api_base: API_BASE.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            refresh_retry_delay: std::time::Duration::from_secs(REFRESH_RETRY_DELAY_SECS),
         })
     }
 
@@ -379,6 +392,31 @@ impl Poller {
     #[allow(dead_code)]
     pub fn credentials_path(&self) -> &PathBuf {
         &self.credentials_path
+    }
+
+    /// Override the usage API base URL and the OAuth token refresh endpoint.
+    ///
+    /// The defaults are the documented Anthropic endpoints ([`API_BASE`] /
+    /// [`TOKEN_ENDPOINT`]). This exists so contract tests can point the
+    /// poller at a local mock server (tests/usage_polling_contract.rs);
+    /// production code never calls it.
+    pub fn with_endpoints(
+        mut self,
+        api_base: impl Into<String>,
+        token_endpoint: impl Into<String>,
+    ) -> Self {
+        self.api_base = api_base.into();
+        self.token_endpoint = token_endpoint.into();
+        self
+    }
+
+    /// Override the delay between token-refresh retry attempts.
+    ///
+    /// The production default is [`REFRESH_RETRY_DELAY_SECS`]; contract tests
+    /// set zero so retry paths complete without sleeping.
+    pub fn with_refresh_retry_delay(mut self, delay: std::time::Duration) -> Self {
+        self.refresh_retry_delay = delay;
+        self
     }
 
     /// Read and parse the credentials file with validation.
@@ -469,7 +507,7 @@ impl Poller {
 
         let response = self
             .agent
-            .post(TOKEN_ENDPOINT)
+            .post(&self.token_endpoint)
             .set("Content-Type", "application/json")
             .set("User-Agent", USER_AGENT)
             .send_string(&json_payload)
@@ -547,9 +585,9 @@ impl Poller {
         // Retry after delay
         log::info!(
             "Retrying token refresh in {} seconds...",
-            REFRESH_RETRY_DELAY_SECS
+            self.refresh_retry_delay.as_secs()
         );
-        std::thread::sleep(std::time::Duration::from_secs(REFRESH_RETRY_DELAY_SECS));
+        std::thread::sleep(self.refresh_retry_delay);
 
         match self.refresh_token(refresh_token) {
             Ok(response) => {
@@ -581,7 +619,7 @@ impl Poller {
 
     /// Fetch usage from the API
     fn fetch_usage(&self, access_token: &str) -> Result<UsageResponse> {
-        let url = format!("{}{}", API_BASE, USAGE_ENDPOINT);
+        let url = format!("{}{}", self.api_base, USAGE_ENDPOINT);
 
         let response = self
             .agent
