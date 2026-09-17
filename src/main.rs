@@ -919,9 +919,12 @@ fn run_scale_command(
         println!("Source: {}", record.source);
     }
 
-    // Warn user that the brake still wins while safe mode is engaged
+    // Warn user that safe mode alone does not suspend the stored pin; the
+    // emergency brake still wins if a usage window reaches its threshold.
     if safe_mode_was_active {
-        println!("NOTE: Safe mode remains active and will reassert its target on the next cycle");
+        println!(
+            "NOTE: Safe mode remains active; this override applies unless the emergency brake engages"
+        );
     }
 
     Ok(())
@@ -2701,7 +2704,7 @@ mod tests {
     /// Test that verifies the stdout notification is displayed when scaling during safe mode.
     ///
     /// This test ensures that when a scale operation is performed while safe mode is active,
-    /// the user is notified via stdout that safe mode will reassert its target on the next cycle.
+    /// the user is notified via stdout that safe mode alone does not suspend the pin.
     ///
     /// The test verifies that:
     /// 1. Safe mode active state is correctly detected
@@ -2761,7 +2764,7 @@ mod tests {
 
         // Verify the expected notification message content
         let expected_notification =
-            "NOTE: Safe mode remains active and will reassert its target on the next cycle";
+            "NOTE: Safe mode remains active; this override applies unless the emergency brake engages";
 
         // When safe mode is active, the notification should contain the expected message
         if safe_mode_was_active {
@@ -2776,8 +2779,8 @@ mod tests {
                 "Notification should mention safe mode remains active"
             );
             assert!(
-                expected_notification.contains("will reassert"),
-                "Notification should mention safe mode will reassert"
+                expected_notification.contains("override applies"),
+                "Notification should explain that safe mode alone does not suspend the pin"
             );
         }
 

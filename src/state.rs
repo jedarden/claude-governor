@@ -1464,14 +1464,14 @@ pub fn merge_act_owned(
 
     // Three-way merge, same shape as `safe_mode` below: copy the act cycle's
     // value only when the cycle itself changed it (the expiry drop from
-    // `resolve_manual_override`, and any future act-side transition). A
-    // `cgov scale` write that landed while this cycle was in flight sits in
-    // `dst` and must survive this save — copying `src` wholesale would erase
-    // the operator's pin with the cycle's stale load-time snapshot. Residual
-    // race: a NEW override written mid-cycle while an older one expires in
-    // the same window still loses to the drop; the window is one act cycle
-    // long and the operator can simply re-run the command.
-    if src.manual_override != *manual_override_at_load {
+    // `resolve_manual_override`, and any future act-side transition) AND the
+    // on-disk value is still the load-time value. A `cgov scale` write that
+    // landed while this cycle was in flight changes `dst` and must survive the
+    // save — including the race where an older pin expires while a newer pin
+    // is written.
+    if src.manual_override != *manual_override_at_load
+        && dst.manual_override == *manual_override_at_load
+    {
         dst.manual_override = src.manual_override.clone();
     }
 

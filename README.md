@@ -258,8 +258,7 @@ telemetry failure.
 ## Manual scale override
 
 `cgov scale N` pins the fleet's aggregate worker target by hand. This section is
-the normative contract for that override; behaviors not yet implemented are
-marked *(not yet wired)*.
+the normative contract for that override.
 
 - **Persistence.** The override lives in governor state —
   `GovernorState.manual_override` (the `ManualOverride` struct in `src/state.rs`,
@@ -279,8 +278,7 @@ marked *(not yet wired)*.
   `resolve_manual_override` (`src/governor.rs`) drops the field once
   `expires_at` passes, and computed targets resume. The `--ttl` and `--clear`
   flags are implemented in the CLI (`run_scale_command` in `src/main.rs`, which
-  also supports `--dry-run`); what is not yet wired is the act cycle *applying*
-  the stored override — see Precedence below.
+  also supports `--dry-run`).
 - **Clamping.** The requested count is stored raw (`ManualOverride.target` is
   pre-clamp) and clamped to the fleet's aggregate `[min, max]` on every
   reconcile — `aggregate_worker_bounds` inside `resolve_manual_override`. The
@@ -298,11 +296,9 @@ marked *(not yet wired)*.
   as the act cycle's aggregate goal. It deliberately does not enter
   `compute_target_workers`; the cycle applies it after that function returns,
   so per-agent distribution (cost priority, floors, caps) is unchanged within
-  the manual total. *(Not yet wired: `resolve_manual_override` has no call site
-  in `run_act_cycle` yet. When landing the wiring, also decide whether
-  `apply_underutilization_sprint` may boost past a binding pin or the pin
-  suspends the sprint — nothing today observes the question, since neither is
-  wired.)*
+  the manual total. An active pin suspends `apply_underutilization_sprint` and
+  the pre-scale adjustment for that cycle; neither may move an explicit
+  operator target.
 - **Emergency brake wins; hysteresis never blocks.** Any usage window at or
   above 98% utilization (`EMERGENCY_BRAKE_THRESHOLD`, found by
   `first_brake_window`) suspends the override: the fleet brakes to 0, the
@@ -310,32 +306,28 @@ marked *(not yet wired)*.
   (`ManualOverrideResolution::SuspendedByBrake`). Conversely, the scale-down
   hysteresis band (`daemon.hysteresis_band` in `apply_scaling`) never suppresses
   an explicit manual change — a deliberate pin takes effect immediately.
-  *(Partially wired: brake suspension exists inside `resolve_manual_override`,
-  which is itself unwired; the hysteresis bypass for manual decisions is not
-  implemented yet.)*
-- **Decision source.** Every act-cycle capacity decision records whether it
-  acted on the manual override or on a computed target, stamped in the entry's
-  context (`narrate_decision` / the `context` block built in `run_act_cycle`)
-  in the decisions audit log `~/.needle/state/governor-decisions.jsonl` (read
-  by `cgov explain`). *(Not yet implemented: entries carry `computed_target`
-  and computed-vs-actual counts but no source field yet.)*
+  Manual changes still respect the configured per-cycle movement cap; only the
+  forecast hysteresis is bypassed. A manually requested zero is a normal
+  scale-down, while zero caused by the emergency brake is recorded as a brake.
+- **Decision source.** Every recorded act-cycle capacity decision records
+  whether it acted on the manual override or on a computed target, stamped in
+  the entry's context (`narrate_decision` / the `context` block built in
+  `run_act_cycle`) in the decisions audit log
+  `~/.needle/state/governor-decisions.jsonl` (read by `cgov explain`). The
+  context uses `decision_source` values `manual_override`, `computed_target`,
+  or `emergency_brake`, and keeps both `computed_target` and
+  `effective_target` for comparison. Computed at-target holds remain omitted
+  to keep the log useful; an active manual pin is recorded even when it holds
+  the fleet at its current total.
 
 ### Status today
 
-`cgov scale N` now stores the persistent override this section describes:
-`run_scale_command` (`src/main.rs`) validates `N` against the aggregate
-envelope, writes `GovernorState.manual_override` under the state lock (with
-`--ttl`, `--clear`, `--dry-run`), survives restarts, and warns — without
-refusing — when safe mode is active. The warning describes today's unwired
-reality (the computed target rules every cycle) and stays true under the
-contract above: what suspends a stored pin is an engaged emergency brake,
-never safe mode alone. What is still missing is the act-cycle wiring that
-makes the override *govern*: `resolve_manual_override` has no call site in
-`run_act_cycle` yet, so computed targets still rule every cycle, and the
-hysteresis bypass and decision-source stamping land with that wiring. Until
-then a stored pin is honored in state and in tests but does not yet move the
-fleet; landing the precedence wiring is what turns this section from contract
-into behavior, and this section should be updated in the same change.
+`cgov scale N` stores the persistent override described above. The act cycle
+resolves it after computing the forecast target, applies the aggregate clamp,
+skips sprint/pre-scale adjustments while it is active, bypasses scale-down
+hysteresis, and records the decision source. Safe mode alone does not suspend a
+pin; an engaged emergency brake does, and the stored pin resumes after the
+brake clears.
 
 ## Usage Windows
 

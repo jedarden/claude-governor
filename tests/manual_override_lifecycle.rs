@@ -5,9 +5,8 @@
 //! restart persistence, clamp/un-clamp, expiry, hold-until-clear, brake
 //! suspension, explicit clear, and the act-owned save's interaction with a
 //! CLI write that lands mid-cycle — so the documented behavior is guaranteed,
-//! not aspirational. The act-cycle *precedence* wiring (the override entering
-//! `run_act_cycle`) is deliberately not covered here: it does not exist yet
-//! (bead claudego-63c4eb12), and the README marks it as unwired.
+//! not aspirational. The real act-cycle precedence path is covered in
+//! `manual_override_act_cycle.rs`.
 
 use chrono::{Duration, Utc};
 use claude_governor::governor::{
@@ -314,4 +313,54 @@ fn act_side_expiry_drop_reaches_disk_over_a_stale_on_disk_copy() {
         after.manual_override.is_none(),
         "the cycle's expiry drop must reach disk"
     );
+}
+
+#[test]
+fn newer_cli_pin_survives_act_expiry_merge() {
+    // If an older pin expires while the operator writes a replacement pin,
+    // the act save must preserve the newer on-disk value rather than applying
+    // its stale expiry-clear over the CLI write.
+    let dir = TempDir::new().unwrap();
+    let path = state_path(&dir);
+    let now = Utc::now();
+
+    let mut base = two_pool_state();
+    base.manual_override = Some(cli_override(3, 1, now));
+    save_state(&base, &path).unwrap();
+
+    let loaded = claude_governor::state::load_state(&path).unwrap();
+    let manual_override_at_load = loaded.manual_override.clone();
+    let mut acting = loaded;
+    assert_eq!(
+        resolve_manual_override(&mut acting, now + Duration::hours(2)),
+        ManualOverrideResolution::ExpiredOrAbsent
+    );
+
+    // The CLI replaces the expired pin while the act cycle is still in flight.
+    with_state_lock(&path, || {
+        let mut disk = claude_governor::state::load_state(&path).unwrap();
+        disk.manual_override = Some(cli_override(1, 0, now + Duration::minutes(1)));
+        save_state(&disk, &path)
+    })
+    .unwrap();
+
+    with_state_lock(&path, || {
+        let mut disk = claude_governor::state::load_state(&path).unwrap();
+        merge_act_owned(
+            &mut disk,
+            &acting,
+            &SafeModeState::default(),
+            &manual_override_at_load,
+        );
+        save_state(&disk, &path)
+    })
+    .unwrap();
+
+    let after = claude_governor::state::load_state(&path).unwrap();
+    assert_eq!(
+        after.manual_override.as_ref().map(|ov| ov.target),
+        Some(1),
+        "a newer CLI pin must win over an older act expiry-clear"
+    );
+    assert_eq!(after.manual_override.unwrap().expires_at, None);
 }

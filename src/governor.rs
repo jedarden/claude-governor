@@ -5027,8 +5027,55 @@ pub fn apply_scaling(
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
 ) -> ScalingDecision {
+    apply_scaling_with_policy(
+        target,
+        current,
+        hysteresis_band,
+        max_up_per_cycle,
+        max_down_per_cycle,
+        true,
+        false,
+    )
+}
+
+/// Apply a stored manual override's target.
+///
+/// A deliberate operator pin bypasses the normal scale-down hysteresis, but it
+/// still respects the configured per-cycle rate cap. `target == 0` here is a
+/// manual scale-down, not the emergency brake; the brake is selected by the
+/// caller when a usage window actually crosses the emergency threshold.
+fn apply_manual_override_scaling(
+    target: u32,
+    current: u32,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+) -> ScalingDecision {
+    apply_scaling_with_policy(
+        target,
+        current,
+        0.0,
+        max_up_per_cycle,
+        max_down_per_cycle,
+        false,
+        true,
+    )
+}
+
+/// Shared scaling-decision implementation. `emergency_brake_zero` keeps the
+/// historical `apply_scaling(0, current, ...)` contract for the computed
+/// target path; manual target zero deliberately opts out so it is not
+/// mislabelled as an emergency event.
+fn apply_scaling_with_policy(
+    target: u32,
+    current: u32,
+    hysteresis_band: f64,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+    emergency_brake_zero: bool,
+    bypass_scale_down_hysteresis: bool,
+) -> ScalingDecision {
     // Emergency brake: target is 0
-    if target == 0 && current > 0 {
+    if emergency_brake_zero && target == 0 && current > 0 {
         log::warn!("[governor] EMERGENCY: scaling {} -> 0 workers", current);
         return ScalingDecision::EmergencyBrake;
     }
@@ -5045,7 +5092,7 @@ pub fn apply_scaling(
 
         // The band applies here and only here: a target within the band below
         // current holds, so forecast noise cannot shed workers.
-        if delta.abs() <= hysteresis {
+        if !bypass_scale_down_hysteresis && delta.abs() <= hysteresis {
             log::debug!(
                 "[governor] hysteresis: target {} is within {:.1} below current {}, no change",
                 target,
@@ -6884,8 +6931,11 @@ pub fn run_act_cycle(
         }
     };
 
-    // 4. Compute target workers
-    let target = compute_target_workers(
+    // 4. Compute the normal target first. A manual override is resolved after
+    // this function so it remains a true act-cycle precedence rule: forecast
+    // computation, including its emergency-brake check, is never taught about
+    // operator state.
+    let computed_target = compute_target_workers(
         &state,
         binding_effective_ceiling,
         effective_composite_risk,
@@ -6893,7 +6943,7 @@ pub fn run_act_cycle(
     );
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%{})",
-        target,
+        computed_target,
         binding_effective_ceiling,
         if state.safe_mode.active {
             ", safe_mode"
@@ -6902,38 +6952,76 @@ pub fn run_act_cycle(
         }
     );
 
-    // 4b. Underutilization sprint: burn spare use-or-lose capacity by boosting a
-    // subscription generator toward its max when a window is under-used and resets
-    // soon — but only while it has queued generation work, so the boost is productive.
-    let pre_sprint_target = target;
-    let target = apply_underutilization_sprint(&state, &pricing_config.sprint, agents, target, now);
-    // A boost that actually moved the target is decision-log context: the resulting
-    // scale-up was driven by underutilization, not by cutoff risk.
-    let sprint_boosted = target > pre_sprint_target;
+    // Resolve the persistent pin before applying any computed-target boosts.
+    // An active manual total is authoritative: the sprint and pre-scale paths
+    // must not move it. A brake suspension is also authoritative, but its
+    // target is zero and its stored pin remains available for resumption.
+    let manual_resolution = resolve_manual_override(&mut state, now);
+    let manual_override_applied =
+        matches!(&manual_resolution, ManualOverrideResolution::Applied { .. });
+    let brake_suspended = matches!(
+        &manual_resolution,
+        ManualOverrideResolution::SuspendedByBrake
+    );
+
+    // Underutilization sprint only modifies a computed target. In particular,
+    // never let a sprint resurrect a fleet that an emergency brake has forced
+    // to zero.
+    let (target, sprint_boosted) = match manual_resolution {
+        ManualOverrideResolution::Applied { applied_target } => (applied_target, false),
+        ManualOverrideResolution::SuspendedByBrake => (0, false),
+        ManualOverrideResolution::ExpiredOrAbsent
+            if first_brake_window(&state.capacity_forecast).is_some() =>
+        {
+            (computed_target, false)
+        }
+        ManualOverrideResolution::ExpiredOrAbsent => {
+            let boosted = apply_underutilization_sprint(
+                &state,
+                &pricing_config.sprint,
+                agents,
+                computed_target,
+                now,
+            );
+            (boosted, boosted > computed_target)
+        }
+    };
 
     // 4a. Pre-scale check: look for upcoming peak/off-peak transitions
     //
     // Conservative-only: pre-scale DOWN before losing multiplier bonus,
     // never pre-scale UP before gaining bonus.
-    let pre_scale = state
-        .usage
-        .sonnet_resets_at
-        .parse::<DateTime<Utc>>()
-        .ok()
-        .and_then(|reset_time| {
-            compute_pre_scale_target(
-                now,
-                pre_scale_minutes,
-                promotions,
-                reset_time,
-                target,
-                current_total,
-                "weekly_scoped",
-            )
-        });
+    let pre_scale = if manual_override_applied || brake_suspended {
+        None
+    } else {
+        state
+            .usage
+            .sonnet_resets_at
+            .parse::<DateTime<Utc>>()
+            .ok()
+            .and_then(|reset_time| {
+                compute_pre_scale_target(
+                    now,
+                    pre_scale_minutes,
+                    promotions,
+                    reset_time,
+                    target,
+                    current_total,
+                    "weekly_scoped",
+                )
+            })
+    };
 
     // Use pre-scale target if set, otherwise use normal target
     let effective_target = pre_scale.unwrap_or(target);
+    let emergency_brake_active = first_brake_window(&state.capacity_forecast).is_some();
+    let decision_source = if manual_override_applied {
+        "manual_override"
+    } else if brake_suspended || emergency_brake_active {
+        "emergency_brake"
+    } else {
+        "computed_target"
+    };
 
     // 5. Apply scaling decision
     //
@@ -6952,13 +7040,17 @@ pub fn run_act_cycle(
     } else {
         (max_up_per_cycle, max_down_per_cycle)
     };
-    let decision = apply_scaling(
-        effective_target,
-        current_total,
-        effective_hysteresis,
-        eff_max_up,
-        eff_max_down,
-    );
+    let decision = if manual_override_applied {
+        apply_manual_override_scaling(effective_target, current_total, eff_max_up, eff_max_down)
+    } else {
+        apply_scaling(
+            effective_target,
+            current_total,
+            effective_hysteresis,
+            eff_max_up,
+            eff_max_down,
+        )
+    };
 
     // 6. Execute scaling (unless dry-run or no change)
     //
@@ -7212,7 +7304,7 @@ pub fn run_act_cycle(
     // ("wanted 3, stayed at 1") — and carries the band in `context`.
     let wanted_delta = effective_target as i64 - current_total as i64;
     let at_target_hold = matches!(decision, ScalingDecision::NoChange) && wanted_delta == 0;
-    if !at_target_hold {
+    if !at_target_hold || manual_override_applied {
         let action = match &decision {
             ScalingDecision::NoChange => crate::narrator::ScaleAction::Hold,
             ScalingDecision::ScaleUp(_) => crate::narrator::ScaleAction::ScaleUp,
@@ -7229,12 +7321,24 @@ pub fn run_act_cycle(
             // A NoChange hold is only ever recorded when a wanted change was
             // suppressed, and only scale-down is suppressible now — so the
             // hold names the scale-down band specifically.
+            ScalingDecision::NoChange if manual_override_applied => format!(
+                "manual override target {} equals current {}",
+                effective_target, current_total
+            ),
             ScalingDecision::NoChange => format!(
                 "hysteresis: target {} within the {:.0}-worker scale-down band of current {}",
                 effective_target, effective_hysteresis, current_total
             ),
+            ScalingDecision::ScaleUp(_) if manual_override_applied => format!(
+                "manual override target {} > current {}",
+                effective_target, current_total
+            ),
             ScalingDecision::ScaleUp(_) => format!(
                 "target {} > current {} (deficits are never band-damped)",
+                effective_target, current_total
+            ),
+            ScalingDecision::ScaleDown(_) if manual_override_applied => format!(
+                "manual override target {} < current {} (hysteresis bypassed)",
                 effective_target, current_total
             ),
             ScalingDecision::ScaleDown(_) => format!(
@@ -7262,7 +7366,10 @@ pub fn run_act_cycle(
         // line up with the cycle's own log lines.
         entry.ts = now;
         entry.context = Some(serde_json::json!({
-            "computed_target": effective_target,
+            "decision_source": decision_source,
+            "computed_target": computed_target,
+            "effective_target": effective_target,
+            "manual_override_target": state.manual_override.as_ref().map(|ov| ov.target),
             "wanted_delta": wanted_delta,
             "hysteresis_band": effective_hysteresis,
             "max_up_per_cycle": eff_max_up,

@@ -1,7 +1,7 @@
 //! Test for safe mode stdout notification verification
 //!
-//! This test verifies that the stdout notification about safe mode reasserting
-//! appears correctly after a manual scale during safe mode.
+//! This test verifies that the stdout notification about safe mode and the
+//! emergency brake appears correctly after a manual scale during safe mode.
 
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -118,11 +118,11 @@ fn simulate_scale_command_with_stdout(state_path: &PathBuf, target_count: u32) -
         )
         .unwrap();
 
-        // Warn user that safe mode will reassert on next cycle
+        // Safe mode alone does not suspend a persistent manual override.
         if safe_mode_was_active {
             writeln!(
                 captured_stdout,
-                "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+                "NOTE: Safe mode remains active; this override applies unless the emergency brake engages"
             )
             .unwrap();
         }
@@ -159,12 +159,12 @@ fn test_scale_safe_mode_stdout_notification() {
         stdout_output
     );
 
-    // 3. Verify the safe mode reassertion notification appears
+    // 3. Verify the safe-mode/pin interaction notification appears
     assert!(
         stdout_output.contains(
-            "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+            "NOTE: Safe mode remains active; this override applies unless the emergency brake engages"
         ),
-        "Stdout should contain notification that safe mode will reassert. Got: {}",
+        "Stdout should explain that safe mode alone does not suspend the pin. Got: {}",
         stdout_output
     );
 
@@ -205,10 +205,10 @@ fn test_scale_without_safe_mode_no_stdout_notification() {
         stdout_output
     );
 
-    // 3. Verify the safe mode reassertion notification does NOT appear
+    // 3. Verify the safe-mode/pin interaction notification does NOT appear
     assert!(
-        !stdout_output.contains("NOTE: Safe mode remains active and will reassert its target on the next cycle"),
-        "Stdout should NOT contain safe mode reassertion notification when safe mode is inactive. Got: {}",
+        !stdout_output.contains("NOTE: Safe mode remains active; this override applies unless the emergency brake engages"),
+        "Stdout should NOT contain safe-mode notification when safe mode is inactive. Got: {}",
         stdout_output
     );
 
@@ -284,7 +284,7 @@ fn test_scale_safe_mode_notification_order_and_completeness() {
     );
     assert!(
         lines[n].contains(
-            "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+            "NOTE: Safe mode remains active; this override applies unless the emergency brake engages"
         ),
         "Notification should have the exact expected format at line {}",
         lines[n]
@@ -306,7 +306,7 @@ fn test_scale_safe_mode_notification_multiple_scales() {
         // Verify notification appears for each scale operation
         assert!(
             stdout_output.contains(
-                "NOTE: Safe mode remains active and will reassert its target on the next cycle"
+                "NOTE: Safe mode remains active; this override applies unless the emergency brake engages"
             ),
             "Safe mode notification should appear for scale to {}. Output: {}",
             count,
@@ -342,7 +342,7 @@ fn test_scale_safe_mode_notification_content_accuracy() {
 
     // Verify exact text match (case-sensitive, no typos)
     let expected_text =
-        "NOTE: Safe mode remains active and will reassert its target on the next cycle";
+        "NOTE: Safe mode remains active; this override applies unless the emergency brake engages";
     assert_eq!(
         notification_line.trim(),
         expected_text,

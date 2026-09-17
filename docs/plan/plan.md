@@ -1298,7 +1298,11 @@ Workers:  2 active  (target: 2 · safe ceiling: 2)  ⚠ SAFE MODE (prediction ac
 
 **Interaction with confidence cone (Component 21):** While safe mode is active, the governor always acts on the p75 (worst-case) estimate regardless of cone width. This is the most conservative posture.
 
-**Manual override:** `cgov scale N` overrides the safe-mode-adjusted target for one cycle but logs `[governor] WARN: manual scale override during safe mode`. Safe mode remains active and will reassert its target on the next cycle unless overridden again.
+**Manual override:** `cgov scale N` persists a fleet pin with a TTL (or until
+`--clear` for `--ttl 0`) and logs `[governor] WARN: manual scale override
+during safe mode`. Safe mode remains active but does not suspend the pin; an
+engaged emergency brake still wins and the stored pin resumes after the brake
+clears.
 
 **`predictions_since_entry` semantics:** Incremented once per window reset event (regardless of how many windows reset at the same time). Three distinct reset events must occur before safe mode can exit, ensuring enough fresh data to judge whether accuracy has genuinely recovered.
 

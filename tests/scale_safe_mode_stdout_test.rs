@@ -1,13 +1,12 @@
 //! Integration test for the safe-mode stdout notification emitted by `cgov scale`.
 //!
 //! When an operator pins the fleet with a manual scale override while the governor is in
-//! safe mode, the write still succeeds. Today the computed target rules the next cycle
-//! regardless (the override does not yet enter `run_act_cycle`), and under the documented
-//! contract it is an engaged emergency brake — never safe mode alone — that suspends a
+//! safe mode, the write still succeeds. Under the documented contract it is an engaged
+//! emergency brake — never safe mode alone — that suspends a
 //! stored pin. The operator is warned on stdout either way:
 //!
 //! ```text
-//! NOTE: Safe mode remains active and will reassert its target on the next cycle
+//! NOTE: Safe mode remains active; this override applies unless the emergency brake engages
 //! ```
 //!
 //! These tests exercise the real `cgov` binary end-to-end and capture its actual stdout,
@@ -23,13 +22,13 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use claude_governor::state::{self, GovernorState, WorkerState};
+use claude_governor::state::{self, GovernorState, ManualOverride, WorkerState};
 use tempfile::TempDir;
 
 /// The exact notification text under test. Kept as a constant so the assertions and the
 /// failure messages can never drift apart.
 const SAFE_MODE_NOTICE: &str =
-    "NOTE: Safe mode remains active and will reassert its target on the next cycle";
+    "NOTE: Safe mode remains active; this override applies unless the emergency brake engages";
 
 /// The exact log line written to `governor.log` when a manual scale happens in safe mode.
 /// This is the operator's audit trail; it is deliberately *not* printed to stdout.
@@ -200,6 +199,31 @@ fn scale_without_safe_mode_prints_no_notification() {
     );
 }
 
+#[test]
+fn scale_clear_removes_the_persistent_pin() {
+    let mut state = make_state(false);
+    state.manual_override = Some(ManualOverride {
+        target: 4,
+        set_at: chrono::Utc::now(),
+        expires_at: None,
+        source: "cli".to_string(),
+    });
+
+    let (temp, output) = run_cgov(&state, &["scale", "--clear"]);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("Manual override cleared (target 4"),
+        "clear should report the removed pin, got:\n{stdout}"
+    );
+    assert!(
+        state::load_state(&state_path_in(temp.path()))
+            .unwrap()
+            .manual_override
+            .is_none(),
+        "clear must remove the persistent pin from state"
+    );
+}
+
 /// The log half of the pair: a manual scale in safe mode must leave an audit line in
 /// `governor.log`, timestamped, and must *not* leak that line onto stdout.
 ///
@@ -263,16 +287,12 @@ fn scale_without_safe_mode_writes_no_warning_to_log_file() {
     );
 }
 
-/// The notification promises the governor "will reassert its target on the next cycle".
-/// This test pins the mechanism that makes that promise true.
-///
-/// `compute_target_workers` derives the next target from each worker's `min`/`max`/`current`
-/// and the capacity forecast — it never reads `worker.target`. So a manually scaled target is
-/// not an input to the next cycle and gets recomputed away. Asserting the invariant (the
-/// manual target has *no* influence) rather than a specific number keeps this test meaningful
-/// without pinning it to whatever the forecast heuristics currently return.
+/// `compute_target_workers` derives a computed target from each worker's
+/// `min`/`max`/`current` and the capacity forecast — it never reads the
+/// per-agent `worker.target` field. The persistent fleet pin is applied later
+/// by `run_act_cycle`, so this pure computation remains independent of it.
 #[test]
-fn manual_scale_target_does_not_influence_next_cycle_target() {
+fn per_agent_target_field_does_not_influence_computed_target() {
     use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
     use claude_governor::governor::compute_target_workers;
 
@@ -292,8 +312,8 @@ fn manual_scale_target_does_not_influence_next_cycle_target() {
 
     assert_eq!(
         target_untouched, target_after_scale,
-        "the manual scale target leaked into the next cycle's computation; safe mode would \
-         not reassert as the notification claims"
+        "a per-agent target leaked into the computed-target function; override precedence \
+         belongs to the act-cycle seam"
     );
 }
 
@@ -336,17 +356,17 @@ fn make_state_with_forecast(manual_target: u32) -> GovernorState {
 /// through *or* by the "hold at current" fallback.
 const FORECAST_DERIVED_TARGET: u32 = 3;
 
-/// Stronger form of the test above: safe mode reasserts a *forecast-derived* target, and the
-/// manual scale is discarded no matter how large it was.
+/// Stronger form of the test above: the computed-target function returns a
+/// forecast-derived target regardless of stale per-agent target fields.
 ///
 /// The preceding test builds its state from `make_state`, whose `capacity_forecast` is empty.
 /// With no forecast, `compute_target_workers` short-circuits to "hold at current" — so that
-/// test never exercises the forecast-driven branch that does the actual reasserting, and it
-/// only ever compares two runs against each other. Here the binding window is populated, so
+/// test never exercises the forecast-driven branch and only compares two runs against each
+/// other. Here the binding window is populated, so
 /// the recomputed target is pinned to a concrete third value that neither the manual target
 /// nor the hold-at-current fallback could produce.
 #[test]
-fn safe_mode_reasserts_forecast_derived_target_over_manual_scale() {
+fn computed_target_uses_forecast_not_stale_per_agent_target() {
     use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
     use claude_governor::governor::compute_target_workers;
 
@@ -365,8 +385,8 @@ fn safe_mode_reasserts_forecast_derived_target_over_manual_scale() {
 
         assert_eq!(
             target, FORECAST_DERIVED_TARGET,
-            "after a manual scale to {manual_target}, the next cycle should reassert the \
-             forecast-derived target {FORECAST_DERIVED_TARGET}, but computed {target}"
+            "a stale per-agent target {manual_target} must not replace the forecast-derived \
+             target {FORECAST_DERIVED_TARGET}, but computed {target}"
         );
     }
 }
