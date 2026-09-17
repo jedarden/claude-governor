@@ -688,6 +688,101 @@ pub struct ModelPricing {
     pub cache_read_per_mtok: f64,
 }
 
+/// Case-insensitive substrings that mark a config reference as pointing at a
+/// component retired on 2026-09-16 — the standalone polish queue, its timer
+/// and seeder, and the subscription generator pool (see the "Retired
+/// 2026-09-16" note in CLAUDE.md). Every retired identifier that existed in
+/// practice (`polish-opus`, `cgov-polish-queue`, `claude-polish-seeder`,
+/// `cgov-polish`) contains `polish`; the `generator-pool` spellings cover the
+/// pool concept under its other name. NEEDLE's native Weave/Explore strands
+/// replaced the retired queue.
+pub const RETIRED_REFERENCE_MARKERS: [&str; 3] = ["polish", "generator-pool", "generator_pool"];
+
+/// Collect one human-readable description per reference to a retired
+/// component in a parsed governor.yaml. Empty means the config is clean.
+///
+/// Deliberately operates on the raw YAML document, not the typed
+/// [`GovernorConfig`]: retired keys are unknown to the struct, so serde
+/// silently drops them — which is exactly how a stale `polish-opus` pool or
+/// `polish_queue:` block could survive the retirement unnoticed. Top-level
+/// key names, agent (pool) names, and each agent's `launch_cmd`,
+/// `session_pattern`, and `heartbeat_dir` are scanned; `launch_cmd` is where
+/// a retired workspace or unit name actually appears, the other two are
+/// scanned because they echo it.
+pub fn find_retired_references(raw: &serde_yaml::Value) -> Vec<String> {
+    let mut violations = Vec::new();
+    let Some(map) = raw.as_mapping() else {
+        return violations;
+    };
+
+    for key in map.keys() {
+        let Some(key) = key.as_str() else { continue };
+        let key_lower = key.to_lowercase();
+        for marker in RETIRED_REFERENCE_MARKERS {
+            if key_lower.contains(marker) {
+                violations.push(format!(
+                    "top-level key `{key}` names a component retired 2026-09-16 (matched \"{marker}\"); cgov does not read this key"
+                ));
+                break;
+            }
+        }
+    }
+
+    let Some(agents) = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("agents"))
+        .and_then(|(_, v)| v.as_mapping())
+    else {
+        return violations;
+    };
+    for (agent_key, agent_value) in agents {
+        let Some(agent_name) = agent_key.as_str() else {
+            continue;
+        };
+        let name_lower = agent_name.to_lowercase();
+        for marker in RETIRED_REFERENCE_MARKERS {
+            if name_lower.contains(marker) {
+                violations.push(format!(
+                    "agents: pool `{agent_name}` is named after a component retired 2026-09-16 (matched \"{marker}\")"
+                ));
+                break;
+            }
+        }
+        for field in ["launch_cmd", "session_pattern", "heartbeat_dir"] {
+            let Some(field_value) = agent_value.get(field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let field_lower = field_value.to_lowercase();
+            for marker in RETIRED_REFERENCE_MARKERS {
+                if field_lower.contains(marker) {
+                    violations.push(format!(
+                        "agents: pool `{agent_name}` field `{field}` references a component retired 2026-09-16 (matched \"{marker}\"): {field_value}"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    violations
+}
+
+/// Reject a config that references retired components. Called from
+/// [`GovernorConfig::load_from_path`] so the daemon and every config-loading
+/// CLI command fail fast on a retired pool, and from `cgov doctor`'s
+/// `retired_component_refs` check, which surfaces the same violation with
+/// remediation text.
+fn reject_retired_references(raw: &serde_yaml::Value) -> Result<()> {
+    let violations = find_retired_references(raw);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config references components retired on 2026-09-16 (the standalone polish queue, its timer and seeder, and the subscription generator pool):\n  - {}\nRemove the retired entries from governor.yaml. NEEDLE's native Weave/Explore strands replaced the retired queue — do not recreate it (see CLAUDE.md, \"Retired 2026-09-16\").",
+        violations.join("\n  - ")
+    )
+}
+
 impl GovernorConfig {
     /// Load configuration from the default path
     ///
@@ -711,12 +806,26 @@ impl GovernorConfig {
     }
 
     /// Load configuration from a specific path
+    ///
+    /// Fails on a config that references components retired on 2026-09-16
+    /// (see [`RETIRED_REFERENCE_MARKERS`]) — the prohibition is enforced here,
+    /// not left to documentation.
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let config: GovernorConfig = serde_yaml::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        Self::parse_and_validate(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
+    /// Parse a config document, rejecting retired-component references before
+    /// the typed parse. Split out from [`Self::load_from_path`] so tests and
+    /// the doctor check can exercise the exact startup validation.
+    pub fn parse_and_validate(contents: &str) -> Result<Self> {
+        let raw: serde_yaml::Value = serde_yaml::from_str(contents)?;
+        reject_retired_references(&raw)?;
+
+        let config: GovernorConfig = serde_yaml::from_str(contents)?;
 
         Ok(config)
     }
@@ -1382,5 +1491,243 @@ daemon:
         let config = AlertConfig::default();
         assert_eq!(config.close_command[0], "bf");
         assert_eq!(config.update_command[0], "bf");
+    }
+
+    // -----------------------------------------------------------------------
+    // Retired-component references (2026-09-16 polish-queue retirement)
+    //
+    // The "must not be configured" rule for retired pools is enforced by the
+    // binary via `GovernorConfig::load_from_path`, not remembered by agents.
+    // These tests pin the guard: every reference class the retirement could
+    // leave behind — an unknown top-level key serde would silently drop, a
+    // pool named after a retired component, a launch command still pointing
+    // at the retired workspace — must be rejected, with all violations named
+    // in one error, and matching must not depend on case.
+    // -----------------------------------------------------------------------
+
+    fn retired_ref_violations(yaml: &str) -> Vec<String> {
+        let raw: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        find_retired_references(&raw)
+    }
+
+    /// The shipped config template must itself always pass the guard, or
+    /// `create_default_config` would write a config the loader then refuses.
+    #[test]
+    fn test_retired_reference_default_template_is_clean() {
+        let violations = retired_ref_violations(include_str!("../config/governor.yaml"));
+        assert!(
+            violations.is_empty(),
+            "shipped config template must not reference retired components: {violations:?}"
+        );
+    }
+
+    /// A retired top-level key is unknown to the struct, so serde drops it
+    /// silently — the guard is what makes it an error instead.
+    #[test]
+    fn test_retired_reference_top_level_key_rejected() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+polish_queue:
+  workspace: /home/coding/cgov-polish-queue
+"#,
+        );
+        assert_eq!(
+            violations.len(),
+            1,
+            "one key, one violation: {violations:?}"
+        );
+        assert!(violations[0].contains("polish_queue"), "{violations:?}");
+        assert!(violations[0].contains("top-level key"), "{violations:?}");
+    }
+
+    #[test]
+    fn test_retired_reference_pool_name_rejected() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+agents:
+  polish-opus:
+    launch_cmd: "needle run --agent claude-print-opus"
+    session_pattern: "needle-claude-print-opus-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("polish-opus"), "{violations:?}");
+    }
+
+    /// A pool with an innocuous name whose launch configuration still points
+    /// at the retired workspace must be caught too — the launch_cmd is the
+    /// load-bearing reference.
+    #[test]
+    fn test_retired_reference_in_launch_cmd_rejected() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+agents:
+  legacy-pool:
+    launch_cmd: "env NEEDLE_STRANDS__EXPLORE__ENABLED=false needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "needle-claude-print-opus-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("launch_cmd"),
+            "violation must name the offending field: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("cgov-polish-queue"),
+            "{violations:?}"
+        );
+    }
+
+    /// All violation classes in one config are reported together — an
+    /// operator pruning a stale config should not discover them one restart
+    /// at a time.
+    #[test]
+    fn test_retired_reference_all_violations_reported() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+polish:
+  enabled: true
+agents:
+  polish-opus:
+    launch_cmd: "needle run --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "polish-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#,
+        );
+        assert!(
+            violations.len() >= 3,
+            "expected key + name + fields, got: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("top-level key")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn test_retired_reference_matching_is_case_insensitive() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+agents:
+  POLISH-OPUS:
+    launch_cmd: "needle run --workspace /home/coding/CGOV-POLISH-QUEUE"
+    session_pattern: "needle-claude-print-opus-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#,
+        );
+        assert!(violations.len() >= 2, "{violations:?}");
+    }
+
+    /// Marker spelling for the pool concept under its other name.
+    #[test]
+    fn test_retired_reference_generator_pool_marker() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+generator_pool:
+  max_workers: 4
+"#,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    /// Substring matching is the deliberate trade-off: a pool whose name
+    /// merely contains a marker (e.g. `english-polish-helper`) is rejected
+    /// too and must be renamed rather than special-cased — the guard has no
+    /// allowlist that could be talked into re-approving a retired pool. Real
+    /// pool names produce no violations.
+    #[test]
+    fn test_retired_reference_marker_is_substring_match() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  english-polish-helper:
+    launch_cmd: "echo not-a-retired-component"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#;
+        let violations = retired_ref_violations(yaml);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+
+        let clean = r#"
+pricing:
+  models: {}
+agents:
+  needle-sonnet:
+    launch_cmd: "needle run --agent claude-anthropic-sonnet --identifier cgov-sonnet-{id}"
+    session_pattern: "needle-claude-anthropic-sonnet-cgov-sonnet-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#;
+        assert!(retired_ref_violations(clean).is_empty());
+
+        let config = GovernorConfig::parse_and_validate(clean).unwrap();
+        assert_eq!(config.agents.len(), 1);
+    }
+
+    /// End to end through the startup path: a retired pool makes
+    /// `parse_and_validate` fail with an error that names the retirement and
+    /// the remediation, whatever the typed parse would have said.
+    #[test]
+    fn test_parse_and_validate_rejects_retired_pool() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  polish-opus:
+    launch_cmd: "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "needle-claude-print-opus-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#;
+        let err = GovernorConfig::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("retired on 2026-09-16"), "{msg}");
+        assert!(msg.contains("polish-opus"), "{msg}");
+        assert!(msg.contains("Remove the retired entries"), "{msg}");
+    }
+
+    /// End to end through the file-loading entry the daemon and every
+    /// config-reading CLI command share: a retired pool on disk must fail
+    /// `load_from_path`, with the config path named so the operator knows
+    /// which file to fix.
+    #[test]
+    fn test_load_from_path_rejects_retired_pool_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governor.yaml");
+        std::fs::write(
+            &path,
+            r#"
+pricing:
+  models: {}
+agents:
+  polish-opus:
+    launch_cmd: "needle run --workspace /home/coding/cgov-polish-queue"
+    session_pattern: "polish-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#,
+        )
+        .unwrap();
+
+        let err = GovernorConfig::load_from_path(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the config file: {msg}"
+        );
+        assert!(msg.contains("retired on 2026-09-16"), "{msg}");
+        assert!(msg.contains("polish-opus"), "{msg}");
     }
 }

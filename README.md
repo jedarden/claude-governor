@@ -216,6 +216,10 @@ pricing:
     cache_read_per_mtok: 0.3
 ```
 
+Configuration is validated before the governor starts. Retired component keys
+and pool references are rejected instead of being silently ignored; `cgov
+doctor` reports the same condition as a failed check.
+
 ## Usage
 
 ```bash

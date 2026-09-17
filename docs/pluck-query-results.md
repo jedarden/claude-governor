@@ -50,7 +50,7 @@ The `--ready` predicate is evaluated by bead-rs before Pluck receives any
 records. It requires an open, unassigned, non-manually-blocked issue with no
 unfinished `blocks` dependency. Results are ordered deterministically by
 `priority ASC`, `created_at ASC`, and `id ASC`. Labels are not an inclusion
-filter: Pluck configures no required labels, and a label such as `polish` or
+filter: Pluck configures no required labels, and a label such as `rust` or
 `documentation` does not make a bead ready by itself.
 
 After parsing the JSONL, Pluck removes records with an excluded label and
@@ -83,8 +83,8 @@ candidates.
 
 ## Overview
 
-Pluck query results are the foundation of NEEDLE's bead claiming system, cgov's
-capacity calculations, and the polish loop's generation pipeline. The
+Pluck query results are the foundation of NEEDLE's bead claiming system and
+cgov's capacity calculations. The
 historical material that follows describes the older `br`/bead-forge model;
 use the current contract above for bead-rs output.
 
@@ -163,7 +163,6 @@ WHERE i.status = 'open'                    -- Must be open
 **Used by:**
 - `bf ready` — CLI command to list claimable beads
 - NEEDLE workers claiming work
-- The polish loop checking queue depth
 
 ### 2. The "Open Beads" Query
 
@@ -231,13 +230,13 @@ Find beads with specific labels (inclusive filtering):
 SELECT DISTINCT i.id, i.title, i.status
 FROM issues i
 JOIN labels l ON l.issue_id = i.id
-WHERE l.label = 'polish'
+WHERE l.label = 'documentation'
   AND i.status = 'open';
 ```
 
 **Used by:**
-- `bf list --labels polish,rust` — Targeted filtering
-- Cohort analysis (all polish beads)
+- `bf list --labels documentation,rust` — Targeted filtering
+- Cohort analysis (all documentation beads)
 - Label-based workload segmentation
 
 ---
@@ -281,7 +280,7 @@ $ br ready
 # Open beads in workspace: claude-governor
 bf-11rt2  Document Pluck query results                task  high 2026-08-03
 bf-10abc  Fix cgov null handling in poller            bug    med 2026-08-02
-bf-9xyz  Implement polish queue seeder              feature  low 2026-08-01
+bf-9xyz  Improve documentation coverage             feature  low 2026-08-01
 ```
 
 #### 2. JSON
@@ -423,25 +422,13 @@ The cgov daemon uses query results to check if a pool has real work before scali
 
 ```bash
 # In governor.rs (simplified)
-ready_count = bf ready --workspace /home/coding/cgov-polish-queue | wc -l
+ready_count = bf ready --workspace /home/coding/<pool-workspace> | wc -l
 if ready_count > running_workers {
     boost_subscription_workers()  # Only boost if real backlog exists
 }
 ```
 
-### 3. Polish Queue Seeder
-
-The seeder script checks query results before creating new meta-beads:
-
-```bash
-# Only seed if backlog is low
-ready_count=$(bf ready --workspace /home/coding/claude-governor | wc -l)
-if [ $ready_count -lt $LOW_WATER ]; then
-    bf create "Polish-gen: claude-governor" ...
-fi
-```
-
-### 4. Interactive Development
+### 3. Interactive Development
 
 Developers use query results for planning and debugging:
 
@@ -523,7 +510,7 @@ cargo test pluck_db_test -- --nocapture
 ### Edge Cases in Query Logic
 
 1. **Beads with both included and excluded labels**
-   - Example: A bead labeled `polish` AND `deferred`
+   - Example: A bead labeled `documentation` AND `deferred`
    - Result: Excluded (exclusion takes precedence)
    - SQL: `NOT EXISTS` clause filters it out before label inclusion
 
@@ -677,7 +664,7 @@ Pluck query results are the foundation of the entire NEEDLE/cgov workflow:
 4. **Result formats** — Human-readable, JSON, JSONL, compact
 5. **Performance** — Indexed on `status`, `assignee`, `updated_at`, and label fields
 6. **Testing** — Comprehensive test coverage validates database integrity and query correctness
-7. **Integration** — Used by NEEDLE workers, cgov daemon, polish seeder, and interactive development
+7. **Integration** — Used by NEEDLE workers, cgov daemon, and interactive development
 
 The test suite in `tests/pluck_db_test.rs` validates that queries work correctly and return expected results, ensuring that the bead discovery system remains reliable as the codebase evolves.
 

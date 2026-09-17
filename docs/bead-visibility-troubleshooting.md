@@ -93,7 +93,7 @@ exclude_labels:
   - starvation-alert
 ```
 
-Labels such as `polish`, `documentation`, and `failure-count:3` are not
+Labels including `rust`, `documentation`, and `failure-count:3` are not
 excluded unless their exact values are added. Pluck has no configured required
 label list, so adding a positive label does not make a bead visible or ready.
 
@@ -176,7 +176,7 @@ Common mistakes:
 | Using a legacy bead-forge command or SQL as current evidence | The command may use a different backend or schema | Use `bead list --ready --json` |
 | Supplying `exclude_labels: []` to disable filtering | The built-in three-label fallback remains active | Configure the complete intended list; do not rely on an empty list as an escape hatch |
 | Writing `deferred*` or `failure-count:*` | No wildcard matching occurs | Use the exact label value |
-| Adding `polish` to a bead and expecting it to become ready | Pluck does not require positive labels | Check status, assignee, block, dependencies, and exclusions |
+| Adding `documentation` to a bead and expecting it to become ready | Pluck does not require positive labels | Check status, assignee, block, dependencies, and exclusions |
 | Running from a parent or sibling directory | A different `.beads` store is queried | Use an absolute `--workspace` and verify the resolved store |
 | Looking for an array in JSON output | JSONL has no top-level array | Pipe through `jq -s` |
 | Editing config while workers keep running | Existing workers continue using their startup config | Restart workers and verify the resolved configuration |
