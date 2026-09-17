@@ -53,7 +53,7 @@ bead list --ready --json --limit 999999 | jq -s 'length'
 bead list --status open --json --limit 999999 | jq -s 'length'
 ```
 
-There is no positive label requirement: `documentation` or `rust` does not
+There is no positive label requirement: `polish` or `documentation` does not
 make a bead ready.
 
 ## Five-minute starvation check

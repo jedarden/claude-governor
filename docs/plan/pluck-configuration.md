@@ -110,7 +110,7 @@ Therefore:
   those defaults should remain excluded;
 - the active four-label list is the effective list for this deployment.
 
-Labels such as `failure-count:N`, `cycling`, `rust`, or `documentation` are
+Labels such as `failure-count:N`, `cycling`, `polish`, or `documentation` are
 not excluded by Pluck unless an operator adds their exact names to
 `exclude_labels`. `failure-count:N` has separate split and ordering behavior,
 described below.
@@ -216,7 +216,7 @@ Labels and statuses are separate fields:
 | `failure-count:N` label | Not an exclusion label. It affects Pluck ordering and may trigger splitting. |
 
 There is no active Pluck filter that requires a bead to have a positive label
-such as `rust`, `documentation`, or `cycling`.
+such as `polish`, `rust`, or `documentation`.
 
 ## Ordering and failure-count behavior
 

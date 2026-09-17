@@ -178,10 +178,8 @@ treating configured agents as fungible.
 - **governor.rs `apply_underutilization_sprint`** — wires the previously **dead** sprint
   (`check_underutilization_sprint` was defined but never called in the cycle) into the
   daemon: when a window is under-used and resets soon and nothing is at cutoff risk,
-  cgov may boost an eligible subscription pool toward its maximum. A governor.yaml
-  that still names a retired pool or queue fails config validation at load
-  (`RETIRED_REFERENCE_MARKERS` in `src/config.rs`), so a sprint target can no longer
-  be a retired pool by construction.
+  cgov may boost an eligible subscription pool toward its maximum. Pools dedicated to
+  the retired polish queue must not be configured.
 
 ---
 

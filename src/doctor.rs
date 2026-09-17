@@ -1051,63 +1051,6 @@ fn check_config_parseable() -> CheckResult {
     }
 }
 
-/// Check for references to components retired 2026-09-16 (claudego-96e3b6a2):
-/// the standalone polish queue, its timer and seeder, and the subscription
-/// generator pool. `GovernorConfig::load_from_path` rejects these at startup;
-/// this check surfaces the same violation (with remediation) in doctor output
-/// — useful while a daemon is still running on a stale config, or when the
-/// config fails to parse for an unrelated reason and the loader error is
-/// already consumed by `config_parseable`.
-fn check_retired_component_refs_at(config_path: &std::path::Path) -> CheckResult {
-    if !config_path.exists() {
-        return CheckResult::warn(
-            "retired_component_refs",
-            format!("Config file not found: {}", config_path.display()),
-            "Run 'cgov init' to create default configuration",
-        );
-    }
-
-    let contents = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return CheckResult::warn(
-                "retired_component_refs",
-                format!("Could not read config: {}", e),
-                "Check file permissions on governor.yaml",
-            )
-        }
-    };
-
-    let raw: serde_yaml::Value = match serde_yaml::from_str(&contents) {
-        Ok(r) => r,
-        Err(e) => {
-            return CheckResult::warn(
-                "retired_component_refs",
-                format!("Config does not parse ({}); retired-reference scan skipped", e),
-                "Fix the YAML syntax error — the config_parseable check names it",
-            )
-        }
-    };
-
-    let violations = crate::config::find_retired_references(&raw);
-    if violations.is_empty() {
-        CheckResult::pass(
-            "retired_component_refs",
-            "No references to components retired 2026-09-16 (polish queue, seeder, generator pool)",
-        )
-    } else {
-        CheckResult::fail(
-            "retired_component_refs",
-            violations.join("; "),
-            "Remove the retired entries from governor.yaml — the daemon refuses to start on a config that names them (see CLAUDE.md, \"Retired 2026-09-16\")",
-        )
-    }
-}
-
-fn check_retired_component_refs() -> CheckResult {
-    check_retired_component_refs_at(&default_config_path())
-}
-
 /// Check tmux availability
 fn check_tmux_available() -> CheckResult {
     match Command::new("tmux").arg("-V").output() {
@@ -2233,7 +2176,6 @@ pub fn run_doctor_with_options(options: DoctorOptions) -> DoctorReport {
         check_collector_running(),
         check_burn_rate_samples(),
         check_config_parseable(),
-        check_retired_component_refs(),
         check_model_generation(),
         check_pricing_coverage(),
         check_promotion_dates(),
@@ -2308,73 +2250,6 @@ pub fn format_doctor_json(report: &DoctorReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- retired_component_refs -------------------------------------------------
-
-    #[test]
-    fn test_retired_component_refs_clean_config_passes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("governor.yaml");
-        std::fs::write(
-            &path,
-            r#"
-pricing:
-  models: {}
-agents:
-  needle-sonnet:
-    launch_cmd: "needle run --agent claude-anthropic-sonnet"
-    session_pattern: "needle-sonnet-*"
-    heartbeat_dir: "/tmp/heartbeats"
-"#,
-        )
-        .unwrap();
-
-        let result = check_retired_component_refs_at(&path);
-        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.message);
-    }
-
-    #[test]
-    fn test_retired_component_refs_fails_on_retired_pool() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("governor.yaml");
-        std::fs::write(
-            &path,
-            r#"
-pricing:
-  models: {}
-agents:
-  polish-opus:
-    launch_cmd: "needle run --workspace /home/coding/cgov-polish-queue"
-    session_pattern: "polish-*"
-    heartbeat_dir: "/tmp/heartbeats"
-"#,
-        )
-        .unwrap();
-
-        let result = check_retired_component_refs_at(&path);
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert!(
-            result.message.contains("polish-opus"),
-            "violation must name the pool: {:?}",
-            result.message
-        );
-        assert!(
-            result
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Remove the retired entries"),
-            "remediation must say what to do: {:?}",
-            result.remediation
-        );
-    }
-
-    #[test]
-    fn test_retired_component_refs_missing_config_warns() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = check_retired_component_refs_at(&tmp.path().join("absent.yaml"));
-        assert_eq!(result.status, CheckStatus::Warn, "{:?}", result.message);
-    }
 
     fn counts(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
         pairs.iter().map(|(m, n)| (m.to_string(), *n)).collect()
