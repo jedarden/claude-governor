@@ -85,13 +85,64 @@ install -m 0755 cgov-linux-amd64 ~/.local/bin/cgov
 
 ### Option 2: Build from source (Forgejo)
 
+Requires a current stable Rust toolchain (`rustup` is the easiest source); the
+clone needs Forgejo credentials. To build a known-good release instead of the
+tip of `main`, check out the tag first (`git checkout v0.1.1`).
+
 ```bash
 git clone https://git.ardenone.com/jedarden/claude-governor.git
 cd claude-governor
 cargo build --release
-cp target/release/cgov ~/.local/bin/
-chmod +x ~/.local/bin/cgov
+install -m 0755 target/release/cgov ~/.local/bin/cgov
 ```
+
+The install path is not a convention — **all three shipped systemd units exec
+`%h/.local/bin/cgov`** (`claude-governor-observe.service`,
+`claude-governor-act.service`, `claude-token-collector.service`). A binary left
+in `target/release/` or installed elsewhere (e.g. `~/.cargo/bin/cgov` via
+`cargo install --path .`) works as a CLI but starts nothing when the services
+run. Keep `~/.local/bin` on your `PATH`.
+
+Then initialize, configure, and start:
+
+```bash
+# 1. Initialize — seeds ~/.config/claude-governor/governor.yaml (shipped
+#    default), creates the log/state directories, installs the three systemd
+#    user units, and runs daemon-reload. --no-systemd skips the units
+#    (tmux mode); --force overwrites existing files.
+cgov init
+
+# 2. Configure — the seeded config ships pricing but no agents; add one
+#    `agents:` entry per subscription pool (see Configuration below).
+cgov config --edit
+
+# 3. Worker-dispatching installs only — install the claude-print NEEDLE
+#    adapters. Only the source tree carries deploy/; install.sh does not.
+#    The adapters invoke claude-print by absolute path and this script is
+#    what establishes and verifies that path. --skip-live runs the static
+#    env-scrub checks only (offline, or conserving subscription quota).
+./deploy/install-claude-print-adapters.sh
+
+# 4. Enable and start observe, act, and the token collector — via systemd
+#    user services, or tmux sessions where systemd user sessions are
+#    unavailable (systemd needs `loginctl enable-linger $USER` to keep the
+#    services alive after logout). Also (re)installs the units if step 1
+#    skipped them.
+cgov enable
+```
+
+Verify the build the same way as a release install:
+
+```bash
+cgov version            # version, build info, component status
+cgov doctor             # full health check; --skip-live for offline/quota-conserving
+cgov status             # capacity view (--watch to keep it open)
+cgov logs --follow      # or: journalctl --user -u claude-governor-observe -f
+```
+
+`cgov doctor`'s `claude_print_adapters` check runs the same verification as
+step 3 (static env-scrub check plus a live invocation of each template), so a
+dispatch-path failure the installer would catch surfaces there too.
 
 ### Installer smoke test
 
