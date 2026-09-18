@@ -1102,7 +1102,7 @@ fn check_retired_component_refs_at(config_path: &std::path::Path) -> CheckResult
         CheckResult::fail(
             "retired_component_refs",
             violations.join("; "),
-            "Remove the retired entries from governor.yaml — the daemon refuses to start on a config that names them (see CLAUDE.md, \"Retired 2026-09-16\")",
+            "Remove the retired entries from governor.yaml — the daemon refuses to start on a config that names them. NEEDLE's native Weave/Explore strands replaced the retired queue; do not recreate it (see CLAUDE.md, \"Retired 2026-09-16\")",
         )
     }
 }
@@ -2424,15 +2424,95 @@ agents:
             "violation must name the pool: {:?}",
             result.message
         );
+        assert_removal_only_remediation(&result);
+    }
+
+    #[test]
+    fn test_retired_component_refs_fails_on_generator_pool_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("governor.yaml");
+        std::fs::write(
+            &path,
+            r#"
+pricing:
+  models: {}
+agents:
+  claude-fable:
+    launch_cmd: "needle run --pool generator-pool-fable"
+    session_pattern: "fable-gen-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#,
+        )
+        .unwrap();
+
+        let result = check_retired_component_refs_at(&path);
+        assert_eq!(result.status, CheckStatus::Fail);
         assert!(
-            result
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Remove the retired entries"),
-            "remediation must say what to do: {:?}",
-            result.remediation
+            result.message.contains("generator-pool"),
+            "violation must name the retired marker: {:?}",
+            result.message
         );
+        assert_removal_only_remediation(&result);
+    }
+
+    #[test]
+    fn test_retired_component_refs_fails_on_top_level_polish_key() {
+        // A stale top-level `polish_queue:` block is invisible to the typed
+        // config (serde drops unknown keys), which is exactly how it survives
+        // the retirement unnoticed — the raw-YAML scan is what catches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("governor.yaml");
+        std::fs::write(
+            &path,
+            r#"
+pricing:
+  models: {}
+polish_queue:
+  dir: "/home/coding/cgov-polish-queue"
+agents:
+  needle-sonnet:
+    launch_cmd: "needle run --agent claude-sonnet"
+    session_pattern: "needle-sonnet-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#,
+        )
+        .unwrap();
+
+        let result = check_retired_component_refs_at(&path);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("polish_queue"),
+            "violation must name the stale key: {:?}",
+            result.message
+        );
+        assert_removal_only_remediation(&result);
+    }
+
+    /// The retirement is removal-only (CLAUDE.md, "Retired 2026-09-16"): the
+    /// remediation for a stale config must say to remove the entries and must
+    /// forbid recreating the queue, and must never route the operator toward
+    /// an install path — `cgov init` writes a fresh config, it does not fix a
+    /// stale one, and nothing may re-install a retired component.
+    fn assert_removal_only_remediation(result: &CheckResult) {
+        let remediation = result.remediation.as_deref().unwrap_or_default();
+        assert!(
+            remediation.contains("Remove the retired entries"),
+            "remediation must say what to do: {remediation:?}"
+        );
+        assert!(
+            remediation.contains("do not recreate"),
+            "remediation must forbid recreating the retired queue: {remediation:?}"
+        );
+        assert!(
+            remediation.contains("2026-09-16"),
+            "remediation must reference the retirement date: {remediation:?}"
+        );
+        for forbidden in ["cgov init", "install", "re-enable"] {
+            assert!(
+                !remediation.contains(forbidden),
+                "remediation must not suggest {forbidden:?}: {remediation:?}"
+            );
+        }
     }
 
     #[test]
