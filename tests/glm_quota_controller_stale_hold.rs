@@ -18,7 +18,17 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const SCRIPT: &str = "scripts/needle-glm-quota-controller";
+/// The controller under test, embedded at compile time so the test binary is
+/// self-contained. NEEDLE's close gate re-runs tests through the shared
+/// /build/target-workers dir, where a binary built in one extraction is
+/// reused in another; a runtime `env!("CARGO_MANIFEST_DIR")` lookup would
+/// then point at a long-deleted checkout and every test fails with
+/// "can't open file '/var/tmp/<deleted>/scripts/...'" (seen 2026-09-18:
+/// 0/5 passed through the gate while the same commit was green in-tree).
+/// Cargo tracks include_str! files as rebuild inputs, so a controller edit
+/// still triggers a fresh build.
+const SCRIPT_BODY: &str = include_str!("../scripts/needle-glm-quota-controller");
+const SCRIPT_NAME: &str = "needle-glm-quota-controller";
 
 const LOCAL_UNITS: &str = "fake-local-a.service,fake-local-b.service";
 const LAB_UNITS: &str = "lab-a.service,lab-b.service,lab-c.service";
@@ -29,6 +39,7 @@ struct Sandbox {
     dir: tempfile::TempDir,
     shim: PathBuf,
     log: PathBuf,
+    script: PathBuf,
 }
 
 impl Sandbox {
@@ -37,6 +48,11 @@ impl Sandbox {
         let shim = dir.path().join("shim");
         std::fs::create_dir(&shim).expect("shim dir");
         let log = dir.path().join("actions.log");
+
+        // The vendored controller itself, materialized from the compile-time
+        // copy (see SCRIPT_BODY) so no test depends on the source checkout.
+        let script = dir.path().join(SCRIPT_NAME);
+        write_shim(&script, SCRIPT_BODY);
 
         // `systemctl`: records every invocation; is-enabled/is-active answer
         // from QUOTA_TEST_MASKED / QUOTA_TEST_ACTIVE (comma-separated lists).
@@ -89,7 +105,7 @@ exit 0
             &shim.join("cgov"),
             "#!/usr/bin/env bash\nexit 1\n",
         );
-        Sandbox { dir, shim, log }
+        Sandbox { dir, shim, log, script }
     }
 
     fn write_backdated_state(&self, name: &str, age: chrono::Duration) -> PathBuf {
@@ -130,10 +146,9 @@ exit 0
 
     /// Run the vendored controller with every external effect sandboxed.
     fn run(&self, quota_state: &Path, controller_state: &Path) -> Output {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(SCRIPT);
         let path = std::env::var("PATH").unwrap_or_default();
         Command::new("python3")
-            .arg(&script)
+            .arg(&self.script)
             .env("PATH", format!("{}:{}", self.shim.display(), path))
             .env("QUOTA_STATE", quota_state)
             .env("QUOTA_CONTROLLER_STATE", controller_state)
@@ -332,9 +347,8 @@ fn unwritable_controller_state_is_still_a_local_error_exit_1() {
     let cstate = ro.join("state.json");
 
     let path = std::env::var("PATH").unwrap_or_default();
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(SCRIPT);
     let output = Command::new("python3")
-        .arg(&script)
+        .arg(&sb.script)
         .env("PATH", format!("{}:{}", sb.shim.display(), path))
         .env("QUOTA_STATE", &quota)
         .env("QUOTA_CONTROLLER_STATE", &cstate)
