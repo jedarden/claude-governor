@@ -144,22 +144,51 @@ exit 0
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Replace the default always-failing cgov shim with a custom body, so a
+    /// test can script exactly how the self-sample poll misbehaves.
+    fn install_cgov_shim(&self, body: &str) {
+        write_shim(&self.shim.join("cgov"), body);
+    }
+
     /// Run the vendored controller with every external effect sandboxed.
-    fn run(&self, quota_state: &Path, controller_state: &Path) -> Output {
+    ///
+    /// `cgov` overrides CGOV_BIN (the sandbox's own shim when `None`); the
+    /// failure-mode tests use it to pin the literal acceptance scenario
+    /// (CGOV_BIN=/bin/false). `extra_env` carries the verification knobs
+    /// (e.g. a short QUOTA_POLL_TIMEOUT_SECS for the timeout test).
+    fn run_with(
+        &self,
+        quota_state: &Path,
+        controller_state: &Path,
+        cgov: Option<&Path>,
+        extra_env: &[(&str, &str)],
+    ) -> Output {
         let path = std::env::var("PATH").unwrap_or_default();
-        Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg(&self.script)
             .env("PATH", format!("{}:{}", self.shim.display(), path))
             .env("QUOTA_STATE", quota_state)
             .env("QUOTA_CONTROLLER_STATE", controller_state)
-            .env("CGOV_BIN", self.shim.join("cgov"))
+            .env(
+                "CGOV_BIN",
+                cgov.map(PathBuf::from).unwrap_or_else(|| self.shim.join("cgov")),
+            )
             .env("QUOTA_LOCAL_UNITS", LOCAL_UNITS)
             .env("QUOTA_LAB_UNITS", LAB_UNITS)
             .env("QUOTA_TEST_LOG", &self.log)
             .env("QUOTA_TEST_MASKED", "lab-c.service")
-            .env("QUOTA_TEST_ACTIVE", "lab-a.service,lab-b.service,lab-c.service")
+            .env("QUOTA_TEST_ACTIVE", "lab-a.service,lab-b.service,lab-c.service");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command
             .output()
             .expect("run controller; python3 must be available")
+    }
+
+    fn run(&self, quota_state: &Path, controller_state: &Path) -> Output {
+        self.run_with(quota_state, controller_state, None, &[])
     }
 }
 
@@ -327,6 +356,132 @@ fn fresh_sample_missing_usage_subtree_degrades_instead_of_exit_1() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(summary_json(&output)["action"], "stale-hold-conservative");
+}
+
+/// Shared assertions for the self-sample failure modes (claudego-b385e643):
+/// whatever way the poll dies -- subprocess failure, stale:true answer, or
+/// timeout -- the controller must degrade to the conservative hold: exit 0,
+/// `action=stale-hold-conservative`, the mode-specific reason logged on
+/// stderr, and no traceback reaching top level.
+fn assert_conservative_degrade(output: &Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "a failed self-sample must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Traceback"),
+        "no traceback may reach top level: {stderr}"
+    );
+    let summary = summary_json(output);
+    assert_eq!(summary["action"], "stale-hold-conservative");
+    summary
+}
+
+#[test]
+fn failed_poll_subprocess_degrades_to_conservative_hold() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let sb = Sandbox::new();
+    let quota = sb.write_backdated_state("quota.json", stale_two_hours());
+    let cstate = sb.controller_state("cstate.json", 0.0);
+
+    // The literal acceptance scenario: the configured cgov binary dies
+    // immediately. Where /bin/false exists it fails with rc=1 ("cgov poll
+    // failed"); on hosts without it (NixOS) the OSError-continue path
+    // exhausts the candidates instead ("no usable cgov binary found").
+    // Either way it is the subprocess-failure mode: exit 0, conservative
+    // hold, reason logged.
+    let output = sb.run_with(&quota, &cstate, Some(Path::new("/bin/false")), &[]);
+
+    let summary = assert_conservative_degrade(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cgov poll failed (rc=") || stderr.contains("no usable cgov binary found"),
+        "the subprocess failure must be the logged reason: {stderr}"
+    );
+    let age = summary["quota_sample_age_secs"].as_f64().expect("age present");
+    assert!(
+        (7100.0..=7400.0).contains(&age),
+        "the hold still records the stale sample's age, got {age}"
+    );
+    // The conservative decision itself: LOCAL_BASE kept up, exactly one lab
+    // unit shed, masked unit untouched.
+    let state = controller_state_json(&cstate);
+    assert_eq!(state["action"], "stale-hold-conservative");
+    assert_eq!(state["lab_workers"], 1, "3 active, 1 masked, 1 shed -> 1 left");
+    let log = sb.log_contents();
+    assert!(log.contains("systemctl --user start --no-block fake-local-a.service fake-local-b.service"));
+    assert!(log.contains("ssh lab systemctl --user disable lab-b.service"));
+    assert!(
+        !log.contains("lab-c.service") || !log.lines().any(|l| l.contains("disable") && l.contains("lab-c.service")),
+        "masked unit must not be disabled: {log}"
+    );
+
+    // And the non-zero-rc reason line itself, deterministically: a cgov that
+    // exists but exits 3 must log its rc. (The hold re-runs on the same
+    // controller state; MIN_SCALE_INTERVAL_SECS then blocks a second shed,
+    // which the shared assertions don't care about.)
+    sb.install_cgov_shim("#!/usr/bin/env bash\nexit 3\n");
+    let output = sb.run(&quota, &cstate);
+    let _ = assert_conservative_degrade(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cgov poll failed (rc=3)"),
+        "a failing cgov must log its rc: {stderr}"
+    );
+}
+
+#[test]
+fn stale_true_poll_answer_degrades_to_conservative_hold() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let sb = Sandbox::new();
+    // A cgov that answers successfully but declares its own sample stale:
+    // the poll must be treated as failed, not as a usable percent.
+    sb.install_cgov_shim("#!/usr/bin/env bash\necho '{\"stale\": true}'\nexit 0\n");
+    let quota = sb.write_backdated_state("quota.json", stale_two_hours());
+    let cstate = sb.controller_state("cstate.json", 0.0);
+
+    let output = sb.run(&quota, &cstate);
+
+    let _ = assert_conservative_degrade(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cgov poll reports its own sample stale"),
+        "the stale:true answer must be the logged reason: {stderr}"
+    );
+}
+
+#[test]
+fn poll_timeout_degrades_to_conservative_hold() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let sb = Sandbox::new();
+    // A cgov that hangs forever: the poll timeout must fire and degrade, not
+    // pass the hang through. QUOTA_POLL_TIMEOUT_SECS shrinks the production
+    // 60s so this runs in ~1s; a shim that merely printed garbage would log
+    // "unusable cgov poll output" instead, so the reason line also proves
+    // the override actually triggered the timeout path.
+    sb.install_cgov_shim("#!/usr/bin/env bash\nsleep 5\n");
+    let quota = sb.write_backdated_state("quota.json", stale_two_hours());
+    let cstate = sb.controller_state("cstate.json", 0.0);
+
+    let output = sb.run_with(&quota, &cstate, None, &[("QUOTA_POLL_TIMEOUT_SECS", "1")]);
+
+    let _ = assert_conservative_degrade(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cgov poll timed out"),
+        "the poll timeout must be the logged reason: {stderr}"
+    );
 }
 
 #[test]

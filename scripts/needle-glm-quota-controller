@@ -24,10 +24,12 @@ The canonical copy of this script is scripts/needle-glm-quota-controller in
 the claude-governor repo; /home/coding/bin holds the deployed copy. Edit the
 repo copy, then redeploy.
 
-QUOTA_STATE, QUOTA_CONTROLLER_STATE, CGOV_BIN, QUOTA_LOCAL_UNITS and
-QUOTA_LAB_UNITS are env-overridable so a verification run can point them at
-copies and empty unit lists and exercise the full pacing logic without
-touching real files or the real fleet.
+QUOTA_STATE, QUOTA_CONTROLLER_STATE, CGOV_BIN, QUOTA_LOCAL_UNITS,
+QUOTA_LAB_UNITS and QUOTA_POLL_TIMEOUT_SECS are env-overridable so a
+verification run can point them at copies and empty unit lists and shrink
+the poll timeout, exercising the full pacing logic and every self-sample
+failure mode (subprocess failure, stale:true answer, poll timeout) without
+touching real files, the real fleet, or waiting out the production 60s.
 """
 
 from __future__ import annotations
@@ -53,6 +55,18 @@ def _env_units(name: str, default: list[str]) -> list[str]:
     return [unit.strip() for unit in override.split(",") if unit.strip()]
 
 
+def _env_float(name: str, default: float) -> float:
+    """Env-overridable float (verification knob); a bad or non-positive value
+    keeps the default -- a zero or negative poll timeout would raise inside
+    the poll call instead of merely firing early, and the degrade posture
+    must survive a misconfigured verification environment too."""
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 QUOTA_STATE = Path(
     os.environ.get("QUOTA_STATE", "/home/coding/.config/claude-governor/governor-state.json")
 )
@@ -68,7 +82,7 @@ SAMPLE_WINDOW_SECS = 60 * 60
 MIN_SAMPLE_SECS = 20 * 60
 MIN_SCALE_INTERVAL_SECS = 5 * 60
 MAX_QUOTA_AGE_SECS = 15 * 60
-POLL_TIMEOUT_SECS = 60
+POLL_TIMEOUT_SECS = _env_float("QUOTA_POLL_TIMEOUT_SECS", 60.0)
 LOCK_WAIT_SECS = 10.0
 
 LOCAL_BASE = _env_units(
