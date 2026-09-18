@@ -1730,4 +1730,91 @@ agents:
         assert!(msg.contains("retired on 2026-09-16"), "{msg}");
         assert!(msg.contains("polish-opus"), "{msg}");
     }
+
+    /// The generator-pool marker's hyphen spelling, in both placements the
+    /// retirement could leave behind: a queue block (top-level key) and a
+    /// pool named after it. The generator markers also require the full
+    /// `-pool`/`_pool` spelling — an unrelated `generator` identifier is
+    /// not falsely flagged.
+    #[test]
+    fn test_retired_reference_generator_pool_hyphen_marker_rejected() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+generator-pool:
+  max_workers: 4
+agents:
+  generator-pool-fable:
+    launch_cmd: "needle run --agent claude-print-fable"
+    session_pattern: "needle-claude-print-fable-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#,
+        );
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("top-level key") && v.contains("generator-pool")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("generator-pool-fable")),
+            "{violations:?}"
+        );
+
+        let clean = r#"
+pricing:
+  models: {}
+agents:
+  midi-generator:
+    launch_cmd: "echo running midi-generator"
+    session_pattern: "midi-generator-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#;
+        assert!(retired_ref_violations(clean).is_empty());
+        assert!(GovernorConfig::parse_and_validate(clean).is_ok());
+    }
+
+    /// The underscore spelling is caught in a pool block too — the
+    /// top-level-key case is pinned separately above.
+    #[test]
+    fn test_retired_reference_generator_pool_underscore_in_pool_rejected() {
+        let violations = retired_ref_violations(
+            r#"
+pricing:
+  models: {}
+agents:
+  generator_pool_legacy:
+    launch_cmd: "needle run --agent claude-print-opus"
+    session_pattern: "needle-claude-print-opus-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+"#,
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("generator_pool_legacy"),
+            "{violations:?}"
+        );
+    }
+
+    /// End to end through the startup path for a non-polish marker: the
+    /// generator spellings reach the same hard failure and the same
+    /// retirement/remediation message, whatever the typed parse would have
+    /// done with the unknown key.
+    #[test]
+    fn test_parse_and_validate_rejects_generator_pool_spelling() {
+        let yaml = r#"
+pricing:
+  models: {}
+generator-pool:
+  max_workers: 4
+"#;
+        let err = GovernorConfig::parse_and_validate(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("retired on 2026-09-16"), "{msg}");
+        assert!(msg.contains("generator-pool"), "{msg}");
+        assert!(msg.contains("Remove the retired entries"), "{msg}");
+        assert!(msg.contains("do not recreate it"), "{msg}");
+    }
 }
