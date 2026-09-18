@@ -2460,6 +2460,11 @@ agents:
 
         let result = check_retired_component_units_at(tmp.path());
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.message);
+        assert!(
+            result.message.contains("No retired polish units installed"),
+            "clean pass must say so: {:?}",
+            result.message
+        );
         assert!(result.remediation.is_none());
     }
 
@@ -2527,6 +2532,43 @@ agents:
                 && !result.message.contains("claude-polish-seeder.service"),
             "must list exactly the installed units: {:?}",
             result.message
+        );
+    }
+
+    #[test]
+    fn test_retired_component_units_partial_service_without_timer() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("claude-polish-seeder.service"),
+            "[Service]\nExecStart=polish-seeder\n",
+        )
+        .unwrap();
+
+        let result = check_retired_component_units_at(tmp.path());
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("claude-polish-seeder.service")
+                && !result.message.contains("claude-polish-seeder.timer"),
+            "must list exactly the installed units: {:?}",
+            result.message
+        );
+        // A partial install is still an install: the remediation stays
+        // removal-only and must not read as an invitation to restore the
+        // missing half.
+        let remediation = result
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            remediation.contains("remove them") && remediation.contains("do not recreate"),
+            "partial installs get the removal-only remediation: {:?}",
+            result.remediation
+        );
+        assert!(
+            !remediation.contains("install claude-polish"),
+            "remediation must not suggest installing a retired unit: {:?}",
+            result.remediation
         );
     }
 
