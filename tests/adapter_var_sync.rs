@@ -37,17 +37,25 @@ use tempfile::TempDir;
 
 const INSTALLER: &str = "deploy/install-claude-print-adapters.sh";
 
+/// The committed installer and the source file its gate cross-checks,
+/// embedded at compile time so the test binary is self-contained. NEEDLE's
+/// close gate re-runs tests through the shared /build/target-workers dir,
+/// where a binary built in one `git archive` extraction is reused in another
+/// (archive mtimes carry the commit time, so every extraction of one commit
+/// looks fresh to cargo); a runtime read at `env!("CARGO_MANIFEST_DIR")` then
+/// points at a long-deleted checkout and the gate fails with ENOENT. Same
+/// defect class the stale-hold suite fixed for the controller script, pinned
+/// for the lib-side drift gates in src/adapter_verify.rs on 2026-09-18.
+/// Cargo tracks include_str! files as rebuild inputs, so an edit to either
+/// embedded file still triggers a fresh build.
+const INSTALLER_SH: &str = include_str!("../deploy/install-claude-print-adapters.sh");
+const ADAPTER_VERIFY_SRC: &str = include_str!("../src/adapter_verify.rs");
+
 /// Marker the harness prints only when the sourced gate returned success.
 const OK_MARKER: &str = "SYNC-OK";
 
-fn installer_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(INSTALLER)
-}
-
 fn installer_source() -> String {
-    let path = installer_path();
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
+    INSTALLER_SH.to_string()
 }
 
 /// Lines from the first line declaring `name=(` (only whitespace may precede
@@ -165,10 +173,20 @@ fn mutate_decl(decl: &str, mutation: &Mutation, this_array: &str) -> String {
 /// text extracted from the installer; the installer never executes.
 fn write_sandbox(dir: &Path, mutation: &Mutation) -> PathBuf {
     let installer = installer_source();
-    let repo_dir = env!("CARGO_MANIFEST_DIR");
+    // `check_var_list_sync` extracts the Rust constants from
+    // `${REPO_DIR}/src/adapter_verify.rs`, so the sandbox materializes an
+    // embedded copy of that file under its own REPO_DIR rather than pointing
+    // at the checkout (see INSTALLER_SH for why the checkout must not be read
+    // at test runtime).
+    let repo_src = dir.join("src");
+    fs::create_dir_all(&repo_src).expect("create sandbox src dir");
+    let verify_rs = repo_src.join("adapter_verify.rs");
+    fs::write(&verify_rs, ADAPTER_VERIFY_SRC)
+        .unwrap_or_else(|e| panic!("cannot write {}: {}", verify_rs.display(), e));
+    let repo_dir = dir.to_str().expect("sandbox dir is valid UTF-8");
     assert!(
         !repo_dir.contains('\'') && !repo_dir.contains('\n'),
-        "manifest dir {:?} needs shell-safe quoting",
+        "sandbox dir {:?} needs shell-safe quoting",
         repo_dir
     );
 

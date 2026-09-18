@@ -494,16 +494,27 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
+    /// The committed artifacts these drift gates police, embedded at compile
+    /// time so the test binary is self-contained. NEEDLE's close gate re-runs
+    /// tests through the shared /build/target-workers dir, where a binary
+    /// built in one `git archive` extraction is reused in another (archive
+    /// mtimes carry the commit time, so every extraction of one commit looks
+    /// fresh to cargo); a runtime read at `env!("CARGO_MANIFEST_DIR")` then
+    /// points at a long-deleted checkout and both gates fail with ENOENT —
+    /// seen 2026-09-18: `cargo test` through the shared cache failed 2/909
+    /// with "cannot read /data/build/scratch/cg-b385e643-dod-jLa6zv/..." from
+    /// a commit whose in-tree run was green. Same defect class the stale-hold
+    /// suite fixed for the controller script (tests/glm_quota_controller_
+    /// stale_hold.rs). Cargo tracks include_str! files as rebuild inputs, so
+    /// an installer or adapter edit still triggers a fresh build.
+    const INSTALLER_SH: &str = include_str!("../deploy/install-claude-print-adapters.sh");
+    const ADAPTER_OPUS_YAML: &str =
+        include_str!("../deploy/needle-adapters/claude-print-opus.yaml");
+    const ADAPTER_FABLE_YAML: &str =
+        include_str!("../deploy/needle-adapters/claude-print-fable.yaml");
+
     fn installer_source() -> String {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/install-claude-print-adapters.sh");
-        fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "cannot read {}: {}",
-                path.display(),
-                e
-            )
-        })
+        INSTALLER_SH.to_string()
     }
 
     /// Space-joined rule-3 + rule-5 sets, derived from the constants rather
@@ -520,8 +531,15 @@ mod tests {
 
     #[test]
     fn committed_adapter_templates_scrub_both_variable_sets() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/needle-adapters");
-        let adapters = load_installed_adapters(&dir).expect("repo adapters must load");
+        // Materialize the embedded committed templates under their committed
+        // names (see INSTALLER_SH for why they are embedded rather than read
+        // from the checkout) and load them through the production loader.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("claude-print-opus.yaml"), ADAPTER_OPUS_YAML)
+            .expect("write opus adapter");
+        std::fs::write(tmp.path().join("claude-print-fable.yaml"), ADAPTER_FABLE_YAML)
+            .expect("write fable adapter");
+        let adapters = load_installed_adapters(tmp.path()).expect("repo adapters must load");
 
         assert!(
             adapters.len() >= 2,
