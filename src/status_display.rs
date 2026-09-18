@@ -317,6 +317,41 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
         }
     }
 
+    // The exogenous reservation (claudego-68056156): burn that belongs to no
+    // pool worker — the operator's sessions, foreign fleets. It is already
+    // netted out of each window's remaining budget; naming it per window here
+    // stops a hot operator session from reading as unexplained fleet pressure.
+    let exogenous: Vec<(&str, f64)> = [
+        (
+            "5h",
+            state.capacity_forecast.five_hour.exogenous_pct_per_hour,
+        ),
+        (
+            "7d",
+            state.capacity_forecast.seven_day.exogenous_pct_per_hour,
+        ),
+        (
+            scoped_label,
+            state
+                .capacity_forecast
+                .weekly_scoped
+                .exogenous_pct_per_hour,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, rate)| *rate > 0.0)
+    .collect();
+    if !exogenous.is_empty() {
+        let parts: Vec<String> = exogenous
+            .iter()
+            .map(|(name, rate)| format!("{name} {rate:.2}%/hr"))
+            .collect();
+        output.push_str(&format!(
+            "Exogenous: {} reserved (non-fleet: operator/foreign burn, not the pool's)\n",
+            parts.join(", ")
+        ));
+    }
+
     output.push_str("\n");
 
     // Billing breakdown section
@@ -577,6 +612,10 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
                 "exh_hrs_p75": if v.exh_hrs_p75.is_infinite() { serde_json::Value::Null } else { serde_json::json!(v.exh_hrs_p75) },
                 "cone_ratio": v.cone_ratio,
                 "risk_score": v.risk_score,
+                // Measured non-fleet burn this window (claudego-68056156):
+                // the reservation already netted out of remaining budgets.
+                // 0.0 = no baseline measured.
+                "exogenous_pct_per_hour": v.exogenous_pct_per_hour,
             }))
         }).collect::<std::collections::HashMap<&str, serde_json::Value>>(),
         "workers": {
@@ -1221,5 +1260,82 @@ mod tests {
         assert_eq!(colors.bold_yellow, "");
 
         std::env::remove_var("NO_COLOR");
+    }
+
+    /// Build a dashboard state through the production seam with the given
+    /// fleet and exogenous rates in every window (claudego-68056156 fixture
+    /// helper), and the per-worker EMA zeroed so the Burn Rate section's
+    /// fleet line reads the idle-fleet value.
+    fn idle_fleet_state(exogenous_pct_hr: f64) -> GovernorState {
+        let mut state = make_test_state();
+        let window = || {
+            crate::burn_rate::generate_window_forecast_with_exogenous(
+                "five_hour",
+                0.0, // fleet rate: zero workers running
+                41.0,
+                90.0,
+                4.0,
+                0.0,
+                0.0,
+                crate::state::EstimateQuality::Calibrated,
+                exogenous_pct_hr,
+            )
+        };
+        state.capacity_forecast = crate::state::CapacityForecast {
+            five_hour: window(),
+            seven_day: window(),
+            weekly_scoped: window(),
+            binding_window: String::new(),
+            ..Default::default()
+        };
+        for model in state.burn_rate.by_model.values_mut() {
+            model.pct_per_worker_per_hour = 0.0;
+            model.dollars_per_worker_per_hour = 0.0;
+        }
+        state
+    }
+
+    /// claudego-68056156: idle fleet + hot operator session. The dashboard
+    /// must show the SPLIT — fleet rate 0 AND the exogenous reservation —
+    /// with no CUTOFF anywhere: the operator's burn is a budget reservation,
+    /// never unexplained fleet pressure.
+    #[test]
+    fn format_dashboard_shows_fleet_vs_exogenous_split() {
+        let state = idle_fleet_state(13.0);
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(
+            output.contains("Fleet: 0.00%/hr"),
+            "fleet rate 0 must be visible, got:\n{output}"
+        );
+        assert!(
+            output.contains("Exogenous: 5h 13.00%/hr, 7d 13.00%/hr, weekly_scoped 13.00%/hr"),
+            "the per-window reservation must be visible, got:\n{output}"
+        );
+        assert!(
+            !output.contains("CUTOFF"),
+            "an idle fleet must not flag CUTOFF anywhere, got:\n{output}"
+        );
+    }
+
+    /// claudego-68056156: no exogenous baseline measured (fresh/idle account)
+    /// → no reservation line and no NaN leak. The dashboard must render
+    /// unchanged from its pre-split shape.
+    #[test]
+    fn format_dashboard_without_exogenous_baseline_has_no_reservation_line() {
+        let state = idle_fleet_state(0.0);
+        let output = format_status_dashboard(&state, Utc::now());
+
+        assert!(
+            !output.contains("Exogenous:"),
+            "no baseline measured → no reservation line, got:\n{output}"
+        );
+        assert!(!output.contains("NaN"), "no NaN may leak, got:\n{output}");
+
+        // And the fresh-state shape (no burn data at all) renders fine too.
+        let fresh = GovernorState::new();
+        let fresh_output = format_status_dashboard(&fresh, Utc::now());
+        assert!(!fresh_output.contains("Exogenous:"));
+        assert!(!fresh_output.contains("NaN"));
     }
 }

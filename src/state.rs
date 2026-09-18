@@ -336,6 +336,18 @@ pub struct WindowForecast {
     pub remaining_pct: f64,
     pub hours_remaining: f64,
     pub fleet_pct_per_hour: f64,
+    /// Measured non-fleet burn for this window, in pct points per hour
+    /// (claudego-68056156).
+    ///
+    /// Everything on the account that is not this pool's workers — the
+    /// operator's interactive sessions, foreign fleets, unattributed records
+    /// (claudego-892a82b1). Display-only: the reservation itself is already
+    /// netted into `remaining_pct` / `hard_limit_*` by
+    /// `generate_window_forecast_with_exogenous`; this field exists so
+    /// status/forecast output can show WHERE the budget went. `0.0` = no
+    /// exogenous baseline measured (fresh state, or nothing but fleet burn).
+    #[serde(default)]
+    pub exogenous_pct_per_hour: f64,
     #[serde(deserialize_with = "deserialize_f64_null_as_infinity")]
     pub predicted_exhaustion_hours: f64,
     pub cutoff_risk: bool,
@@ -415,6 +427,7 @@ impl Default for WindowForecast {
             remaining_pct: 0.0,
             hours_remaining: 0.0,
             fleet_pct_per_hour: 0.0,
+            exogenous_pct_per_hour: 0.0,
             predicted_exhaustion_hours: 0.0,
             cutoff_risk: false,
             margin_hrs: 0.0,

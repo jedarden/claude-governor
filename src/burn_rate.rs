@@ -1473,6 +1473,17 @@ pub fn generate_window_forecast_with_exogenous(
     };
     let effective_utilization = current_utilization + exogenous_reserve_pct;
 
+    // Display copy of the baseline (claudego-68056156). The reservation is
+    // applied above; this field only records the rate so status/forecast
+    // output can show where the budget went. Sanitized to a finite,
+    // non-negative value so no NaN/Inf can reach a rendered pane — a corrupt
+    // EMA degrades to "no reservation shown", never to "NaN".
+    let exogenous_pct_per_hour = if exogenous_pct_hr.is_finite() && exogenous_pct_hr > 0.0 {
+        exogenous_pct_hr
+    } else {
+        0.0
+    };
+
     let remaining_pct = (target_ceiling - effective_utilization).max(0.0);
 
     let predicted_exhaustion_hours = if fleet_pct_hr > 0.0 {
@@ -1557,6 +1568,7 @@ pub fn generate_window_forecast_with_exogenous(
         remaining_pct,
         hours_remaining,
         fleet_pct_per_hour: fleet_pct_hr,
+        exogenous_pct_per_hour,
         predicted_exhaustion_hours,
         cutoff_risk,
         margin_hrs,
@@ -3800,6 +3812,62 @@ mod tests {
         // 40/(10*2) = 2 whole workers vs 30/(10*2) = 1.5 → duty-cycled to 1.
         assert_eq!(fleet_only.safe_worker_count, Some(2));
         assert_eq!(with_exo.safe_worker_count, Some(1));
+    }
+
+    /// The display field (claudego-68056156) carries the measured baseline
+    /// verbatim, defaults to 0.0 through the no-exogenous wrapper, and
+    /// sanitizes a corrupt (NaN/negative) baseline to 0.0 so no NaN can reach
+    /// a rendered pane.
+    #[test]
+    fn exogenous_display_field_is_carried_sanitized_and_zero_by_default() {
+        use crate::state::EstimateQuality;
+
+        let forecast = |exo: f64| {
+            generate_window_forecast_with_exogenous(
+                "five_hour",
+                2.0,
+                50.0,
+                90.0,
+                2.0,
+                10.0,
+                0.0,
+                EstimateQuality::Calibrated,
+                exo,
+            )
+        };
+
+        assert!(
+            (forecast(13.0).exogenous_pct_per_hour - 13.0).abs() < 1e-9,
+            "a measured baseline is carried through for display"
+        );
+        assert_eq!(
+            forecast(0.0).exogenous_pct_per_hour,
+            0.0,
+            "an unmeasured baseline stays 0.0"
+        );
+        assert_eq!(
+            forecast(f64::NAN).exogenous_pct_per_hour,
+            0.0,
+            "a corrupt NaN baseline must not leak into the display field"
+        );
+        assert_eq!(
+            forecast(-3.0).exogenous_pct_per_hour,
+            0.0,
+            "a negative baseline is not a reservation"
+        );
+
+        // The convenience wrapper measures no exogenous burn by definition.
+        let wrapper = generate_window_forecast(
+            "five_hour",
+            2.0,
+            50.0,
+            90.0,
+            2.0,
+            10.0,
+            0.0,
+            EstimateQuality::Calibrated,
+        );
+        assert_eq!(wrapper.exogenous_pct_per_hour, 0.0);
     }
 
     /// The sawtooth: a fractional ideal is served by alternating 1 and 0, and

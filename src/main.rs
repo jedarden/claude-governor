@@ -643,8 +643,21 @@ fn format_forecast_human(state: &GovernorState) -> String {
             }
             _ => String::new(),
         };
+        // The exogenous reservation (claudego-68056156): non-fleet burn the
+        // window's budget is already netting out. Shown only when a baseline
+        // is measured, so a hot operator session can never read as a bare
+        // fleet Burn percentage or an unexplained CUTOFF RISK — an idle fleet
+        // under operator load renders as 0.00%/hr fleet + N%/hr reserved.
+        let exogenous = if win.exogenous_pct_per_hour > 0.0 {
+            format!(
+                "  Exogenous: {:.2}%/hr reserved (operator/foreign burn — not the pool's)\n",
+                win.exogenous_pct_per_hour
+            )
+        } else {
+            String::new()
+        };
         output.push_str(&format!(
-            "{}{}\n  Utilization: {:.1}% / {:.0}% ceiling\n  Remaining: {:.1}% ({:.1}h to reset)\n{}  Burn Rate: {:.2}%/hr\n  Exhaustion: {:.1}h {}\n  Margin: {:.1}h\n\n",
+            "{}{}\n  Utilization: {:.1}% / {:.0}% ceiling\n  Remaining: {:.1}% ({:.1}h to reset)\n{}  Burn Rate: {:.2}%/hr\n{}  Exhaustion: {:.1}h {}\n  Margin: {:.1}h\n\n",
             name,
             binding,
             win.current_utilization,
@@ -653,6 +666,7 @@ fn format_forecast_human(state: &GovernorState) -> String {
             win.hours_remaining,
             pace,
             win.fleet_pct_per_hour,
+            exogenous,
             win.predicted_exhaustion_hours,
             cutoff,
             win.margin_hrs
@@ -2559,6 +2573,118 @@ mod tests {
             3,
             "every window pane must render exhaustion as never, got:\n{output}"
         );
+    }
+
+    /// claudego-68056156: the idle-fleet + hot-operator geometry must render
+    /// the SPLIT, not just the consequence. Built through the production seam
+    /// (generate_window_forecast_with_exogenous) with fleet rate 0 and the
+    /// operator's ~13%/hr measured as exogenous (the claudego-0ccbae3c
+    /// incident numbers), the pane must show BOTH — 0.00%/hr fleet burn AND
+    /// the reservation — and no fleet CUTOFF RISK: the operator's burn is a
+    /// budget reservation, not pool risk.
+    #[test]
+    fn forecast_output_idle_fleet_shows_exogenous_reservation_split() {
+        use claude_governor::state::CapacityForecast;
+
+        let win = claude_governor::burn_rate::generate_window_forecast_with_exogenous(
+            "five_hour",
+            0.0, // fleet rate: zero workers running
+            41.0, // utilization as the operator's session left it
+            90.0,
+            4.0,
+            0.0,  // no per-worker rate to size with at zero workers
+            0.0,
+            claude_governor::state::EstimateQuality::Calibrated,
+            13.0, // measured exogenous baseline
+        );
+        assert_eq!(win.fleet_pct_per_hour, 0.0);
+        assert!(
+            (win.exogenous_pct_per_hour - 13.0).abs() < 1e-9,
+            "the measured baseline must be carried for display, got {}",
+            win.exogenous_pct_per_hour
+        );
+        assert!(
+            !win.cutoff_risk,
+            "fleet rate 0 can pose no cutoff risk, exogenous or not"
+        );
+
+        let mut state = GovernorState::new();
+        state.capacity_forecast = CapacityForecast {
+            five_hour: win,
+            ..CapacityForecast::default()
+        };
+
+        let output = format_forecast_human(&state);
+
+        assert!(
+            output.contains("Burn Rate: 0.00%/hr"),
+            "fleet rate 0 must be visible, got:\n{output}"
+        );
+        assert!(
+            output.contains("Exogenous: 13.00%/hr reserved"),
+            "the exogenous reservation must be visible next to it, got:\n{output}"
+        );
+        assert!(
+            !output.contains("CUTOFF RISK"),
+            "an idle fleet must not flag CUTOFF RISK, got:\n{output}"
+        );
+    }
+
+    /// claudego-68056156: a fresh state carries no exogenous baseline. Neither
+    /// the human nor the JSON forecast may invent one, leak NaN/Inf into the
+    /// field, or crash rendering it.
+    #[test]
+    fn forecast_output_fresh_state_renders_no_exogenous_line_and_no_nan() {
+        let state = GovernorState::new();
+
+        let output = format_forecast_human(&state);
+        assert!(
+            !output.contains("Exogenous:"),
+            "no baseline measured → no reservation line, got:\n{output}"
+        );
+        assert!(!output.contains("NaN"), "no NaN may leak, got:\n{output}");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_forecast_json(&state)).unwrap();
+        assert_eq!(
+            parsed["five_hour"]["exogenous_pct_per_hour"],
+            0.0,
+            "fresh state serializes 0.0, never null/NaN"
+        );
+    }
+
+    /// claudego-68056156: `cgov forecast --json` carries the split per window,
+    /// so a machine consumer can see the reservation without parsing prose.
+    #[test]
+    fn forecast_json_carries_exogenous_rate_per_window() {
+        use claude_governor::state::CapacityForecast;
+
+        let win = |exo: f64| {
+            claude_governor::burn_rate::generate_window_forecast_with_exogenous(
+                "five_hour",
+                0.0,
+                41.0,
+                90.0,
+                4.0,
+                0.0,
+                0.0,
+                claude_governor::state::EstimateQuality::Calibrated,
+                exo,
+            )
+        };
+        let mut state = GovernorState::new();
+        state.capacity_forecast = CapacityForecast {
+            five_hour: win(13.0),
+            seven_day: win(3.5),
+            weekly_scoped: win(0.0),
+            ..CapacityForecast::default()
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format_forecast_json(&state)).unwrap();
+        assert_eq!(parsed["five_hour"]["exogenous_pct_per_hour"], 13.0);
+        assert_eq!(parsed["seven_day"]["exogenous_pct_per_hour"], 3.5);
+        assert_eq!(parsed["weekly_scoped"]["exogenous_pct_per_hour"], 0.0);
     }
 
     /// Test that verifies the warning log message appears when cgov scale is used during safe mode.
