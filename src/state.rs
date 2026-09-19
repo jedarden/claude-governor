@@ -1825,6 +1825,69 @@ mod tests {
         );
     }
 
+    // --- Backward compatibility: state files written before manual_override ---
+
+    #[test]
+    fn legacy_state_without_manual_override_key_loads_as_none() {
+        // A governor-state.json written by a binary that predates
+        // manual_override has no such key at all. `#[serde(default)]` on
+        // GovernorState and on the manual_override field must turn that
+        // absence into None, not a missing-field error — and must not
+        // disturb the fields a legacy file does carry.
+        let json = r#"{
+            "updated_at": "2026-03-18T14:30:00Z",
+            "usage": { "sonnet_pct": 72.0 },
+            "alerts": []
+        }"#;
+
+        let state: GovernorState = serde_json::from_str(json).unwrap();
+
+        assert!(
+            state.manual_override.is_none(),
+            "a legacy state file without the manual_override key must load with manual_override = None"
+        );
+        assert_eq!(
+            state.updated_at,
+            "2026-03-18T14:30:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "legacy load must carry updated_at through unchanged"
+        );
+    }
+
+    #[test]
+    fn manual_override_null_and_populated_variants_deserialize() {
+        // An explicit null (what some serializers emit for a None Option)
+        // loads as None; a fully-populated override carries all four fields.
+        let none_state: GovernorState =
+            serde_json::from_str(r#"{"manual_override": null}"#).unwrap();
+        assert!(none_state.manual_override.is_none());
+
+        let full: GovernorState = serde_json::from_str(
+            r#"{
+                "manual_override": {
+                    "target": 4,
+                    "set_at": "2026-03-18T12:00:00Z",
+                    "expires_at": "2026-03-18T14:00:00Z",
+                    "source": "cli"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let ov = full
+            .manual_override
+            .expect("a populated manual_override must load as Some");
+        assert_eq!(ov.target, 4);
+        assert_eq!(ov.source, "cli");
+        assert_eq!(
+            ov.set_at,
+            "2026-03-18T12:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            ov.expires_at,
+            Some("2026-03-18T14:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
+    }
+
     // --- Load from missing file -> default ---
 
     #[test]
