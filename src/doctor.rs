@@ -2946,16 +2946,19 @@ agents:
 
     // -- claude_print_adapters ------------------------------------------------
 
-    /// A template that scrubs every rule-3 and rule-5 variable.
-    const SCRUB_ALL: &str = concat!(
-        "CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE ",
-        "VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS ",
-        "VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD ",
-        "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL ",
-        "ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ",
-        "CLAUDE_CODE_SUBAGENT_MODEL"
-    );
+    /// A template that scrubs every rule-3 and rule-5 variable — joined from
+    /// the shared constants in src/adapter_verify.rs rather than retyped, so
+    /// this fixture cannot become a third hand-maintained copy of the lists
+    /// (the drift the sync gates exist to catch) and a variable added to the
+    /// constants is covered here automatically.
+    fn scrub_all() -> String {
+        crate::adapter_verify::IDE_ENV_VARS
+            .iter()
+            .chain(crate::adapter_verify::API_ROUTING_ENV_VARS.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     fn write_adapter(dir: &std::path::Path, name: &str, invoke_template: &str) {
         fs::write(
@@ -3003,7 +3006,7 @@ agents:
             "opus",
             format!(
                 "cd {{workspace}} && unset {} && /bin/claude-print < {{prompt_file}}",
-                SCRUB_ALL
+                scrub_all()
             )
             .as_str(),
         );
@@ -3031,7 +3034,7 @@ agents:
             "stub",
             format!(
                 "cd {{workspace}} && unset {} && {} < {{prompt_file}}",
-                SCRUB_ALL,
+                scrub_all(),
                 stub.display()
             )
             .as_str(),
