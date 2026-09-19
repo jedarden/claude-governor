@@ -199,4 +199,9 @@ treating configured agents as fungible.
   loss). Scaling is unaffected. Cursor saves are atomic (unique temp file +
   rename), so new corruption should be rare.
 - `cargo test` offloads to iad-ci when the tree is clean; runs locally (cgroup-limited)
-  with uncommitted changes. `cargo build` always runs locally.
+  with uncommitted changes. `cargo build` always runs locally. Host-scoped 2026-09-19:
+  true on lab; on codinghome `~/.local/bin/cargo` was found clobbered to a plain
+  symlink into `~/.cargo/bin` (replaced 2026-08-12, untracked — restoration bead
+  claudego-41ca0b41), so `cargo test` there always runs real cargo locally and iad-ci
+  runs need an explicit `cargo-remote`. The adapter sync gates are unaffected — they
+  run under any `cargo test`, including NEEDLE's close-gate re-extraction.
