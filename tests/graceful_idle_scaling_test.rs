@@ -19,7 +19,9 @@
 //!    running while a fresh idle worker absorbs the cut.
 //! 3. **Per-cycle caps bound every move** — a 3-worker shed with
 //!    `max_down_per_cycle = 2` signals exactly the two oldest idle workers
-//!    and leaves the rest for the next cycle.
+//!    and leaves the rest for the next cycle. The next cycle is pinned too:
+//!    it sheds the next-oldest survivors, again within the cap, and never
+//!    re-signals a worker it already stopped.
 //! 4. **Hysteresis is asymmetric** — a 1-worker surplus holds at any band
 //!    while the same-size deficit always closes, and a hold touches no
 //!    worker at all.
@@ -292,6 +294,21 @@ impl Harness {
     fn worker(&self, name: &str, age_secs: i64, is_idle: bool) {
         seed_worker(&self.sessions_file, &self.hb_dir, name, age_secs, is_idle);
     }
+
+    /// Simulate the named workers having exited: drop their sessions from the
+    /// fake tmux census the way a real tmux server drops a session whose
+    /// process ended, so the NEXT cycle counts — and considers as shutdown
+    /// candidates — only the survivors. Their heartbeat files stay on disk,
+    /// as they do in production until the orphan sweep collects them.
+    fn reap(&self, sessions: &[&str]) {
+        let census = std::fs::read_to_string(&self.sessions_file).expect("read sessions file");
+        let survivors: Vec<&str> = census.lines().filter(|s| !sessions.contains(s)).collect();
+        let mut body = survivors.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        std::fs::write(&self.sessions_file, body).expect("rewrite sessions file");
+    }
 }
 
 /// Sessions touched by `verb` (`send-keys` = graceful SIGINT, `kill-session`
@@ -473,6 +490,70 @@ fn scale_down_honors_per_cycle_cap_regression() {
         signalled(&h.calls_log),
         sorted(&["cgidle-old", "cgidle-older-still"]),
         "the cap signals only the oldest idle workers; the rest wait for the next cycle"
+    );
+}
+
+/// The cap binds on EVERY cycle, not just the first. Five idle workers, two
+/// cuts: the first cycle sheds the two oldest (wanted 3, cap 2), the signalled
+/// workers exit, and the next cycle — facing the three survivors with the
+/// target one lower still — sheds the next-oldest pair, again capped at 2.
+/// The continuation proves what a first-cycle test cannot: the next cycle
+/// resumes from the RIGHT candidates (the ones the cap left running, oldest
+/// first, and never re-signals a worker it already stopped), and the cap
+/// bounds that cycle too — "no cycle ever removes more than the cap allows".
+#[test]
+fn scale_down_honors_per_cycle_cap_on_every_consecutive_cycle_regression() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    h.worker("ancient", 40, true);
+    h.worker("old", 30, true);
+    h.worker("middle", 20, true);
+    h.worker("young", 5, true);
+    h.worker("youngest", 4, true);
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    // Cycle one: five idle workers, safe count 2 — a wanted shed of 3, capped
+    // at 2, landing on the two oldest.
+    let first = cycle_with_target(&h, &agents, 2, 0.5, 10, 2);
+    assert_eq!(
+        first,
+        ScalingDecision::ScaleDown(2),
+        "a wanted shed of 3 is capped at max_down_per_cycle = 2 in the first cycle"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-ancient", "cgidle-old"]),
+        "cycle one sheds exactly the two oldest idle workers"
+    );
+
+    // The two signalled workers exit; their tmux sessions end.
+    h.reap(&["cgidle-ancient", "cgidle-old"]);
+
+    // Cycle two: three survivors, safe count 1 — a wanted shed of 2, again at
+    // the cap. It must fall on the next-oldest live workers, not restart from
+    // the top of the departed age order, and not exceed the cap either way.
+    let second = cycle_with_target(&h, &agents, 1, 0.5, 10, 2);
+    assert_eq!(
+        second,
+        ScalingDecision::ScaleDown(2),
+        "the next cycle sheds the remainder, again capped at max_down_per_cycle = 2"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&[
+            "cgidle-ancient",
+            "cgidle-old",
+            "cgidle-middle",
+            "cgidle-young"
+        ]),
+        "cycle two takes the next-oldest live workers: no session is signalled twice \
+         and the youngest survives for the cycle after"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "a capped graceful scale-down never kill-sessions, in any cycle"
     );
 }
 
