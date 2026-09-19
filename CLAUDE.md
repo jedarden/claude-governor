@@ -199,9 +199,18 @@ treating configured agents as fungible.
   loss). Scaling is unaffected. Cursor saves are atomic (unique temp file +
   rename), so new corruption should be rare.
 - `cargo test` offloads to iad-ci when the tree is clean; runs locally (cgroup-limited)
-  with uncommitted changes. `cargo build` always runs locally. Host-scoped 2026-09-19:
-  true on lab; on codinghome `~/.local/bin/cargo` was found clobbered to a plain
-  symlink into `~/.cargo/bin` (replaced 2026-08-12, untracked — restoration bead
-  claudego-41ca0b41), so `cargo test` there always runs real cargo locally and iad-ci
-  runs need an explicit `cargo-remote`. The adapter sync gates are unaffected — they
-  run under any `cargo test`, including NEEDLE's close-gate re-extraction.
+  with uncommitted changes. `cargo build` always runs locally. Host note, updated
+  2026-09-19: codinghome's `~/.local/bin/cargo` had been clobbered to a plain
+  `~/.cargo/bin` symlink (2026-08-12, untracked), so `cargo test` there ran real cargo
+  locally for five weeks; restored as of 2026-09-19 byte-identical to the tracked lab
+  copy (verified by claudego-41ca0b41) — the wrapper intercepts on both hosts again.
+  The wrapper is still untracked on both hosts: its upstream tracked copy lives in
+  operator dotfiles and installs via `fleet/lab/apply-lab-fleet.sh
+  --install-cargo-wrapper`, so a clobber can recur. codinghome's
+  `~/.local/bin/cargo-remote` carries both scope hardenings —
+  `--slice="$(current_slice)"` (2026-08-24) and `-p RuntimeMaxSec=14400`
+  (needle-3d5c65d8, reaps hung scopes after 4h) — but the lab's `cargo-remote` is
+  older and has neither, so the lab's dirty-tree fallback scopes still land in
+  app.slice and are unreaped; deploying codinghome's copy to the lab is an operator
+  sync still owed. The adapter sync gates are unaffected — they run under any
+  `cargo test`, including NEEDLE's close-gate re-extraction.
