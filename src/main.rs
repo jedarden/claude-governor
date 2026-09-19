@@ -3549,8 +3549,16 @@ mod tests {
         let st = scale_test_state();
 
         // Above the envelope max (max-of-maxes 4): rejected up front — it is
-        // exactly the count reconcile-time clamping could never bind.
-        assert!(validate_scale_count(&st, 5).is_err());
+        // exactly the count reconcile-time clamping could never bind. The
+        // rejection names the requested count and the identical envelope
+        // reconcile-time clamping uses (the README's "name and use the
+        // identical range" clause).
+        let err = validate_scale_count(&st, 5).expect_err("5 is above the envelope max of 4");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Worker count 5 is outside the fleet's aggregate bounds (0 - 4)"),
+            "the rejection must name the count and the aggregate envelope: {msg}"
+        );
         // Inside the envelope, including the floor (min-of-mins 0): accepted.
         assert!(validate_scale_count(&st, 4).is_ok());
         assert!(validate_scale_count(&st, 0).is_ok());

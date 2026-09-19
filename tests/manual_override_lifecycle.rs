@@ -3,10 +3,10 @@
 //!
 //! These exercise the public state/governor API against real files — set,
 //! restart persistence, clamp/un-clamp, expiry, hold-until-clear, brake
-//! suspension, explicit clear, and the act-owned save's interaction with a
-//! CLI write that lands mid-cycle — so the documented behavior is guaranteed,
-//! not aspirational. The real act-cycle precedence path is covered in
-//! `manual_override_act_cycle.rs`.
+//! suspension, explicit clear, and the act-owned and observe-owned saves'
+//! interactions with a CLI write that lands mid-cycle — so the documented
+//! behavior is guaranteed, not aspirational. The real act-cycle precedence
+//! path is covered in `manual_override_act_cycle.rs`.
 
 use chrono::{Duration, Utc};
 use claude_governor::governor::{
@@ -14,8 +14,8 @@ use claude_governor::governor::{
     EMERGENCY_BRAKE_THRESHOLD, MANUAL_OVERRIDE_DEFAULT_TTL_HOURS,
 };
 use claude_governor::state::{
-    merge_act_owned, save_state, with_state_lock, GovernorState, ManualOverride, SafeModeState,
-    WorkerState,
+    merge_act_owned, merge_observe_owned, save_state, with_state_lock, GovernorState,
+    ManualOverride, SafeModeState, WorkerState,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -268,6 +268,52 @@ fn cli_scale_write_survives_an_act_save_that_was_in_flight() {
         Some(3),
         "no loop-side save may revert a cgov scale write — including one that \
          landed while an act cycle was in flight"
+    );
+}
+
+#[test]
+fn observe_save_never_touches_a_stored_pin() {
+    // The act-ownership clause's other half: merge_observe_owned never
+    // touches manual_override, so a concurrent observe cycle saving its stale
+    // load-time snapshot cannot revert a cgov scale write — the mirror image
+    // of cli_scale_write_survives_an_act_save_that_was_in_flight.
+    let dir = TempDir::new().unwrap();
+    let path = state_path(&dir);
+    let now = Utc::now();
+
+    let base = two_pool_state();
+    save_state(&base, &path).unwrap();
+
+    // Observe loads (no override yet)...
+    let observed = claude_governor::state::load_state(&path).unwrap();
+    assert!(observed.manual_override.is_none());
+
+    // ...the CLI writes under the lock...
+    with_state_lock(&path, || {
+        let mut s = claude_governor::state::load_state(&path).unwrap();
+        s.manual_override = Some(cli_override(3, MANUAL_OVERRIDE_DEFAULT_TTL_HOURS, now));
+        save_state(&s, &path)
+    })
+    .unwrap();
+
+    // ...and the observe cycle saves its stale in-memory snapshot.
+    with_state_lock(&path, || {
+        let mut disk = claude_governor::state::load_state(&path).unwrap();
+        assert!(
+            disk.manual_override.is_some(),
+            "precondition: the CLI write reached disk"
+        );
+        merge_observe_owned(&mut disk, &observed, &SafeModeState::default());
+        save_state(&disk, &path)
+    })
+    .unwrap();
+
+    let after = claude_governor::state::load_state(&path).unwrap();
+    assert_eq!(
+        after.manual_override.as_ref().map(|ov| ov.target),
+        Some(3),
+        "merge_observe_owned never touches manual_override: no observe-side \
+         save may revert a cgov scale write"
     );
 }
 

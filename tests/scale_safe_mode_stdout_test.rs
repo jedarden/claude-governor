@@ -224,6 +224,54 @@ fn scale_clear_removes_the_persistent_pin() {
     );
 }
 
+/// The TTL clauses of the contract, checked on the stored state file rather than only on
+/// the stdout wording: `cgov scale N` with no `--ttl` binds for the documented default of
+/// 2 hours (`MANUAL_OVERRIDE_DEFAULT_TTL_HOURS`), and `--ttl 0` stores no expiry at all —
+/// it holds until an explicit `cgov scale --clear`.
+#[test]
+fn scale_stores_the_default_two_hour_ttl_and_ttl_zero_holds_until_clear() {
+    // Default: the stored expiry is exactly set_at + 2h. Both timestamps are
+    // stamped from the same `now` inside the CLI, so the round-tripped state
+    // pins the default exactly.
+    let (temp, output) = run_cgov(&make_state(false), &["scale", "3"]);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("Manual override stored: fleet target 3"),
+        "expected the scale confirmation on stdout, got:\n{stdout}"
+    );
+    let ov = state::load_state(&state_path_in(temp.path()))
+        .unwrap()
+        .manual_override
+        .expect("scale stored a pin");
+    assert_eq!(ov.source, "cli");
+    assert_eq!(
+        (ov.expires_at.expect("the default TTL stores an expiry") - ov.set_at).num_minutes(),
+        120,
+        "no --ttl means the documented default of 2 hours"
+    );
+    assert!(
+        stdout.contains("binding until"),
+        "the confirmation must tell the operator when the pin lapses, got:\n{stdout}"
+    );
+
+    // `--ttl 0`: no expiry is stored — the clock never ends the pin.
+    let (temp, output) = run_cgov(&make_state(false), &["scale", "3", "--ttl", "0"]);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("binding until `cgov scale --clear`"),
+        "ttl 0 must be reported as hold-until-clear, got:\n{stdout}"
+    );
+    let stored = state::load_state(&state_path_in(temp.path())).unwrap();
+    assert_eq!(
+        stored
+            .manual_override
+            .expect("scale stored a pin")
+            .expires_at,
+        None,
+        "--ttl 0 must store no expiry: the pin holds until cgov scale --clear"
+    );
+}
+
 /// The log half of the pair: a manual scale in safe mode must leave an audit line in
 /// `governor.log`, timestamped, and must *not* leak that line onto stdout.
 ///
