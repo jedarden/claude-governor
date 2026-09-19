@@ -308,6 +308,10 @@ mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};
 
+    // The real subscription windows (src/config.rs); spelled out here so the
+    // tests stay independent of config-module internals.
+    const REAL_WINDOWS: [&str; 3] = ["five_hour", "seven_day", "weekly_scoped"];
+
     // Test promotion: March 15-25, 2026 with 2x off-peak for weekly_scoped only
     fn test_promo() -> Promotion {
         Promotion {
@@ -1021,6 +1025,263 @@ mod tests {
         // A directory at the configured path fails fs::read_to_string — the
         // warn-and-empty path, not a panic.
         assert!(load_promotions(dir.path()).is_empty());
+    }
+
+    // --- Pinning tests: fallback paths not covered above (claudego-2d46409e) ---
+
+    /// Regression: `current_multiplier` is the live-clock entry point the bead
+    /// names; with the fallback empty schedule it must be flat 1x for every
+    /// real window at whatever "now" happens to be. Deterministic despite
+    /// Utc::now() because an empty promotion list can never match.
+    #[test]
+    fn current_multiplier_with_empty_schedule_is_flat_1x() {
+        let promos: Vec<Promotion> = vec![];
+        for window in REAL_WINDOWS {
+            assert!(
+                (current_multiplier(&promos, window) - 1.0).abs() < 1e-9,
+                "current_multiplier with no promotions must be 1.0 for {}",
+                window
+            );
+        }
+    }
+
+    /// Regression: the empty-schedule fallback is flat 1x for *every* window at
+    /// *every* class of instant — peak, off-peak, both peak boundaries, the
+    /// Fri 14:00 weekend edge, and midnight — and produces no transitions
+    /// anywhere (the Fri 14:00 -> Mon 08:00 stretch included), so the
+    /// governor's pre-scaling path sees a None transition and a raw-hours
+    /// forecast.
+    #[test]
+    fn empty_schedule_returns_1x_for_every_window_and_instant_class() {
+        let promos: Vec<Promotion> = vec![];
+        let instants = [
+            ("weekday peak", et_to_utc(2026, 3, 16, 10, 0)),
+            ("weekday off-peak", et_to_utc(2026, 3, 16, 6, 0)),
+            ("peak start boundary", et_to_utc(2026, 3, 16, 8, 0)),
+            ("peak end boundary", et_to_utc(2026, 3, 16, 14, 0)),
+            ("friday 14:00 edge", et_to_utc(2026, 3, 20, 14, 0)),
+            ("weekend noon", et_to_utc(2026, 3, 21, 12, 0)),
+            ("midnight", et_to_utc(2026, 3, 17, 0, 0)),
+        ];
+
+        for window in REAL_WINDOWS {
+            for (label, t) in instants {
+                assert!(
+                    (get_multiplier_at(t, &promos, window) - 1.0).abs() < 1e-9,
+                    "{} at {} must be 1x with no promotions",
+                    window,
+                    label
+                );
+            }
+
+            // The whole Fri 14:00 -> Mon 08:00 stretch carries one constant
+            // 1x multiplier: no transition inside it, none before its end.
+            let fri_2pm = et_to_utc(2026, 3, 20, 14, 0);
+            let mon_8am = et_to_utc(2026, 3, 23, 8, 0);
+            assert!(
+                find_next_transition(fri_2pm, mon_8am, &promos, window).is_none(),
+                "empty schedule must have no transition across the weekend stretch for {}",
+                window
+            );
+            assert!(
+                next_transition_from(fri_2pm, mon_8am, &promos, window).is_none(),
+                "next_transition_from must be None with no promotions for {}",
+                window
+            );
+
+            // The forecast sees no bonus: exactly the raw wall hours
+            // (Fri 14:00 -> Mon 08:00 = 10 + 24 + 24 + 8 = 66h).
+            let effective =
+                effective_hours_remaining_from(fri_2pm, mon_8am, &promos, window);
+            assert!(
+                (effective - 66.0).abs() < 1e-6,
+                "empty schedule must forecast raw 66h for {}, got {}",
+                window,
+                effective
+            );
+        }
+    }
+
+    /// Regression: a zero-length promotion (start == end, never satisfied by
+    /// the start-inclusive/end-exclusive comparison) degrades to the flat 1x
+    /// model without panicking — no multiplier, no transitions, raw forecast.
+    #[test]
+    fn zero_length_promo_resolves_to_flat_1x_without_panic() {
+        let promo = Promotion {
+            start_date: "2026-03-16".to_string(),
+            end_date: "2026-03-16".to_string(),
+            ..test_promo()
+        };
+        let promos = vec![promo];
+
+        // Every instant of the would-be promo day stays 1x — the off-peak
+        // ones isolate the date logic from the peak window.
+        for (label, t) in [
+            ("00:00", et_to_utc(2026, 3, 16, 0, 0)),
+            ("06:00 off-peak", et_to_utc(2026, 3, 16, 6, 0)),
+            ("13:59 peak", et_to_utc(2026, 3, 16, 13, 59)),
+            ("23:59", et_to_utc(2026, 3, 16, 23, 59)),
+        ] {
+            assert!(
+                !is_promo_active_at(t, &promos[0]),
+                "zero-length promo must never be active ({})",
+                label
+            );
+            assert!(
+                (get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9,
+                "zero-length promo must leave {} at 1x",
+                label
+            );
+        }
+
+        // Walking the whole day finds no transition and forecasts raw hours.
+        let day_start = et_to_utc(2026, 3, 16, 0, 0);
+        assert!(
+            find_next_transition(
+                day_start,
+                day_start + Duration::hours(24),
+                &promos,
+                "weekly_scoped"
+            )
+            .is_none(),
+            "zero-length promo must not surface a transition"
+        );
+        let effective = effective_hours_remaining_from(
+            day_start,
+            day_start + Duration::hours(24),
+            &promos,
+            "weekly_scoped",
+        );
+        assert!(
+            (effective - 24.0).abs() < 1e-6,
+            "zero-length promo must forecast raw 24h, got {}",
+            effective
+        );
+    }
+
+    /// Regression: an inverted promotion range (end before start) satisfies no
+    /// instant, so it degrades to flat 1x without panicking — same shape as
+    /// the zero-length case but across a multi-day span.
+    #[test]
+    fn inverted_promo_range_resolves_to_flat_1x_without_panic() {
+        let promo = Promotion {
+            start_date: "2026-03-20".to_string(),
+            end_date: "2026-03-16".to_string(), // ends before it starts
+            ..test_promo()
+        };
+        let promos = vec![promo];
+
+        for (label, t) in [
+            ("inside the inverted span", et_to_utc(2026, 3, 17, 6, 0)),
+            ("late in the inverted span", et_to_utc(2026, 3, 19, 23, 59)),
+            ("weekend inside the span", et_to_utc(2026, 3, 21, 12, 0)),
+        ] {
+            assert!(
+                !is_promo_active_at(t, &promos[0]),
+                "inverted range must never be active ({})",
+                label
+            );
+            assert!(
+                (get_multiplier_at(t, &promos, "weekly_scoped") - 1.0).abs() < 1e-9,
+                "inverted range must leave {} at 1x",
+                label
+            );
+        }
+
+        let span_start = et_to_utc(2026, 3, 16, 0, 0);
+        assert!(
+            find_next_transition(
+                span_start,
+                span_start + Duration::hours(120),
+                &promos,
+                "weekly_scoped"
+            )
+            .is_none(),
+            "inverted range must not surface a transition"
+        );
+        let effective = effective_hours_remaining_from(
+            span_start,
+            span_start + Duration::hours(24),
+            &promos,
+            "weekly_scoped",
+        );
+        assert!(
+            (effective - 24.0).abs() < 1e-6,
+            "inverted range must forecast raw 24h, got {}",
+            effective
+        );
+    }
+
+    /// Regression: the per-promotion peak-hour fields are inert — the peak
+    /// window comes from the module constants, so even degenerate values
+    /// (inverted or zero-length) change nothing and panic nothing.
+    #[test]
+    fn degenerate_peak_hour_fields_are_inert() {
+        let inverted = Promotion {
+            peak_start_hour_et: 14,
+            peak_end_hour_et: 8, // inverted "window"
+            ..test_promo()
+        };
+        let zero_length = Promotion {
+            peak_start_hour_et: 8,
+            peak_end_hour_et: 8, // empty "window"
+            ..test_promo()
+        };
+        let baseline = vec![test_promo()];
+
+        let instants = [
+            ("off-peak", et_to_utc(2026, 3, 16, 6, 0)),
+            ("peak", et_to_utc(2026, 3, 16, 10, 0)),
+            ("13:59 peak edge", et_to_utc(2026, 3, 16, 13, 59)),
+            ("14:00 off-peak edge", et_to_utc(2026, 3, 16, 14, 0)),
+        ];
+        for promo in [inverted, zero_length] {
+            let promos = vec![promo];
+            for (label, t) in instants {
+                assert_eq!(
+                    get_multiplier_at(t, &promos, "weekly_scoped"),
+                    get_multiplier_at(t, &baseline, "weekly_scoped"),
+                    "degenerate peak fields must not change the multiplier at {}",
+                    label
+                );
+            }
+        }
+    }
+
+    /// Regression: valid JSON of the wrong shape (not an array of promotion
+    /// objects) hits the same warn-and-empty parse-failure path as malformed
+    /// JSON rather than panicking or partially loading.
+    #[test]
+    fn load_promotions_from_wrong_shape_json_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (label, contents) in [
+            ("object", r#"{"name": "lone promo"}"#),
+            ("null", "null"),
+            ("string", r#""just a string""#),
+            ("number", "42"),
+            ("array of non-objects", r#"[1, 2, 3]"#),
+        ] {
+            let path = dir.path().join(format!("wrong-shape-{}.json", label));
+            std::fs::write(&path, contents).unwrap();
+            assert!(
+                load_promotions(&path).is_empty(),
+                "wrong-shape JSON ({}) must fall back to an empty schedule",
+                label
+            );
+        }
+    }
+
+    /// Regression: a file that exists but is not valid UTF-8 fails
+    /// fs::read_to_string — the same warn-and-empty read-failure path a
+    /// directory triggers — rather than panicking.
+    #[test]
+    fn load_promotions_from_non_utf8_file_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("binary-promotions.json");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x81, 0x01]).unwrap();
+
+        assert!(path.exists(), "the file must exist to reach the read path");
+        assert!(load_promotions(&path).is_empty());
     }
 
     // --- Deterministic forecasts: exact effective-hour values ---
