@@ -561,8 +561,16 @@ pub fn format_status_dashboard(state: &GovernorState, now: DateTime<Utc>) -> Str
     output
 }
 
-/// Format status as JSON for machine consumption
-pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
+/// Format status as JSON for machine consumption.
+///
+/// `ledger_yield` carries the per-adapter verified-closure economics read from
+/// the NEEDLE attempt ledger (`crate::ledger_yield`). The caller computes it —
+/// this formatter stays pure and does no I/O — and passes `None` when the
+/// ledger cannot be read, which renders as `null` rather than fabricated zeros.
+pub fn format_status_json(
+    state: &GovernorState,
+    ledger_yield: Option<&crate::ledger_yield::LedgerYieldReport>,
+) -> serde_json::Value {
     let pressure = compute_pressure_level(&state.capacity_forecast);
     let exit_code = StatusExitCode::from_state(state);
 
@@ -639,6 +647,13 @@ pub fn format_status_json(state: &GovernorState) -> serde_json::Value {
             "offpeak_ratio_expected": state.burn_rate.offpeak_ratio_expected,
             "promotion_peak_samples": state.burn_rate.promotion_peak_samples,
             "promotion_offpeak_samples": state.burn_rate.promotion_offpeak_samples,
+        },
+        // Per-adapter verified-closure economics from the NEEDLE attempt
+        // ledger (claudego-bba5584b). null when the caller could not read the
+        // ledger — absence is information, never a fabricated zero.
+        "ledger_yield": match ledger_yield {
+            Some(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
         },
         "fleet": {
             "cache_efficiency": state.last_fleet_aggregate.fleet_cache_eff,
@@ -1062,7 +1077,7 @@ mod tests {
     #[test]
     fn format_json_includes_all_fields() {
         let state = make_test_state();
-        let json = format_status_json(&state);
+        let json = format_status_json(&state, None);
 
         assert!(json.get("pressure").is_some());
         assert!(json.get("exit_code").is_some());
@@ -1074,9 +1089,53 @@ mod tests {
     }
 
     #[test]
+    fn format_json_includes_ledger_yield_when_provided() {
+        let state = make_test_state();
+
+        let mut by_adapter = std::collections::BTreeMap::new();
+        by_adapter.insert(
+            "claude-code-glm-5.3-flash".to_string(),
+            crate::ledger_yield::AdapterYield {
+                adapter: "claude-code-glm-5.3-flash".to_string(),
+                attempts: 4,
+                verified: 3,
+                verified_yield: Some(0.75),
+                cost_usd: 6.0,
+                cost_per_verified_usd: Some(2.0),
+            },
+        );
+        let report = crate::ledger_yield::LedgerYieldReport {
+            window_hours: 72,
+            window_start: Utc::now() - chrono::Duration::hours(72),
+            computed_at: Utc::now(),
+            attempts: 4,
+            verified: 3,
+            verified_yield: Some(0.75),
+            cost_usd: 6.0,
+            cost_per_verified_usd: Some(2.0),
+            rows_ignored: 2,
+            by_adapter,
+        };
+
+        let with_ledger = format_status_json(&state, Some(&report));
+        let block = &with_ledger["ledger_yield"];
+        assert_eq!(block["attempts"], 4);
+        assert_eq!(block["verified"], 3);
+        assert_eq!(block["cost_per_verified_usd"], 2.0);
+        assert_eq!(
+            block["by_adapter"]["claude-code-glm-5.3-flash"]["verified_yield"],
+            0.75
+        );
+
+        // Without a report the block is null, never a fabricated zero.
+        let without = format_status_json(&state, None);
+        assert!(without["ledger_yield"].is_null());
+    }
+
+    #[test]
     fn format_json_exit_code_matches_state() {
         let state = make_test_state();
-        let json = format_status_json(&state);
+        let json = format_status_json(&state, None);
 
         // State has cutoff_risk = true, so exit_code should be 2
         assert_eq!(json["exit_code"], 2);
@@ -1097,7 +1156,7 @@ mod tests {
             binding: true,
             ..Default::default()
         };
-        let json = format_status_json(&state);
+        let json = format_status_json(&state, None);
         let win = &json["windows"]["weekly_scoped"];
 
         assert_eq!(win["remain_to_ceiling_pct"], 28.0);

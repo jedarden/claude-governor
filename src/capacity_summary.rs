@@ -179,7 +179,15 @@ fn get_recommendation(level: PressureLevel) -> &'static str {
 /// When the binding window is the model-scoped weekly window, the line shows
 /// the resolved model name (e.g. "Fable") it is scoped to, falling back to
 /// the generic "weekly_scoped" key when no model is known for this period.
-pub fn generate_capacity_summary(state: &GovernorState) -> String {
+///
+/// `ledger_yield` carries the per-adapter verified-closure economics read from
+/// the NEEDLE attempt ledger (claudego-bba5584b). The caller computes it —
+/// this stays a pure formatter with no I/O. `None` (ledger unreadable) omits
+/// the section entirely: absence must not masquerade as data.
+pub fn generate_capacity_summary(
+    state: &GovernorState,
+    ledger_yield: Option<&crate::ledger_yield::LedgerYieldReport>,
+) -> String {
     let forecast = &state.capacity_forecast;
     let pressure_level = compute_pressure_level(forecast);
     let recommendation = get_recommendation(pressure_level);
@@ -235,7 +243,49 @@ pub fn generate_capacity_summary(state: &GovernorState) -> String {
 - Capacity pressure: {} ({})
 - Recommendation: {}"#,
         binding_name, headroom_pct, reset_time, pressure_level, pressure_reason, recommendation
-    )
+    ) + &ledger_yield.map(format_ledger_economics).unwrap_or_default()
+}
+
+/// Render one line of per-adapter verified-closure economics (claudego-bba5584b):
+/// fleet attempts, verified yield and cost per verified closure, then the same
+/// per adapter. A fixture-excluded, decomposed, costed=false or partial row is
+/// already absent from the report — this only formats what survived the reader.
+fn format_ledger_economics(report: &crate::ledger_yield::LedgerYieldReport) -> String {
+    let mut line = match report.verified_yield {
+        Some(fleet_yield) => format!(
+            "\n- Verified-closure economics ({}h ledger): fleet {} attempts, {:.0}% verified, {}",
+            report.window_hours,
+            report.attempts,
+            fleet_yield * 100.0,
+            match report.cost_per_verified_usd {
+                Some(cost_per) => format!("${:.2} per verified closure", cost_per),
+                None => "no verified closures".to_string(),
+            }
+        ),
+        None => format!(
+            "\n- Verified-closure economics ({}h ledger): no in-window attempts",
+            report.window_hours
+        ),
+    };
+    if report.by_adapter.is_empty() {
+        return line;
+    }
+    line.push_str("; per adapter:");
+    for adapter in report.by_adapter.values() {
+        let yield_pct = adapter
+            .verified_yield
+            .map(|y| format!("{:.0}%", y * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        let per_verified = match adapter.cost_per_verified_usd {
+            Some(cost_per) => format!("${:.2}/verified", cost_per),
+            None => "no verified".to_string(),
+        };
+        line.push_str(&format!(
+            " {} {} att {} {}",
+            adapter.adapter, adapter.attempts, yield_pct, per_verified
+        ));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -451,7 +501,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         // Should be valid markdown with header
         assert!(summary.starts_with("## Fleet Capacity"));
@@ -476,7 +526,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(summary.contains("LOW"));
         assert!(summary.contains("ample headroom"));
@@ -499,7 +549,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(summary.contains("MEDIUM"));
         assert!(summary.contains("moderate headroom"));
@@ -522,7 +572,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(summary.contains("HIGH"));
         assert!(summary.contains("cutoff risk active"));
@@ -546,7 +596,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         // Should show minutes for < 1 hour
         assert!(summary.contains("30m"));
@@ -562,7 +612,7 @@ mod tests {
         };
         let state = make_state(forecast);
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(summary.contains("weekly_scoped"));
     }
@@ -580,7 +630,7 @@ mod tests {
         let mut state = make_state(forecast);
         state.usage.weekly_scoped_model = Some("Fable".to_string());
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(
             summary.contains("Binding window: Fable"),
@@ -603,7 +653,7 @@ mod tests {
         };
         let state = make_state(forecast); // UsageState::default() -> weekly_scoped_model None
 
-        let summary = generate_capacity_summary(&state);
+        let summary = generate_capacity_summary(&state, None);
 
         assert!(
             summary.contains("Binding window: weekly_scoped"),
@@ -638,5 +688,103 @@ mod tests {
 
         let constrained = find_most_constrained_window(&forecast);
         assert!((constrained.margin_hrs - 1.0).abs() < 0.01);
+    }
+
+    // --- Ledger Yield Economics (claudego-bba5584b) ---
+
+    #[test]
+    fn summary_appends_ledger_economics_when_reported() {
+        let forecast = CapacityForecast {
+            weekly_scoped: make_forecast(10.0, 37.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
+            ..CapacityForecast::default()
+        };
+        let state = make_state(forecast);
+
+        let mut by_adapter = std::collections::BTreeMap::new();
+        by_adapter.insert(
+            "flash".to_string(),
+            crate::ledger_yield::AdapterYield {
+                adapter: "flash".to_string(),
+                attempts: 4,
+                verified: 3,
+                verified_yield: Some(0.75),
+                cost_usd: 4.5,
+                cost_per_verified_usd: Some(1.5),
+            },
+        );
+        by_adapter.insert(
+            "glm".to_string(),
+            crate::ledger_yield::AdapterYield {
+                adapter: "glm".to_string(),
+                attempts: 2,
+                verified: 0,
+                verified_yield: Some(0.0),
+                cost_usd: 4.0,
+                cost_per_verified_usd: None,
+            },
+        );
+        let report = crate::ledger_yield::LedgerYieldReport {
+            window_hours: 72,
+            window_start: chrono::Utc::now() - chrono::Duration::hours(72),
+            computed_at: chrono::Utc::now(),
+            attempts: 6,
+            verified: 3,
+            verified_yield: Some(0.5),
+            cost_usd: 8.5,
+            cost_per_verified_usd: Some(8.5 / 3.0),
+            rows_ignored: 2,
+            by_adapter,
+        };
+
+        let summary = generate_capacity_summary(&state, Some(&report));
+
+        assert!(
+            summary.contains("- Verified-closure economics (72h ledger): fleet 6 attempts, 50% verified, $2.83 per verified closure"),
+            "fleet line must carry attempts, yield and cost per verified: {summary}"
+        );
+        assert!(
+            summary.contains("flash 4 att 75% $1.50/verified"),
+            "per-adapter numbers must render: {summary}"
+        );
+        assert!(
+            summary.contains("glm 2 att 0% no verified"),
+            "an adapter with no verified closures must not render a fabricated cost: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_omits_ledger_economics_when_absent() {
+        let forecast = CapacityForecast {
+            weekly_scoped: make_forecast(10.0, 37.0, false, true),
+            binding_window: "weekly_scoped".to_string(),
+            ..CapacityForecast::default()
+        };
+        let state = make_state(forecast);
+
+        // An unreadable ledger renders nothing — absence must not masquerade
+        // as data.
+        let summary = generate_capacity_summary(&state, None);
+        assert!(!summary.contains("Verified-closure economics"));
+
+        // An empty report is honest data, not absence: it renders as zero
+        // attempts in the window.
+        let empty = crate::ledger_yield::LedgerYieldReport {
+            window_hours: 72,
+            window_start: chrono::Utc::now() - chrono::Duration::hours(72),
+            computed_at: chrono::Utc::now(),
+            attempts: 0,
+            verified: 0,
+            verified_yield: None,
+            cost_usd: 0.0,
+            cost_per_verified_usd: None,
+            rows_ignored: 0,
+            by_adapter: Default::default(),
+        };
+        let summary = generate_capacity_summary(&state, Some(&empty));
+        assert!(
+            summary.contains("no in-window attempts"),
+            "empty ledger must say so explicitly: {summary}"
+        );
     }
 }

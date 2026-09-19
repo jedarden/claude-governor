@@ -14,6 +14,9 @@ pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod governor;
+/// Per-adapter verified-closure yield from the NEEDLE attempt ledger
+/// (claudego-bba5584b).
+pub mod ledger_yield;
 pub mod narrator;
 pub mod poller;
 pub mod pricing;

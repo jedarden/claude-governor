@@ -32,6 +32,7 @@ use claude_governor::config::GovernorConfig;
 use claude_governor::db;
 use claude_governor::doctor;
 use claude_governor::governor;
+use claude_governor::ledger_yield;
 use claude_governor::narrator;
 use claude_governor::poller::{Poller, UsageData};
 use claude_governor::schedule;
@@ -1373,15 +1374,38 @@ fn main() -> Result<()> {
             let state = state::load_state(&state_path)?;
             let exit_code = StatusExitCode::from_state(&state);
 
+            // Per-adapter verified-closure economics, computed fresh at
+            // render time (claudego-bba5584b). Read-only scan; a failure
+            // leaves the block null in the output rather than blocking
+            // status.
+            let settings = ledger_yield::LedgerYieldSettings::from_env();
+            let ledger_report = ledger_yield::read_ledger_yield(
+                &settings.logs_dir,
+                Utc::now(),
+                settings.window_hours,
+            )
+            .map_err(|e| {
+                log::warn!(
+                    "ledger yield read failed ({}): {}",
+                    settings.logs_dir.display(),
+                    e
+                );
+                e
+            })
+            .ok();
+
             // --summary: NEEDLE prompt injection format
             if summary {
-                print!("{}", generate_capacity_summary(&state));
+                print!(
+                    "{}",
+                    generate_capacity_summary(&state, ledger_report.as_ref())
+                );
                 std::process::exit(exit_code.as_exit_code());
             }
 
             // --json or non-TTY: raw state JSON
             if json || !std::io::stdout().is_terminal() {
-                println!("{}", format_status_json(&state));
+                println!("{}", format_status_json(&state, ledger_report.as_ref()));
                 std::process::exit(exit_code.as_exit_code());
             }
 
