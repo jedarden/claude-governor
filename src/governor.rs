@@ -1171,9 +1171,9 @@ fn count_ready_beads(workspace: &str) -> u32 {
     }
 }
 
-/// Underutilization sprint: when a subscription generator pool is sprint-eligible (a
+/// Underutilization sprint: when a subscription pool is sprint-eligible (a
 /// window is under-used, resets soon, nothing at cutoff risk, not in safe mode) AND
-/// there is more queued generation work than running workers, boost the target toward
+/// there is more queued work in the pool's workspace than running workers, boost the target toward
 /// that pool's max so spare use-or-lose capacity is burned *productively* rather than
 /// left to reset unused. The backlog gate is what keeps "never leave the subscription
 /// empty" from meaning "spin up idle runners". Returns the (possibly boosted) target.
@@ -4644,6 +4644,8 @@ fn get_agent_cost_per_worker(
 /// - `burn_rate_by_model`: Per-model burn rate data for cost lookup
 /// - `pricing_config`: Pricing configuration for cost estimation
 /// - `cutoff_risk`: Whether we're in cutoff_risk mode (affects scale-down priority)
+/// - `capacity_forecast`: The cycle's per-window forecasts, for the per-pool
+///   window-affinity cap
 ///
 /// # Returns
 /// HashMap of agent name -> target worker count
@@ -4654,11 +4656,12 @@ fn distribute_workers_by_cost_priority(
     burn_rate_by_model: &HashMap<String, state::ModelBurnRate>,
     pricing_config: &crate::config::GovernorConfig,
     _cutoff_risk: bool, // Reserved for future scale-down priority adjustments
+    capacity_forecast: &state::CapacityForecast,
 ) -> HashMap<String, u32> {
     // Base distribution: start from the current allocation and adjust gently by the
     // delta (minimising churn) — scale down sheds the most expensive workers first,
     // scale up adds to the cheapest agent first. A second pass then enforces each
-    // agent's min_workers floor so a dedicated pool (e.g. an Opus polish strand with
+    // agent's min_workers floor so a dedicated pool (e.g. an Opus strand with
     // max_workers=1) actually launches — the pure cost sort would otherwise always
     // fill the cheap, high-max agent (glm, max 8) first and never give it a slot.
     let mut result: HashMap<String, u32> = HashMap::new();
@@ -4743,7 +4746,206 @@ fn distribute_workers_by_cost_priority(
         }
     }
 
+    // Per-pool window-affinity cap (claudego-ec6d3ae3): a pool is never
+    // allocated past what the windows IT consumes can support, regardless of
+    // which window binds the aggregate. Two effects: a pool that does not
+    // consume the binding window is freed from its risk (weekly_scoped cutoff
+    // risk no longer starves the Sonnet pool — the aggregate side of that is
+    // the affinity gate on binding selection in the observe half), and a pool
+    // that does consume a window the aggregate ignored stays bounded by it (a
+    // premium pool keeps its weekly_scoped bound even when seven_day binds).
+    //
+    // The operator's min_workers floor still wins: an explicit floor is a
+    // stated intent to run through tight windows, matching the floor pass
+    // above, so the cap only binds allocations the floor does not claim.
+    //
+    // The cap REDISTRIBUTES between pools; it must not shrink the fleet.
+    // `target_total` is already the authorized move — the scaling decision
+    // applied the hysteresis band and `max_scale_{up,down}_per_cycle` to
+    // produce it — so a cap that also cut the total would silently overrule
+    // both. It did, before this pass was written the obvious way: a single
+    // undeclared pool's cap is just the raw `safe_worker_count`, which the
+    // smoothing deliberately lags behind, so clamping the allocation outright
+    // made a NoChange cycle signal a worker and made an authorized shed of 2
+    // signal 3 (`hysteresis_hold_touches_no_worker_regression` and
+    // `scale_down_honors_per_cycle_cap_regression`). Slots freed by a clamp
+    // are therefore re-homed to pools that can still take them (cheapest
+    // first, under their own ceiling), and whatever cannot be re-homed is
+    // returned to the pool it came from — bounded by that pool's CURRENT
+    // worker count, so it is never a growth path. Net effect: the cap bounds
+    // growth absolutely, while shrink pacing stays with the aggregate
+    // decision, which is what owns it.
+    //
+    // Known consequence (claudego-ad125e03): on a hold cycle with no other
+    // pool able to absorb the freed slots, a pool above its own ceiling gets
+    // its workers back and sheds nothing. Inert while needle-sonnet is the
+    // only configured pool; the real fix is for the aggregate to authorize
+    // that shed, so it passes through max_scale_down_per_cycle like any
+    // other. Do NOT "fix" it by dropping the give-back — that is exactly the
+    // code shape the two regression tests above rejected.
+    let pool_ceiling = |cfg: &AgentConfig| -> u32 {
+        pool_window_safe_cap(cfg, capacity_forecast)
+            .map(|cap| cap.max(cfg.min_workers.min(cfg.max_workers)))
+            .unwrap_or(cfg.max_workers)
+            .min(cfg.max_workers)
+    };
+
+    let mut freed: u32 = 0;
+    let mut clamped: Vec<(String, u32)> = Vec::new();
+    for (name, cfg) in agents {
+        let ceiling = pool_ceiling(cfg);
+        let target = *result.get(name).unwrap_or(&0);
+        if target > ceiling {
+            log::info!(
+                "[governor] window-affinity cap: {} {} -> {} workers (min safe count across its \
+                 windows: {:?}, floor: {})",
+                name,
+                target,
+                ceiling,
+                pool_window_safe_cap(cfg, capacity_forecast),
+                cfg.min_workers.min(cfg.max_workers)
+            );
+            result.insert(name.clone(), ceiling);
+            freed += target - ceiling;
+            clamped.push((name.clone(), target - ceiling));
+        }
+    }
+
+    if freed > 0 {
+        // Re-home the freed slots, cheapest pool first — the same preference
+        // the scale-up pass uses — bounded by each pool's own ceiling.
+        let mut by_cost = agent_costs.clone();
+        by_cost.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, _cost, _current, _min, _max) in &by_cost {
+            if freed == 0 {
+                break;
+            }
+            let Some(cfg) = agents.get(name) else {
+                continue;
+            };
+            let ceiling = pool_ceiling(cfg);
+            let have = *result.get(name).unwrap_or(&0);
+            if have < ceiling {
+                let add = (ceiling - have).min(freed);
+                result.insert(name.clone(), have + add);
+                freed -= add;
+            }
+        }
+
+        // Nowhere to re-home: give it back rather than shed below the
+        // authorized total, but never above what the pool is already running.
+        for (name, removed) in clamped {
+            if freed == 0 {
+                break;
+            }
+            let have = *result.get(&name).unwrap_or(&0);
+            let running = *current_workers.get(&name).unwrap_or(&0);
+            let give_back = removed.min(freed).min(running.saturating_sub(have));
+            if give_back > 0 {
+                result.insert(name.clone(), have + give_back);
+                freed -= give_back;
+            }
+        }
+    }
+
     result
+}
+
+/// The tightest `safe_worker_count` across the windows this pool actually
+/// consumes — the most workers of this kind the forecast says are affordable
+/// (claudego-ec6d3ae3). Uses the p50 estimate, matching the aggregate's
+/// non-wide-cone path; the cone-selected binding estimate still governs the
+/// aggregate on top of this.
+///
+/// Windows whose safe count is `None` (insufficient burn data) impose no cap:
+/// "hold for lack of data" is the aggregate's decision
+/// (`safe_worker_count_or_hold`), not a per-pool bound of zero. A pool with no
+/// capped window returns `None` — unbounded by affinity (max_workers and the
+/// emergency brake still apply).
+fn pool_window_safe_cap(cfg: &AgentConfig, forecast: &state::CapacityForecast) -> Option<u32> {
+    cfg.consumed_windows()
+        .into_iter()
+        .filter_map(|w| match w {
+            "five_hour" => forecast.five_hour.safe_worker_count,
+            "seven_day" => forecast.seven_day.safe_worker_count,
+            _ => forecast.weekly_scoped.safe_worker_count,
+        })
+        .min()
+}
+
+/// The windows eligible to bind the fleet-wide scaling decision, given every
+/// enabled pool's declared window affinity ([`AgentConfig::windows`]).
+///
+/// The binding window drives the AGGREGATE target for the whole fleet, so a
+/// window may bind only if every enabled pool consumes it. Affinity is what a
+/// pool's model actually draws down (docs/notes/human-reserve-policy.md): a
+/// Sonnet pool draws on five_hour + seven_day and never weekly_scoped
+/// (premium-only), so weekly_scoped's risk — the operator's own Fable session —
+/// must not hold the Sonnet fleet at 0 while the windows Sonnet actually burns
+/// have headroom.
+///
+/// Returns `None` when affinity must not restrict selection:
+/// - no enabled pool (`max_workers > 0`) declares an explicit list — an
+///   undeclared pool is ASSUMED to consume everything (the conservative
+///   default), so it excludes nothing and no declaration anywhere means
+///   today's behaviour; a disabled pool consumes nothing and restricts
+///   nothing; or
+/// - the enabled pools' declarations are disjoint (empty intersection): no
+///   window is common to all pools, so none may bind the aggregate —
+///   `distribute_workers_by_cost_priority` still caps each pool by its own
+///   windows, so falling back to unrestricted here stays conservative.
+fn fleet_binding_affinity(agents: &HashMap<String, AgentConfig>) -> Option<Vec<&'static str>> {
+    let mut intersection: Option<Vec<&'static str>> = None;
+    for cfg in agents.values() {
+        if cfg.max_workers == 0 || cfg.windows.is_none() {
+            // Disabled (consumes nothing) or undeclared (assumed to consume
+            // everything) — either way this pool excludes no window.
+            continue;
+        }
+        let declared = cfg.consumed_windows();
+        intersection = Some(match intersection {
+            None => declared,
+            Some(common) => common
+                .into_iter()
+                .filter(|w| declared.contains(w))
+                .collect(),
+        });
+    }
+    match intersection {
+        Some(ref common) if common.is_empty() => None,
+        other => other,
+    }
+}
+
+/// Pick the binding window: the eligible window with the highest `risk_score`.
+///
+/// The score combines margin urgency, duration weight, and volatility
+/// (cone_ratio); higher = more urgent window. `eligible` decides candidacy —
+/// the observe cycle composes two gates into it:
+/// - **data presence**: a window absent from `hours_remaining` (no reset-time
+///   data this cycle) or one the API has consecutively omitted carries a
+///   phantom 0.0 risk_score that can beat a real window's legitimately
+///   negative (low-risk) score; and
+/// - **pool affinity** ([`fleet_binding_affinity`]): a window no enabled pool
+///   consumes must not be the binding window, or its risk holds pools it
+///   cannot touch at 0.
+///
+/// Returns the empty string when nothing is eligible (the caller's existing
+/// downstream fallbacks treat that as "no binding information").
+fn select_binding_window(
+    windows: &[(&'static str, &state::WindowForecast)],
+    eligible: impl Fn(&'static str) -> bool,
+) -> String {
+    windows
+        .iter()
+        .filter(|(name, _)| eligible(name))
+        .max_by(|(_, a), (_, b)| {
+            a.risk_score
+                .partial_cmp(&b.risk_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_default()
 }
 
 /// The first usage window at/above the emergency-brake threshold, if any.
@@ -4865,6 +5067,7 @@ pub fn resolve_manual_override(
         applied_target: clamped,
     }
 }
+
 /// Compute the target worker count from capacity forecast and schedule state.
 ///
 /// Uses the binding window's `safe_worker_count` as the primary constraint.
@@ -6561,6 +6764,15 @@ pub fn run_observe_cycle(
         ("weekly_scoped", &weekly_scoped_forecast),
     ];
 
+    // Pool affinity gate (claudego-ec6d3ae3): the binding window drives the
+    // aggregate target for the whole fleet, so a window no enabled pool
+    // consumes must not bind it. weekly_scoped is premium-model-only — when no
+    // enabled pool declares it, its cutoff risk (the operator's own premium
+    // session) must not hold the Sonnet fleet at 0 for as long as that window
+    // takes to reset. The emergency brake is deliberately NOT affinity-gated:
+    // 98% on any window — including weekly_scoped — still zeroes everything.
+    let affinity = fleet_binding_affinity(agents);
+
     // Only consider windows we actually have reset-time data for this cycle. A
     // window absent from `hours_remaining` (e.g. seven_day_sonnet on an account
     // with no distinct Sonnet-scoped limit) falls back to hrs_left=0.0 upstream,
@@ -6568,18 +6780,20 @@ pub fn run_observe_cycle(
     // score that can beat a real, healthy window's legitimately negative
     // (low-risk) score. Excluding data-absent windows keeps binding selection
     // limited to windows the API actually reports as real constraints.
-    let binding_window = windows
-        .iter()
-        .filter(|(name, _)| {
-            hours_remaining.contains_key(*name) && !state.is_window_consecutively_absent(name)
-        })
-        .max_by(|(_, a), (_, b)| {
-            a.risk_score
-                .partial_cmp(&b.risk_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(name, _)| name.to_string())
-        .unwrap_or_default();
+    let binding_window = select_binding_window(&windows, |name| {
+        hours_remaining.contains_key(name)
+            && !state.is_window_consecutively_absent(name)
+            && affinity.as_ref().is_none_or(|set| set.contains(&name))
+    });
+    if let Some(set) = &affinity {
+        if !set.contains(&"weekly_scoped") {
+            log::info!(
+                "[governor] weekly_scoped excluded from binding selection: no enabled pool \
+                 consumes it (pool window affinity) — its risk no longer holds pools that \
+                 cannot touch it; the 98% emergency brake still covers it"
+            );
+        }
+    }
 
     // Set binding flag
     if binding_window == "five_hour" {
@@ -7067,7 +7281,7 @@ pub fn run_act_cycle(
     match &decision {
         ScalingDecision::NoChange => {
             // The aggregate total is unchanged, but the per-agent allocation can
-            // still violate a pool's min_workers (e.g. a dedicated polish pool that
+            // still violate a pool's min_workers (e.g. a dedicated pool that
             // must always run 1 worker). Reconcile the distribution so such a pool
             // launches even at a steady total — moving a worker off an over-allocated
             // agent — instead of only ever acting on aggregate deltas.
@@ -7088,6 +7302,7 @@ pub fn run_act_cycle(
                     &state.burn_rate.by_model,
                     pricing_config,
                     cutoff_risk,
+                    &state.capacity_forecast,
                 );
                 let mut reconciled = false;
                 // Free capacity from over-allocated agents first, then launch the deficit.
@@ -7170,6 +7385,7 @@ pub fn run_act_cycle(
                     &state.burn_rate.by_model,
                     pricing_config,
                     cutoff_risk,
+                    &state.capacity_forecast,
                 );
 
                 // Scale up each agent individually based on distribution
@@ -7227,6 +7443,7 @@ pub fn run_act_cycle(
                     &state.burn_rate.by_model,
                     pricing_config,
                     cutoff_risk,
+                    &state.capacity_forecast,
                 );
 
                 // Scale down each agent individually based on distribution
@@ -7418,6 +7635,7 @@ pub fn run_act_cycle(
                 &state.burn_rate.by_model,
                 pricing_config,
                 cutoff_risk,
+                &state.capacity_forecast,
             );
             for (agent_name, ws) in state.workers.iter_mut() {
                 ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
@@ -7432,6 +7650,7 @@ pub fn run_act_cycle(
                 &state.burn_rate.by_model,
                 pricing_config,
                 cutoff_risk,
+                &state.capacity_forecast,
             );
             for (agent_name, ws) in state.workers.iter_mut() {
                 ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
@@ -7446,6 +7665,7 @@ pub fn run_act_cycle(
                 &state.burn_rate.by_model,
                 pricing_config,
                 cutoff_risk,
+                &state.capacity_forecast,
             );
             for (agent_name, ws) in state.workers.iter_mut() {
                 ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);
@@ -9300,14 +9520,8 @@ mod tests {
         let baseline_usd_per_pct = 5.0 / baseline_pct;
 
         // Measured EMA: the fleet burns 1.6%/hr across its 2 workers.
-        let fleet_pct_hr = effective_fleet_pct_rate(
-            current_total,
-            7,
-            1.6,
-            0.0,
-            3.33,
-            baseline_usd_per_pct,
-        );
+        let fleet_pct_hr =
+            effective_fleet_pct_rate(current_total, 7, 1.6, 0.0, 3.33, baseline_usd_per_pct);
         assert!(
             (fleet_pct_hr - 1.6).abs() < 1e-9,
             "measured EMA must be used verbatim with workers running, got {}",
@@ -9840,9 +10054,9 @@ mod tests {
     fn workspace_from_launch_cmd_parses_flag() {
         assert_eq!(
             workspace_from_launch_cmd(
-                "needle run --agent claude-print-opus --workspace /home/coding/cgov-polish-queue --identifier cgov-polish"
+                "needle run --agent claude-print-opus --workspace /home/coding/example-workspace --identifier cgov-example"
             ),
-            Some("/home/coding/cgov-polish-queue".to_string())
+            Some("/home/coding/example-workspace".to_string())
         );
         assert_eq!(workspace_from_launch_cmd("needle run --agent x"), None);
     }
@@ -10098,6 +10312,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         agents.insert(
@@ -10110,6 +10325,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -10159,6 +10375,7 @@ mod tests {
             &burn_rate_by_model,
             &pricing_config,
             false, // cutoff_risk doesn't affect scale-down priority
+            &state::CapacityForecast::default(), // no affinity caps in this test
         );
 
         // Opus should be reduced from 5 to 3 (highest cost first)
@@ -10190,6 +10407,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         agents.insert(
@@ -10202,6 +10420,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -10251,6 +10470,7 @@ mod tests {
             &burn_rate_by_model,
             &pricing_config,
             false,
+            &state::CapacityForecast::default(), // no affinity caps in this test
         );
 
         // Sonnet should be filled first (lowest cost), from 2 to 6 (all 4 new workers)
@@ -10284,6 +10504,7 @@ mod tests {
                 max_workers: 1,
                 subscription: true,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         agents.insert(
@@ -10296,6 +10517,7 @@ mod tests {
                 max_workers: 8,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -10345,6 +10567,7 @@ mod tests {
             &burn_rate_by_model,
             &pricing_config,
             false,
+            &state::CapacityForecast::default(), // no affinity caps in this test
         );
 
         assert_eq!(
@@ -10377,6 +10600,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         agents.insert(
@@ -10389,6 +10613,7 @@ mod tests {
                 max_workers: 3, // Limited capacity
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -10438,6 +10663,7 @@ mod tests {
             &burn_rate_by_model,
             &pricing_config,
             false,
+            &state::CapacityForecast::default(), // no affinity caps in this test
         );
 
         // Haiku should be filled to max (3)
@@ -10476,6 +10702,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         agents.insert(
@@ -10488,6 +10715,7 @@ mod tests {
                 max_workers: 10,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -10533,6 +10761,7 @@ mod tests {
             &burn_rate_by_model,
             &pricing_config,
             false,
+            &state::CapacityForecast::default(), // no affinity caps in this test
         );
 
         // Opus should be reduced first based on empirical burn rate ($12 > $4)
@@ -10547,6 +10776,463 @@ mod tests {
             "Sonnet should not be reduced"
         );
         assert_eq!(result.values().sum::<u32>(), 8, "Total should be 8");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool window affinity (claudego-ec6d3ae3)
+    // -----------------------------------------------------------------------
+
+    /// The 2026-09-07 live shape: weekly_scoped (premium-only) sits at cutoff
+    /// risk with the highest risk score, while the windows the Sonnet executor
+    /// pool actually consumes have headroom. The binding selection must not
+    /// pick weekly_scoped, and the per-pool cap must not starve the pool by
+    /// it — the pool held at 0 for the ~28h of a Fable-window reset is exactly
+    /// the bug. The 98% emergency brake is separate and stays global.
+    #[test]
+    fn weekly_scoped_risk_cannot_bind_pool_that_does_not_consume_it() {
+        let mut weekly = state::WindowForecast {
+            safe_worker_count: Some(0),
+            risk_score: 10.0, // by far the riskiest
+            cutoff_risk: true,
+            ..Default::default()
+        };
+        let seven_day = state::WindowForecast {
+            safe_worker_count: Some(2),
+            risk_score: 1.0, // the riskiest window the pool DOES consume
+            ..Default::default()
+        };
+        let five_hour = state::WindowForecast {
+            safe_worker_count: Some(8),
+            risk_score: 0.0,
+            ..Default::default()
+        };
+        let windows = [
+            ("five_hour", &five_hour),
+            ("seven_day", &seven_day),
+            ("weekly_scoped", &weekly),
+        ];
+
+        // Sonnet pool affinity: five_hour + seven_day, never weekly_scoped.
+        let affinity = fleet_binding_affinity(&make_agents_with_windows(
+            "needle-sonnet",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            8,
+        ));
+        let binding = select_binding_window(&windows, |name| {
+            affinity
+                .as_ref()
+                .map_or(true, |set| set.iter().any(|w| *w == name))
+        });
+
+        assert_eq!(
+            binding, "seven_day",
+            "the riskiest window must not bind when no enabled pool consumes it"
+        );
+        assert!(!binding.is_empty());
+        weekly.binding = binding == "weekly_scoped";
+        assert!(
+            !weekly.binding,
+            "weekly_scoped must not carry the BINDING flag"
+        );
+    }
+
+    /// An enabled premium pool — one that DOES consume weekly_scoped — must
+    /// keep it bindable. The reserve policy is not weakened by affinity: only
+    /// pools that cannot touch a window are freed from its risk.
+    #[test]
+    fn weekly_scoped_stays_bindable_when_an_enabled_pool_consumes_it() {
+        let weekly = state::WindowForecast {
+            safe_worker_count: Some(0),
+            risk_score: 10.0,
+            ..Default::default()
+        };
+        let seven_day = state::WindowForecast {
+            safe_worker_count: Some(2),
+            risk_score: -1.0,
+            ..Default::default()
+        };
+        let five_hour = state::WindowForecast {
+            safe_worker_count: Some(8),
+            risk_score: 0.0,
+            ..Default::default()
+        };
+        let windows = [
+            ("five_hour", &five_hour),
+            ("seven_day", &seven_day),
+            ("weekly_scoped", &weekly),
+        ];
+
+        // Undeclared affinity = assumed to consume everything (the
+        // conservative default), so weekly_scoped must stay a candidate.
+        for (label, agents) in [
+            ("undeclared pool", make_agents_with_windows("pool", None, 8)),
+            (
+                "premium pool declaring all three",
+                make_agents_with_windows(
+                    "polish-opus",
+                    Some(vec![
+                        "five_hour".to_string(),
+                        "seven_day".to_string(),
+                        "weekly_scoped".to_string(),
+                    ]),
+                    4,
+                ),
+            ),
+        ] {
+            let affinity = fleet_binding_affinity(&agents);
+            let binding = select_binding_window(&windows, |name| {
+                affinity
+                    .as_ref()
+                    .map_or(true, |set| set.iter().any(|w| *w == name))
+            });
+            assert_eq!(
+                binding, "weekly_scoped",
+                "{label}: a pool that consumes weekly_scoped must stay bounded by its risk"
+            );
+        }
+    }
+
+    /// Affinity gate edge cases: no declaration anywhere → unrestricted;
+    /// a disabled pool consumes nothing and restricts nothing; disjoint
+    /// declarations have no common window → unrestricted at the aggregate
+    /// (per-pool caps still bound each pool by its own windows).
+    #[test]
+    fn fleet_binding_affinity_edge_cases() {
+        // No agents at all (fresh test harness): unrestricted.
+        assert_eq!(fleet_binding_affinity(&HashMap::new()), None);
+
+        // Only a disabled pool (max_workers 0): it consumes nothing, so its
+        // declaration restricts nothing — a re-enabled premium pool must be
+        // the thing that brings weekly_scoped back, not a disabled one's
+        // leftover config.
+        let disabled = make_agents_with_windows(
+            "polish-opus",
+            Some(vec![
+                "five_hour".to_string(),
+                "seven_day".to_string(),
+                "weekly_scoped".to_string(),
+            ]),
+            0,
+        );
+        assert_eq!(
+            fleet_binding_affinity(&disabled),
+            None,
+            "a disabled pool must not restrict binding candidacy"
+        );
+
+        // Disjoint declarations: no window is common to all pools.
+        let mut disjoint = make_agents_with_windows("a", Some(vec!["five_hour".to_string()]), 4);
+        disjoint.extend(make_agents_with_windows(
+            "b",
+            Some(vec!["seven_day".to_string()]),
+            4,
+        ));
+        assert_eq!(
+            fleet_binding_affinity(&disjoint),
+            None,
+            "disjoint declarations must fall back to unrestricted aggregate selection"
+        );
+
+        // One declaring + one undeclared enabled pool: the declaration binds
+        // both (the undeclared pool is per-pool capped by its assumed-all set).
+        let mut mixed = make_agents_with_windows(
+            "needle-sonnet",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            8,
+        );
+        mixed.extend(make_agents_with_windows("undeclared", None, 8));
+        assert_eq!(
+            fleet_binding_affinity(&mixed),
+            Some(vec!["five_hour", "seven_day"]),
+            "an explicit declaration restricts candidacy even alongside undeclared pools"
+        );
+    }
+
+    /// The per-pool cap: min safe_worker_count across the windows the pool
+    /// itself consumes. A Sonnet pool is not capped by weekly_scoped; an
+    /// undeclared (assumed premium) pool is.
+    #[test]
+    fn pool_window_safe_cap_uses_only_consumed_windows() {
+        let forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                safe_worker_count: Some(8),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                safe_worker_count: Some(2),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sonnet = make_agents_with_windows(
+            "needle-sonnet",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            8,
+        )
+        .get("needle-sonnet")
+        .unwrap()
+        .clone();
+        assert_eq!(
+            pool_window_safe_cap(&sonnet, &forecast),
+            Some(2),
+            "min across five_hour/seven_day; weekly_scoped must not enter the cap"
+        );
+
+        let premium = make_agents_with_windows("polish-opus", None, 4)
+            .get("polish-opus")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            pool_window_safe_cap(&premium, &forecast),
+            Some(0),
+            "undeclared affinity means all windows — weekly_scoped's 0 caps it"
+        );
+
+        // None safe counts impose no cap at all: insufficient data is the
+        // aggregate's hold decision, not a per-pool zero.
+        let empty = state::CapacityForecast::default();
+        assert_eq!(
+            pool_window_safe_cap(&sonnet, &empty),
+            None,
+            "no Some safe count anywhere must mean no affinity cap"
+        );
+    }
+
+    /// End to end over the distribution seam: the aggregate target comes from
+    /// the affinity-correct binding window (seven_day, Some(2)), and the
+    /// distribution must actually hand those workers to the Sonnet pool even
+    /// though weekly_scoped says 0 — the live log line
+    /// `safe_worker_count: 0 workers from binding window weekly_scoped` must
+    /// not be replaceable by the same starvation through the cap. The inverse
+    /// case pins the reserve side: an undeclared (assumed premium) pool IS
+    /// capped by weekly_scoped's 0, and its explicit floor still wins over the
+    /// cap, matching the floor supremacy of the min pass above.
+    #[test]
+    fn distribution_applies_per_pool_window_affinity_cap() {
+        let forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                safe_worker_count: Some(8),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                safe_worker_count: Some(2),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            binding_window: "seven_day".to_string(),
+            ..Default::default()
+        };
+
+        let mut agents = make_agents_with_windows(
+            "needle-sonnet",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            8,
+        );
+        agents.insert(
+            "polish-opus".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print-opus".to_string(),
+                session_pattern: "needle-claude-print-opus-*".to_string(),
+                heartbeat_dir: "~/.needle/state/heartbeats".to_string(),
+                min_workers: 0,
+                max_workers: 4,
+                subscription: true,
+                baseline_burn_rate: None,
+                windows: Some(vec![
+                    "five_hour".to_string(),
+                    "seven_day".to_string(),
+                    "weekly_scoped".to_string(),
+                ]),
+            },
+        );
+
+        let mut current_workers = HashMap::new();
+        current_workers.insert("needle-sonnet".to_string(), 0);
+        current_workers.insert("polish-opus".to_string(), 0);
+
+        let result = distribute_workers_by_cost_priority(
+            &agents,
+            &current_workers,
+            2, // aggregate target from the seven_day binding window
+            &HashMap::new(),
+            &affinity_test_config(),
+            false,
+            &forecast,
+        );
+
+        assert_eq!(
+            result.get("needle-sonnet"),
+            Some(&2),
+            "the Sonnet pool must receive the binding window's headroom — weekly_scoped \
+             holds no affinity over it"
+        );
+        assert_eq!(
+            result.get("polish-opus"),
+            Some(&0),
+            "the premium pool stays bounded by weekly_scoped's 0"
+        );
+
+        // Floor supremacy: min_workers 3 on the premium pool overrides its
+        // window cap of 0, matching how the min pass treats floors elsewhere.
+        // The premium pool is the expensive one, so the cost sort gives it
+        // nothing and the floor pass raises it to 3 by pulling from the Sonnet
+        // pool; the affinity cap must not cut it back below the floor.
+        let mut floored = agents.clone();
+        floored.get_mut("polish-opus").unwrap().min_workers = 3;
+        let mut burn = HashMap::new();
+        burn.insert(
+            "claude-print-opus".to_string(),
+            state::ModelBurnRate {
+                pct_per_worker_per_hour: 2.5,
+                dollars_per_worker_per_hour: 12.0,
+                samples: 5,
+            },
+        );
+        let empty_current: HashMap<String, u32> = current_workers
+            .iter()
+            .map(|(k, _)| (k.clone(), 0))
+            .collect();
+        let result3 = distribute_workers_by_cost_priority(
+            &floored,
+            &empty_current,
+            3,
+            &burn,
+            &affinity_test_config(),
+            false,
+            &forecast,
+        );
+        assert_eq!(
+            result3.get("polish-opus"),
+            Some(&3),
+            "an explicit min_workers floor wins over the window cap, as the floor pass intends"
+        );
+        assert_eq!(
+            result3.get("needle-sonnet"),
+            Some(&0),
+            "the floor was funded by pulling the Sonnet pool's allocation"
+        );
+    }
+
+    /// The cap redistributes between pools; it must never shrink the fleet
+    /// below the authorized aggregate. `target_total` already carries the
+    /// hysteresis band and `max_scale_{up,down}_per_cycle`, while a single
+    /// undeclared pool's cap is the raw `safe_worker_count` that smoothing
+    /// deliberately lags behind — so clamping the allocation outright made a
+    /// hold signal a worker and an authorized shed of 2 signal 3
+    /// (`hysteresis_hold_touches_no_worker_regression` and
+    /// `scale_down_honors_per_cycle_cap_regression` in
+    /// tests/graceful_idle_scaling_test.rs, both caught landing this).
+    /// Growth stays bounded absolutely: give-back is capped at what the pool
+    /// is already running, so it is never a path to more workers.
+    #[test]
+    fn window_affinity_cap_never_shrinks_below_the_authorized_total() {
+        let tight = state::WindowForecast {
+            safe_worker_count: Some(1),
+            ..Default::default()
+        };
+        let forecast = state::CapacityForecast {
+            five_hour: tight.clone(),
+            seven_day: tight.clone(),
+            weekly_scoped: tight,
+            ..Default::default()
+        };
+        let agents = make_agents_with_windows("solo", None, 8);
+        let running: HashMap<String, u32> = [("solo".to_string(), 4)].into_iter().collect();
+
+        let shed = distribute_workers_by_cost_priority(
+            &agents,
+            &running,
+            2, // an authorized shed of 2, already per-cycle capped
+            &HashMap::new(),
+            &affinity_test_config(),
+            false,
+            &forecast,
+        );
+        assert_eq!(
+            shed.get("solo"),
+            Some(&2),
+            "the cap must not shed past the authorized total down to the raw safe count"
+        );
+
+        let hold = distribute_workers_by_cost_priority(
+            &agents,
+            &running,
+            4, // NoChange: target == current
+            &HashMap::new(),
+            &affinity_test_config(),
+            false,
+            &forecast,
+        );
+        assert_eq!(
+            hold.get("solo"),
+            Some(&4),
+            "a hold must touch nobody; the cap is not a shrink path"
+        );
+
+        let cold: HashMap<String, u32> = [("solo".to_string(), 0)].into_iter().collect();
+        let grow = distribute_workers_by_cost_priority(
+            &agents,
+            &cold,
+            6,
+            &HashMap::new(),
+            &affinity_test_config(),
+            false,
+            &forecast,
+        );
+        assert_eq!(
+            grow.get("solo"),
+            Some(&1),
+            "growth stays bounded by the cap — give-back never exceeds what is running"
+        );
+    }
+
+    /// Helper: a minimal GovernorConfig for the affinity tests (no pricing,
+    /// default everything) — `smoke_governor_config` lives in another module.
+    fn affinity_test_config() -> crate::config::GovernorConfig {
+        crate::config::GovernorConfig {
+            pricing: crate::config::PricingConfig {
+                models: HashMap::new(),
+            },
+            sprint: crate::config::SprintConfig::default(),
+            daemon: crate::config::DaemonConfig::default(),
+            alerts: crate::config::AlertConfig::default(),
+            composite_risk: crate::config::CompositeRiskConfig::default(),
+            cone_scaling: crate::config::ConeScalingConfig::default(),
+            agents: HashMap::new(),
+            credentials_path: None,
+        }
+    }
+
+    /// Helper: an agents map with one pool of the given declared window
+    /// affinity (`None` = undeclared) and max_workers (0 = disabled).
+    fn make_agents_with_windows(
+        name: &str,
+        windows: Option<Vec<String>>,
+        max_workers: u32,
+    ) -> HashMap<String, AgentConfig> {
+        let mut agents = HashMap::new();
+        agents.insert(
+            name.to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print".to_string(),
+                session_pattern: "needle-claude-print-*".to_string(),
+                heartbeat_dir: "~/.needle/state/heartbeats".to_string(),
+                min_workers: 0,
+                max_workers,
+                subscription: true,
+                baseline_burn_rate: None,
+                windows,
+            },
+        );
+        agents
     }
 
     // -----------------------------------------------------------------------
@@ -10971,6 +11657,7 @@ mod tests {
                 max_workers: 8,
                 subscription: true,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -11011,7 +11698,7 @@ mod tests {
 
         // A newly configured pool with no prior entry is upserted.
         agents.insert(
-            "polish-opus".to_string(),
+            "needle-opus".to_string(),
             AgentConfig {
                 launch_cmd: "needle run --agent claude-print-opus".to_string(),
                 heartbeat_dir: "/tmp/heartbeats".to_string(),
@@ -11020,11 +11707,12 @@ mod tests {
                 max_workers: 0,
                 subscription: true,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
         sync_workers_to_agents(&mut state, &agents);
         assert_eq!(state.workers.len(), 2);
-        assert_eq!(state.workers["polish-opus"].max, 0);
+        assert_eq!(state.workers["needle-opus"].max, 0);
 
         // With no configured agents at all the map is left alone — a
         // config-parse failure must not wipe worker tracking.

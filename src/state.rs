@@ -946,7 +946,7 @@ pub struct GovernorState {
     pub p7ds_delta: Option<f64>,
     /// Per-agent baseline burn rates from config.
     /// Used as fallback when token collector is offline or EMA is not yet ready.
-    /// Key is agent name (e.g., "needle-sonnet", "polish-opus").
+    /// Key is agent name (e.g., "needle-sonnet", "needle-opus").
     #[serde(default)]
     pub baseline_burn_rates: HashMap<String, BaselineBurnRates>,
     /// Per-window count of consecutive polls in which the window was absent
@@ -1126,7 +1126,7 @@ impl GovernorState {
     /// Callers can use `BaselineBurnRates::default()` as a fallback when None is returned.
     ///
     /// # Arguments
-    /// - `agent_name`: The name of the agent (e.g., "needle-sonnet", "polish-opus")
+    /// - `agent_name`: The name of the agent (e.g., "needle-sonnet", "needle-opus")
     ///
     /// # Returns
     /// - `Some(BaselineBurnRates)` if the agent has a configured baseline
@@ -2122,11 +2122,12 @@ mod tests {
                     pct_per_worker_per_hour: 1.8,
                     dollars_per_worker_per_hour: 6.5,
                 }),
+                windows: None,
             },
         );
 
         agents_config.insert(
-            "polish-opus".to_string(),
+            "needle-opus".to_string(),
             AgentConfig {
                 launch_cmd: "needle run --agent opus".to_string(),
                 session_pattern: "opus-*".to_string(),
@@ -2138,6 +2139,7 @@ mod tests {
                     pct_per_worker_per_hour: 2.5,
                     dollars_per_worker_per_hour: 10.0,
                 }),
+                windows: None,
             },
         );
 
@@ -2152,6 +2154,7 @@ mod tests {
                 max_workers: 8,
                 subscription: false,
                 baseline_burn_rate: None,
+                windows: None,
             },
         );
 
@@ -2166,8 +2169,8 @@ mod tests {
         assert!((sonnet_baseline.unwrap().pct_per_worker_per_hour - 1.8).abs() < 1e-9);
         assert!((sonnet_baseline.unwrap().dollars_per_worker_per_hour - 6.5).abs() < 1e-9);
 
-        // Check polish-opus baseline
-        let opus_baseline = state.get_baseline_burn_rates("polish-opus");
+        // Check needle-opus baseline
+        let opus_baseline = state.get_baseline_burn_rates("needle-opus");
         assert!(opus_baseline.is_some());
         assert!((opus_baseline.unwrap().pct_per_worker_per_hour - 2.5).abs() < 1e-9);
         assert!((opus_baseline.unwrap().dollars_per_worker_per_hour - 10.0).abs() < 1e-9);
@@ -2207,6 +2210,7 @@ mod tests {
                     pct_per_worker_per_hour: 3.0,
                     dollars_per_worker_per_hour: 12.0,
                 }),
+                windows: None,
             },
         );
 

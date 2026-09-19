@@ -78,6 +78,63 @@ pub struct AgentConfig {
     /// Baseline burn rate for this agent (fallback when collector is offline or EMA not ready)
     #[serde(default)]
     pub baseline_burn_rate: Option<BaselineBurnRateConfig>,
+
+    /// Which usage windows this pool's consumption actually draws down
+    /// (claudego-ec6d3ae3). Drives two things:
+    ///
+    /// 1. **Binding candidacy** — a window no enabled pool consumes must not be
+    ///    the binding window, or its risk holds pools it cannot touch at 0
+    ///    (weekly_scoped at cutoff risk holding the Sonnet fleet at 0 while the
+    ///    windows Sonnet actually burns have headroom).
+    /// 2. **Per-pool scaling caps** — a pool is never allocated past the
+    ///    min `safe_worker_count` across ITS windows, so a premium pool stays
+    ///    bounded by weekly_scoped even when the binding window is seven_day.
+    ///
+    /// Values: any of `five_hour`, `seven_day`, `weekly_scoped` (unknown names
+    /// are dropped; a list that normalizes to empty means the whole field is
+    /// treated as absent). **Absent means ALL windows** — the conservative
+    /// default, so an undeclared pool keeps today's behaviour and the human
+    /// reserve (docs/notes/human-reserve-policy.md) can never be weakened by a
+    /// missing annotation: an unannotated pool that really does consume the
+    /// premium window stays bounded by it. Declare a pool's windows only when
+    /// its model's consumption is known — e.g. a Sonnet pool draws on
+    /// five_hour + seven_day and never weekly_scoped (premium-only). If
+    /// Anthropic re-scopes the weekly window to a model a pool runs, that
+    /// pool's declaration must be updated to include weekly_scoped again.
+    #[serde(default)]
+    pub windows: Option<Vec<String>>,
+}
+
+/// The usage windows cgov knows, in canonical order.
+pub const KNOWN_WINDOWS: [&str; 3] = ["five_hour", "seven_day", "weekly_scoped"];
+
+impl AgentConfig {
+    /// Normalize the pool's declared window affinity to the windows it is
+    /// bounded by, in canonical order.
+    ///
+    /// - `None` → all windows (conservative default; unchanged behaviour).
+    /// - `Some(list)` → the declared names that are known windows, in
+    ///   canonical order.
+    /// - A list with no known window (typo, or `windows: []`) → all windows,
+    ///   so a config mistake can never leave a pool unconstrained. Callers
+    ///   that care can distinguish via [`Self::windows`].
+    pub fn consumed_windows(&self) -> Vec<&'static str> {
+        match &self.windows {
+            None => KNOWN_WINDOWS.to_vec(),
+            Some(declared) => {
+                let known: Vec<&'static str> = KNOWN_WINDOWS
+                    .iter()
+                    .copied()
+                    .filter(|w| declared.iter().any(|d| d == *w))
+                    .collect();
+                if known.is_empty() {
+                    KNOWN_WINDOWS.to_vec()
+                } else {
+                    known
+                }
+            }
+        }
+    }
 }
 
 /// Per-agent baseline burn rate configuration
@@ -1078,6 +1135,7 @@ agents:
             max_workers: 8,
             subscription: false,
             baseline_burn_rate: None,
+            windows: None,
         };
         let expanded = agent.heartbeat_dir_expanded();
         assert!(expanded.to_string_lossy().contains(".needle"));
@@ -1092,6 +1150,7 @@ agents:
             max_workers: 8,
             subscription: false,
             baseline_burn_rate: None,
+            windows: None,
         };
         let expanded_abs = agent_abs.heartbeat_dir_expanded();
         assert_eq!(expanded_abs.to_string_lossy(), "/var/lib/heartbeats");
@@ -1107,6 +1166,7 @@ agents:
             max_workers: 8,
             subscription: false,
             baseline_burn_rate: None,
+            windows: None,
         };
         assert_eq!(agent.session_prefix(), "needle-claude");
 
@@ -1119,6 +1179,7 @@ agents:
             max_workers: 8,
             subscription: false,
             baseline_burn_rate: None,
+            windows: None,
         };
         assert_eq!(agent2.session_prefix(), "worker");
     }
@@ -1138,6 +1199,88 @@ agents:
         let agent = config.agents.get("default-agent").unwrap();
         // subscription should default to false
         assert_eq!(agent.subscription, false);
+    }
+
+    /// claudego-ec6d3ae3: an agent with no `windows` key must parse as None and
+    /// normalize to ALL windows — the conservative default. A pool whose
+    /// affinity is undeclared keeps today's behaviour (bounded by everything),
+    /// so the human reserve can never be weakened by a missing annotation.
+    #[test]
+    fn test_agent_config_windows_default_is_all_windows() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  sonnet-pool:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("sonnet-pool").unwrap();
+        assert!(agent.windows.is_none(), "absent key must parse as None");
+        assert_eq!(
+            agent.consumed_windows(),
+            vec!["five_hour", "seven_day", "weekly_scoped"],
+            "undeclared affinity must mean all windows"
+        );
+    }
+
+    /// A declared affinity parses and normalizes to canonical order; the
+    /// Sonnet-pool case from the reserve policy is the canonical example.
+    #[test]
+    fn test_agent_config_windows_declared_subset() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  sonnet-pool:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+    windows: ["seven_day", "five_hour"]
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = config.agents.get("sonnet-pool").unwrap();
+        assert_eq!(
+            agent.consumed_windows(),
+            vec!["five_hour", "seven_day"],
+            "declared order must not matter; canonical order is five_hour, seven_day, weekly_scoped"
+        );
+    }
+
+    /// Unknown window names are dropped, and a declaration that normalizes to
+    /// nothing must fall back to ALL windows: a config typo must never leave a
+    /// pool unconstrained.
+    #[test]
+    fn test_agent_config_windows_unknown_or_empty_falls_back_to_all() {
+        let yaml = r#"
+pricing:
+  models: {}
+agents:
+  typo-pool:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+    windows: ["seven_day_sonnet", "weekly"]
+  empty-pool:
+    launch_cmd: "echo test"
+    session_pattern: "test-*"
+    heartbeat_dir: "/tmp/heartbeats"
+    windows: []
+"#;
+        let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
+        let all = vec!["five_hour", "seven_day", "weekly_scoped"];
+        assert_eq!(
+            config.agents.get("typo-pool").unwrap().consumed_windows(),
+            all,
+            "no known name in the list must mean all windows"
+        );
+        assert_eq!(
+            config.agents.get("empty-pool").unwrap().consumed_windows(),
+            all,
+            "an empty list must mean all windows, not an unbounded pool"
+        );
     }
 
     #[test]
@@ -1213,6 +1356,7 @@ agents:
                 pct_per_worker_per_hour: 3.0,
                 dollars_per_worker_per_hour: 10.0,
             }),
+            windows: None,
         };
 
         let baseline = agent.baseline_burn_rate_or_default();
@@ -1230,6 +1374,7 @@ agents:
             max_workers: 8,
             subscription: false,
             baseline_burn_rate: None,
+            windows: None,
         };
 
         let baseline = agent.baseline_burn_rate_or_default();
