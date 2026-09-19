@@ -1,8 +1,8 @@
 // Test Pluck workspace mismatch bug
 // Demonstrates that Pluck returns 0 results due to incorrect workspace path resolution
 
-use std::path::PathBuf;
 use rusqlite::Connection;
+use std::path::PathBuf;
 
 #[test]
 fn test_pluck_workspace_mismatch() {
@@ -16,7 +16,10 @@ fn test_pluck_workspace_mismatch() {
     // Test both databases
     let test_dbs = vec![
         ("Current workspace (correct)", current_workspace),
-        ("Parent workspace (wrong - where '.' resolves)", parent_workspace),
+        (
+            "Parent workspace (wrong - where '.' resolves)",
+            parent_workspace,
+        ),
     ];
 
     for (description, workspace_path) in test_dbs {
@@ -36,11 +39,19 @@ fn test_pluck_workspace_mismatch() {
                 println!("✅ Connection successful");
 
                 // Count total issues
-                let total: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0)).unwrap_or(0);
+                let total: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))
+                    .unwrap_or(0);
                 println!("   Total issues: {}", total);
 
                 // Count open issues
-                let open: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE status = 'open'", [], |row| row.get(0)).unwrap_or(0);
+                let open: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM issues WHERE status = 'open'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
                 println!("   Open issues: {}", open);
 
                 // Run full Pluck query
@@ -56,7 +67,9 @@ fn test_pluck_workspace_mismatch() {
                     )
                 ";
 
-                let ready: i64 = conn.query_row(pluck_query, [], |row| row.get(0)).unwrap_or(0);
+                let ready: i64 = conn
+                    .query_row(pluck_query, [], |row| row.get(0))
+                    .unwrap_or(0);
                 println!("   Ready beads (Pluck query): {}", ready);
 
                 if ready == 0 && total > 0 {

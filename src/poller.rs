@@ -431,9 +431,10 @@ impl Poller {
             ))
         })?;
 
-        let creds: Credentials = serde_json::from_str(&content).map_err(|e: serde_json::Error| {
-            anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
-        })?;
+        let creds: Credentials =
+            serde_json::from_str(&content).map_err(|e: serde_json::Error| {
+                anyhow::anyhow!(PollerError::InvalidCredentials(e.to_string()))
+            })?;
 
         // Validate credentials are not corrupted
         if creds.claude_ai_oauth.access_token.is_empty() {
@@ -472,8 +473,8 @@ impl Poller {
 
         // Write to temp file
         {
-            let mut file = File::create(&temp_path)
-                .context("Failed to create temp credentials file")?;
+            let mut file =
+                File::create(&temp_path).context("Failed to create temp credentials file")?;
             file.write_all(content.as_bytes())
                 .context("Failed to write temp credentials file")?;
             // fsync to ensure data is on disk before rename

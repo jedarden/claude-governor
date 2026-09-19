@@ -1,8 +1,8 @@
 // Systematic Pluck filter combination test
 // Tests each filter individually and in combination to identify blocking conditions
 
-use std::path::PathBuf;
 use rusqlite::Connection;
+use std::path::PathBuf;
 
 #[test]
 fn test_pluck_filter_combinations() {
@@ -87,7 +87,7 @@ fn test_pluck_filter_combinations() {
 
     // Find the delta - what each filter removes
     println!("\n=== FILTER IMPACT ANALYSIS ===");
-    let base_count = results[0].1;  // BASE - No filters
+    let base_count = results[0].1; // BASE - No filters
     println!("Base count (no filters): {}", base_count);
 
     for (name, count, _) in &results {

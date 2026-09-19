@@ -59,7 +59,9 @@ fn test_path_format(db_path: &PathBuf, description: &str) -> bool {
             println!("✅ {} - Connection successful", description);
 
             // Count total beads
-            match conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get::<_, i64>(0)) {
+            match conn.query_row("SELECT COUNT(*) FROM issues", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
                 Ok(count) => println!("   Total beads: {}", count),
                 Err(e) => println!("   Query failed: {}", e),
             }
@@ -68,7 +70,7 @@ fn test_path_format(db_path: &PathBuf, description: &str) -> bool {
             match conn.query_row(
                 "SELECT COUNT(*) FROM issues WHERE status = 'open'",
                 [],
-                |row| row.get::<_, i64>(0)
+                |row| row.get::<_, i64>(0),
             ) {
                 Ok(count) => println!("   Open beads: {}", count),
                 Err(e) => println!("   Query failed: {}", e),

@@ -107,11 +107,7 @@ fn test_four_rows_complex_distribution() {
 #[test]
 fn test_zero_delta_all_zeros() {
     // When delta is zero, all rows should get zero
-    let rows = vec![
-        (0.10, 0.0),
-        (0.20, 0.0),
-        (0.30, 0.0),
-    ];
+    let rows = vec![(0.10, 0.0), (0.20, 0.0), (0.30, 0.0)];
     verify_apportioning(rows, 0.0);
 }
 
@@ -146,9 +142,9 @@ fn test_small_fractional_weights() {
     // Total: 0.001 + 0.002 + 0.003 = 0.006
     // Delta: 0.12
     let rows = vec![
-        (0.001, 0.02),  // 1/6 of delta = 0.02
-        (0.002, 0.04),  // 2/6 of delta = 0.04
-        (0.003, 0.06),  // 3/6 of delta = 0.06
+        (0.001, 0.02), // 1/6 of delta = 0.02
+        (0.002, 0.04), // 2/6 of delta = 0.04
+        (0.003, 0.06), // 3/6 of delta = 0.06
     ];
     verify_apportioning(rows, 0.12);
 
@@ -161,8 +157,8 @@ fn test_small_fractional_weights() {
 fn test_one_row_zero_weight_gets_nothing() {
     // One row has zero weight, another has all the weight
     let rows = vec![
-        (0.0, 0.0),   // Zero weight → zero apportioned
-        (1.0, 1.5),   // All weight → full delta
+        (0.0, 0.0), // Zero weight → zero apportioned
+        (1.0, 1.5), // All weight → full delta
     ];
     verify_apportioning(rows, 1.5);
 }
