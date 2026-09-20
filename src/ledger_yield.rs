@@ -124,6 +124,83 @@ pub struct AdapterYield {
     pub cost_per_verified_usd: Option<f64>,
 }
 
+/// Where an adapter sits in the exhaustion shed order (claudego-f80857a2).
+///
+/// When a window forecasts exhaustion the governor must stop someone; it
+/// stops the adapter whose measured spend bought the least verified output
+/// first. Ordered worst-first:
+///
+/// 1. [`YieldShedRank::NoVerified`] — attempts were recorded but nothing
+///    verified came out. Whether the dollars were real or the rows carried
+///    no cost, shedding loses no verified output, so this sheds before any
+///    adapter that has verified anything.
+/// 2. [`YieldShedRank::Unknown`] — no in-window ledger evidence. Shedding it
+///    destroys no *measured* verified output either, so it sheds after the
+///    proven-waste pools and before any pool whose value the ledger can
+///    actually point at.
+/// 3. [`YieldShedRank::CostPerVerified`] — verified output exists; the
+///    higher the dollars per verified closure, the worse the yield per
+///    dollar, the earlier it sheds.
+///
+/// `Unknown` must sit in a fixed seat rather than compare equal to
+/// everything: the shed order is realised as a `sort_by` key, and a
+/// comparator that returns `Equal` across classes is not a total order —
+/// with three pools mixing measured and unmeasured adapters it contradicts
+/// itself (`A < B`, `B == C`, `A == C`), which since Rust 1.81 can panic
+/// mid-sort and in any case makes the order depend on input arrangement.
+/// Within the `Unknown` class the caller's tiebreak (the pre-ledger
+/// cost-per-hour order) applies, so today's order survives intact whenever
+/// the ledger is absent or silent about *every* pool under consideration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum YieldShedRank {
+    NoVerified,
+    Unknown,
+    CostPerVerified(f64),
+}
+
+/// Rank an adapter's measured economics for the exhaustion shed order.
+///
+/// [`AdapterYield::cost_per_verified_usd`] is `None` exactly when `verified`
+/// is zero (the report's ratio helper never divides by zero), so the branch
+/// is on `verified` and the `unwrap_or` only guards hand-built fixtures.
+pub fn shed_rank(yield_: &AdapterYield) -> YieldShedRank {
+    if yield_.verified > 0 {
+        YieldShedRank::CostPerVerified(yield_.cost_per_verified_usd.unwrap_or(f64::INFINITY))
+    } else {
+        YieldShedRank::NoVerified
+    }
+}
+
+/// Order two shed ranks: `Less` sheds first.
+///
+/// A strict total order — the shed order is realised as a `sort_by` key, and
+/// the sort is free to panic on a comparator that is not one. Ranks in the
+/// same [`YieldShedRank`] class compare `Equal` (leaving the order to the
+/// caller's cost tiebreak); across classes the enum declaration order is the
+/// shed order.
+pub fn cmp_shed_order(a: &YieldShedRank, b: &YieldShedRank) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use YieldShedRank::{CostPerVerified, NoVerified, Unknown};
+    match (a, b) {
+        (NoVerified, NoVerified) | (Unknown, Unknown) => Ordering::Equal,
+        (NoVerified, Unknown)
+        | (NoVerified, CostPerVerified(_))
+        | (Unknown, CostPerVerified(_)) => Ordering::Less,
+        (Unknown, NoVerified)
+        | (CostPerVerified(_), NoVerified)
+        | (CostPerVerified(_), Unknown) => Ordering::Greater,
+        // Higher cost per verified closure sheds first; an equal ratio is a
+        // tie for the caller's cost tiebreak. NaN cannot come out of
+        // `finalize`, but a hand-built fixture carrying one ranks as infinity
+        // (worst) so the comparator stays a total order.
+        (CostPerVerified(x), CostPerVerified(y)) => {
+            let x = if x.is_nan() { f64::INFINITY } else { *x };
+            let y = if y.is_nan() { f64::INFINITY } else { *y };
+            y.partial_cmp(&x).unwrap_or(Ordering::Equal)
+        }
+    }
+}
+
 /// Per-adapter verified-closure economics over one rolling window.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LedgerYieldReport {
@@ -465,5 +542,125 @@ mod tests {
     fn ratio_never_divides_by_zero() {
         assert_eq!(ratio(1, 0), None);
         assert_eq!(ratio_f64(1.0, 0), None);
+    }
+
+    fn fixture_yield(verified: u64, cost_usd: f64) -> AdapterYield {
+        AdapterYield {
+            adapter: "fixture".to_string(),
+            attempts: verified + 1,
+            verified,
+            verified_yield: ratio(verified, verified + 1),
+            cost_usd,
+            cost_per_verified_usd: ratio_f64(cost_usd, verified),
+        }
+    }
+
+    #[test]
+    fn shed_rank_puts_zero_verified_before_anything_measured() {
+        // Nothing verified — whether dollars were spent or the rows carried
+        // no cost — sheds before an adapter that verified anything.
+        assert_eq!(shed_rank(&fixture_yield(0, 5.0)), YieldShedRank::NoVerified);
+        assert_eq!(shed_rank(&fixture_yield(0, 0.0)), YieldShedRank::NoVerified);
+        assert_eq!(
+            shed_rank(&fixture_yield(2, 4.0)),
+            YieldShedRank::CostPerVerified(2.0)
+        );
+        // finalize-derived None on a zero-verified fixture cannot happen, but
+        // a hand-built one must not rank above a measured adapter.
+        let mut broken = fixture_yield(0, 0.0);
+        broken.verified = 3; // verified > 0 while cost_per_verified is None
+        assert_eq!(
+            shed_rank(&broken),
+            YieldShedRank::CostPerVerified(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn shed_order_worst_yield_per_dollar_first() {
+        use YieldShedRank::{CostPerVerified, NoVerified, Unknown};
+
+        // NoVerified sheds before anything measured.
+        assert_eq!(
+            cmp_shed_order(&NoVerified, &CostPerVerified(0.01)),
+            std::cmp::Ordering::Less
+        );
+        // Within the measured class, MORE dollars per verified closure sheds
+        // first — i.e. the worst verified-closure yield per dollar.
+        assert_eq!(
+            cmp_shed_order(&CostPerVerified(9.0), &CostPerVerified(0.5)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_shed_order(&CostPerVerified(0.5), &CostPerVerified(9.0)),
+            std::cmp::Ordering::Greater
+        );
+        // Equal yields tie (the caller's cost tiebreak decides).
+        assert_eq!(
+            cmp_shed_order(&CostPerVerified(2.0), &CostPerVerified(2.0)),
+            std::cmp::Ordering::Equal
+        );
+        // An unmeasured adapter sits between proven waste and proven value:
+        // after the zero-verified pools, before anything that verified.
+        assert_eq!(
+            cmp_shed_order(&NoVerified, &Unknown),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_shed_order(&Unknown, &CostPerVerified(0.01)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_shed_order(&CostPerVerified(9.0), &Unknown),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_shed_order(&Unknown, &Unknown),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// The shed order is realised as a `sort_by` key, and Rust's sort panics
+    /// on a comparator that is not a total order. Pin antisymmetry and
+    /// transitivity over every triple of the rank space, including the NaN
+    /// fixture rank.
+    #[test]
+    fn shed_order_is_a_total_order() {
+        let ranks = vec![
+            YieldShedRank::NoVerified,
+            YieldShedRank::Unknown,
+            YieldShedRank::CostPerVerified(0.5),
+            YieldShedRank::CostPerVerified(2.0),
+            YieldShedRank::CostPerVerified(9.0),
+            YieldShedRank::CostPerVerified(f64::NAN),
+        ];
+        for a in &ranks {
+            for b in &ranks {
+                let ab = cmp_shed_order(a, b);
+                assert_eq!(
+                    ab,
+                    cmp_shed_order(b, a).reverse(),
+                    "antisymmetry violated: {a:?} vs {b:?}"
+                );
+                for c in &ranks {
+                    let bc = cmp_shed_order(b, c);
+                    // Total preorder: a <= b <= c implies a <= c.
+                    if ab != std::cmp::Ordering::Greater && bc != std::cmp::Ordering::Greater {
+                        assert_ne!(
+                            cmp_shed_order(a, c),
+                            std::cmp::Ordering::Greater,
+                            "preorder violated: {a:?} <= {b:?} <= {c:?} but {a:?} > {c:?}"
+                        );
+                    }
+                    // Transitivity of the tie class: a ~ b ~ c implies a ~ c.
+                    if ab == std::cmp::Ordering::Equal && bc == std::cmp::Ordering::Equal {
+                        assert_eq!(
+                            cmp_shed_order(a, c),
+                            std::cmp::Ordering::Equal,
+                            "tie class intransitive: {a:?} ~ {b:?} ~ {c:?} but {a:?} !~ {c:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

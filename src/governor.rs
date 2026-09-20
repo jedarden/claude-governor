@@ -9,7 +9,7 @@
 //! - Main daemon loop: poll -> schedule -> burn_rate -> target -> scale -> alert -> write_state
 
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +29,7 @@ use crate::config::{
     AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, SprintConfig,
 };
 use crate::db;
+use crate::ledger_yield::{cmp_shed_order, shed_rank, AdapterYield, YieldShedRank};
 use crate::poller::Poller;
 use crate::poller::UsagePoller;
 #[cfg(test)]
@@ -4632,10 +4633,44 @@ fn get_agent_cost_per_worker(
     10.50
 }
 
+/// Per-adapter ledger economics for the act cycle's shed order
+/// (claudego-f80857a2).
+///
+/// Reads the NEEDLE attempt ledger through the same env-configurable
+/// settings `cgov status` uses. The scan stats every file under the logs
+/// directory (~1s at fleet size), so the cycle only pays it on the path the
+/// economics can change — a forecast-exhaustion scale-down — never on the
+/// NoChange hot path. `None` on any read failure: a broken ledger degrades
+/// the shed order to the pre-ledger cost sort, it never blocks scaling.
+fn read_cycle_ledger_yields() -> Option<BTreeMap<String, AdapterYield>> {
+    let settings = crate::ledger_yield::LedgerYieldSettings::from_env();
+    match crate::ledger_yield::read_ledger_yield(
+        &settings.logs_dir,
+        Utc::now(),
+        settings.window_hours,
+    ) {
+        Ok(report) => Some(report.by_adapter),
+        Err(e) => {
+            log::warn!(
+                "[governor] ledger yield read failed ({}): {} — shedding by cost order",
+                settings.logs_dir.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Distribute workers across agents by cost priority.
 ///
 /// When scaling down (new_total < current_total): prioritize high-cost agents first.
 /// When scaling up (new_total > current_total): prioritize low-cost agents first.
+///
+/// This is the ledger-blind entry point: every pool ranks
+/// [`YieldShedRank::Unknown`], so the shed order is exactly the pre-ledger
+/// cost sort. The act cycle's scale-down path uses
+/// [`distribute_workers_by_ledger_yield`] instead (claudego-f80857a2); the
+/// scale-up, NoChange-reconcile and manual-override paths keep this one.
 ///
 /// # Arguments
 /// - `agents`: HashMap of agent name -> AgentConfig
@@ -4657,6 +4692,48 @@ fn distribute_workers_by_cost_priority(
     pricing_config: &crate::config::GovernorConfig,
     _cutoff_risk: bool, // Reserved for future scale-down priority adjustments
     capacity_forecast: &state::CapacityForecast,
+) -> HashMap<String, u32> {
+    // No ledger economics: every pool ranks `Unknown` and the shed order is
+    // exactly the pre-ledger cost sort. All pre-existing callers and tests
+    // keep today's behaviour through this wrapper.
+    distribute_workers_by_ledger_yield(
+        agents,
+        current_workers,
+        target_total,
+        burn_rate_by_model,
+        pricing_config,
+        _cutoff_risk,
+        capacity_forecast,
+        None,
+    )
+}
+
+/// [`distribute_workers_by_cost_priority`] with the ledger's per-adapter
+/// verified-closure economics folded into the scale-down order
+/// (claudego-f80857a2).
+///
+/// `ledger_yields` maps needle adapter name (the `--agent` value in a pool's
+/// launch_cmd, which is what the ledger's `attempt.resolved` rows carry) to
+/// that adapter's measured economics over the rolling window. When scaling
+/// down, pools on adapters with the worst verified-closure yield per dollar
+/// shed first; unmeasured adapters shed after the proven-waste pools and
+/// before proven-value ones, and the cost-per-hour order breaks every tie
+/// the ledger cannot (equal yields, or every pool unmeasured — the whole
+/// pre-ledger behaviour whenever the ledger is absent or silent). Scale-up,
+/// floors and the window-affinity cap are untouched by the ledger.
+///
+/// Public so the scale-down ordering contract can be pinned from
+/// `tests/scale_down_ordering.rs`; the act cycle is the production caller.
+#[allow(clippy::too_many_arguments)]
+pub fn distribute_workers_by_ledger_yield(
+    agents: &HashMap<String, AgentConfig>,
+    current_workers: &HashMap<String, u32>,
+    target_total: u32,
+    burn_rate_by_model: &HashMap<String, state::ModelBurnRate>,
+    pricing_config: &crate::config::GovernorConfig,
+    _cutoff_risk: bool, // Reserved for future scale-down priority adjustments
+    capacity_forecast: &state::CapacityForecast,
+    ledger_yields: Option<&BTreeMap<String, crate::ledger_yield::AdapterYield>>,
 ) -> HashMap<String, u32> {
     // Base distribution: start from the current allocation and adjust gently by the
     // delta (minimising churn) — scale down sheds the most expensive workers first,
@@ -4685,9 +4762,45 @@ fn distribute_workers_by_cost_priority(
     }
 
     if delta < 0 {
-        // Scale down: remove from the highest-cost agent first.
+        // Scale down: shed the worst verified-closure yield per dollar first
+        // (claudego-f80857a2), the highest-cost agent breaking ties — which is
+        // the whole pre-ledger order whenever the ledger has no evidence for
+        // these pools (no `--agent` in the launch_cmd, no in-window rows, or
+        // no ledger at all). Within one pool the executor still sheds idle
+        // workers first, so a busy worker is only ever touched when a pool's
+        // idle capacity cannot cover its cut — unchanged by this ordering.
+        let rank_of = |name: &str| {
+            ledger_yields
+                .and_then(|ledger| {
+                    agents
+                        .get(name)
+                        .and_then(|cfg| extract_model_from_launch_cmd(&cfg.launch_cmd))
+                        .and_then(|adapter| ledger.get(&adapter))
+                })
+                .map(shed_rank)
+                .unwrap_or(YieldShedRank::Unknown)
+        };
         let mut remaining = delta.unsigned_abs();
-        agent_costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        agent_costs.sort_by(|a, b| {
+            cmp_shed_order(&rank_of(&a.0), &rank_of(&b.0)).then_with(|| {
+                // Yield tie (equal, or both unmeasured): today's cost order.
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        if ledger_yields.is_some()
+            && agent_costs
+                .iter()
+                .any(|(name, ..)| !matches!(rank_of(name), YieldShedRank::Unknown))
+        {
+            log::info!(
+                "[governor] ledger shed order (worst verified-closure yield per dollar first): {}",
+                agent_costs
+                    .iter()
+                    .map(|(name, cost, ..)| format!("{} ${:.2}/hr {:?}", name, cost, rank_of(name)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         for (name, _cost, current, _min, _max) in &agent_costs {
             if remaining == 0 {
                 break;
@@ -7351,6 +7464,16 @@ pub fn run_act_cycle(
         )
     };
 
+    // Ledger-backed shed order (claudego-f80857a2): only a scale-down pays
+    // for the read (see `read_cycle_ledger_yields` for why). Every other
+    // decision — scale-up, NoChange reconcile, emergency brake — keeps the
+    // ledger-blind cost-order entry point.
+    let ledger_yields = if matches!(decision, ScalingDecision::ScaleDown(_)) {
+        read_cycle_ledger_yields()
+    } else {
+        None
+    };
+
     // 6. Execute scaling (unless dry-run or no change)
     //
     // Use priority-based distribution when scaling multiple agents:
@@ -7520,8 +7643,10 @@ pub fn run_act_cycle(
                 // Calculate new target total
                 let new_total = current_total.saturating_sub(*n);
 
-                // Distribute workers by cost priority (highest cost first when scaling down)
-                let target_distribution = distribute_workers_by_cost_priority(
+                // Distribute workers by cost priority (highest cost first when scaling down),
+                // reordered by worst verified-closure yield per dollar first when the ledger
+                // has evidence (claudego-f80857a2)
+                let target_distribution = distribute_workers_by_ledger_yield(
                     agents,
                     &current_workers_map,
                     new_total,
@@ -7529,6 +7654,7 @@ pub fn run_act_cycle(
                     pricing_config,
                     cutoff_risk,
                     &state.capacity_forecast,
+                    ledger_yields.as_ref(),
                 );
 
                 // Scale down each agent individually based on distribution
@@ -7728,7 +7854,7 @@ pub fn run_act_cycle(
         }
         ScalingDecision::ScaleDown(n) => {
             let new_total = current_total.saturating_sub(*n);
-            let target_distribution = distribute_workers_by_cost_priority(
+            let target_distribution = distribute_workers_by_ledger_yield(
                 agents,
                 &current_workers_map,
                 new_total,
@@ -7736,6 +7862,7 @@ pub fn run_act_cycle(
                 pricing_config,
                 cutoff_risk,
                 &state.capacity_forecast,
+                ledger_yields.as_ref(),
             );
             for (agent_name, ws) in state.workers.iter_mut() {
                 ws.target = *target_distribution.get(agent_name).unwrap_or(&ws.current);

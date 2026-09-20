@@ -476,9 +476,17 @@ fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
 
 /// Pick up to `n` shutdown candidates from `heartbeats`, restricted to `live_sessions`.
 ///
+/// Order: idle workers first (oldest heartbeat breaking ties — it may already
+/// be dead), busy workers last. A busy session is therefore selected only once
+/// every idle candidate has been taken — the within-pool half of the
+/// exhaustion shed contract, pinned from outside the crate by
+/// `tests/scale_down_ordering.rs` (claudego-f80857a2); the across-pool half
+/// (worst verified-closure yield per dollar first) lives in the governor's
+/// `distribute_workers_by_ledger_yield`.
+///
 /// Split out from [`find_workers_to_stop`] so the selection rules can be tested
 /// against an explicit set of live tmux sessions.
-fn select_workers_to_stop(
+pub fn select_workers_to_stop(
     n: usize,
     heartbeats: HashMap<String, Heartbeat>,
     live_sessions: &HashSet<String>,
