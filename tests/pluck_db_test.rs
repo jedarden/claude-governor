@@ -3,14 +3,113 @@
 // 1. Pluck can connect to and query the beads database
 // 2. Query construction matches expected filter configuration
 // 3. All filter parameters are properly logged before execution
+//
+// The suite is hermetic: every store it touches is seeded inside an isolated
+// tempdir workspace via the real `bead` CLI. It never reads the live shared
+// bead store — that frontier legitimately holds ready beads carrying
+// excluded labels (`human` is how operators park beads out of Pluck's
+// reach), so asserting on it made the suite fail on environment races
+// instead of code (claudego-6003fe75). The seeded store deliberately
+// contains a ready bead for every excluded label, so the adapter's
+// exclusion contract is pinned under exactly the condition that used to
+// break the suite, deterministically.
 
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::TempDir;
 
-const PLUCK_WORKSPACE: &str = "/home/coding/claude-governor";
 const PLUCK_STATE: &str = "open";
 const PLUCK_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
+
+/// A bead workspace seeded inside its own tempdir.
+///
+/// `_dir` must stay alive for the test's duration — dropping it removes the
+/// store. `path` is the workspace root the Pluck backend command runs in.
+struct SeededWorkspace {
+    _dir: TempDir,
+    path: PathBuf,
+    /// Ready beads carrying no excluded label — Pluck's candidate set.
+    clean_ids: Vec<String>,
+    /// Ready beads carrying an excluded label — present in the raw frontier,
+    /// dropped by the adapter's label exclusion.
+    excluded_ids: Vec<String>,
+}
+
+/// Run the real `bead` CLI inside `dir`, asserting success and returning stdout.
+///
+/// `--skip-foreign-workspace` keeps workspace discovery inside `dir` even
+/// when a foreign `.beads` (no config.json — e.g. the traces directory the
+/// CLI itself leaves in /tmp) sits on the walk-up path: without it, seeding a
+/// tempdir under /tmp fails once any bead invocation from a /tmp cwd has
+/// created /tmp/.beads, which makes the suite self-poisoning. Post-init the
+/// tempdir's own valid `.beads/config.json` is the first store discovery
+/// finds, so the flag never widens the search past the seeded workspace.
+fn run_bead(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("bead")
+        .arg("--skip-foreign-workspace")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("bead CLI must be executable");
+    assert!(
+        output.status.success(),
+        "bead {} failed: {}",
+        args.first().unwrap_or(&"<none>"),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Create one bead in the seeded workspace and return its printed ID.
+fn create_bead(dir: &Path, title: &str, labels: &[&str]) -> String {
+    let mut args = vec!["create", "--title", title];
+    for label in labels {
+        args.push("--label");
+        args.push(label);
+    }
+    let stdout = run_bead(dir, &args);
+    let id = stdout.trim().to_string();
+    assert!(!id.is_empty(), "bead create must print the new issue ID");
+    id
+}
+
+/// Seed an isolated workspace exercising every frontier shape the adapter
+/// must distinguish: clean labeled/unlabelled candidates, one ready bead per
+/// excluded label, an assigned-open bead, and an in-progress bead.
+fn seed_workspace() -> SeededWorkspace {
+    let dir = TempDir::new().expect("tempdir for seeded bead workspace");
+    let path = dir.path().to_path_buf();
+    run_bead(&path, &["init"]);
+
+    let clean_labeled = create_bead(&path, "clean labeled candidate", &["codinghome"]);
+    let clean_unlabelled = create_bead(&path, "clean unlabelled candidate", &[]);
+    let human = create_bead(
+        &path,
+        "human-parked candidate",
+        &["codinghome", "human", "quota"],
+    );
+    let deferred = create_bead(&path, "deferred-label candidate", &["deferred"]);
+    let blocked = create_bead(&path, "blocked-label candidate", &["blocked"]);
+    let starved = create_bead(&path, "starvation-alert candidate", &["starvation-alert"]);
+    let assigned = create_bead(&path, "assigned open candidate", &[]);
+    let in_progress = create_bead(&path, "in-progress candidate", &[]);
+    run_bead(
+        &path,
+        &["update", assigned.as_str(), "--assignee", "worker-x"],
+    );
+    run_bead(
+        &path,
+        &["update", in_progress.as_str(), "--status", "in_progress"],
+    );
+
+    SeededWorkspace {
+        _dir: dir,
+        path,
+        clean_ids: vec![clean_labeled, clean_unlabelled],
+        excluded_ids: vec![human, deferred, blocked, starved],
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct PluckInvocation {
@@ -57,12 +156,18 @@ fn render_pluck_invocation(query: &PluckInvocation) -> String {
     )
 }
 
-/// Verify the exact backend query Pluck constructs before it is executed.
+/// Verify the exact backend query Pluck constructs before it is executed,
+/// against a seeded isolated workspace — never the live shared store.
 #[test]
 fn test_pluck_query_matches_expected_configuration() {
+    let ws = seed_workspace();
     let labels: &[&str] = &[];
-    let query =
-        construct_pluck_invocation(PLUCK_WORKSPACE, labels, PLUCK_EXCLUDE_LABELS, PLUCK_STATE);
+    let query = construct_pluck_invocation(
+        ws.path.to_str().expect("tempdir path is UTF-8"),
+        labels,
+        PLUCK_EXCLUDE_LABELS,
+        PLUCK_STATE,
+    );
 
     println!("\n=== PLUCK QUERY PARAMETERS ===");
     println!("workspace_path: {}", query.workspace_path.display());
@@ -75,7 +180,7 @@ fn test_pluck_query_matches_expected_configuration() {
     );
     println!("===============================\n");
 
-    assert_eq!(query.workspace_path, PathBuf::from(PLUCK_WORKSPACE));
+    assert_eq!(query.workspace_path, ws.path);
     assert!(
         query.labels.is_empty(),
         "Pluck does not configure include labels"
@@ -109,13 +214,14 @@ fn test_pluck_query_matches_expected_configuration() {
 
     // The raw backend output is the dependency-safe frontier, and label
     // exclusion is applied to the returned JSON by the store adapter (see
-    // construct_pluck_invocation's command comment) — the frontier may
-    // legitimately contain excluded-label beads, e.g. `human` is how operators
-    // park beads out of Pluck's reach. So what is asserted here is the
-    // adapter's exclusion contract over whatever the frontier holds, not that
-    // the live frontier is already clean: test_label_exclusion_drops_excluded_label_candidates
-    // pins the filtering itself against a fixture.
+    // construct_pluck_invocation's command comment). The seeded frontier
+    // deliberately carries a ready bead for every excluded label — the live
+    // condition that used to fail this suite — so what is asserted here is
+    // both halves of the contract, deterministically: `--ready` surfaces
+    // exactly the seeded unassigned open beads, and the adapter's exclusion
+    // reduces them to the clean candidates.
     let mut raw_candidates = 0;
+    let mut candidates = Vec::new();
     let mut excluded = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -126,13 +232,49 @@ fn test_pluck_query_matches_expected_configuration() {
         assert_eq!(bead["status"], PLUCK_STATE);
         assert!(bead["assignee"].is_null());
         assert!(bead["labels"].is_array(), "Pluck JSON must include labels");
+        let id = bead["id"].as_str().unwrap_or("<unknown id>").to_string();
         if carries_excluded_label(&bead, PLUCK_EXCLUDE_LABELS) {
-            excluded.push(bead["id"].as_str().unwrap_or("<unknown id>").to_string());
+            excluded.push(id);
+        } else {
+            candidates.push(id);
         }
         raw_candidates += 1;
     }
+
+    let mut raw_ids: Vec<String> = candidates.iter().chain(excluded.iter()).cloned().collect();
+    raw_ids.sort();
+    let mut expected_frontier: Vec<String> = ws
+        .clean_ids
+        .iter()
+        .chain(ws.excluded_ids.iter())
+        .cloned()
+        .collect();
+    expected_frontier.sort();
+    assert_eq!(
+        raw_ids, expected_frontier,
+        "--ready must return exactly the seeded unassigned open beads; assigned and in-progress beads stay hidden"
+    );
+
+    let mut sorted_candidates = candidates;
+    sorted_candidates.sort();
+    let mut expected_candidates = ws.clean_ids.clone();
+    expected_candidates.sort();
+    assert_eq!(
+        sorted_candidates, expected_candidates,
+        "adapter label exclusion must reduce the frontier to the clean candidates"
+    );
+
+    let mut sorted_excluded = excluded;
+    sorted_excluded.sort();
+    let mut expected_excluded = ws.excluded_ids.clone();
+    expected_excluded.sort();
+    assert_eq!(
+        sorted_excluded, expected_excluded,
+        "the beads dropped by label exclusion must be exactly the seeded excluded-label beads"
+    );
+
     println!(
-        "Pluck backend returned {raw_candidates} ready candidates; adapter label exclusion drops {excluded:?}"
+        "Pluck backend returned {raw_candidates} ready candidates; adapter label exclusion drops {sorted_excluded:?}"
     );
 }
 
@@ -140,7 +282,7 @@ fn test_pluck_query_matches_expected_configuration() {
 ///
 /// Static form of the exclusion decision the store adapter applies to the
 /// backend's returned JSONL (NEEDLE `bead_store::excluded_by_labels`, without
-/// the expired-quarantine exception). Shared by the live-frontier check above
+/// the expired-quarantine exception). Shared by the seeded-frontier check above
 /// and the fixture test below so the two cannot drift.
 fn carries_excluded_label(bead: &serde_json::Value, exclude_labels: &[&str]) -> bool {
     bead["labels"]
@@ -154,11 +296,11 @@ fn carries_excluded_label(bead: &serde_json::Value, exclude_labels: &[&str]) -> 
         .unwrap_or(false)
 }
 
-/// Label exclusion is deterministic JSONL filtering, independent of the live
-/// frontier: every configured exclude label drops its bead, and only a bead
-/// carrying none of them reaches Pluck's candidate set. Exercises all four
-/// configured labels plus multi-label mixes so the contract is pinned without
-/// reading shared bead state.
+/// Label exclusion is deterministic JSONL filtering, independent of any
+/// particular frontier: every configured exclude label drops its bead, and
+/// only a bead carrying none of them reaches Pluck's candidate set.
+/// Exercises all four configured labels plus multi-label mixes so the
+/// contract is pinned without needing a store at all.
 #[test]
 fn test_label_exclusion_drops_excluded_label_candidates() {
     let candidates: &[(&str, &[&str])] = &[
@@ -190,10 +332,13 @@ fn test_label_exclusion_drops_excluded_label_candidates() {
     assert!(!carries_excluded_label(&unlabelled, PLUCK_EXCLUDE_LABELS));
 }
 
-/// Test database connection and basic query functionality
+/// Test database connection and basic query functionality against a seeded
+/// isolated workspace — the counts asserted below are properties of the
+/// seed, not of whatever the live shared store happens to hold.
 #[test]
 fn test_pluck_database_connectivity() {
-    let db_path = PathBuf::from(PLUCK_WORKSPACE).join(".beads/beads.db");
+    let ws = seed_workspace();
+    let db_path = ws.path.join(".beads/beads.db");
 
     // Define filter parameters
     let labels_filter: Vec<&str> = vec![]; // Empty = no label inclusion filter
@@ -234,6 +379,11 @@ fn test_pluck_database_connectivity() {
     println!("Total issues in database: {}", test_results.total_issues);
     println!("Open issues: {}", test_results.open_issues);
     println!("Issues with labels: {}", test_results.issues_with_labels);
+    println!(
+        "Claimable (constructed Pluck query): {:?}",
+        test_results.claimable_count
+    );
+    println!("Excluded by labels: {:?}", test_results.excluded_by_labels);
 
     let error_string = if test_results.errors.is_empty() {
         "None".to_string()
@@ -255,6 +405,34 @@ fn test_pluck_database_connectivity() {
     );
     assert!(test_results.schema_valid, "Database schema must be valid");
 
+    // Deterministic seeded-store counts. The seed holds 2 clean candidates,
+    // 4 excluded-label beads, 1 assigned-open bead, and 1 in-progress bead.
+    let seeded_total = (ws.clean_ids.len() + ws.excluded_ids.len() + 2) as i64;
+    assert_eq!(
+        test_results.total_issues, seeded_total,
+        "seeded store must hold every created bead"
+    );
+    assert_eq!(
+        test_results.open_issues,
+        seeded_total - 1,
+        "only the in-progress bead leaves base_status='open'"
+    );
+    assert_eq!(
+        test_results.issues_with_labels,
+        ws.excluded_ids.len() as i64 + 1,
+        "only the labeled clean bead and the excluded-label beads carry labels"
+    );
+    assert_eq!(
+        test_results.claimable_count,
+        Some(ws.clean_ids.len() as i64),
+        "constructed Pluck query must count exactly the clean candidates"
+    );
+    assert_eq!(
+        test_results.excluded_by_labels,
+        Some(ws.excluded_ids.len() as i64),
+        "label exclusion must cover exactly the seeded excluded-label beads"
+    );
+
     // If we have errors, report them but don't fail on minor issues
     if !test_results.errors.is_empty() {
         eprintln!("WARNING: Database connectivity issues detected:");
@@ -272,6 +450,8 @@ struct DatabaseTestResults {
     total_issues: i64,
     open_issues: i64,
     issues_with_labels: i64,
+    claimable_count: Option<i64>,
+    excluded_by_labels: Option<i64>,
     errors: Vec<String>,
 }
 
@@ -289,6 +469,8 @@ fn test_database_connection(
         total_issues: 0,
         open_issues: 0,
         issues_with_labels: 0,
+        claimable_count: None,
+        excluded_by_labels: None,
         errors: Vec::new(),
     };
 
@@ -504,6 +686,8 @@ fn test_database_connection(
                 println!("    - Required labels: {:?}", labels_filter);
             }
             println!("================================\n");
+
+            results.claimable_count = Some(claimable_count);
         }
         Err(e) => {
             results
@@ -523,6 +707,7 @@ fn test_database_connection(
     match conn.query_row(exclude_query, [], |row| row.get::<_, i64>(0)) {
         Ok(excluded_count) => {
             println!("Issues excluded by Pluck filters: {}", excluded_count);
+            results.excluded_by_labels = Some(excluded_count);
         }
         Err(e) => {
             results
