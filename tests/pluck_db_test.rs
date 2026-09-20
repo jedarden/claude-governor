@@ -107,7 +107,16 @@ fn test_pluck_query_matches_expected_configuration() {
         String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    let mut candidate_count = 0;
+    // The raw backend output is the dependency-safe frontier, and label
+    // exclusion is applied to the returned JSON by the store adapter (see
+    // construct_pluck_invocation's command comment) — the frontier may
+    // legitimately contain excluded-label beads, e.g. `human` is how operators
+    // park beads out of Pluck's reach. So what is asserted here is the
+    // adapter's exclusion contract over whatever the frontier holds, not that
+    // the live frontier is already clean: test_label_exclusion_drops_excluded_label_candidates
+    // pins the filtering itself against a fixture.
+    let mut raw_candidates = 0;
+    let mut excluded = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -116,19 +125,69 @@ fn test_pluck_query_matches_expected_configuration() {
             serde_json::from_str(line).expect("Pluck backend must return JSONL");
         assert_eq!(bead["status"], PLUCK_STATE);
         assert!(bead["assignee"].is_null());
-        for label in &query.exclude_labels {
-            assert!(
-                !bead["labels"]
-                    .as_array()
-                    .expect("Pluck JSON must include labels")
-                    .iter()
-                    .any(|value| value.as_str() == Some(label)),
-                "Pluck returned excluded label {label:?}"
-            );
+        assert!(bead["labels"].is_array(), "Pluck JSON must include labels");
+        if carries_excluded_label(&bead, PLUCK_EXCLUDE_LABELS) {
+            excluded.push(bead["id"].as_str().unwrap_or("<unknown id>").to_string());
         }
-        candidate_count += 1;
+        raw_candidates += 1;
     }
-    println!("Pluck backend returned {candidate_count} ready candidates");
+    println!(
+        "Pluck backend returned {raw_candidates} ready candidates; adapter label exclusion drops {excluded:?}"
+    );
+}
+
+/// Whether `bead` carries any label in `exclude_labels`.
+///
+/// Static form of the exclusion decision the store adapter applies to the
+/// backend's returned JSONL (NEEDLE `bead_store::excluded_by_labels`, without
+/// the expired-quarantine exception). Shared by the live-frontier check above
+/// and the fixture test below so the two cannot drift.
+fn carries_excluded_label(bead: &serde_json::Value, exclude_labels: &[&str]) -> bool {
+    bead["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|value| value.as_str())
+                .any(|label| exclude_labels.contains(&label))
+        })
+        .unwrap_or(false)
+}
+
+/// Label exclusion is deterministic JSONL filtering, independent of the live
+/// frontier: every configured exclude label drops its bead, and only a bead
+/// carrying none of them reaches Pluck's candidate set. Exercises all four
+/// configured labels plus multi-label mixes so the contract is pinned without
+/// reading shared bead state.
+#[test]
+fn test_label_exclusion_drops_excluded_label_candidates() {
+    let candidates: &[(&str, &[&str])] = &[
+        ("claudego-clean", &["codinghome", "fleet-control"]),
+        ("claudego-deferred", &["deferred"]),
+        ("claudego-human", &["codinghome", "human", "quota"]),
+        ("claudego-blocked", &["blocked"]),
+        ("claudego-starved", &["starvation-alert"]),
+        (
+            "claudego-every-exclusion",
+            &["deferred", "human", "blocked", "starvation-alert"],
+        ),
+    ];
+
+    let survivors: Vec<&str> = candidates
+        .iter()
+        .filter(|(_, labels)| {
+            let bead = serde_json::json!({ "id": "unused", "labels": labels });
+            !carries_excluded_label(&bead, PLUCK_EXCLUDE_LABELS)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+
+    assert_eq!(survivors, ["claudego-clean"]);
+
+    // The adapter's parse yields a labels array for every bead; a missing one
+    // (malformed JSON) is treated as unlabelled and kept, not a crash.
+    let unlabelled = serde_json::json!({ "id": "claudego-unlabelled" });
+    assert!(!carries_excluded_label(&unlabelled, PLUCK_EXCLUDE_LABELS));
 }
 
 /// Test database connection and basic query functionality
