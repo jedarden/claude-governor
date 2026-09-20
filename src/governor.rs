@@ -4776,24 +4776,16 @@ fn distribute_workers_by_cost_priority(
     // growth absolutely, while shrink pacing stays with the aggregate
     // decision, which is what owns it.
     //
-    // Known consequence (claudego-ad125e03): on a hold cycle with no other
-    // pool able to absorb the freed slots, a pool above its own ceiling gets
-    // its workers back and sheds nothing. Inert while needle-sonnet is the
-    // only configured pool; the real fix is for the aggregate to authorize
-    // that shed, so it passes through max_scale_down_per_cycle like any
-    // other. Do NOT "fix" it by dropping the give-back — that is exactly the
-    // code shape the two regression tests above rejected.
-    let pool_ceiling = |cfg: &AgentConfig| -> u32 {
-        pool_window_safe_cap(cfg, capacity_forecast)
-            .map(|cap| cap.max(cfg.min_workers.min(cfg.max_workers)))
-            .unwrap_or(cfg.max_workers)
-            .min(cfg.max_workers)
-    };
-
+    // The aggregate side of this gap is [`affinity_shed_target`]: when every
+    // pool fits its ceilings except one that cannot shed (nothing to re-home
+    // onto, aggregate holding), the act cycle lowers the computed target to
+    // what the ceilings support and the shed arrives here as an ordinary,
+    // per-cycle-paced down-move. This pass stays shrink-conservative either
+    // way — see the give-back below.
     let mut freed: u32 = 0;
     let mut clamped: Vec<(String, u32)> = Vec::new();
     for (name, cfg) in agents {
-        let ceiling = pool_ceiling(cfg);
+        let ceiling = pool_affinity_ceiling(cfg, capacity_forecast);
         let target = *result.get(name).unwrap_or(&0);
         if target > ceiling {
             log::info!(
@@ -4823,7 +4815,7 @@ fn distribute_workers_by_cost_priority(
             let Some(cfg) = agents.get(name) else {
                 continue;
             };
-            let ceiling = pool_ceiling(cfg);
+            let ceiling = pool_affinity_ceiling(cfg, capacity_forecast);
             let have = *result.get(name).unwrap_or(&0);
             if have < ceiling {
                 let add = (ceiling - have).min(freed);
@@ -4871,6 +4863,73 @@ fn pool_window_safe_cap(cfg: &AgentConfig, forecast: &state::CapacityForecast) -
             _ => forecast.weekly_scoped.safe_worker_count,
         })
         .min()
+}
+
+/// The pool's effective allocation ceiling under window affinity: the min safe
+/// count across its windows, lifted to the pool's `min_workers` floor (an
+/// explicit floor is a stated intent to run through tight windows) and capped
+/// at `max_workers`. Shared by the distribution pass
+/// ([`distribute_workers_by_cost_priority`]) and the aggregate shed
+/// ([`affinity_shed_target`]) so both sides of the decision mean the same
+/// bound.
+fn pool_affinity_ceiling(cfg: &AgentConfig, forecast: &state::CapacityForecast) -> u32 {
+    pool_window_safe_cap(cfg, forecast)
+        .map(|cap| cap.max(cfg.min_workers.min(cfg.max_workers)))
+        .unwrap_or(cfg.max_workers)
+        .min(cfg.max_workers)
+}
+
+/// The fleet total the per-pool window-affinity ceilings actually support,
+/// when — and only when — that requires a shed (claudego-ad125e03).
+///
+/// `distribute_workers_by_cost_priority` caps every pool at
+/// [`pool_affinity_ceiling`], but it must not shrink the fleet: slots freed by
+/// a cap that no other pool can absorb are given back to the pool they came
+/// from, so shrink pacing stays with the aggregate decision (clamping the
+/// allocation outright made a hold signal a worker and an authorized shed of 2
+/// signal 3 — `hysteresis_hold_touches_no_worker_regression` and
+/// `scale_down_honors_per_cycle_cap_regression`). The price of that bounding
+/// was the gap this closes: on a hold cycle with nowhere to re-home, a pool
+/// sitting above its OWN window ceiling shed nothing, cycle after cycle.
+///
+/// This supplies the missing authorization at the aggregate level: the sum of
+/// `min(current, ceiling)` across configured pools — what the ceilings
+/// actually support — whenever at least one pool runs above its own ceiling.
+/// The caller lowers the computed target to it, so the shed travels the normal
+/// down-move path and the hysteresis band and `max_scale_down_per_cycle` pace
+/// it like every other shed, instead of the distribution smuggling it through.
+///
+/// `None` when every pool fits its own ceiling: the bound never gates growth,
+/// a hold, or a cold start (at current 0 nothing is over its ceiling, so a
+/// start stays authorized). It never sheds more than the excess itself.
+///
+/// `floor_min` (the aggregate min from [`aggregate_worker_bounds`]) floors the
+/// result, so a pool transiently running below its own configured floor cannot
+/// drag the shed target under the fleet's stated floor.
+///
+/// A supported total of 0 (every running pool's ceiling is 0) is returned as
+/// `Some(0)` and rides the same decision path as a binding
+/// `safe_worker_count = Some(0)` — the forecast says not even one worker of
+/// that kind is affordable before reset, and the pool's own declaration (or
+/// the conservative undeclared default) said it consumes that window.
+pub fn affinity_shed_target(
+    agents: &HashMap<String, AgentConfig>,
+    current_workers: &HashMap<String, u32>,
+    forecast: &state::CapacityForecast,
+    floor_min: u32,
+) -> Option<u32> {
+    let mut supported: u32 = 0;
+    let mut excess: u32 = 0;
+    for (name, cfg) in agents {
+        let ceiling = pool_affinity_ceiling(cfg, forecast);
+        let current = current_workers.get(name).copied().unwrap_or(0);
+        supported = supported.saturating_add(current.min(ceiling));
+        excess = excess.saturating_add(current.saturating_sub(ceiling));
+    }
+    if excess == 0 {
+        return None;
+    }
+    Some(supported.max(floor_min))
 }
 
 /// The windows eligible to bind the fleet-wide scaling decision, given every
@@ -7155,6 +7214,32 @@ pub fn run_act_cycle(
         effective_composite_risk,
         effective_cone_scaling,
     );
+    // Window-affinity shed (claudego-ad125e03): a pool running above its own
+    // window ceiling must shed, even on a cycle the binding window would hold.
+    // The distribution pass cannot authorize that shed itself — its give-back
+    // deliberately keeps the fleet at the authorized total — so the
+    // authorization is supplied here, at the aggregate, and the move paces
+    // through the hysteresis band and `max_scale_down_per_cycle` below like
+    // every other down-move. A manual override or sprint boost later in this
+    // cycle still supersedes it: both are explicit intents to run, the same
+    // precedence the per-pool `min_workers` floor already holds over the cap.
+    let computed_target = match affinity_shed_target(
+        agents,
+        &current_workers_per_agent,
+        &state.capacity_forecast,
+        aggregate_worker_bounds(&state).map_or(0, |(lo, _)| lo),
+    ) {
+        Some(bound) if bound < computed_target => {
+            log::info!(
+                "[governor] window-affinity shed: computed target {} -> {} — a pool runs above \
+                 its own window ceiling with no pool able to re-home the excess",
+                computed_target,
+                bound
+            );
+            bound
+        }
+        _ => computed_target,
+    };
     log::info!(
         "[governor] target workers: {} (ceiling: {:.0}%{})",
         computed_target,
@@ -11191,6 +11276,215 @@ mod tests {
             grow.get("solo"),
             Some(&1),
             "growth stays bounded by the cap — give-back never exceeds what is running"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate window-affinity shed (claudego-ad125e03)
+    // -----------------------------------------------------------------------
+
+    /// The aggregate authorization the distribution pass cannot give itself:
+    /// pool B sits above its OWN window ceiling (weekly_scoped says 0 are
+    /// affordable) while the binding window holds the fleet, and pool A has no
+    /// headroom to re-home B's workers onto. The distribution gives B its
+    /// workers back; `affinity_shed_target` is what authorizes the shed — the
+    /// total the ceilings actually support, so the move paces through
+    /// hysteresis and `max_scale_down_per_cycle` like any other down-move.
+    #[test]
+    fn affinity_shed_authorizes_shedding_a_pool_above_its_own_ceiling() {
+        let forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                safe_worker_count: Some(12),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                safe_worker_count: Some(11),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            binding_window: "seven_day".to_string(),
+            ..Default::default()
+        };
+
+        // A consumes the two windows with headroom — ceiling 11, running 8,
+        // fits. B declares the premium window too — ceiling 0, running 3,
+        // over by 3. The binding window (seven_day, safe 11) equals the
+        // running total: a hold, before this shed exists.
+        let mut agents = make_agents_with_windows(
+            "pool-a",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            12,
+        );
+        agents.insert(
+            "pool-b".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print-opus".to_string(),
+                session_pattern: "needle-claude-print-opus-*".to_string(),
+                heartbeat_dir: "~/.needle/state/heartbeats".to_string(),
+                min_workers: 0,
+                max_workers: 4,
+                subscription: true,
+                baseline_burn_rate: None,
+                windows: Some(vec![
+                    "five_hour".to_string(),
+                    "seven_day".to_string(),
+                    "weekly_scoped".to_string(),
+                ]),
+            },
+        );
+        let current: HashMap<String, u32> = [("pool-a".to_string(), 8), ("pool-b".to_string(), 3)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            affinity_shed_target(&agents, &current, &forecast, 0),
+            Some(8),
+            "the ceilings support 8 of the running 11 — the shed of pool B's excess \
+             is authorized at the aggregate"
+        );
+    }
+
+    /// The shed bound exists only to shed: when every pool fits its own
+    /// ceiling — including the everything-at-zero cold start — it returns
+    /// `None`, so it never gates a hold, growth, or an authorized start.
+    #[test]
+    fn affinity_shed_is_none_when_every_pool_fits_its_own_ceiling() {
+        let forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                safe_worker_count: Some(12),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                safe_worker_count: Some(11),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            binding_window: "seven_day".to_string(),
+            ..Default::default()
+        };
+        let mut agents = make_agents_with_windows(
+            "pool-a",
+            Some(vec!["five_hour".to_string(), "seven_day".to_string()]),
+            12,
+        );
+        agents.insert(
+            "pool-b".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print-opus".to_string(),
+                session_pattern: "needle-claude-print-opus-*".to_string(),
+                heartbeat_dir: "~/.needle/state/heartbeats".to_string(),
+                min_workers: 0,
+                max_workers: 4,
+                subscription: true,
+                baseline_burn_rate: None,
+                windows: Some(vec![
+                    "five_hour".to_string(),
+                    "seven_day".to_string(),
+                    "weekly_scoped".to_string(),
+                ]),
+            },
+        );
+
+        let holding: HashMap<String, u32> = [("pool-a".to_string(), 8), ("pool-b".to_string(), 0)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            affinity_shed_target(&agents, &holding, &forecast, 0),
+            None,
+            "B idle, A under its ceiling: nothing is over its own ceiling, no shed"
+        );
+
+        let cold: HashMap<String, u32> = [("pool-a".to_string(), 0), ("pool-b".to_string(), 0)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            affinity_shed_target(&agents, &cold, &forecast, 0),
+            None,
+            "a cold start has no excess by construction — the start stays authorized"
+        );
+    }
+
+    /// The bound never sheds below the fleet's aggregate min: a pool running
+    /// under its own configured floor cannot drag the shed target beneath the
+    /// floor the fleet already clamps every target to.
+    #[test]
+    fn affinity_shed_floors_at_the_aggregate_minimum() {
+        let forecast = state::CapacityForecast {
+            seven_day: state::WindowForecast {
+                safe_worker_count: Some(4),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            binding_window: "seven_day".to_string(),
+            ..Default::default()
+        };
+
+        let mut agents =
+            make_agents_with_windows("understaffed", Some(vec!["seven_day".to_string()]), 4);
+        agents.get_mut("understaffed").unwrap().min_workers = 2;
+        agents.insert(
+            "over-ceiling".to_string(),
+            AgentConfig {
+                launch_cmd: "needle run --agent claude-print-opus".to_string(),
+                session_pattern: "needle-claude-print-opus-*".to_string(),
+                heartbeat_dir: "~/.needle/state/heartbeats".to_string(),
+                min_workers: 0,
+                max_workers: 4,
+                subscription: true,
+                baseline_burn_rate: None,
+                windows: Some(vec![
+                    "five_hour".to_string(),
+                    "seven_day".to_string(),
+                    "weekly_scoped".to_string(),
+                ]),
+            },
+        );
+        let current: HashMap<String, u32> = [
+            ("understaffed".to_string(), 1),
+            ("over-ceiling".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+
+        // Supported = 1 (understaffed) + 0 (over-ceiling) = 1, but the fleet
+        // min is 2 — the shed lands on 2, not 1.
+        assert_eq!(
+            affinity_shed_target(&agents, &current, &forecast, 2),
+            Some(2),
+            "the shed target never dips under the aggregate min"
+        );
+    }
+
+    /// An undeclared pool is assumed to consume every window (the
+    /// conservative default), so a `Some(0)` on any window caps it. A
+    /// supported total of 0 comes back as `Some(0)` and rides the same
+    /// decision path as a binding `safe_worker_count = Some(0)`.
+    #[test]
+    fn affinity_shed_covers_undeclared_pools_and_return_zero_as_some_zero() {
+        let forecast = state::CapacityForecast {
+            weekly_scoped: state::WindowForecast {
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            binding_window: "seven_day".to_string(),
+            ..Default::default()
+        };
+        let agents = make_agents_with_windows("undeclared", None, 8);
+        let current: HashMap<String, u32> = [("undeclared".to_string(), 2)].into_iter().collect();
+
+        assert_eq!(
+            affinity_shed_target(&agents, &current, &forecast, 0),
+            Some(0),
+            "the undeclared pool consumes weekly_scoped's 0 — nothing is supported"
         );
     }
 

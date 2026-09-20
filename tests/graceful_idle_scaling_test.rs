@@ -720,3 +720,229 @@ fn scale_down_sheds_actives_last_and_oldest_first_when_idle_pool_exhausted_regre
         "idle first, then the oldest active; the youngest active worker survives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. Window-affinity shed — a pool above its own ceiling sheds on a hold
+//    cycle, paced (claudego-ad125e03)
+// ---------------------------------------------------------------------------
+
+/// An agent config for the two-pool matrix: explicit session pattern, window
+/// affinity declaration, and a launch_cmd whose `--agent` name keys the
+/// per-model burn rate that makes its cost deterministic.
+fn affinity_agent_config(
+    launch_cmd: String,
+    session_pattern: &str,
+    heartbeat_dir: &Path,
+    max_workers: u32,
+    windows: &[&str],
+) -> AgentConfig {
+    serde_json::from_value(serde_json::json!({
+        "launch_cmd": launch_cmd,
+        "session_pattern": session_pattern,
+        "heartbeat_dir": heartbeat_dir.to_string_lossy(),
+        "min_workers": 0,
+        "max_workers": max_workers,
+        "subscription": false,
+        "windows": windows,
+    }))
+    .expect("agent config fixture should deserialize")
+}
+
+/// Register a worker for a named pool: the full session name goes into the
+/// shared fake-tmux census and its heartbeat into that pool's heartbeat dir,
+/// so each pool's census (pattern-filtered) counts only its own workers.
+fn seed_pool_worker(
+    sessions_file: &Path,
+    hb_dir: &Path,
+    session: &str,
+    age_secs: i64,
+    is_idle: bool,
+) {
+    use std::io::Write;
+    let mut sessions = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sessions_file)
+        .expect("open sessions file");
+    writeln!(sessions, "{session}").expect("append session");
+    write_heartbeat(hb_dir, session, age_secs, is_idle);
+}
+
+/// The affinity-shed forecast: five_hour supports 13, the binding seven_day
+/// is roomy at 16, and weekly_scoped — the premium window only pool B
+/// consumes — says ZERO workers are affordable. Per-model burn rates make
+/// pool B the expensive pool, so the down-pass sheds it first, deterministically.
+fn seeded_affinity_shed_state() -> state::GovernorState {
+    fn seed(win: &mut state::WindowForecast, utilization: f64, safe: u32) {
+        win.current_utilization = utilization;
+        win.hours_remaining = 40.0;
+        win.cutoff_risk = false;
+        win.safe_worker_count = Some(safe);
+        win.safe_worker_count_p75 = Some(safe);
+        win.cone_ratio = 0.0; // narrow cone → p50 estimate selected
+    }
+
+    let mut s = state::GovernorState::new();
+    s.capacity_forecast.binding_window = "seven_day".to_string();
+    seed(&mut s.capacity_forecast.five_hour, 65.0, 13);
+    seed(&mut s.capacity_forecast.seven_day, 60.0, 16);
+    seed(&mut s.capacity_forecast.weekly_scoped, 45.0, 0);
+    s.burn_rate.by_model.insert(
+        "cgaff-a".to_string(),
+        state::ModelBurnRate {
+            pct_per_worker_per_hour: 5.0,
+            dollars_per_worker_per_hour: 10.5,
+            samples: 10,
+        },
+    );
+    s.burn_rate.by_model.insert(
+        "cgaff-b".to_string(),
+        state::ModelBurnRate {
+            pct_per_worker_per_hour: 10.0,
+            dollars_per_worker_per_hour: 22.5,
+            samples: 10,
+        },
+    );
+    s
+}
+
+/// Re-seed the affinity-shed state, then run a real act cycle against it.
+/// Caller holds [`ENV_LOCK`]; `harness()` already activated the fakes.
+fn affinity_shed_cycle(h: &Harness, agents: &HashMap<String, AgentConfig>) -> ScalingDecision {
+    std::fs::write(
+        &h.state_path,
+        serde_json::to_string_pretty(&seeded_affinity_shed_state()).expect("serialize state"),
+    )
+    .expect("write state fixture");
+    act_cycle(h, agents, 0.5, 10, 2)
+}
+
+/// The bead's worked example, end to end (claudego-ad125e03). Pool A
+/// consumes five_hour only: safe 13, running 13 — AT its ceiling, no
+/// headroom. Pool B consumes all three windows: weekly_scoped says 0, so its
+/// ceiling is 0 while 3 of its workers run. The binding seven_day window
+/// (safe 16) equals the running total of 16 — a hold the aggregate
+/// authorized no move on — and there is no pool with headroom to re-home
+/// B's workers onto, so the distribution's give-back handed them straight
+/// back, cycle after cycle, forever.
+///
+/// The aggregate now supplies the missing authorization, and the move is
+/// indistinguishable from any other shed: capped at `max_down_per_cycle` = 2
+/// (then 1 — not the full excess of 3 at once), landed only on the
+/// over-ceiling pool, never on pool A, and CONVERGED — once the excess is
+/// gone the bound returns None, the roomy binding window is free to want its
+/// growth back, and the affinity caps deny it without shedding anyone.
+#[test]
+fn affinity_shed_sheds_an_over_ceiling_pool_on_a_hold_cycle_paced_and_converged() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let hb_a = env.join("heartbeats-a");
+    let hb_b = env.join("heartbeats-b");
+    let stub = env.join("bin").join("launch-stub");
+    // `--agent <name>` keys the burn rate seeded in the state fixture.
+    let launch_a = format!(
+        "{} --agent cgaff-a --workspace {} idle-scaled {}",
+        stub.display(),
+        env.display(),
+        h.launch_log.display()
+    );
+    let launch_b = format!(
+        "{} --agent cgaff-b --workspace {} idle-scaled {}",
+        stub.display(),
+        env.display(),
+        h.launch_log.display()
+    );
+
+    for i in 1..=13 {
+        seed_pool_worker(
+            &h.sessions_file,
+            &hb_a,
+            &format!("cgaff-a-w{i:02}"),
+            10 + i,
+            true,
+        );
+    }
+    seed_pool_worker(&h.sessions_file, &hb_b, "cgaff-b-old", 30, true);
+    seed_pool_worker(&h.sessions_file, &hb_b, "cgaff-b-mid", 20, true);
+    seed_pool_worker(&h.sessions_file, &hb_b, "cgaff-b-young", 5, true);
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "pool-a".to_string(),
+        affinity_agent_config(launch_a, "cgaff-a-*", &hb_a, 16, &["five_hour"]),
+    );
+    agents.insert(
+        "pool-b".to_string(),
+        affinity_agent_config(
+            launch_b,
+            "cgaff-b-*",
+            &hb_b,
+            4,
+            &["five_hour", "seven_day", "weekly_scoped"],
+        ),
+    );
+
+    // Cycle one: the hold would keep all 16 workers; the shed bound lowers
+    // the target to the supported 13, and the wanted shed of 3 arrives paced
+    // at max_down_per_cycle = 2, on pool B's two oldest idle workers.
+    let first = affinity_shed_cycle(&h, &agents);
+    assert_eq!(
+        first,
+        ScalingDecision::ScaleDown(2),
+        "the aggregate sheds its over-ceiling pool on a hold cycle, paced at the cap"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgaff-b-old", "cgaff-b-mid"]),
+        "pool B absorbs the cut; pool A at its own ceiling is never touched"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "a paced affinity shed takes the graceful path"
+    );
+
+    // Cycle two: pool B's last worker is still above a ceiling of 0. The
+    // remaining excess of 1 sheds — the hold no longer protects it.
+    h.reap(&["cgaff-b-old", "cgaff-b-mid"]);
+    let second = affinity_shed_cycle(&h, &agents);
+    assert_eq!(
+        second,
+        ScalingDecision::ScaleDown(1),
+        "the shed resumes at the new excess, still paced like any down-move"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgaff-b-old", "cgaff-b-mid", "cgaff-b-young"]),
+        "exactly pool B's three workers are shed, oldest first"
+    );
+
+    // Cycle three: the excess is gone, so the bound returns None — the shed
+    // exists only to shed. The roomy binding window now wants its growth
+    // back (safe 16 vs 13 running) and the decision says so, but every pool
+    // is at or under its own ceiling, so the distribution refuses to grow:
+    // nothing launches, nothing is signalled, pool B stays at 0.
+    h.reap(&["cgaff-b-young"]);
+    let third = affinity_shed_cycle(&h, &agents);
+    assert!(
+        matches!(third, ScalingDecision::ScaleUp(_)),
+        "with the excess gone the shed stops; the binding window wants growth again"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgaff-b-old", "cgaff-b-mid", "cgaff-b-young"]),
+        "the converged cycle sheds nobody new"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "the affinity caps never kill"
+    );
+    assert!(
+        std::fs::read_to_string(&h.launch_log)
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "growth past a pool's own ceiling is denied absolutely: nothing launches"
+    );
+}
