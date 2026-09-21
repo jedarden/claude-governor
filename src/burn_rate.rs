@@ -1318,6 +1318,75 @@ pub fn behind_flat_spend_pace(
     }
 }
 
+/// How many whole pace blocks of this window have already elapsed.
+///
+/// The window is cut into `blocks` equal stretches of wall-clock time — four
+/// blocks of ~42h on the 168h weekly window — and each is budgeted an equal
+/// share of the quota. `None` for a window whose nominal length is unknown, or
+/// for a nonsensical block count.
+///
+/// Clamped to `blocks - 1`: at the very end of the window every block has
+/// elapsed, and a "block 4 of 4" checkpoint would demand 100% consumption,
+/// which is never an underspend signal worth acting on with no time left.
+pub fn elapsed_pace_blocks(window: &str, hours_remaining: f64, blocks: u32) -> Option<u32> {
+    let window_hours = window_duration_hours(window)?;
+    if blocks == 0 || !(window_hours > 0.0) || !hours_remaining.is_finite() {
+        return None;
+    }
+    let elapsed = (window_hours - hours_remaining).max(0.0);
+    let block_hours = window_hours / f64::from(blocks);
+    let completed = (elapsed / block_hours).floor();
+    if !completed.is_finite() || completed < 0.0 {
+        return None;
+    }
+    Some((completed as u32).min(blocks.saturating_sub(1)))
+}
+
+/// The utilisation a flat-spend plan would have reached by the last completed
+/// pace-block boundary, as a percentage of total quota.
+///
+/// This is the block-quantised twin of [`flat_spend_pace_target`]. Where that
+/// draws a continuous line and produces a fine sawtooth, this samples the same
+/// line at `blocks` checkpoints, so the authorisation only changes at a
+/// boundary instead of flapping cycle to cycle. `None` before the first
+/// boundary: one block must actually have passed before "we are behind" means
+/// anything, and at the very start of a window every fleet is trivially behind.
+pub fn pace_block_expected_utilization(
+    window: &str,
+    hours_remaining: f64,
+    blocks: u32,
+) -> Option<f64> {
+    let completed = elapsed_pace_blocks(window, hours_remaining, blocks)?;
+    if completed == 0 {
+        return None;
+    }
+    Some(f64::from(completed) * (100.0 / f64::from(blocks)))
+}
+
+/// Is this window underspent against the block-quantised pace line?
+///
+/// True when at least one block boundary has passed and consumption is still
+/// below that boundary's budgeted share — "the first block passed and more than
+/// 75% of quota is left", generalised to every boundary. False before the first
+/// boundary, and for a window whose length cannot be placed.
+///
+/// Deliberately stated against TOTAL quota rather than the worker ceiling: the
+/// question it answers is "is the subscription being underspent", which is a
+/// fact about the plan, not about the share of it workers are allowed. The
+/// ceiling still bounds how many workers the answer buys
+/// (docs/notes/human-reserve-policy.md).
+pub fn behind_pace_blocks(
+    window: &str,
+    utilization_pct: f64,
+    hours_remaining: f64,
+    blocks: u32,
+) -> bool {
+    match pace_block_expected_utilization(window, hours_remaining, blocks) {
+        Some(expected) => utilization_pct.is_finite() && utilization_pct < expected,
+        None => false,
+    }
+}
+
 /// Convert an affordable-worker quotient into an authorised worker count.
 ///
 /// `affordable = remaining_pct / (per_worker_rate * hours_remaining)` answers:
@@ -2078,6 +2147,9 @@ pub fn build_burn_rate_state(
         usd_per_pct_ema_seven_day: 0.0,
         usd_per_pct_ema_weekly_scoped: 0.0,
         fleet_pct_ema_samples: 0,
+        // Freshly computed burn rates carry no idle-pause state; the governor
+        // loop owns the flag (claudego-ddd93cee).
+        fleet_ema_idle_paused: false,
         prev_usage_snapshot: None,
     }
 }
@@ -3908,6 +3980,109 @@ mod tests {
             duty_cycle_safe_workers("some_new_window", 5.0, 1.5, 29.67, 90.0),
             1,
             "an unplaceable window must fall back to authorising, not to idling"
+        );
+    }
+
+    /// The week cut into four ~42h blocks: no boundary has passed inside the
+    /// first block, so nothing is "behind" yet however little has been spent.
+    /// At the start of a window every fleet is trivially behind, and acting on
+    /// that would make the signal meaningless.
+    #[test]
+    fn pace_blocks_say_nothing_before_the_first_boundary() {
+        // 168h window, 130h left -> 38h elapsed, still inside block 1.
+        assert_eq!(elapsed_pace_blocks("seven_day", 130.0, 4), Some(0));
+        assert_eq!(pace_block_expected_utilization("seven_day", 130.0, 4), None);
+        assert!(
+            !behind_pace_blocks("seven_day", 0.0, 130.0, 4),
+            "0% used 38h in must not trigger: no boundary has passed"
+        );
+    }
+
+    /// Each boundary budgets an equal share, and the test is strictly "below
+    /// the share". Exactly on the share is on pace, not behind.
+    #[test]
+    fn pace_blocks_flag_underspend_at_each_boundary() {
+        // 42h elapsed (block 1 done): budgeted 25%.
+        assert_eq!(elapsed_pace_blocks("seven_day", 126.0, 4), Some(1));
+        assert_eq!(
+            pace_block_expected_utilization("seven_day", 126.0, 4),
+            Some(25.0)
+        );
+        assert!(behind_pace_blocks("seven_day", 24.9, 126.0, 4));
+        assert!(!behind_pace_blocks("seven_day", 25.0, 126.0, 4));
+        assert!(!behind_pace_blocks("seven_day", 60.0, 126.0, 4));
+
+        // 84h elapsed (two blocks done): budgeted 50%.
+        assert_eq!(
+            pace_block_expected_utilization("seven_day", 84.0, 4),
+            Some(50.0)
+        );
+        assert!(behind_pace_blocks("seven_day", 49.0, 84.0, 4));
+        assert!(!behind_pace_blocks("seven_day", 51.0, 84.0, 4));
+
+        // 126h elapsed (three blocks done): budgeted 75%.
+        assert_eq!(
+            pace_block_expected_utilization("seven_day", 42.0, 4),
+            Some(75.0)
+        );
+
+        // The live shape on 2026-09-21: 71% used with 44.8h left is 123.2h
+        // elapsed — still only TWO blocks done, so it is measured against 50%
+        // and is NOT behind. It crosses into "behind" 2.8h later when the
+        // third boundary raises the bar to 75%. Pinned because the difference
+        // is entirely the boundary, not the utilisation, and a continuous pace
+        // line would have answered "behind" at both instants.
+        assert!(
+            !behind_pace_blocks("seven_day", 71.0, 44.8, 4),
+            "two blocks done budgets 50%; 71% used is ahead of that, not behind"
+        );
+        assert!(
+            behind_pace_blocks("seven_day", 71.0, 42.0, 4),
+            "the third boundary budgets 75%; the same 71% is now behind"
+        );
+    }
+
+    /// The final block is never a checkpoint: with the window essentially over
+    /// a "4 of 4" boundary would demand 100% consumption and call every fleet
+    /// behind at the moment there is no time left to act.
+    #[test]
+    fn pace_blocks_clamp_at_the_last_block() {
+        assert_eq!(elapsed_pace_blocks("seven_day", 0.0, 4), Some(3));
+        assert_eq!(
+            pace_block_expected_utilization("seven_day", 0.0, 4),
+            Some(75.0)
+        );
+        assert_eq!(elapsed_pace_blocks("seven_day", -5.0, 4), Some(3));
+    }
+
+    /// Unknown window, or blocks disabled, means no opinion — and note this is
+    /// the OPPOSITE default from `behind_flat_spend_pace`, deliberately. That
+    /// gate returning true keeps scaling alive for a window it cannot place;
+    /// this one returning false withholds an authorisation it cannot justify.
+    /// A sprint must never be invented from an unplaceable window.
+    #[test]
+    fn pace_blocks_withhold_on_unknown_window_or_disabled() {
+        assert_eq!(elapsed_pace_blocks("some_new_window", 10.0, 4), None);
+        assert!(!behind_pace_blocks("some_new_window", 0.0, 10.0, 4));
+        assert_eq!(elapsed_pace_blocks("seven_day", 42.0, 0), None);
+        assert!(!behind_pace_blocks("seven_day", 0.0, 42.0, 0));
+    }
+
+    /// A five-hour window placed into blocks is nearly always "behind" its own
+    /// share, which is exactly why the sprint ignores it. Pinned here so the
+    /// helper's behaviour on that window is a known quantity rather than an
+    /// assumption made at the call site.
+    #[test]
+    fn pace_blocks_on_five_hour_are_real_but_unused_by_the_sprint() {
+        // 5h window, 1h left -> 4h elapsed -> 3 blocks of 1.25h -> 75% budgeted.
+        assert_eq!(
+            pace_block_expected_utilization("five_hour", 1.0, 4),
+            Some(75.0)
+        );
+        assert!(
+            behind_pace_blocks("five_hour", 11.0, 1.0, 4),
+            "the live 2026-09-21 five-hour shape is 'behind' — the sprint must \
+             exclude this window rather than rely on it being quiet"
         );
     }
 

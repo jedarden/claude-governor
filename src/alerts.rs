@@ -292,6 +292,126 @@ pub fn check_underutilization_sprint_for_worker(
     None
 }
 
+/// Pace-block sprint: authorise a pool that is underspending its share of the
+/// week at the last completed block boundary.
+///
+/// The week is cut into `config.pace_blocks` equal stretches (default four of
+/// ~42h), each budgeted an equal share of quota. Once a boundary has passed, a
+/// pool still below that boundary's share is behind the flat-spend line and is
+/// authorised to run up to `max_workers` so the real burn can be MEASURED.
+/// That is the point: this is the only pace signal available with no burn data,
+/// because it is computed from the clock and the account's own utilisation
+/// rather than from the fleet. `safe_worker_count` cannot supply one — it
+/// returns 0 on `!(per_worker_rate > 0.0)` before reaching its own continuous
+/// pace gate, so a pool that has never run can never earn the samples that
+/// would let it run (claudego-ddd93cee).
+///
+/// Differences from [`check_underutilization_sprint_for_worker`], which this
+/// sits beside rather than replaces:
+/// - it is not confined to the end of a window (that one needs
+///   `hours_remaining < 2h`), because underspending is worth acting on as soon
+///   as a boundary proves it;
+/// - it only considers WEEKLY windows, since the blocks divide the week. The
+///   five-hour window is nearly always "behind" its own blocks and would
+///   authorise a fleet the week cannot afford;
+/// - it is scoped to the windows the pool actually consumes, so a premium
+///   window the pool never touches neither triggers it nor inhibits it
+///   (claudego-ec6d3ae3).
+pub fn check_pace_block_sprint_for_worker(
+    state: &crate::state::GovernorState,
+    config: &crate::config::SprintConfig,
+    worker_id: &str,
+    max_workers: u32,
+    consumed_windows: &[&str],
+    now: DateTime<Utc>,
+) -> Option<SprintTrigger> {
+    if config.pace_blocks == 0 || max_workers == 0 {
+        return None;
+    }
+
+    // Predictions unreliable — the same inhibition the sibling sprint applies.
+    if state.safe_mode.active {
+        log::debug!(
+            "Pace-block sprint inhibited: safe mode active (trigger: {:?})",
+            state.safe_mode.trigger
+        );
+        return None;
+    }
+
+    let forecast = &state.capacity_forecast;
+    let windows = [
+        ("five_hour", &forecast.five_hour),
+        ("seven_day", &forecast.seven_day),
+        ("weekly_scoped", &forecast.weekly_scoped),
+    ];
+
+    // Cutoff risk inhibits, but only on windows this pool can actually move.
+    for (name, win) in windows {
+        if consumed_windows.contains(&name) && win.cutoff_risk {
+            log::debug!("Pace-block sprint inhibited: {} has cutoff_risk", name);
+            return None;
+        }
+    }
+
+    for (name, win) in windows {
+        // The blocks divide the WEEK; a five-hour window is not one.
+        if name == "five_hour" || !consumed_windows.contains(&name) {
+            continue;
+        }
+        if !crate::burn_rate::behind_pace_blocks(
+            name,
+            win.current_utilization,
+            win.hours_remaining,
+            config.pace_blocks,
+        ) {
+            continue;
+        }
+        let expected = crate::burn_rate::pace_block_expected_utilization(
+            name,
+            win.hours_remaining,
+            config.pace_blocks,
+        )?;
+        let blocks_done =
+            crate::burn_rate::elapsed_pace_blocks(name, win.hours_remaining, config.pace_blocks)?;
+
+        let trigger = SprintTrigger {
+            worker_id: worker_id.to_string(),
+            window: name.to_string(),
+            utilization_pct: win.current_utilization,
+            hours_remaining: win.hours_remaining,
+            target_workers: max_workers,
+            reason: format!(
+                "Pace-block sprint on {} for worker {}: {} of {} blocks elapsed, \
+                 {:.1}% used against a {:.1}% flat-spend share, {:.1}h to reset",
+                name,
+                worker_id,
+                blocks_done,
+                config.pace_blocks,
+                win.current_utilization,
+                expected,
+                win.hours_remaining
+            ),
+            triggered_at: now,
+        };
+
+        log::info!(
+            "[governor] pace-block sprint: {} {:.1}% used vs {:.1}% budgeted after {}/{} blocks \
+             ({:.1}h to reset) -> authorising up to {} workers to measure the shortfall",
+            name,
+            win.current_utilization,
+            expected,
+            blocks_done,
+            config.pace_blocks,
+            win.hours_remaining,
+            max_workers
+        );
+
+        return Some(trigger);
+    }
+
+    None
+}
+
 /// Check whether a *new* episode may open for the given episode key.
 ///
 /// This is the anti-flap floor, not a repeat interval: it is consulted only when no

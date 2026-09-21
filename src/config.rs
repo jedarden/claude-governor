@@ -441,6 +441,25 @@ pub struct SprintConfig {
     /// Sprint ends if headroom drops below this
     #[serde(default = "default_sprint_end_headroom_pct")]
     pub sprint_end_headroom_pct: f64,
+
+    /// Pace-block sprint: how many equal stretches the weekly window is cut
+    /// into, each budgeted an equal share of quota (default: 4, i.e. ~42h
+    /// blocks of 25% each on the 168h week).
+    ///
+    /// At every boundary after the first, a pool whose consumption is still
+    /// below that boundary's budgeted share is underspending, and is authorised
+    /// to run so the shortfall can be measured rather than inferred. 0 disables
+    /// the pace-block sprint entirely.
+    ///
+    /// Why this exists at all: `safe_worker_count` returns 0 before it ever
+    /// reaches the continuous flat-spend gate when there is no measured
+    /// per-worker rate (`!(per_worker_rate > 0.0)` bails out first). For a pool
+    /// that has never run, that is permanent — no workers, so no samples, so no
+    /// rate, so no workers. The block line is the one pace signal available
+    /// with zero burn data, because it is computed from the clock and the
+    /// account's own utilisation rather than from the fleet.
+    #[serde(default = "default_pace_blocks")]
+    pub pace_blocks: u32,
 }
 
 fn default_underutilization_threshold_pct() -> f64 {
@@ -471,6 +490,11 @@ fn default_sprint_end_headroom_pct() -> f64 {
     5.0
 }
 
+/// Four blocks of ~42h on the 168h week, 25% of quota each.
+fn default_pace_blocks() -> u32 {
+    4
+}
+
 impl Default for SprintConfig {
     fn default() -> Self {
         Self {
@@ -481,6 +505,7 @@ impl Default for SprintConfig {
             max_workers_boost: default_max_workers_boost(),
             max_cone_ratio: default_max_cone_ratio(),
             sprint_end_headroom_pct: default_sprint_end_headroom_pct(),
+            pace_blocks: default_pace_blocks(),
         }
     }
 }
