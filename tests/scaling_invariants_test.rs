@@ -192,7 +192,7 @@ fn invariant_1_every_deficit_closes_for_any_band_and_gap() {
         for current in 0u32..=6 {
             for gap in 1u32..=6 {
                 let target = current + gap;
-                let decision = apply_scaling(target, current, band, cap, 2);
+                let decision = apply_scaling(target, current, band, cap, 2, false);
                 assert_eq!(
                     decision,
                     ScalingDecision::ScaleUp(gap.min(cap)),
@@ -218,7 +218,7 @@ fn invariant_1_band_cushions_scale_down_only() {
     // current 10, surpluses 1..=6 → targets 9..=4: never zero, so the
     // emergency brake (a separate invariant) cannot fire here.
     for surplus in 1u32..=6 {
-        let decision = apply_scaling(10 - surplus, 10, band, 3, 2);
+        let decision = apply_scaling(10 - surplus, 10, band, 3, 2, false);
         if surplus <= cushion {
             assert_eq!(
                 decision,
@@ -240,26 +240,65 @@ fn invariant_1_band_cushions_scale_down_only() {
 }
 
 // ---------------------------------------------------------------------------
-// Invariant 2: the emergency brake overrides everything
+// Invariant 2: the emergency brake overrides everything — but only when the
+// brake window is real
 // ---------------------------------------------------------------------------
 
-/// `target == 0` with live workers is `EmergencyBrake` regardless of band or
-/// per-cycle caps — the brake check runs before the hysteresis and
-/// rate-limit logic entirely.
+/// `target == 0` WITH a genuine >=98% window (brake flag true) and live
+/// workers is `EmergencyBrake` regardless of band or per-cycle caps — the
+/// brake check runs before the hysteresis and rate-limit logic entirely.
 #[test]
 fn invariant_2_zero_target_brakes_regardless_of_band_and_caps() {
     for band in [0.0f64, 1.0, 5.0, 100.0] {
         for current in 1u32..=10 {
             for (max_up, max_down) in [(0, 0), (1, 1), (10, 10)] {
                 assert_eq!(
-                    apply_scaling(0, current, band, max_up, max_down),
+                    apply_scaling(0, current, band, max_up, max_down, true),
                     ScalingDecision::EmergencyBrake,
-                    "target 0 vs current {} must brake (band {}, caps {}/{})",
+                    "target 0 vs current {} must brake with an active brake window (band {}, caps {}/{})",
                     current,
                     band,
                     max_up,
                     max_down
                 );
+            }
+        }
+    }
+}
+
+/// The complement (claudego-1138ab78): the SAME zero target without a brake
+/// window is an ordinary graceful scale-down — damped by the band when it
+/// falls inside the cushion, capped by `max_down_per_cycle` when it does not.
+/// A computed Some(0) sizing verdict is a duty-cycle withdrawal, never the
+/// kill-sessions path.
+#[test]
+fn invariant_2_computed_zero_without_brake_window_scales_down_gracefully() {
+    for band in [0.0f64, 1.0, 5.0, 100.0] {
+        let cushion = band as u32;
+        for current in 1u32..=10 {
+            for max_down in [1u32, 2, 10] {
+                let decision = apply_scaling(0, current, band, 3, max_down, false);
+                if current <= cushion {
+                    assert_eq!(
+                        decision,
+                        ScalingDecision::NoChange,
+                        "computed zero within band {} of current {} holds (band-damped withdrawal)",
+                        current,
+                        band
+                    );
+                } else {
+                    // The band only gates hold-vs-shed; the shed itself is the
+                    // full surplus, capped by max_down_per_cycle.
+                    let expected_scale = current.min(max_down);
+                    assert_eq!(
+                        decision,
+                        ScalingDecision::ScaleDown(expected_scale),
+                        "computed zero beyond band {} of current {} sheds gracefully, capped by {}",
+                        current,
+                        band,
+                        max_down
+                    );
+                }
             }
         }
     }
@@ -444,7 +483,7 @@ fn invariant_3c_widened_band_still_only_damps_scale_down() {
     // Deficits close under the widened band...
     for gap in 1u32..=3 {
         assert_eq!(
-            apply_scaling(gap, 0, widened, 3, 2),
+            apply_scaling(gap, 0, widened, 3, 2, false),
             ScalingDecision::ScaleUp(gap.min(3)),
             "deficit {} closes under the widened band",
             gap
@@ -454,12 +493,12 @@ fn invariant_3c_widened_band_still_only_damps_scale_down() {
     // ...but the widened cushion now also absorbs a 2-worker surplus that the
     // base band would have shed.
     assert_eq!(
-        apply_scaling(3, 5, base, 3, 2),
+        apply_scaling(3, 5, base, 3, 2, false),
         ScalingDecision::ScaleDown(2),
         "base band 1.0: a 2-worker surplus sheds"
     );
     assert_eq!(
-        apply_scaling(3, 5, widened, 3, 2),
+        apply_scaling(3, 5, widened, 3, 2, false),
         ScalingDecision::NoChange,
         "widened band 2.0: the same 2-worker surplus is inside the cushion and holds"
     );
@@ -671,10 +710,17 @@ fn invariant_5_safe_count_zero_targets_zero_workers() {
         "per-agent min bounds still apply on top of the safe count"
     );
 
-    // And a target of 0 against live workers is the emergency brake, not a
-    // ramp-down — the executor takes the fleet straight to zero.
+    // The resulting zero target against live workers is a duty-cycle
+    // withdrawal, not an emergency (claudego-1138ab78): without a brake
+    // window it ramps down gracefully under the per-cycle cap...
     assert_eq!(
-        apply_scaling(0, 3, 1.0, 2, 2),
+        apply_scaling(0, 3, 1.0, 2, 2, false),
+        ScalingDecision::ScaleDown(2)
+    );
+    // ...and only a genuine >=98% window (brake flag true) kills straight to
+    // zero.
+    assert_eq!(
+        apply_scaling(0, 3, 1.0, 2, 2, true),
         ScalingDecision::EmergencyBrake
     );
 }
@@ -766,7 +812,7 @@ fn invariant_7_progressive_caps_converge_without_overshoot() {
             let mut steps = 0;
             while current < target {
                 let cap = progressive_scale_cap(base_cap, target - current);
-                match apply_scaling(target, current, 1.0, cap, cap) {
+                match apply_scaling(target, current, 1.0, cap, cap, false) {
                     ScalingDecision::ScaleUp(n) => {
                         current += n;
                         assert!(
@@ -794,7 +840,7 @@ fn invariant_7_progressive_caps_converge_without_overshoot() {
             }
             assert_eq!(current, target, "converges exactly to target");
             assert_eq!(
-                apply_scaling(target, current, 1.0, base_cap, base_cap),
+                apply_scaling(target, current, 1.0, base_cap, base_cap, false),
                 ScalingDecision::NoChange,
                 "at target the decision settles"
             );

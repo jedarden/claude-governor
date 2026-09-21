@@ -26,7 +26,7 @@ fn test_hysteresis_exact_threshold() {
     // still closed — this is the convergence fix; the old symmetric band
     // swallowed a 1-worker deficit forever and stranded the fleet one short
     // of target.
-    let decision = apply_scaling(6, 5, 1.0, 3, 2);
+    let decision = apply_scaling(6, 5, 1.0, 3, 2, false);
 
     assert_eq!(
         decision,
@@ -39,7 +39,7 @@ fn test_hysteresis_exact_threshold() {
 fn test_hysteresis_exact_threshold_scale_down() {
     // Scale-DOWN keeps the band: a target exactly `hysteresis_band` below
     // current holds, so a one-worker forecast dip does not shed workers.
-    let decision = apply_scaling(4, 5, 1.0, 3, 2);
+    let decision = apply_scaling(4, 5, 1.0, 3, 2, false);
 
     assert_eq!(
         decision,
@@ -51,7 +51,7 @@ fn test_hysteresis_exact_threshold_scale_down() {
 #[test]
 fn test_hysteresis_below_threshold() {
     // When |target - current| < hysteresis_band, should return NoChange
-    let decision = apply_scaling(5, 5, 1.0, 3, 2);
+    let decision = apply_scaling(5, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::NoChange),
@@ -62,7 +62,7 @@ fn test_hysteresis_below_threshold() {
 #[test]
 fn test_hysteresis_above_threshold() {
     // When |target - current| > hysteresis_band, should take scaling action
-    let decision = apply_scaling(7, 5, 1.0, 3, 2);
+    let decision = apply_scaling(7, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleUp(2)),
@@ -73,7 +73,7 @@ fn test_hysteresis_above_threshold() {
 #[test]
 fn test_hysteresis_zero_band() {
     // With zero hysteresis band, any delta triggers scaling
-    let decision = apply_scaling(6, 5, 0.0, 3, 2);
+    let decision = apply_scaling(6, 5, 0.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleUp(1)),
@@ -85,7 +85,7 @@ fn test_hysteresis_zero_band() {
 fn test_hysteresis_wide_band() {
     // Wide hysteresis band (e.g., safe mode 2.0x multiplier). The band damps
     // scale-DOWN only — a deficit still closes, at the per-cycle cap.
-    let up = apply_scaling(7, 5, 2.0, 3, 2);
+    let up = apply_scaling(7, 5, 2.0, 3, 2, false);
     assert_eq!(
         up,
         ScalingDecision::ScaleUp(2),
@@ -93,7 +93,7 @@ fn test_hysteresis_wide_band() {
     );
 
     // The same wide band does hold a surplus of 2 (gap <= band, damped).
-    let down = apply_scaling(3, 5, 2.0, 3, 2);
+    let down = apply_scaling(3, 5, 2.0, 3, 2, false);
     assert_eq!(
         down,
         ScalingDecision::NoChange,
@@ -104,7 +104,7 @@ fn test_hysteresis_wide_band() {
 #[test]
 fn test_hysteresis_scale_down_within_band() {
     // Scale down should also respect hysteresis band
-    let decision = apply_scaling(4, 5, 1.0, 3, 2);
+    let decision = apply_scaling(4, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::NoChange),
@@ -115,7 +115,7 @@ fn test_hysteresis_scale_down_within_band() {
 #[test]
 fn test_hysteresis_scale_down_above_threshold() {
     // Scale down when delta exceeds hysteresis band
-    let decision = apply_scaling(2, 5, 1.0, 3, 2);
+    let decision = apply_scaling(2, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleDown(2)),
@@ -130,7 +130,7 @@ fn test_hysteresis_scale_down_above_threshold() {
 #[test]
 fn test_rate_limit_scale_up() {
     // Scale up should be limited by max_scale_up_per_cycle
-    let decision = apply_scaling(10, 5, 1.0, 2, 3);
+    let decision = apply_scaling(10, 5, 1.0, 2, 3, false);
 
     // Delta is 5, but max_up_per_cycle is 2
     assert!(
@@ -142,10 +142,11 @@ fn test_rate_limit_scale_up() {
 #[test]
 fn test_rate_limit_scale_down() {
     // Scale down should be limited by max_scale_down_per_cycle. A non-zero
-    // target is used because target == 0 is the emergency-brake condition in
-    // apply_scaling and bypasses hysteresis and the rate limits entirely (see
-    // test_emergency_brake_bypasses_hysteresis).
-    let decision = apply_scaling(3, 8, 1.0, 3, 2);
+    // target is used because target == 0 with an ACTIVE emergency brake
+    // (brake flag true) bypasses hysteresis and the rate limits entirely (see
+    // test_emergency_brake_bypasses_hysteresis); without the brake a zero
+    // target ramps down gracefully (see test_zero_workers_target).
+    let decision = apply_scaling(3, 8, 1.0, 3, 2, false);
 
     // Delta is -5, but max_down_per_cycle is 2
     assert!(
@@ -158,7 +159,7 @@ fn test_rate_limit_scale_down() {
 fn test_rate_limit_no_limit_when_delta_small() {
     // When delta is small, rate limit should not be reached — and the gap-1
     // deficit still closes (it used to be swallowed by the symmetric band).
-    let decision = apply_scaling(6, 5, 1.0, 10, 10);
+    let decision = apply_scaling(6, 5, 1.0, 10, 10, false);
 
     assert_eq!(
         decision,
@@ -173,8 +174,9 @@ fn test_rate_limit_no_limit_when_delta_small() {
 
 #[test]
 fn test_emergency_brake_bypasses_hysteresis() {
-    // Emergency brake (target=0) should bypass hysteresis and rate limits
-    let decision = apply_scaling(0, 10, 5.0, 1, 1);
+    // Emergency brake (target=0 WITH a genuine >=98% window — brake flag
+    // true) should bypass hysteresis and rate limits
+    let decision = apply_scaling(0, 10, 5.0, 1, 1, true);
 
     assert!(
         matches!(decision, ScalingDecision::EmergencyBrake),
@@ -185,7 +187,7 @@ fn test_emergency_brake_bypasses_hysteresis() {
 #[test]
 fn test_emergency_brake_zero_current() {
     // When already at 0, emergency brake should return NoChange
-    let decision = apply_scaling(0, 0, 1.0, 3, 2);
+    let decision = apply_scaling(0, 0, 1.0, 3, 2, true);
 
     // This is implementation-specific; adjust based on actual behavior
     // Either NoChange or EmergencyBrake could be valid
@@ -213,7 +215,7 @@ fn test_large_gap_binary_scaling() {
     ];
 
     for (current, target) in scenarios {
-        let decision = apply_scaling(target, current, 1.0, 1, 1);
+        let decision = apply_scaling(target, current, 1.0, 1, 1, false);
 
         match decision {
             ScalingDecision::ScaleUp(n) => {
@@ -253,7 +255,7 @@ fn test_large_gap_progressive_scaling_simulation() {
         );
 
         // The decision function itself honours the widened cap.
-        let decision = apply_scaling(target, current, 1.0, expected_scale, 2);
+        let decision = apply_scaling(target, current, 1.0, expected_scale, 2, false);
         assert_eq!(
             decision,
             ScalingDecision::ScaleUp(expected_scale),
@@ -300,7 +302,7 @@ fn test_progressive_scale_cap_tiers_and_clamps() {
 fn test_progressive_scaling_converges_faster_and_exactly() {
     // 5 -> 10 with progressive base cap 3: gap 5 lands in the 2x tier,
     // min(3*2, 5) = 5, so the whole deficit closes in ONE cycle.
-    let decision = apply_scaling(10, 5, 1.0, progressive_scale_cap(3, 5), 3);
+    let decision = apply_scaling(10, 5, 1.0, progressive_scale_cap(3, 5), 3, false);
     assert_eq!(
         decision,
         ScalingDecision::ScaleUp(5),
@@ -318,6 +320,7 @@ fn test_progressive_scaling_converges_faster_and_exactly() {
             1.0,
             progressive_scale_cap(3, target - current),
             3,
+            false,
         ) {
             ScalingDecision::ScaleUp(n) => n,
             ScalingDecision::NoChange => break,
@@ -355,7 +358,7 @@ fn test_smooth_scale_up_sequence() {
 
     while cycles < 20 {
         // Simulate target computation returning stable target
-        let decision = apply_scaling(target, current, hysteresis, max_up, max_down);
+        let decision = apply_scaling(target, current, hysteresis, max_up, max_down, false);
 
         match decision {
             ScalingDecision::ScaleUp(n) => {
@@ -387,7 +390,7 @@ fn test_scale_up_converges_from_one_short() {
     // The regression in one line: target 10, current 9, band 1.0. The old
     // symmetric band read |10 - 9| = 1 <= 1 and held there FOREVER — the
     // documented example ended "stops at 9 due to hysteresis".
-    let decision = apply_scaling(10, 9, 1.0, 1, 1);
+    let decision = apply_scaling(10, 9, 1.0, 1, 1, false);
 
     assert_eq!(
         decision,
@@ -408,7 +411,7 @@ fn test_smooth_scale_down_sequence() {
     let mut sequence = vec![current];
 
     for _ in 0..20 {
-        let decision = apply_scaling(target, current, hysteresis, max_up, max_down);
+        let decision = apply_scaling(target, current, hysteresis, max_up, max_down, false);
 
         match decision {
             ScalingDecision::ScaleDown(n) => {
@@ -445,7 +448,7 @@ fn test_hysteresis_prevents_oscillation() {
     let mut downs = 0;
 
     for target in targets {
-        match apply_scaling(target, current, hysteresis, 3, 2) {
+        match apply_scaling(target, current, hysteresis, 3, 2, false) {
             ScalingDecision::ScaleUp(n) => current += n,
             ScalingDecision::ScaleDown(n) => {
                 downs += 1;
@@ -469,7 +472,7 @@ fn test_hysteresis_allows_significant_change() {
     // Target change that exceeds hysteresis
     let target = 7;
 
-    let decision = apply_scaling(target, current, hysteresis, 3, 2);
+    let decision = apply_scaling(target, current, hysteresis, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleUp(2)),
@@ -483,36 +486,37 @@ fn test_hysteresis_allows_significant_change() {
 
 #[test]
 fn test_zero_workers_target() {
-    // Target of 0 workers with non-zero current is the emergency-brake
-    // condition by design: apply_scaling short-circuits target == 0 ahead of
-    // the hysteresis and rate-limit logic, so there is no graceful ramp-down.
-    let decision = apply_scaling(0, 5, 1.0, 3, 2);
+    // A computed zero target with live workers and NO brake window (brake
+    // flag false) is a duty-cycle withdrawal, not an emergency
+    // (claudego-1138ab78): it ramps down gracefully, capped by
+    // max_scale_down_per_cycle. This was the #[ignore]d aspirational contract
+    // of the old test_zero_workers_target_graceful_ramp_down.
+    let decision = apply_scaling(0, 5, 1.0, 3, 2, false);
 
     assert!(
-        matches!(decision, ScalingDecision::EmergencyBrake),
-        "A zero target with live workers should trigger the emergency brake"
+        matches!(decision, ScalingDecision::ScaleDown(2)),
+        "A computed zero target with live workers should ramp down gracefully, \
+         respecting max_scale_down_per_cycle"
     );
 }
 
 #[test]
-#[ignore = "documents desired behaviour: apply_scaling treats target == 0 as the emergency-brake condition and never rate-limits a ramp-down to zero"]
-fn test_zero_workers_target_graceful_ramp_down() {
-    // Split out of test_zero_workers_target: the original assertion expected a
-    // rate-limited ScaleDown toward a zero target. The current contract is
-    // that a zero target means emergency brake; if a graceful ramp-down is
-    // ever implemented, drop the #[ignore] and this should hold.
-    let decision = apply_scaling(0, 5, 1.0, 3, 2);
+fn test_zero_workers_target_with_active_brake_still_kills() {
+    // The complement: the SAME zero target with a genuine >=98% window (brake
+    // flag true) still takes the violent path — kill-sessions, no ramp-down.
+    // Replaces the old #[ignore]d test_zero_workers_target_graceful_ramp_down.
+    let decision = apply_scaling(0, 5, 1.0, 3, 2, true);
 
     assert!(
-        matches!(decision, ScalingDecision::ScaleDown(2)),
-        "Graceful scale down toward a zero target should respect max_scale_down_per_cycle"
+        matches!(decision, ScalingDecision::EmergencyBrake),
+        "A zero target WITH an active brake window should trigger the emergency brake"
     );
 }
 
 #[test]
 fn test_target_equals_current() {
     // No action needed when target equals current
-    let decision = apply_scaling(5, 5, 1.0, 3, 2);
+    let decision = apply_scaling(5, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::NoChange),
@@ -523,7 +527,7 @@ fn test_target_equals_current() {
 #[test]
 fn test_fractional_hysteresis_band() {
     // Hysteresis band as float should be handled correctly
-    let decision = apply_scaling(6, 5, 0.5, 3, 2);
+    let decision = apply_scaling(6, 5, 0.5, 3, 2, false);
 
     // Delta is 1, hysteresis is 0.5, so should scale up
     assert!(
@@ -537,7 +541,7 @@ fn test_very_large_hysteresis_band() {
     // Very large hysteresis band damps scale-DOWN only — a deficit still
     // closes (at the per-cycle cap), because no band may strand the fleet
     // below target.
-    let up = apply_scaling(10, 5, 10.0, 3, 2);
+    let up = apply_scaling(10, 5, 10.0, 3, 2, false);
     assert_eq!(
         up,
         ScalingDecision::ScaleUp(3),
@@ -545,7 +549,7 @@ fn test_very_large_hysteresis_band() {
     );
 
     // The same huge band does hold an equally large surplus (gap <= band).
-    let down = apply_scaling(2, 12, 10.0, 3, 2);
+    let down = apply_scaling(2, 12, 10.0, 3, 2, false);
     assert_eq!(
         down,
         ScalingDecision::NoChange,
@@ -604,7 +608,7 @@ fn test_target_computation_with_hysteresis() {
 
     // Apply hysteresis: current=5, target=7, hysteresis=1.0
     // Delta is 2, exceeds hysteresis, so should scale up
-    let decision = apply_scaling(target, 5, 1.0, 3, 2);
+    let decision = apply_scaling(target, 5, 1.0, 3, 2, false);
 
     assert!(
         matches!(decision, ScalingDecision::ScaleUp(2)),

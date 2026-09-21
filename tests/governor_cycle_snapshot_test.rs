@@ -78,12 +78,15 @@ fn test_governor_cycle_with_snapshot() {
     let max_up_per_cycle = 3;
     let max_down_per_cycle = 2;
 
+    // No brake window in this snapshot: the computed target travels through
+    // the graceful path even if it were 0.
     let decision = apply_scaling(
         target,
         current_total,
         hysteresis_band,
         max_up_per_cycle,
         max_down_per_cycle,
+        false,
     );
 
     // 6. Verify the cycle completed and decision is reasonable
@@ -187,7 +190,9 @@ fn test_snapshot_high_utilization_emergency_brake() {
     // At 99% utilization, target should be 0 (emergency brake)
     assert_eq!(target, 0, "Target should be 0 at 99% utilization");
 
-    let decision = apply_scaling(target, 10, 2.0, 3, 2);
+    // Brake flag true: the polled snapshot has a window at/above the 98%
+    // threshold — the act cycle derives exactly this from first_brake_window.
+    let decision = apply_scaling(target, 10, 2.0, 3, 2, true);
 
     assert!(
         matches!(decision, ScalingDecision::EmergencyBrake),
@@ -249,7 +254,7 @@ fn test_snapshot_low_utilization_scale_down() {
         target
     );
 
-    let decision = apply_scaling(target, 8, 2.0, 3, 2);
+    let decision = apply_scaling(target, 8, 2.0, 3, 2, false);
 
     // With target=2, current=8, hysteresis=2: should scale down by max 2
     match decision {

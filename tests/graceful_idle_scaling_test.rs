@@ -570,7 +570,7 @@ fn scale_down_honors_per_cycle_cap_on_every_consecutive_cycle_regression() {
 fn hysteresis_is_asymmetric_one_worker_mirror_regression() {
     for band in [1.0f64, 2.0, 5.0, 10.0] {
         for current in [3u32, 5, 9] {
-            let down = apply_scaling(current - 1, current, band, 10, 10);
+            let down = apply_scaling(current - 1, current, band, 10, 10, false);
             assert_eq!(
                 down,
                 ScalingDecision::NoChange,
@@ -578,7 +578,7 @@ fn hysteresis_is_asymmetric_one_worker_mirror_regression() {
                 current,
                 band
             );
-            let up = apply_scaling(current + 1, current, band, 10, 10);
+            let up = apply_scaling(current + 1, current, band, 10, 10, false);
             assert_eq!(
                 up,
                 ScalingDecision::ScaleUp(1),

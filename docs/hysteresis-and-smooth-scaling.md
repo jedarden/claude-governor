@@ -51,7 +51,7 @@ pub fn apply_scaling(
 }
 ```
 
-**Why asymmetric**: cgov is a use-or-lose subscription governor. Capacity below target is capacity that resets unused, so every deficit closes immediately — a symmetric band turned a 1-worker deficit into a permanent strand one worker short of target (with band 1.0 and integer worker counts, `|delta| == 1` was never actionable). A surplus above the soft target, by contrast, is tolerated up to the band: the forecast jitters, an extra worker burns quota productively, and the hard protections (emergency brake, `safe_worker_count = Some(0)`) still override regardless. The scale-down band is the noise cushion; the scale-up path is the convergence guarantee.
+**Why asymmetric**: cgov is a use-or-lose subscription governor. Capacity below target is capacity that resets unused, so every deficit closes immediately — a symmetric band turned a 1-worker deficit into a permanent strand one worker short of target (with band 1.0 and integer worker counts, `|delta| == 1` was never actionable). A surplus above the soft target, by contrast, is tolerated up to the band: the forecast jitters, an extra worker burns quota productively, and the hard protection (the emergency brake, a window actually at/above 98%) still overrides regardless — including a computed `safe_worker_count = Some(0)`, which without such a window is an ordinary band-damped withdrawal (claudego-1138ab78). The scale-down band is the noise cushion; the scale-up path is the convergence guarantee.
 
 **Configuration**: `config/governor.yaml`
 ```yaml
@@ -128,7 +128,7 @@ Per-cycle rate limiting is binary by default (1 worker up, 1 down per 5-minute c
 | 7     | 3       | -1    | Within band → NoChange |
 | 8     | 3       | -1    | NoChange (band) |
 
-**Result**: Takes 40 minutes to reach 3, then **holds one above the soft target of 2 by design**. The last worker of surplus is the down-side cushion: a target sitting one below current is within forecast noise, and shedding a worker on that signal is exactly what the band exists to prevent. If the window genuinely runs out, the emergency brake (≥98%) or a `safe_worker_count` of 0 forces the fleet down regardless of the band.
+**Result**: Takes 40 minutes to reach 3, then **holds one above the soft target of 2 by design**. The last worker of surplus is the down-side cushion: a target sitting one below current is within forecast noise, and shedding a worker on that signal is exactly what the band exists to prevent. If a window genuinely hits ≥98%, the emergency brake forces the fleet down regardless of the band; a computed `safe_worker_count` of 0 without one is a duty-cycle withdrawal that respects the band and the per-cycle cap like any other surplus (claudego-1138ab78).
 
 ### Example: Progressive Scale-Up
 
@@ -222,10 +222,10 @@ if delta < 0 {
 
 ### Emergency Brake Override
 
-The emergency brake (≥98% utilization) always bypasses hysteresis and rate limits:
+The emergency brake — a usage window at/above 98% on the last polled snapshot — always bypasses hysteresis and rate limits. A computed target of 0 *without* such a window is an ordinary graceful scale-down (claudego-1138ab78):
 
 ```rust
-if target == 0 && current > 0 {
+if emergency_brake_active && target == 0 && current > 0 {
     return ScalingDecision::EmergencyBrake;  // Immediate scale to 0
 }
 ```

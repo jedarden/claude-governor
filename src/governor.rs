@@ -1108,7 +1108,10 @@ pub enum ScalingDecision {
     ScaleUp(u32),
     /// Scale down by N workers (graceful)
     ScaleDown(u32),
-    /// Emergency brake — scale all to zero
+    /// Emergency brake — kill every worker session immediately and engage
+    /// safe_mode. Reserved for the genuine signal (a usage window at/above the
+    /// 98% threshold); a computed target of 0 without one travels as
+    /// [`ScalingDecision::ScaleDown`] instead.
     EmergencyBrake,
 }
 
@@ -1127,10 +1130,15 @@ pub enum ScalingDecision {
 ///   current utilization, checked before this fallback runs) still applies
 ///   regardless of data availability, so a real cutoff is still caught.
 /// - `Some(0)` → `0`: the forecast says even one worker exhausts the binding window
-///   before it resets — scale to 0 and let the window recover. (This is a `use-or-lose`
-///   subscription-utilisation governor: idle-then-refill is the intended cycle, and the
-///   pools it drives idle at no cost, so there is no cold-start penalty worth holding
-///   capacity that would drive the window to a platform cutoff.)
+///   before it resets — a duty-cycle withdrawal, not an emergency. The zero travels to
+///   `apply_scaling` as a normal target and executes through the graceful
+///   [`ScalingDecision::ScaleDown`] path (hysteresis and per-cycle caps as configured),
+///   letting in-flight work finish instead of killing sessions mid-task. Only a real
+///   >= 98% window (checked before this fallback runs) takes the violent brake.
+///   (This is a `use-or-lose` subscription-utilisation governor: idle-then-refill is
+///   the intended cycle, and the pools it drives idle at no cost, so there is no
+///   cold-start penalty worth holding capacity that would drive the window to a
+///   platform cutoff.)
 /// - `Some(w)` → `w`: normal case.
 fn safe_worker_count_or_hold(safe: Option<u32>, _max_workers: u32, current_total: u32) -> u32 {
     match safe {
@@ -5460,16 +5468,23 @@ pub fn compute_target_workers(
 /// The asymmetry is deliberate for a use-or-lose subscription governor:
 /// capacity below target is capacity that resets unused, so any deficit closes
 /// immediately; surplus above the soft target is tolerated up to the band
-/// because the forecast jitters, and the hard protections (emergency brake,
-/// `safe_worker_count = Some(0)`) still force their way through regardless.
+/// because the forecast jitters. A computed target of 0 (an honest pace-ahead
+/// verdict, `safe_worker_count = Some(0)`) is a duty-cycle withdrawal like any
+/// other scale-down: it takes this damped path so in-flight work finishes
+/// gracefully (claudego-1138ab78). Only `emergency_brake_active` — a usage
+/// window actually at/above the 98% threshold on the last polled snapshot —
+/// forces its way through regardless.
 ///
-/// Emergency brake bypasses hysteresis entirely.
+/// `emergency_brake_active && target == 0` returns [`ScalingDecision::EmergencyBrake`],
+/// which bypasses hysteresis entirely (and, in the executor, kill-sessions every
+/// worker and engages safe_mode).
 pub fn apply_scaling(
     target: u32,
     current: u32,
     hysteresis_band: f64,
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
+    emergency_brake_active: bool,
 ) -> ScalingDecision {
     apply_scaling_with_policy(
         target,
@@ -5477,7 +5492,7 @@ pub fn apply_scaling(
         hysteresis_band,
         max_up_per_cycle,
         max_down_per_cycle,
-        true,
+        emergency_brake_active,
         false,
     )
 }
@@ -5488,6 +5503,11 @@ pub fn apply_scaling(
 /// still respects the configured per-cycle rate cap. `target == 0` here is a
 /// manual scale-down, not the emergency brake; the brake is selected by the
 /// caller when a usage window actually crosses the emergency threshold.
+///
+/// The brake flag is always `false` here because the two states cannot
+/// coincide: `resolve_manual_override` returns `SuspendedByBrake` (not
+/// `Applied`) whenever a brake window is present, so an override that reaches
+/// this function is by construction not competing with a >= 98% window.
 fn apply_manual_override_scaling(
     target: u32,
     current: u32,
@@ -5505,21 +5525,26 @@ fn apply_manual_override_scaling(
     )
 }
 
-/// Shared scaling-decision implementation. `emergency_brake_zero` keeps the
-/// historical `apply_scaling(0, current, ...)` contract for the computed
-/// target path; manual target zero deliberately opts out so it is not
-/// mislabelled as an emergency event.
+/// Shared scaling-decision implementation. `emergency_brake_active` gates the
+/// violent arm on the real signal — a usage window at/above the 98% threshold
+/// (`first_brake_window`), which is data-independent — so a computed target of
+/// 0 without one degrades to an ordinary (graceful, band-damped, capped)
+/// scale-down instead of kill-sessions plus safe_mode (claudego-1138ab78).
+/// Manual overrides deliberately pass `false`: a genuine brake suspends the
+/// override before it can be applied.
 fn apply_scaling_with_policy(
     target: u32,
     current: u32,
     hysteresis_band: f64,
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
-    emergency_brake_zero: bool,
+    emergency_brake_active: bool,
     bypass_scale_down_hysteresis: bool,
 ) -> ScalingDecision {
-    // Emergency brake: target is 0
-    if emergency_brake_zero && target == 0 && current > 0 {
+    // Emergency brake: a real >= 98% window drove the target to 0. A computed
+    // Some(0) verdict with no such window falls through to the graceful
+    // scale-down below — that is a duty-cycle withdrawal, not an emergency.
+    if emergency_brake_active && target == 0 && current > 0 {
         log::warn!("[governor] EMERGENCY: scaling {} -> 0 workers", current);
         return ScalingDecision::EmergencyBrake;
     }
@@ -7544,12 +7569,16 @@ pub fn run_act_cycle(
     let decision = if manual_override_applied {
         apply_manual_override_scaling(effective_target, current_total, eff_max_up, eff_max_down)
     } else {
+        // `emergency_brake_active` (a >= 98% window on the last polled snapshot)
+        // is the only thing that selects the violent arm; a computed zero
+        // without it scales down gracefully like any other surplus.
         apply_scaling(
             effective_target,
             current_total,
             effective_hysteresis,
             eff_max_up,
             eff_max_down,
+            emergency_brake_active,
         )
     };
 
@@ -7783,10 +7812,12 @@ pub fn run_act_cycle(
             }
         }
         ScalingDecision::EmergencyBrake => {
-            // A zero target here can be a real >=98% window (source
-            // "emergency_brake") or a computed Some(0) sizing verdict carried
-            // to 0 with workers running (source "computed_target") — very
-            // different events that this arm used to log identically, sending
+            // Reaching this arm means `emergency_brake_active` was true: a real
+            // >=98% usage window on the last polled snapshot — either the
+            // computed target was braked to 0, or a stored manual override was
+            // suspended by the brake. A computed Some(0) sizing verdict with no
+            // such window travels as ScaleDown instead (claudego-1138ab78);
+            // before that change any zero target landed here, sending
             // operators hunting for a threshold breach that never happened
             // (claudego-ddd93cee, 2026-09-21 03:38Z kill cycle).
             log::warn!(
@@ -7871,10 +7902,21 @@ pub fn run_act_cycle(
                 "target {} < current {} beyond hysteresis {:.0}",
                 effective_target, current_total, effective_hysteresis
             ),
-            ScalingDecision::EmergencyBrake => format!(
-                "binding window '{}' at/above cutoff threshold; target forced to 0",
-                state.capacity_forecast.binding_window
-            ),
+            ScalingDecision::EmergencyBrake => {
+                // This arm only fires on a real window at/above the threshold;
+                // name that window, which need not be the binding one
+                // (first_brake_window scans all three).
+                match first_brake_window(&state.capacity_forecast) {
+                    Some((name, util)) => format!(
+                        "window '{}' at {:.1}% (>= {:.0}% cutoff threshold); target forced to 0",
+                        name, util, EMERGENCY_BRAKE_THRESHOLD
+                    ),
+                    None => format!(
+                        "emergency brake engaged; target forced to 0 (source={})",
+                        decision_source
+                    ),
+                }
+            }
         };
         // The decision does not move the forecast (observe owns it), so before
         // and after are the same state — margins are the binding window's as
@@ -10546,8 +10588,10 @@ mod tests {
 
     #[test]
     fn safe_worker_count_some_zero_scales_to_zero() {
-        // Some(0) → 0: the binding window can't afford even one worker; scale to 0 and
-        // let it recover (use-or-lose governor: idle-then-refill, no cold-start penalty).
+        // Some(0) → 0: the binding window can't afford even one worker; the
+        // target goes to 0 and executes as a graceful scale-down (not the
+        // emergency arm — that needs a real >=98% window, claudego-1138ab78).
+        // Use-or-lose governor: idle-then-refill, no cold-start penalty.
         assert_eq!(safe_worker_count_or_hold(Some(0), 8, 3), 0);
     }
 
@@ -12519,9 +12563,10 @@ mod tests {
         let decision = apply_scaling(
             target,
             current_total,
-            2.0, // hysteresis_band
-            3,   // max_up_per_cycle
-            2,   // max_down_per_cycle
+            2.0,                                                    // hysteresis_band
+            3,                                                      // max_up_per_cycle
+            2,                                                      // max_down_per_cycle
+            first_brake_window(&state.capacity_forecast).is_some(), // no window near the threshold
         );
 
         // 6. A single snapshot has exactly one right answer, so assert it rather
@@ -12558,7 +12603,9 @@ mod tests {
     /// Test governor cycle with high utilization triggers emergency brake.
     ///
     /// This test verifies that when utilization exceeds the emergency brake threshold,
-    /// the governor correctly responds with an EmergencyBrake decision.
+    /// the governor correctly responds with an EmergencyBrake decision. The brake flag
+    /// is derived exactly as the act cycle derives it — `first_brake_window` on the
+    /// forecast — so the test pins the wiring, not just the enum arm.
     #[test]
     fn test_governor_cycle_emergency_brake() {
         let mut state = state::GovernorState::new();
@@ -12603,12 +12650,133 @@ mod tests {
         // At 99% utilization, target should be 0 (emergency brake)
         assert_eq!(target, 0, "Target should be 0 at 99% utilization");
 
-        let decision = apply_scaling(target, 10, 2.0, 3, 2);
+        let decision = apply_scaling(
+            target,
+            10,
+            2.0,
+            3,
+            2,
+            first_brake_window(&state.capacity_forecast).is_some(),
+        );
 
         assert!(
             matches!(decision, ScalingDecision::EmergencyBrake),
             "Should trigger EmergencyBrake decision at 99% utilization"
         );
+    }
+
+    /// An honest computed zero is a duty-cycle withdrawal, not an emergency
+    /// (claudego-1138ab78).
+    ///
+    /// A binding window whose `safe_worker_count` is `Some(0)` — with every
+    /// window well below the 98% brake threshold — drives the target to 0, and
+    /// that target must execute through the graceful ScaleDown path: capped by
+    /// `max_down_per_cycle`, no kill-sessions, no safe_mode. Before
+    /// claudego-1138ab78 any zero target with workers running selected
+    /// EmergencyBrake, so the 2026-09-21 03:38Z cycle killed sessions mid-task
+    /// off a sizing verdict that never went near the threshold.
+    #[test]
+    fn computed_zero_without_brake_window_takes_graceful_scale_down() {
+        let mut state = state::GovernorState::new();
+        // min: 0 matters — unlike the brake path (which returns 0 before the
+        // clamp), a computed Some(0) flows through the [min, max] clamp, so a
+        // floor of 1 would mask the zero entirely.
+        state.workers.insert(
+            "test-agent".to_string(),
+            state::WorkerState {
+                current: 5,
+                target: 5,
+                min: 0,
+                max: 10,
+            },
+        );
+        // Pace-ahead verdict: the binding window cannot afford even one
+        // worker, but nothing is anywhere near the brake threshold.
+        state.capacity_forecast = state::CapacityForecast {
+            five_hour: state::WindowForecast {
+                current_utilization: 60.0,
+                safe_worker_count: Some(0),
+                ..Default::default()
+            },
+            seven_day: state::WindowForecast {
+                current_utilization: 50.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            weekly_scoped: state::WindowForecast {
+                current_utilization: 40.0,
+                safe_worker_count: Some(5),
+                ..Default::default()
+            },
+            binding_window: WINDOW_FIVE_HOUR.to_string(),
+            ..Default::default()
+        };
+
+        let target = compute_target_workers(
+            &state,
+            90.0,
+            &CompositeRiskConfig::default(),
+            &ConeScalingConfig::default(),
+        );
+        assert_eq!(
+            target, 0,
+            "Some(0) on the binding window should drive the target to 0"
+        );
+
+        // Wired exactly as the act cycle wires it: the brake flag is off (no
+        // window >= 98%), so the zero degrades to a graceful scale-down
+        // instead of the emergency arm.
+        let decision = apply_scaling(
+            target,
+            5,
+            2.0, // hysteresis_band
+            3,   // max_up_per_cycle
+            2,   // max_down_per_cycle
+            first_brake_window(&state.capacity_forecast).is_some(),
+        );
+        assert_eq!(
+            decision,
+            ScalingDecision::ScaleDown(2),
+            "a computed zero with no >=98% window is a duty-cycle withdrawal: \
+             graceful ScaleDown capped by max_down_per_cycle, got {:?}",
+            decision
+        );
+    }
+
+    /// The band still damps a computed zero: hysteresis and per-cycle caps
+    /// apply to the graceful path exactly as configured (claudego-1138ab78).
+    #[test]
+    fn computed_zero_within_hysteresis_band_holds() {
+        // target 0 is within the 2-worker band below current 2 → hold, like
+        // any other surplus inside the cushion.
+        let decision = apply_scaling(0, 2, 2.0, 3, 2, false);
+        assert_eq!(
+            decision,
+            ScalingDecision::NoChange,
+            "a computed zero inside the scale-down band must not shed workers"
+        );
+    }
+
+    /// Some(0) + a genuine >=98% window is exactly the brake case: the violent
+    /// path stays selected even though the computed zero alone no longer
+    /// selects it (claudego-1138ab78).
+    #[test]
+    fn computed_zero_with_brake_window_still_takes_emergency_brake() {
+        let decision = apply_scaling(0, 5, 2.0, 3, 2, true);
+        assert_eq!(
+            decision,
+            ScalingDecision::EmergencyBrake,
+            "a zero target WITH a >=98% window is the real emergency — kill-sessions + safe_mode"
+        );
+    }
+
+    /// The brake arm requires workers to kill: at current 0 there is nothing
+    /// to brake, and the decision is NoChange even with the window at/above
+    /// the threshold.
+    #[test]
+    fn emergency_brake_with_no_workers_running_is_no_change() {
+        let decision = apply_scaling(0, 0, 2.0, 3, 2, true);
+        assert_eq!(decision, ScalingDecision::NoChange);
     }
 
     /// Test governor cycle with scaling decision within hysteresis band.
@@ -12661,7 +12829,14 @@ mod tests {
             "Target should equal current at moderate utilization"
         );
 
-        let decision = apply_scaling(target, 5, 2.0, 3, 2);
+        let decision = apply_scaling(
+            target,
+            5,
+            2.0,
+            3,
+            2,
+            first_brake_window(&state.capacity_forecast).is_some(), // all windows at 50%
+        );
 
         assert!(
             matches!(decision, ScalingDecision::NoChange),
