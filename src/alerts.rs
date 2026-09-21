@@ -2948,6 +2948,232 @@ mod tests {
         );
     }
 
+    // --- Pace-block sprint tests (claudego-a351d271) ---
+
+    fn make_pace_state(
+        five_hour: (f64, f64, bool),
+        seven_day: (f64, f64, bool),
+        weekly_scoped: (f64, f64, bool),
+    ) -> GovernorState {
+        let forecast = CapacityForecast {
+            five_hour: make_window_with_util(five_hour.0, five_hour.1, five_hour.2),
+            seven_day: make_window_with_util(seven_day.0, seven_day.1, seven_day.2),
+            weekly_scoped: make_window_with_util(
+                weekly_scoped.0, weekly_scoped.1, weekly_scoped.2,
+            ),
+            binding_window: "seven_day".to_string(),
+            dollars_per_pct_7d_s: 0.0,
+            estimated_remaining_dollars: 0.0,
+        };
+        make_state_with_forecast(forecast)
+    }
+
+    #[test]
+    fn pace_block_sprint_fires_behind_at_a_boundary() {
+        // One ~42h block elapsed (126h left), 20% used against a 25% share ->
+        // behind, and the trigger authorises the full worker ceiling.
+        let state = make_pace_state(
+            (20.0, 1.5, false),
+            (20.0, 126.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        )
+        .unwrap();
+        assert_eq!(trigger.window, "seven_day");
+        assert_eq!(trigger.worker_id, "needle-sonnet");
+        assert_eq!(trigger.target_workers, 5, "boost to the pool's ceiling");
+        assert_eq!(trigger.hours_remaining, 126.0);
+    }
+
+    #[test]
+    fn pace_block_sprint_holds_when_ahead_of_pace() {
+        // Three blocks elapsed (42h left), 80% used against a 75% share ->
+        // ahead of the line, nothing to measure, no sprint.
+        let state = make_pace_state(
+            (20.0, 1.5, false),
+            (80.0, 42.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "ahead of pace must not fire");
+    }
+
+    #[test]
+    fn pace_block_sprint_holds_before_the_first_boundary() {
+        // 130h of 168h left: not even one block has passed, so every fleet is
+        // trivially behind and the signal means nothing yet.
+        let state = make_pace_state(
+            (20.0, 1.5, false),
+            (5.0, 130.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "no boundary yet, no sprint");
+    }
+
+    #[test]
+    fn pace_block_sprint_inhibited_by_cutoff_risk_on_consumed_window() {
+        // The week is behind, but a consumed window is at cutoff risk and the
+        // sprint must not pile workers onto a window about to hard-stop.
+        let state = make_pace_state(
+            (60.0, 0.5, true),
+            (20.0, 126.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "cutoff risk on a consumed window inhibits");
+    }
+
+    #[test]
+    fn pace_block_sprint_ignores_cutoff_risk_on_unconsumed_window() {
+        // Same five_hour risk, but this pool does not consume five_hour, so
+        // the risk is not its to react to and the week's underspend stands.
+        let state = make_pace_state(
+            (60.0, 0.5, true),
+            (20.0, 126.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["seven_day"],
+            base_now(),
+        );
+        assert!(
+            trigger.is_some(),
+            "cutoff risk on an unconsumed window must not inhibit"
+        );
+    }
+
+    #[test]
+    fn pace_block_sprint_skips_the_five_hour_window_even_when_behind() {
+        // The blocks divide the WEEK. A five_hour window that has burned
+        // almost nothing is always "behind" its own blocks and would
+        // permanently authorise a fleet the week cannot afford.
+        let state = make_pace_state(
+            (1.0, 1.0, false),
+            (80.0, 42.0, false),
+            (95.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "five_hour must never pace-block fire");
+    }
+
+    #[test]
+    fn pace_block_sprint_ignores_windows_the_pool_does_not_consume() {
+        // Both week-shaped windows are far behind, but this pool consumes
+        // neither: a premium window it never touches neither triggers the
+        // sprint nor inhibits it (claudego-ec6d3ae3 scoping).
+        let state = make_pace_state(
+            (20.0, 1.5, false),
+            (5.0, 126.0, false),
+            (5.0, 100.0, false),
+        );
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-fable",
+            2,
+            &["five_hour"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "unconsumed windows must not fire the sprint");
+    }
+
+    #[test]
+    fn pace_block_sprint_inhibited_by_safe_mode() {
+        let mut state = make_pace_state(
+            (20.0, 1.5, false),
+            (20.0, 126.0, false),
+            (95.0, 100.0, false),
+        );
+        state.safe_mode.active = true;
+        state.safe_mode.trigger = Some("median_error".to_string());
+        let config = default_sprint_config();
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "safe mode inhibits, same as the sibling sprint");
+    }
+
+    #[test]
+    fn pace_block_sprint_disabled_when_pace_blocks_zero() {
+        let state = make_pace_state(
+            (20.0, 1.5, false),
+            (20.0, 126.0, false),
+            (95.0, 100.0, false),
+        );
+        let mut config = default_sprint_config();
+        config.pace_blocks = 0;
+
+        let trigger = check_pace_block_sprint_for_worker(
+            &state,
+            &config,
+            "needle-sonnet",
+            5,
+            &["five_hour", "seven_day"],
+            base_now(),
+        );
+        assert!(trigger.is_none(), "pace_blocks=0 disables the sprint");
+    }
+
     // --- Alert firing tests ---
 
     #[test]

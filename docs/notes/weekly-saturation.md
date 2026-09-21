@@ -18,6 +18,15 @@ Leftover-budget guards exist so the window isn't left unused at reset:
 - **End-of-window sprint** (config `sprint`): within `horizon_minutes` (90) of
   reset with headroom > `min_headroom_pct` (15%), temporarily raises the cap by
   `max_workers_boost` (+3), blocked if the confidence cone ratio > 2.0.
+- **Pace-block sprint** (config `sprint.pace_blocks`, default 4):
+  claudego-a351d271. Cuts the 168h week into ~42h blocks budgeted 25% of quota
+  each; once a boundary has passed, a pool still below that boundary's share
+  boosts to `max_workers` so the shortfall can be measured. Unlike the guards
+  above it needs **no burn data at all** — it is computed from the clock and
+  the account's own utilisation, so a pool that has never run (no per-worker
+  rate, `safe_worker_count` stuck at 0, claudego-ddd93cee) can still earn its
+  first samples. Week-shaped windows the pool actually consumes only;
+  inhibited by safe mode and by cutoff risk on a consumed window.
 
 Scale-up throttle (`max_scale_up_per_cycle=1` per 300s loop) reaches 8 workers
 from 0 in ~40 min — negligible against a 7-day window. No change needed.
