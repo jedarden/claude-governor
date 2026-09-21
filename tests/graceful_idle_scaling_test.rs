@@ -34,6 +34,14 @@
 //! cut, active workers are shed last and oldest-heartbeat-first, so the
 //! youngest active worker survives longest.
 //!
+//! Section 8 pins the ledger shed order (claudego-f80857a2) on the LIVE
+//! path (claudego-ea621a6d): with ledger evidence present the exhaustion
+//! shed consumes the worst verified-closure yield per dollar first; with the
+//! ledger absent — a silent directory or a failed read — every pool ranks
+//! Unknown and the shed is byte-for-byte the pre-ledger cost-per-hour
+//! order; and whatever the pool-level order says, a pool's own shed still
+//! takes its idle workers before its busy ones.
+//!
 //! Every test that swaps PATH / CGOV_DECISIONS_PATH holds [`ENV_LOCK`] for
 //! its whole body (tests in one binary share a process and run in threads).
 
@@ -945,4 +953,415 @@ fn affinity_shed_sheds_an_over_ceiling_pool_on_a_hold_cycle_paced_and_converged(
             .is_empty(),
         "growth past a pool's own ceiling is denied absolutely: nothing launches"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. The ledger shed order is live (claudego-ea621a6d)
+// ---------------------------------------------------------------------------
+
+/// One `attempt.resolved` ledger row, shaped the way a NEEDLE worker appends
+/// it to `~/.needle/logs/*.jsonl`. The worker id and workspace must look
+/// real: rows whose worker id ends in `-test-worker` or whose workspace is
+/// `.` are fixture invocations by ADR-030 and every ledger consumer skips
+/// them — a fixture row here would silently contribute no economics.
+fn write_attempt_row(
+    ledger_dir: &Path,
+    worker_id: &str,
+    adapter: &str,
+    outcome: &str,
+    cost_usd: f64,
+) {
+    use std::io::Write;
+    std::fs::create_dir_all(ledger_dir).expect("ledger dir");
+    let row = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "event_type": "attempt.resolved",
+        "worker_id": worker_id,
+        "session_id": "leadgen-fixture",
+        "bead_id": "claudego-ea621a6d",
+        "workspace": ledger_dir.parent().unwrap_or(ledger_dir).to_string_lossy(),
+        "data": {
+            "adapter": adapter,
+            "outcome": outcome,
+            "costed": true,
+            "estimated_cost_usd": cost_usd,
+        },
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ledger_dir.join("attempts.jsonl"))
+        .expect("open ledger file");
+    writeln!(file, "{row}").expect("append ledger row");
+}
+
+/// An adapter's measured economics as distinct ledger rows: `verified` rows
+/// resolving `verified_success` and `failed` rows resolving `work_failure`,
+/// each costing `cost_per_row` dollars — so the adapter's cost per verified
+/// closure is `cost_per_row * (verified + failed) / verified`.
+fn seed_adapter_economics(
+    ledger_dir: &Path,
+    adapter: &str,
+    verified: u64,
+    failed: u64,
+    cost_per_row: f64,
+) {
+    for i in 0..verified {
+        write_attempt_row(
+            ledger_dir,
+            &format!("leadgen-{adapter}-{i}"),
+            adapter,
+            "verified_success",
+            cost_per_row,
+        );
+    }
+    for i in 0..failed {
+        write_attempt_row(
+            ledger_dir,
+            &format!("leadgen-{adapter}-f{i}"),
+            adapter,
+            "work_failure",
+            cost_per_row,
+        );
+    }
+}
+
+/// Launch command and config for one pool of the ledger fleet. The
+/// `--agent` value is BOTH the burn-rate key that pins the pool's hourly
+/// cost AND the ledger adapter key the shed order ranks — the same wiring
+/// the production pools use.
+fn ledger_pool_config(
+    env: &Path,
+    launch_log: &Path,
+    hb_dir: &Path,
+    session_prefix: &str,
+    adapter: &str,
+) -> AgentConfig {
+    let launch_cmd = format!(
+        "{} --agent {} --workspace {} idle-scaled {}",
+        env.join("bin").join("launch-stub").display(),
+        adapter,
+        env.display(),
+        launch_log.display()
+    );
+    affinity_agent_config(launch_cmd, &format!("{session_prefix}-*"), hb_dir, 8, &["five_hour"])
+}
+
+/// The exhaustion-shed forecast: five_hour binds at `safe`, the other two
+/// windows carry no safe count (they cannot bind over it or cap a pool), and
+/// per-model burn rates pin every pool's hourly cost deterministically —
+/// the pre-ledger shed order is therefore known before any ledger is read.
+fn seeded_ledger_shed_state(safe: u32) -> state::GovernorState {
+    fn seed(win: &mut state::WindowForecast, utilization: f64, safe: Option<u32>) {
+        win.current_utilization = utilization;
+        win.hours_remaining = 40.0;
+        win.cutoff_risk = false;
+        win.safe_worker_count = safe;
+        win.safe_worker_count_p75 = safe;
+        win.cone_ratio = 0.0; // narrow cone → p50 estimate selected
+    }
+
+    let mut s = state::GovernorState::new();
+    s.capacity_forecast.binding_window = "five_hour".to_string();
+    seed(&mut s.capacity_forecast.five_hour, 65.0, Some(safe));
+    seed(&mut s.capacity_forecast.seven_day, 50.0, None);
+    seed(&mut s.capacity_forecast.weekly_scoped, 45.0, None);
+    for (adapter, dollars_per_worker_hour) in [
+        ("lg-none", 20.0),
+        ("lg-cheap", 5.0),
+        ("lg-mid", 15.0),
+        ("lg-exp", 30.0),
+        ("lg-worst", 20.0),
+        ("lg-guarded", 30.0),
+        ("lg-busy", 20.0),
+        ("lg-idle-rich", 30.0),
+    ] {
+        s.burn_rate.by_model.insert(
+            adapter.to_string(),
+            state::ModelBurnRate {
+                pct_per_worker_per_hour: 1.0,
+                dollars_per_worker_per_hour: dollars_per_worker_hour,
+                samples: 24,
+            },
+        );
+    }
+    s
+}
+
+/// Re-seed the ledger-shed state, then run a real act cycle against it.
+/// Caller holds [`ENV_LOCK`] and has already pointed `CGOV_LEDGER_LOGS_DIR`
+/// where the cycle should read the ledger from.
+fn ledger_shed_cycle(
+    h: &Harness,
+    agents: &HashMap<String, AgentConfig>,
+    safe: u32,
+) -> ScalingDecision {
+    std::fs::write(
+        &h.state_path,
+        serde_json::to_string_pretty(&seeded_ledger_shed_state(safe)).expect("serialize state"),
+    )
+    .expect("write state fixture");
+    act_cycle(h, agents, 0.0, 10, 10)
+}
+
+/// The four-pool ledger fleet, two idle workers per pool (the pool's own
+/// session prefixes never prefix-collide — the fake tmux census filters by
+/// prefix, so `shd-m-*` would count `shd-mid-*` sessions and double-book
+/// the pool). Hourly costs: exp $30 > none $20 > mid $15 > cheap $5, so the
+/// pre-ledger order sheds exp → none → mid → cheap.
+fn four_pool_ledger_fleet(h: &Harness) -> HashMap<String, AgentConfig> {
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let mut agents = HashMap::new();
+    for (pool, prefix, adapter) in [
+        ("pool-none", "shd-none", "lg-none"),
+        ("pool-cheap", "shd-cheap", "lg-cheap"),
+        ("pool-mid", "shd-mid", "lg-mid"),
+        ("pool-exp", "shd-exp", "lg-exp"),
+    ] {
+        let hb = env.join(format!("hb-{prefix}"));
+        agents.insert(
+            pool.to_string(),
+            ledger_pool_config(&env, &h.launch_log, &hb, prefix, adapter),
+        );
+        h.worker_in(&hb, &format!("{prefix}-w1"), 20, true);
+        h.worker_in(&hb, &format!("{prefix}-w2"), 10, true);
+    }
+    agents
+}
+
+/// The ledger's verdict on the four fleet adapters, written as real rows:
+/// none proved waste (5 attempts, nothing verified), cheap proved worst
+/// value ($100 per verified closure), mid middling ($15), exp the best
+/// ($1). The yield order (none → cheap → mid → exp) is the REVERSE of the
+/// cost order for the measured pools — the two orders cannot be confused.
+fn seed_four_pool_evidence(ledger_dir: &Path) {
+    seed_adapter_economics(ledger_dir, "lg-none", 0, 5, 10.0);
+    seed_adapter_economics(ledger_dir, "lg-cheap", 2, 0, 100.0);
+    seed_adapter_economics(ledger_dir, "lg-mid", 1, 0, 15.0);
+    seed_adapter_economics(ledger_dir, "lg-exp", 10, 0, 1.0);
+}
+
+impl Harness {
+    /// [`Harness::worker`] against an explicit heartbeat dir — the ledger
+    /// fleet runs one heartbeat dir per pool, like the affinity fleet.
+    fn worker_in(&self, hb_dir: &Path, session: &str, age_secs: i64, is_idle: bool) {
+        use std::io::Write;
+        let mut sessions = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.sessions_file)
+            .expect("open sessions file");
+        writeln!(sessions, "{session}").expect("append session");
+        write_heartbeat(hb_dir, session, age_secs, is_idle);
+    }
+}
+
+/// Property 1, live (claudego-ea621a6d): with ledger evidence present the
+/// exhaustion shed follows worst verified-closure yield per dollar — the
+/// proven-waste pool sheds first, then the worst-yield-per-dollar measured
+/// pool, and the pool the ledger can point at keeps its workers even though
+/// it is the most EXPENSIVE pool the pre-ledger order would have shed first.
+///
+/// Eight idle workers, shed six. Ledger order: lg-none (nothing verified,
+/// sheds before anything measured), lg-cheap ($100/closure), lg-mid
+/// ($15/closure) — lg-exp ($1/closure) survives untouched. The pre-ledger
+/// cost order predicts the disjoint set exp+none+mid and would have kept
+/// cheap: passing this test requires the ledger path, not the cost sort.
+#[test]
+fn ledger_shed_follows_worst_yield_per_dollar_through_the_live_cycle() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let ledger_dir = env.join("ledger");
+    seed_four_pool_evidence(&ledger_dir);
+    std::env::set_var("CGOV_LEDGER_LOGS_DIR", ledger_dir.display().to_string());
+
+    let agents = four_pool_ledger_fleet(&h);
+    let decision = ledger_shed_cycle(&h, &agents, 2);
+
+    std::env::remove_var("CGOV_LEDGER_LOGS_DIR");
+
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleDown(6),
+        "8 workers against a safe count of 2 sheds exactly 6"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&[
+            "shd-none-w1", "shd-none-w2", // proven waste sheds first
+            "shd-cheap-w1", "shd-cheap-w2", // worst yield per dollar next
+            "shd-mid-w1", "shd-mid-w2", // then middling yield
+        ]),
+        "the shed follows worst verified-closure yield per dollar: none, cheap, mid"
+    );
+    assert!(
+        !signalled(&h.calls_log).iter().any(|s| s.starts_with("shd-exp")),
+        "the best-yield pool keeps both workers although it is the most \
+         expensive pool — the cost order would have shed it first"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "a ledger-ordered graceful shed never kill-sessions"
+    );
+}
+
+/// Property 2, live (claudego-ea621a6d): with the ledger absent every pool
+/// ranks Unknown and the shed is byte-for-byte the pre-ledger
+/// cost-per-hour order. Two shapes of absence go through the live cycle:
+/// a ledger directory with no evidence (the read succeeds, the map is
+/// empty) and an unreadable ledger path (`read_cycle_ledger_yields`
+/// returns None on the read failure). Both must produce the SAME shed —
+/// the cost order exp ($30) → none ($20) → mid ($15), cheap ($5) surviving —
+/// which is the disjoint complement of the ledger-ordered shed above.
+#[test]
+fn without_ledger_evidence_the_live_shed_is_todays_cost_order() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let expected_cost_order = sorted(&[
+        "shd-exp-w1", "shd-exp-w2", // most expensive sheds first
+        "shd-none-w1", "shd-none-w2", // then $20
+        "shd-mid-w1", "shd-mid-w2", // then $15; cheap ($5) survives
+    ]);
+
+    // Shape one: the ledger directory exists but carries no in-window rows —
+    // every pool ranks Unknown and the tiebreak is the whole order.
+    let h = harness();
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    std::env::set_var(
+        "CGOV_LEDGER_LOGS_DIR",
+        env.join("empty-ledger").display().to_string(),
+    );
+    let agents = four_pool_ledger_fleet(&h);
+    let decision = ledger_shed_cycle(&h, &agents, 2);
+    std::env::remove_var("CGOV_LEDGER_LOGS_DIR");
+
+    assert_eq!(decision, ScalingDecision::ScaleDown(6));
+    assert_eq!(
+        signalled(&h.calls_log),
+        expected_cost_order,
+        "no ledger evidence: the shed is exactly the pre-ledger cost-per-hour order"
+    );
+    assert!(
+        !signalled(&h.calls_log).iter().any(|s| s.starts_with("shd-cheap")),
+        "the cheap pool survives although the ledger would have shed it first"
+    );
+    assert!(killed(&h.calls_log).is_empty());
+
+    // Shape two: the ledger path is unreadable — read_ledger_yield fails and
+    // read_cycle_ledger_yields degrades to None, the documented
+    // broken-ledger behaviour. The shed must not move by a single session.
+    let h2 = harness();
+    let env2 = h2.state_path.parent().unwrap().to_path_buf();
+    let not_a_dir = env2.join("ledger-unreadable");
+    std::fs::write(&not_a_dir, "a regular file, not a directory").expect("write blocker file");
+    std::env::set_var("CGOV_LEDGER_LOGS_DIR", not_a_dir.display().to_string());
+    let agents2 = four_pool_ledger_fleet(&h2);
+    let decision2 = ledger_shed_cycle(&h2, &agents2, 2);
+    std::env::remove_var("CGOV_LEDGER_LOGS_DIR");
+
+    assert_eq!(decision2, ScalingDecision::ScaleDown(6));
+    assert_eq!(
+        signalled(&h2.calls_log),
+        expected_cost_order,
+        "a failed ledger read degrades to the identical pre-ledger cost order"
+    );
+    assert!(killed(&h2.calls_log).is_empty());
+}
+
+/// Property 3, live (claudego-ea621a6d), the prohibition: the pool the
+/// ledger order selects sheds its IDLE worker, never its busy one — even
+/// when the busy worker carries the OLDER heartbeat (the age-first trap).
+/// The selected pool is the cheap NoVerified one; the protected pool is the
+/// most expensive, so the cost order would have shed the protected pool and
+/// this test cannot pass through the cost sort either.
+#[test]
+fn worst_ledger_pool_sheds_its_idle_worker_never_its_busy_one() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let ledger_dir = env.join("ledger");
+    seed_adapter_economics(&ledger_dir, "lg-worst", 0, 5, 10.0);
+    seed_adapter_economics(&ledger_dir, "lg-guarded", 40, 0, 1.0);
+    std::env::set_var("CGOV_LEDGER_LOGS_DIR", ledger_dir.display().to_string());
+
+    let hb_worst = env.join("hb-shd-w");
+    let hb_guarded = env.join("hb-shd-p");
+    h.worker_in(&hb_worst, "shd-w-idle", 20, true);
+    // The busy worker's heartbeat is the OLDER one — an age-first candidate
+    // sort inside the pool would signal it.
+    h.worker_in(&hb_worst, "shd-w-busy", 40, false);
+    h.worker_in(&hb_guarded, "shd-p-idle-a", 15, true);
+    h.worker_in(&hb_guarded, "shd-p-idle-b", 5, true);
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "pool-worst".to_string(),
+        ledger_pool_config(&env, &h.launch_log, &hb_worst, "shd-w", "lg-worst"),
+    );
+    agents.insert(
+        "pool-guarded".to_string(),
+        ledger_pool_config(&env, &h.launch_log, &hb_guarded, "shd-p", "lg-guarded"),
+    );
+
+    let decision = ledger_shed_cycle(&h, &agents, 3);
+    std::env::remove_var("CGOV_LEDGER_LOGS_DIR");
+
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleDown(1),
+        "4 workers against a safe count of 3 sheds exactly 1"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["shd-w-idle"]),
+        "the ledger-selected pool sheds its idle worker; the older busy worker \
+         and the expensive-but-verified pool are untouched"
+    );
+    assert!(killed(&h.calls_log).is_empty());
+}
+
+/// Property 3, live (claudego-ea621a6d), the sanctioned complement: a busy
+/// worker IS shed when the pool-level ledger order selects its pool and that
+/// pool has no idle candidate — and it is the pool's OLDEST busy worker.
+/// The idle workers of the lower-ranked pool survive, although a global
+/// idle-first sort would have taken them: the ledger decides WHICH pool
+/// bleeds, and only within that pool does idle-first decide who.
+#[test]
+fn busy_worker_sheds_only_when_no_idle_candidate_exists_in_its_pool() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let ledger_dir = env.join("ledger");
+    seed_adapter_economics(&ledger_dir, "lg-busy", 0, 5, 10.0);
+    seed_adapter_economics(&ledger_dir, "lg-idle-rich", 40, 0, 1.0);
+    std::env::set_var("CGOV_LEDGER_LOGS_DIR", ledger_dir.display().to_string());
+
+    let hb_busy = env.join("hb-shd-b");
+    let hb_rich = env.join("hb-shd-i");
+    h.worker_in(&hb_busy, "shd-b-old", 40, false);
+    h.worker_in(&hb_busy, "shd-b-young", 30, false);
+    h.worker_in(&hb_rich, "shd-i-idle-a", 20, true);
+    h.worker_in(&hb_rich, "shd-i-idle-b", 5, true);
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "pool-busy".to_string(),
+        ledger_pool_config(&env, &h.launch_log, &hb_busy, "shd-b", "lg-busy"),
+    );
+    agents.insert(
+        "pool-rich".to_string(),
+        ledger_pool_config(&env, &h.launch_log, &hb_rich, "shd-i", "lg-idle-rich"),
+    );
+
+    let decision = ledger_shed_cycle(&h, &agents, 3);
+    std::env::remove_var("CGOV_LEDGER_LOGS_DIR");
+
+    assert_eq!(decision, ScalingDecision::ScaleDown(1));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["shd-b-old"]),
+        "the ledger-selected pool has no idle candidate, so its oldest busy \
+         worker sheds; the idle workers of the protected pool survive"
+    );
+    assert!(killed(&h.calls_log).is_empty());
 }
