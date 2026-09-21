@@ -105,6 +105,7 @@ fn create_burn_rate_with_fable_history() -> BurnRateState {
         calibration: claude_governor::state::CalibrationState::default(),
         usd_per_pct_ema_five_hour: 2.8,
         usd_per_pct_ema_seven_day: 3.0,
+        fleet_ema_idle_paused: false,
         prev_usage_snapshot: None,
     }
 }

@@ -624,6 +624,19 @@ pub struct BurnRateState {
     #[serde(default)]
     pub fleet_pct_ema_samples: u32,
 
+    /// Set while EMA updates are paused because the fleet is at 0 workers
+    /// (claudego-ddd93cee): the observed burn is not fleet burn, so deltas are
+    /// skipped — but the persisted EMA keeps the value it held when workers
+    /// last ran, and that value outlives the idle period with full strategy-(A)
+    /// authority. When workers return, [`crate::governor::resume_fleet_ema_after_idle`]
+    /// consumes this flag and resets `fleet_pct_ema_samples` to 0 so the first
+    /// fresh fleet-attributed delta OVERWRITES the stale EMA (first-sample
+    /// semantics, same mechanism as the model-change reset) instead of blending
+    /// with it at alpha=0.2 — which would take a dozen cycles to decay, more
+    /// than the one cycle a mis-sized launch gets before the brake kills it.
+    #[serde(default)]
+    pub fleet_ema_idle_paused: bool,
+
     /// Previous API usage snapshot, used to compute cross-cycle pct deltas.
     #[serde(default)]
     pub prev_usage_snapshot: Option<PrevUsageSnapshot>,
@@ -647,6 +660,7 @@ impl Default for BurnRateState {
             usd_per_pct_ema_seven_day: 0.0,
             usd_per_pct_ema_weekly_scoped: 0.0,
             fleet_pct_ema_samples: 0,
+            fleet_ema_idle_paused: false,
             prev_usage_snapshot: None,
         }
     }

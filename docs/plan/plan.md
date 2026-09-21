@@ -2221,3 +2221,45 @@ Verified live on `lab` post-deploy: the collector recovered on its first pass wi
 
 - Consider re-introducing the plan's staleness-tiered fallback (Alternative 3) as a deliberate enhancement — `current_total`-hold is safe but coarse; a 10-30min "trust the last known EMA" tier would reduce startup latency for short-lived collector blips without reintroducing the max_workers guess. Not filed as a bead yet; revisit if hold-at-current proves too conservative in practice.
 - The affected subscription Opus pool's `max_workers: 4` in `governor.yaml` predates this incident and was not itself changed by this ADR. That pool is no longer part of the shipped configuration, so its ceiling is not an active operator-facing setting; the ADR's `current_total`-hold policy remains in force for configured pools.
+
+---
+
+## ADR-003: 2026-09-21 — One sizing basis when no fleet burn rate is measured: the baseline, at any worker count; stale EMA authority evicted on resume from idle
+
+**Status:** Implemented (bead claudego-ddd93cee)
+
+### Context
+
+Live on codinghome, 2026-09-21 03:33–03:44Z: `needle-sonnet` oscillated launch/kill on a 5-minute cycle — 0 workers → target 2 → launch one; one cycle later 1 worker → target 0 → `EmergencyBrake` (tmux kill-session mid-task, stranding an in-progress bead claim); back to 0 → target 2 → repeat. Each iteration started a real Sonnet session and threw it away. `claude-governor.service` was stopped at 03:45Z to stop the churn.
+
+The state file frozen at the final cycle (`governor-state.json`, written 03:43Z) pins the mechanism exactly:
+
+- binding window `seven_day`: 70% used, 45.27h remaining, 85% ceiling → 15% remaining;
+- `fleet_pct_hr_ema.seven_day = 12.68 %/hr` with `fleet_pct_ema_samples = 2033` — accumulated under a **previous** fleet epoch and frozen there ever since, because the claudego-1942b4ea guard correctly skips EMA updates at 0 workers (observed burn is not fleet burn);
+- at 0 workers the guard pins the fleet rate to 0, so `per_worker_pct_for_sizing` returns the configured baseline (0.15 %/worker/hr) → `duty_cycle_safe_workers(15 / (0.15 × 45.27)) = 2` → **launch**;
+- at 1 worker the guard stops pinning, strategy (A) hands the stale 12.68 %/hr to sizing as that one worker's rate → `duty_cycle_safe_workers(15 / (12.68 × 45.27)) = 0.026 → Some(0)` → `apply_scaling` labels the computed zero an emergency → **kill**, bypassing scale-down hysteresis and flipping safe mode on.
+
+Two guards each correct in isolation — the ADR-002-lineage distrust of unattributed burn data, and the claudego-d64682d5 zero-worker bootstrap — disagreed about the same physical state one cycle apart, and the fleet ping-ponged between them. Neither guard's tests covered the handoff, which is why the pair shipped.
+
+### Decision
+
+1. **`per_worker_pct_for_sizing` has one no-data basis.** When the fleet rate is not positive, sizing returns the configured baseline at ANY worker count, not just at 0. The basis can no longer flip as a function of `current_total` alone: a launch authorized from the baseline is not reversed one cycle later by the same basis answering zero. The prior third arm (returning `0.0` with workers running and no measured rate) is the direct cause of the no-data half of the oscillation, and its doc comment's claim that the zero "falls through to the max_workers-ceiling bootstrap path downstream" was false — it produced target 0.
+2. **Stale EMA authority is evicted on resume from idle.** `BurnRateState.fleet_ema_idle_paused` is set by every zero-worker observe cycle; the first resumed update calls `resume_fleet_ema_after_idle`, which resets `fleet_pct_ema_samples` to 0 (same mechanism and precedent as the model-change reset). Because the EMA update block uses first-sample-overwrite semantics at `samples == 0`, the first fresh fleet-attributed delta REPLACES the stale value wholesale instead of blending toward it at α=0.2 (a dozen-plus cycles — longer than a mis-sized launch survives). It also returns estimation to ColdStart, so the bf-3ebgd baseline seeding engages until real samples exist.
+3. **The brake log names its source.** A zero target reaching the executor is either a real ≥98% window (`source=emergency_brake`) or a computed sizing verdict (`source=computed_target`). The arm now logs which, so an operator reading "EMERGENCY BRAKE: scaling all to 0" does not hunt for a threshold breach that never happened (this cost real diagnosis time on 2026-09-21).
+
+### Why the baseline fallback is safe now when "run blind" was rightly rejected in ADR-002
+
+ADR-002 rejected data-absent guessing because the governor could then launch to `max_workers` with no idea how much quota was left. The sizing path it feared no longer exists: the fallback basis feeds `duty_cycle_safe_workers`, which derives the count from **real polled API utilization** (remaining budget ÷ baseline rate ÷ hours remaining), clamps to 0 as the ceiling approaches, and is reached one hysteresis/cap-limited step per cycle. The utilization poll is independent of the token collector whose corruption triggered the ADR-002 incident, and the ≥98% emergency brake fires on that poll regardless of any burn-rate data. The worst case of a dead measurement pipeline is therefore no longer "unbounded blind launch" but "fleet sized from config against a real percent budget" — which is the governor's use-or-lose purpose, and self-corrects as fresh samples arrive (evicted authority guarantees they are fresh).
+
+### Alternatives considered
+
+1. **Drop the zero-worker bootstrap instead** (keep strict no-data distrust at n>0). Rejected: the pool then never cold-starts without a measured rate, and the 1942b4ea pin structurally guarantees no measured rate at n=0 — the exact state that blocked `needle-sonnet` from starting at all before claudego-d64682d5.
+2. **Gate the fallback on EMA sample count** (baseline only while samples < 3, then trust the EMA and hold at 0 if absent). Rejected as structurally broken by the same pin: once ≥3 samples exist (they persist forever), every return to 0 workers has a pinned-to-0 fleet rate, so "trust the EMA" is unavailable exactly when the launch decision is made — the pool could start once and never again.
+
+### Consequences
+
+**Positive:** the launch decision and the keep decision now share one basis, so the 5-minute churn cannot recur; stale EMA values cannot strangle a fresh launch regardless of how long the fleet idled; the brake log is truthful about its trigger.
+
+**Negative / costs:** with the measurement pipeline fully dead, the fleet runs at the duty-cycled baseline sizing (capped by `max_workers`, withdrawn as real utilization approaches the ceiling) rather than holding at 0 — a deliberate weakening of ADR-002's posture, justified above. The `usd_per_pct_ema_*` learned ratios still persist across idle gaps (they are dimensional conversion factors, not rates, and a stale ratio stays within hysteresis of truth); this is noted rather than solved here.
+
+**Follow-up (not done here):** a computed `Some(0)` still routes through `apply_scaling`'s emergency arm — bypassing scale-down hysteresis, killing sessions mid-task, and setting `safe_mode.active`. With honest data that verdict is rare and means "even one worker exhausts the window", but routing it through the graceful scale-down path (reserving the hard brake for the ≥98% threshold) would stop a future sizing mistake from executing in-flight work. Filed separately; deliberately out of scope for this bead.

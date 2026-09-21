@@ -64,6 +64,7 @@ fn create_brand_new_state() -> BurnRateState {
         usd_per_pct_ema_seven_day: 0.0,
         usd_per_pct_ema_weekly_scoped: 0.0,
         fleet_pct_ema_samples: 0, // Zero samples = cold-start
+        fleet_ema_idle_paused: false,
         prev_usage_snapshot: None,
     }
 }

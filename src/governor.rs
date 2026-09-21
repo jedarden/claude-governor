@@ -1193,6 +1193,12 @@ fn apply_underutilization_sprint(
             Some(w) => w,
             None => continue,
         };
+        // NOTE: this counts the pool's HOME workspace only. With NEEDLE's
+        // Explore strand enabled the pool roams, so a home workspace that has
+        // drained understates the work actually reachable and can withhold a
+        // sprint the fleet could have used. Conservative in the safe direction
+        // (it can only suppress a sprint, never invent one), so left as is —
+        // an explore-aware count is its own change.
         let backlog = count_ready_beads(&workspace);
         let current = state.workers.get(name).map(|w| w.current).unwrap_or(0);
         // Only sprint if there is unclaimed work for the extra runners to do.
@@ -1210,6 +1216,29 @@ fn apply_underutilization_sprint(
             if boosted > base_target {
                 log::info!(
                     "[governor] underutilization sprint: {} has backlog {} > {} workers; boosting target {} -> {} ({})",
+                    name, backlog, current, base_target, boosted, trigger.reason
+                );
+                return boosted;
+            }
+        }
+        // Pace-block sprint (claudego-a351d271). Checked after the
+        // end-of-window sprint because that one is the narrower, more urgent
+        // signal; this one covers the rest of the week. It is the only sprint
+        // that can fire with no burn data at all, which is what lets a pool
+        // that has never run earn its first measurement (claudego-ddd93cee).
+        let consumed = cfg.consumed_windows();
+        if let Some(trigger) = crate::alerts::check_pace_block_sprint_for_worker(
+            state,
+            sprint_config,
+            name,
+            cfg.max_workers,
+            &consumed,
+            now,
+        ) {
+            let boosted = base_target.max(trigger.target_workers);
+            if boosted > base_target {
+                log::info!(
+                    "[governor] pace-block sprint: {} has backlog {} > {} workers; boosting target {} -> {} ({})",
                     name, backlog, current, base_target, boosted, trigger.reason
                 );
                 return boosted;
@@ -1368,32 +1397,72 @@ pub fn effective_fleet_pct_rate(
 /// Per-worker pct/hr rate used to size the fleet ("if I ran one worker, could
 /// I afford it?").
 ///
-/// Zero-worker bootstrap (claudego-d64682d5's live-path twin, wired in by the
-/// claudego-1942b4ea guard): with the fleet at 0 workers there is no measured
-/// per-worker rate — [`effective_fleet_pct_rate`] pins the fleet rate to 0 —
-/// so size the hypothetical from the configured baseline. Without this the
-/// gate closes the claudego-d64682d5 loop again: 0 workers -> rate 0 ->
-/// safe_worker_count None -> the governor holds at current (0) -> 0 workers
-/// forever, and the pool can never start.
+/// No-measured-rate fallback (claudego-ddd93cee): whenever the fleet rate is
+/// not positive — [`effective_fleet_pct_rate`] pins it to 0 at 0 workers, and
+/// it is genuinely 0 when no EMA, dollar aggregate, or ratio exists — the
+/// sizing basis is the configured baseline, at ANY worker count. The basis
+/// must not flip as a function of `current_total` alone: sizing 0 workers
+/// from the baseline (launch) while sizing 1 worker from a zero rate (kill)
+/// made the same physical state answer "afford 2" and "afford 0" one cycle
+/// apart, and the fleet oscillated launch/kill every 5 minutes. The
+/// zero-worker arm (claudego-d64682d5's live-path twin, wired in by the
+/// claudego-1942b4ea guard) and the workers-present arm are therefore the
+/// SAME fallback: without a measured rate the governor believes its config,
+/// and the duty-cycle budget math — not an unmeasured guess — bounds the
+/// result against real polled utilization.
 ///
-/// With workers running, `current_total.max(1)` rather than a strict divide:
-/// when the fleet has genuinely scaled to 0-but-holding while real aggregate
-/// rate data exists, dividing by a hypothetical 1 worker yields a
-/// conservative (pessimistic) per-worker estimate. True cold start
-/// (`fleet_pct_hr == 0`, workers running) yields 0.0 and falls through to the
-/// max_workers-ceiling bootstrap path downstream.
+/// With a positive measured rate and workers running,
+/// `current_total.max(1)` rather than a strict divide: when the fleet has
+/// genuinely scaled to 0-but-holding while real aggregate rate data exists,
+/// dividing by a hypothetical 1 worker yields a conservative (pessimistic)
+/// per-worker estimate.
 pub fn per_worker_pct_for_sizing(
     current_total: u32,
     fleet_pct_hr: f64,
     baseline_pct_per_worker: f64,
 ) -> f64 {
-    if current_total == 0 {
-        baseline_pct_per_worker
-    } else if fleet_pct_hr > 0.0 {
+    if fleet_pct_hr > 0.0 && current_total > 0 {
         fleet_pct_hr / current_total.max(1) as f64
     } else {
-        0.0
+        // No measured rate: the baseline is the single sizing basis at any
+        // worker count. A launch authorized from this basis is not reversed
+        // one cycle later by the same basis answering 0.
+        baseline_pct_per_worker
     }
+}
+
+/// Consume the idle-pause flag when the fleet resumes from a zero-worker gap
+/// (claudego-ddd93cee).
+///
+/// While the fleet is at 0 workers the EMA update is skipped (observed burn is
+/// not fleet burn), but the persisted EMA keeps the value it held when workers
+/// last ran — for weeks, if the gap lasts weeks. Handing that value full
+/// strategy-(A) authority the moment one worker launches sizes the new worker
+/// at the OLD fleet's rate: in the 2026-09-21 Sonnet incident a 7-day EMA of
+/// 12.68 %/hr — accumulated 2033 samples ago under a different fleet — was
+/// charged to a single 5-minute-old worker, the duty-cycle budget answered
+/// Some(0), and the brake killed the worker the bootstrap had launched one
+/// cycle earlier. Launch/kill every 5 minutes.
+///
+/// Resetting the sample count (not the EMA values) re-uses the existing
+/// first-sample-overwrite semantics: with `fleet_pct_ema_samples == 0` the
+/// next fresh fleet-attributed delta REPLACES the EMA wholesale instead of
+/// blending with the stale value at alpha=0.2 (a dozen+ cycles to decay —
+/// longer than a mis-sized launch survives). It also returns the estimate to
+/// ColdStart/InsufficientSamples, so the bf-3ebgd baseline seeding engages
+/// until real samples exist — the same basis that authorized the launch.
+///
+/// Returns `Some(evicted)` with the stale sample count when a reset fired, so
+/// the caller can log what was discarded; `None` when the EMA was live
+/// (no idle gap, or the gap is still ongoing).
+pub fn resume_fleet_ema_after_idle(burn: &mut crate::state::BurnRateState) -> Option<u32> {
+    if !burn.fleet_ema_idle_paused {
+        return None;
+    }
+    let evicted = burn.fleet_pct_ema_samples;
+    burn.fleet_ema_idle_paused = false;
+    burn.fleet_pct_ema_samples = 0;
+    Some(evicted)
 }
 
 /// Render a snapshot instant for a delta log line.
@@ -6301,6 +6370,11 @@ pub fn run_observe_cycle(
                     // snapshot below still advances, so no stale-span delta is
                     // computed across the idle stretch either.
                     if current_total == 0 {
+                        // Arm the eviction (claudego-ddd93cee): the EMA freezes
+                        // here for the whole idle stretch, and this flag is
+                        // what lets [`resume_fleet_ema_after_idle`] strip its
+                        // authority when workers return.
+                        state.burn_rate.fleet_ema_idle_paused = true;
                         log::info!(
                             "[governor] 0 workers: skipping fleet EMA update — observed burn is \
                              not fleet burn (5h={:+.3}% 7d={:+.3}% 7ds={:+.3}% over {:.0}s)",
@@ -6310,6 +6384,21 @@ pub fn run_observe_cycle(
                             elapsed_secs,
                         );
                     } else {
+                        // First update after an idle stretch: the persisted EMA
+                        // describes the PREVIOUS fleet epoch, so strip its
+                        // sample authority before reading `samples` below — the
+                        // first fresh delta then overwrites it wholesale
+                        // (claudego-ddd93cee).
+                        if let Some(evicted) =
+                            resume_fleet_ema_after_idle(&mut state.burn_rate)
+                        {
+                            log::info!(
+                                "[governor] fleet resumed from idle: evicting {} stale EMA \
+                                 samples persisted from the previous active period — sizing \
+                                 falls back to the collector/baseline until fresh deltas land",
+                                evicted
+                            );
+                        }
                         // Compute per-window deltas from consecutive API snapshots
                         let old_pct = crate::db::WindowPctSnapshot {
                             five_hour: snap.five_hour_pct,
@@ -7694,7 +7783,16 @@ pub fn run_act_cycle(
             }
         }
         ScalingDecision::EmergencyBrake => {
-            log::warn!("[governor] EMERGENCY BRAKE: scaling all to 0");
+            // A zero target here can be a real >=98% window (source
+            // "emergency_brake") or a computed Some(0) sizing verdict carried
+            // to 0 with workers running (source "computed_target") — very
+            // different events that this arm used to log identically, sending
+            // operators hunting for a threshold breach that never happened
+            // (claudego-ddd93cee, 2026-09-21 03:38Z kill cycle).
+            log::warn!(
+                "[governor] EMERGENCY BRAKE (source={}): scaling all to 0",
+                decision_source
+            );
             if !dry_run {
                 // Kill all workers immediately across all agents
                 for session in &all_sessions {
@@ -9485,9 +9583,205 @@ mod tests {
         // the current_total == 1 case identical to before).
         assert_eq!(per_worker_pct_for_sizing(2, 13.0, baseline), 6.5);
         assert_eq!(per_worker_pct_for_sizing(1, 13.0, baseline), 13.0);
-        // Workers running, no rate yet (true cold start): 0.0, which falls
-        // through to the max_workers-ceiling bootstrap downstream.
-        assert_eq!(per_worker_pct_for_sizing(2, 0.0, baseline), 0.0);
+        // Workers running, no measured rate yet: the SAME baseline basis as at
+        // 0 workers (claudego-ddd93cee). The basis must not flip with the
+        // worker count — sizing the launch from the baseline and the freshly
+        // launched worker from a zero rate is the launch/kill oscillation.
+        assert_eq!(per_worker_pct_for_sizing(2, 0.0, baseline), baseline);
+        assert_eq!(per_worker_pct_for_sizing(1, 0.0, baseline), baseline);
+    }
+
+    /// Resume-from-idle eviction (claudego-ddd93cee): the flag set by every
+    /// zero-worker observe cycle must, on the first resumed update, reset the
+    /// sample count so the first fresh fleet-attributed delta OVERWRITES the
+    /// stale EMA (first-sample semantics) instead of blending with it, and
+    /// must fire exactly once. Without the eviction, the pre-idle EMA retains
+    /// full strategy-(A) authority across the gap — the 2026-09-21 incident
+    /// charged a 12.68 %/hr stale seven_day EMA to a single 5-minute-old
+    /// worker and braked it one cycle after the bootstrap launched it.
+    #[test]
+    fn resume_from_idle_evicts_stale_ema_authority_once() {
+        use crate::state::BurnRateState;
+
+        let mut burn = BurnRateState::default();
+        burn.fleet_pct_hr_ema.seven_day = 12.68; // stale value from the last active period
+        burn.fleet_pct_ema_samples = 2033;
+
+        // No idle gap: the EMA is live, nothing may be reset.
+        assert_eq!(resume_fleet_ema_after_idle(&mut burn), None);
+        assert_eq!(burn.fleet_pct_ema_samples, 2033);
+
+        // The fleet goes idle: the observe cycle arms the flag (skips deltas).
+        burn.fleet_ema_idle_paused = true;
+
+        // First resumed update: samples evicted, values left in place (the
+        // `samples == 0` arms in the update block overwrite them), flag clears.
+        assert_eq!(resume_fleet_ema_after_idle(&mut burn), Some(2033));
+        assert_eq!(burn.fleet_pct_ema_samples, 0);
+        assert!(!burn.fleet_ema_idle_paused);
+        assert!(
+            (burn.fleet_pct_hr_ema.seven_day - 12.68).abs() < 1e-9,
+            "the EMA value itself is overwritten by the next fresh delta, not here"
+        );
+
+        // Exactly once: a second resume without a new idle gap is a no-op.
+        assert_eq!(resume_fleet_ema_after_idle(&mut burn), None);
+        assert_eq!(burn.fleet_pct_ema_samples, 0);
+    }
+
+    /// THE oscillation regression (claudego-ddd93cee): a full 0 -> 1 worker
+    /// transition must not collapse the target to 0. The incident geometry,
+    /// from the state file frozen at the 2026-09-21 03:38Z kill: binding
+    /// seven_day at 70% with 45.3h left against an 85% ceiling (15% remaining),
+    /// a stale 2033-sample seven_day EMA of 12.68 %/hr persisted from the
+    /// previous active period, and a token collector that has not yet counted
+    /// the just-launched worker. The bootstrap sizes 2 workers at 0 -> launch;
+    /// one cycle later the target must still be >= 1, not the brake.
+    #[test]
+    fn one_worker_after_bootstrap_launch_does_not_collapse_to_zero() {
+        use crate::state::{BurnRateState, EstimateQuality};
+
+        let baseline_pct = 0.15; // needle-sonnet's configured baseline_burn_rate
+        let baseline_usd_per_pct = 5.0 / 1.5; // daemon default ratio
+        let stale_ema = 12.68;
+
+        // --- Cycle 1: 0 workers, the bootstrap launch. ---
+        let fleet_pct_hr = effective_fleet_pct_rate(
+            0,
+            2033,
+            stale_ema,
+            0.0, // collector blind: aggregate shows no fleet workers
+            1.835,
+            baseline_usd_per_pct,
+        );
+        assert_eq!(fleet_pct_hr, 0.0, "0 workers pin the fleet rate to 0");
+        let pct_per_worker = per_worker_pct_for_sizing(0, fleet_pct_hr, baseline_pct);
+        assert_eq!(pct_per_worker, baseline_pct);
+        let seven_day = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            70.0,
+            85.0,
+            45.268,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::ColdStart,
+        );
+        assert_eq!(
+            seven_day.safe_worker_count,
+            Some(2),
+            "15% remaining over 45.3h at the 0.15 baseline affords 2 — the launch"
+        );
+
+        // The handoff: the observe cycle armed the flag during idle, the first
+        // resumed update evicts the stale authority.
+        let mut burn = BurnRateState::default();
+        burn.fleet_pct_hr_ema.seven_day = stale_ema;
+        burn.fleet_pct_ema_samples = 2033;
+        burn.fleet_ema_idle_paused = true;
+        assert_eq!(resume_fleet_ema_after_idle(&mut burn), Some(2033));
+
+        // --- Cycle 2: 1 worker, samples evicted, collector still blind. ---
+        // Strategy (A) must now be unavailable: samples == 0, so the stale
+        // 12.68 %/hr cannot be charged to the new worker even though the EMA
+        // value still sits in state.
+        let fleet_pct_hr = effective_fleet_pct_rate(
+            1,
+            burn.fleet_pct_ema_samples,
+            burn.fleet_pct_hr_ema.seven_day,
+            0.0,
+            1.835,
+            baseline_usd_per_pct,
+        );
+        assert_eq!(
+            fleet_pct_hr, 0.0,
+            "evicted samples must demote the stale EMA; with no dollar data the rate is 0"
+        );
+        let pct_per_worker = per_worker_pct_for_sizing(1, fleet_pct_hr, baseline_pct);
+        assert_eq!(
+            pct_per_worker, baseline_pct,
+            "no measured rate at 1 worker sizes from the SAME baseline that authorised the launch"
+        );
+        let seven_day = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            70.0,
+            85.0,
+            45.268,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::ColdStart,
+        );
+        assert_eq!(
+            seven_day.safe_worker_count,
+            Some(2),
+            "the keep-decision must agree with the launch-decision — not Some(0)"
+        );
+
+        // Through the decision seam with that forecast as binding: 1 running,
+        // target 2 — no brake, no collapse.
+        let mut state = state::GovernorState::new();
+        state.workers.insert(
+            "needle-sonnet".to_string(),
+            state::WorkerState {
+                current: 1,
+                target: 2,
+                min: 0,
+                max: 2,
+            },
+        );
+        state.capacity_forecast.binding_window = "seven_day".to_string();
+        state.capacity_forecast.seven_day = seven_day;
+        let target = compute_target_workers(
+            &state,
+            85.0,
+            &CompositeRiskConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            &ConeScalingConfig::default(),
+        );
+        assert!(
+            target >= 1,
+            "0 -> 1 worker transition collapsed to target {target} — the launch/kill oscillation"
+        );
+    }
+
+    /// The collector-visible twin of the regression above: once the token
+    /// collector has counted the new worker, strategy (B) sizes it from its
+    /// own measured dollar burn — per-worker-attributed data, not the account
+    /// EMA — and the keep-decision still agrees with the launch.
+    #[test]
+    fn one_worker_sized_from_collector_data_once_counted() {
+        use crate::state::EstimateQuality;
+
+        let baseline_pct = 0.15;
+        let baseline_usd_per_pct = 5.0 / 1.5;
+
+        // One fresh worker at an honest $0.50/hr through the learned
+        // seven_day ratio of 1.835 $/pct -> 0.27 %/hr.
+        let fleet_pct_hr = effective_fleet_pct_rate(1, 0, 12.68, 0.5, 1.835, baseline_usd_per_pct);
+        assert!(
+            (fleet_pct_hr - 0.5 / 1.835).abs() < 1e-9,
+            "samples == 0 demotes the stale EMA; the collector's dollar rate sizes the worker, got {}",
+            fleet_pct_hr
+        );
+        let pct_per_worker = per_worker_pct_for_sizing(1, fleet_pct_hr, baseline_pct);
+        let seven_day = generate_window_forecast(
+            "seven_day",
+            fleet_pct_hr,
+            70.0,
+            85.0,
+            45.268,
+            pct_per_worker,
+            1.2,
+            EstimateQuality::ColdStart,
+        );
+        assert_eq!(
+            seven_day.safe_worker_count,
+            Some(1),
+            "an honest 0.27 %/hr worker affords 1 whole worker on the incident geometry"
+        );
     }
 
     /// End-to-end over the seams the observe cycle actually calls, with the

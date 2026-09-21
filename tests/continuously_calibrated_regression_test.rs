@@ -64,6 +64,7 @@ fn create_continuously_calibrated_state() -> BurnRateState {
         calibration: claude_governor::state::CalibrationState::default(),
         usd_per_pct_ema_five_hour: 3.33,
         usd_per_pct_ema_seven_day: 3.33,
+        fleet_ema_idle_paused: false,
         prev_usage_snapshot: None,
     }
 }
