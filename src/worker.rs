@@ -33,22 +33,39 @@ const STALE_HEARTBEAT_THRESHOLD: i64 = 60; // seconds
 /// where the bound belongs: stop feeding a filling disk.
 const SCALE_UP_MAX_DISK_USE_PCT: u8 = 90;
 
-/// Worker heartbeat JSON structure (written by each worker instance)
+/// Worker heartbeat JSON structure (written by each worker instance).
+///
+/// Two name spaces meet in this struct and they are not the same
+/// (claudego-ec3aff17): a NEEDLE worker writes `session` = its worker_id —
+/// the rendered `--identifier` value, e.g. `cgov-sonnet-20260921125550-0` —
+/// while its tmux session is named `needle-{agent}-{worker_id}` and the file
+/// itself is named by the qualified id, `{agent}-{worker_id}.json`. The
+/// timestamp travels in NEEDLE's `last_heartbeat` field. [`worker_id_prefix`]
+/// and [`resolve_worker_session`] carry the mapping; without it every NEEDLE
+/// heartbeat either failed to parse (missing `timestamp`) or was filtered out
+/// (worker_id does not start with the tmux prefix), and every cycle logged
+/// `0 heartbeats, consistent=false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
-    /// Worker session identifier
+    /// NEEDLE worker id (e.g. `cgov-sonnet-20260921125550-0`); workers that
+    /// predate NEEDLE's heartbeat format wrote the tmux session name here.
     pub session: String,
 
-    /// Timestamp of this heartbeat
+    /// Timestamp of this heartbeat. NEEDLE names the field `last_heartbeat`;
+    /// `timestamp` stays as an alias so legacy files keep parsing.
+    #[serde(rename = "last_heartbeat", alias = "timestamp")]
     pub timestamp: DateTime<Utc>,
 
     /// Whether the worker is currently idle (no active task)
+    #[serde(default)]
     pub is_idle: bool,
 
     /// Current task ID if any
+    #[serde(default)]
     pub current_task: Option<String>,
 
     /// Model being used
+    #[serde(default)]
     pub model: String,
 }
 
@@ -137,36 +154,57 @@ pub struct ScaleDownResult {
 /// something may be wrong (stale heartbeats, orphaned sessions, etc.)
 ///
 /// Orphaned heartbeats (stale, with no matching tmux session) are swept by
-/// [`read_heartbeats`] and excluded from `heartbeat_count`, so a count that went
-/// inconsistent because a worker died without cleanup returns to consistent once
-/// its heartbeat ages past [`STALE_HEARTBEAT_THRESHOLD`].
+/// [`read_heartbeats_with_sessions`] and excluded from `heartbeat_count`, so a
+/// count that went inconsistent because a worker died without cleanup returns
+/// to consistent once its heartbeat ages past [`STALE_HEARTBEAT_THRESHOLD`].
 pub fn count_workers(config: &WorkerConfig) -> WorkerCount {
-    // Count heartbeat files, filtered to this agent's session prefix
-    let heartbeat_count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+    // One tmux census feeds both the heartbeat liveness checks and tmux_count,
+    // so the two counts always describe the same instant.
+    let tmux_sessions = list_tmux_sessions(&config.session_prefix);
+    let live_sessions = tmux_sessions
+        .as_ref()
+        .map(|sessions| sessions.iter().cloned().collect::<HashSet<String>>());
 
-    // Count tmux sessions
-    let (tmux_count, sessions) = count_tmux_sessions(&config.session_prefix);
+    let heartbeat_count = count_heartbeat_files(
+        &config.heartbeat_dir,
+        &config.session_prefix,
+        worker_id_prefix(&config.launch_cmd).as_deref(),
+        live_sessions.as_ref(),
+    );
+
+    // tmux unanswerable counts as zero sessions — the same number the old
+    // census reported — but leaves the sweep skipped, see list_tmux_sessions.
+    let tmux_count = tmux_sessions.as_ref().map_or(0, Vec::len);
 
     WorkerCount {
         heartbeat_count,
         tmux_count,
         consistent: heartbeat_count == tmux_count,
-        sessions,
+        sessions: tmux_sessions.unwrap_or_default(),
     }
 }
 
-/// Count heartbeat JSON files in the heartbeat directory, filtered by session prefix.
+/// Count this pool's heartbeat JSON files in `dir`.
 ///
-/// Only counts files whose `session` field starts with `session_prefix`, so workers
-/// from other projects sharing the same heartbeat directory are excluded.
-fn count_heartbeat_files(dir: &Path, session_prefix: &str) -> usize {
-    read_heartbeats(dir, session_prefix).len()
+/// See [`read_heartbeats_with_sessions`] for what makes a heartbeat belong to
+/// the pool.
+fn count_heartbeat_files(
+    dir: &Path,
+    session_prefix: &str,
+    id_prefix: Option<&str>,
+    live_sessions: Option<&HashSet<String>>,
+) -> usize {
+    read_heartbeats_with_sessions(dir, session_prefix, id_prefix, live_sessions).len()
 }
 
-/// Count tmux sessions with the given prefix.
+/// List tmux session names starting with `prefix`.
 ///
-/// Returns (count, session_names).
-fn count_tmux_sessions(prefix: &str) -> (usize, Vec<String>) {
+/// `None` means tmux itself could not be consulted (binary missing, spawn
+/// failed): no session is known to exist or not exist, so callers must not act
+/// on liveness — in particular the orphan sweep must not delete anything, or a
+/// broken tmux would mass-delete live workers' heartbeats. An empty list
+/// means tmux answered and no session matches.
+fn list_tmux_sessions(prefix: &str) -> Option<Vec<String>> {
     let output = match Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -175,23 +213,115 @@ fn count_tmux_sessions(prefix: &str) -> (usize, Vec<String>) {
         Err(e) => {
             // tmux not running or not installed
             log::debug!("[worker] tmux list-sessions failed: {}", e);
-            return (0, Vec::new());
+            return None;
         }
     };
 
     if !output.status.success() {
         // No sessions exist (tmux returns error when no sessions)
-        return (0, Vec::new());
+        return Some(Vec::new());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let sessions: Vec<String> = stdout
-        .lines()
-        .filter(|line| line.starts_with(prefix))
-        .map(|s| s.to_string())
-        .collect();
+    Some(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
 
-    (sessions.len(), sessions)
+/// The static worker-id prefix shared by every worker this pool launches.
+///
+/// cgov renders `{id}` into `launch_cmd` (see [`scale_up`]) and NEEDLE passes
+/// the rendered value to the worker verbatim as `--identifier`
+/// (`needle run --identifier cgov-sonnet-20260921125550-0`); the worker then
+/// writes that value into its heartbeat's `session` field. The literal text
+/// before `{id}` is therefore the liveness-independent membership anchor for
+/// this pool's heartbeats — the only name space that still identifies a pool
+/// worker when its tmux session has not appeared yet or is already gone.
+///
+/// `None` when the launch command names no `--identifier` template, the
+/// template carries no `{id}` (every launch would collide on one id), or
+/// `{id}` is the entire value (no static prefix to anchor on).
+fn worker_id_prefix(launch_cmd: &str) -> Option<String> {
+    let value = shell_arg_after_flag(launch_cmd, "--identifier")?;
+    let idx = value.find("{id}")?;
+    if idx == 0 {
+        return None;
+    }
+    Some(value[..idx].to_string())
+}
+
+/// Split a shell command string into whitespace-separated tokens, treating
+/// single- and double-quoted spans as literal. Good enough for the governor's
+/// own `launch_cmd` templates; not a general shell parser (no escapes, no
+/// substitutions).
+fn shell_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in cmd.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// The argument carried by `flag` in a tokenized command — either glued
+/// (`--flag=value`) or following (`--flag value`). The last occurrence wins,
+/// matching shell semantics for repeated flags.
+fn shell_arg_after_flag(cmd: &str, flag: &str) -> Option<String> {
+    let tokens = shell_tokens(cmd);
+    let mut found = None;
+    let mut iter = tokens.iter().peekable();
+    while let Some(token) = iter.next() {
+        if let Some(glued) = token.strip_prefix(&format!("{flag}=")) {
+            found = Some(glued.to_string());
+        } else if token == flag {
+            found = iter.next().cloned();
+        }
+    }
+    found
+}
+
+/// Resolve a heartbeat `session` value (NEEDLE's worker_id) to the live tmux
+/// session carrying it.
+///
+/// NEEDLE names tmux sessions `needle-{agent}-{worker_id}` (needle
+/// `src/cli/mod.rs`) and writes the bare worker_id into the heartbeat (needle
+/// `src/health/mod.rs`), so the session name is the worker_id with a
+/// dash-delimited prefix attached. The match is therefore either exact —
+/// legacy workers whose heartbeat carries the tmux name itself — or the
+/// longest live session ending in `-{worker_id}` (longest, so an agent name
+/// that is itself dash-suffixed resolves to the most specific session).
+///
+/// `None` means no live session carries this worker: a dead worker whose
+/// heartbeat is on its way to the orphan sweep, or a session that has not
+/// appeared yet.
+fn resolve_worker_session(worker_id: &str, live_sessions: &HashSet<String>) -> Option<String> {
+    if live_sessions.contains(worker_id) {
+        return Some(worker_id.to_string());
+    }
+    let suffix = format!("-{worker_id}");
+    live_sessions
+        .iter()
+        .filter(|session| session.ends_with(&suffix))
+        .max_by_key(|session| session.len())
+        .cloned()
 }
 
 /// Scale up by launching n new workers.
@@ -454,21 +584,28 @@ pub fn scale_down_graceful(n: u32, config: &WorkerConfig, dry_run: bool) -> Scal
 
 /// Find workers to stop, preferring idle workers.
 ///
-/// Returns up to `n` session names, sorted by idle status and heartbeat age.
+/// Returns up to `n` tmux session names, sorted by idle status and heartbeat
+/// age.
 ///
 /// Only workers whose tmux session is currently live are eligible: a heartbeat
 /// without a matching tmux session belongs to a worker that is already gone, and
 /// signalling it would send SIGINT/kill to a nonexistent session.
 fn find_workers_to_stop(n: usize, config: &WorkerConfig) -> Vec<String> {
-    // One tmux snapshot for both the orphan sweep and the liveness filter, so
-    // selection can never disagree with what cleanup just saw.
-    let (_, tmux_sessions) = count_tmux_sessions(&config.session_prefix);
+    // One tmux snapshot for the orphan sweep, the liveness filter, and the
+    // returned names, so selection can never disagree with what cleanup just
+    // saw. No snapshot at all when tmux cannot be consulted — signalling a
+    // session we failed to enumerate is how the wrong worker gets interrupted.
+    let Some(tmux_sessions) = list_tmux_sessions(&config.session_prefix) else {
+        log::warn!("[worker] tmux unavailable; skipping scale-down selection");
+        return Vec::new();
+    };
     let live_sessions: HashSet<String> = tmux_sessions.into_iter().collect();
 
     let heartbeats = read_heartbeats_with_sessions(
         &config.heartbeat_dir,
         &config.session_prefix,
-        &live_sessions,
+        worker_id_prefix(&config.launch_cmd).as_deref(),
+        Some(&live_sessions),
     );
 
     select_workers_to_stop(n, heartbeats, &live_sessions)
@@ -527,31 +664,39 @@ pub fn select_workers_to_stop(
         .collect()
 }
 
-/// Read heartbeat files from the directory, filtered to sessions with the given prefix.
+/// Read this pool's heartbeat files from `dir`.
 ///
-/// Only heartbeats whose `session` field starts with `session_prefix` are returned,
-/// so workers from other projects sharing the same heartbeat directory are excluded.
+/// A heartbeat belongs to the pool when any of these holds:
+///
+/// - its `session` starts with the launch command's worker-id prefix (NEEDLE
+///   workers: `session` is the rendered `--identifier` value), or
+/// - its `session` starts with the tmux `session_prefix` (legacy workers that
+///   wrote the tmux name itself), or
+/// - its `session` resolves against a live pool tmux session (either shape).
+///
+/// Heartbeats from other pools sharing the directory match none of these and
+/// are skipped — and never swept, even when stale.
 ///
 /// Stale heartbeat handling:
 /// - Heartbeats older than STALE_HEARTBEAT_THRESHOLD are considered stale
-/// - For stale heartbeats, we verify against tmux list-sessions
-/// - If the tmux session no longer exists, the heartbeat file is removed
-/// - If the tmux session exists, the heartbeat is retained but treated as executing
-///   (never selected for shutdown based on an outdated idle status)
-fn read_heartbeats(dir: &Path, session_prefix: &str) -> HashMap<String, Heartbeat> {
-    let (_, tmux_sessions) = count_tmux_sessions(session_prefix);
-    let tmux_sessions_set: HashSet<String> = tmux_sessions.into_iter().collect();
-    read_heartbeats_with_sessions(dir, session_prefix, &tmux_sessions_set)
-}
-
-/// [`read_heartbeats`] against an already-taken snapshot of live tmux sessions.
+/// - A stale heartbeat whose worker still has a live tmux session is retained
+///   but treated as executing (never selected for shutdown based on an
+///   outdated idle status)
+/// - A stale heartbeat with no live session is an orphan: the file is removed
+///   and the entry excluded. The sweep runs only when tmux answered
+///   (`live_sessions` is `Some`); with tmux unavailable nothing is deleted,
+///   because "no live session" is then unknowable rather than false — the
+///   stale entry is kept and treated as executing instead.
 ///
-/// Callers that also need the session list (to filter shutdown candidates, say)
-/// query tmux once and pass the result here.
+/// The returned map is keyed by the tmux session name wherever the worker is
+/// live — that is the name `tmux send-keys` / `has-session` must target — and
+/// by the raw `session` value otherwise. Such entries can never be shutdown
+/// candidates: [`select_workers_to_stop`] drops them against the live set.
 fn read_heartbeats_with_sessions(
     dir: &Path,
     session_prefix: &str,
-    tmux_sessions_set: &HashSet<String>,
+    id_prefix: Option<&str>,
+    live_sessions: Option<&HashSet<String>>,
 ) -> HashMap<String, Heartbeat> {
     let mut heartbeats = HashMap::new();
     let now = Utc::now();
@@ -582,19 +727,38 @@ fn read_heartbeats_with_sessions(
         match fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str::<Heartbeat>(&content) {
                 Ok(mut hb) => {
-                    if !hb.session.starts_with(session_prefix) {
+                    let resolved = live_sessions
+                        .as_ref()
+                        .and_then(|live| resolve_worker_session(&hb.session, live));
+                    let member = id_prefix.is_some_and(|p| hb.session.starts_with(p))
+                        || hb.session.starts_with(session_prefix)
+                        || resolved.is_some();
+                    if !member {
                         continue;
                     }
 
                     let age = now.signed_duration_since(hb.timestamp);
-                    let is_stale = age > stale_threshold;
+                    if age <= stale_threshold {
+                        // Fresh — no tmux verification needed.
+                        heartbeats.insert(resolved.unwrap_or_else(|| hb.session.clone()), hb);
+                        continue;
+                    }
 
-                    if is_stale {
-                        // Stale heartbeat — verify against tmux
-                        let session_exists = tmux_sessions_set.contains(&hb.session);
-
-                        if !session_exists {
-                            // Session no longer exists, remove orphaned heartbeat file
+                    match (resolved, live_sessions.is_some()) {
+                        (Some(session), _) => {
+                            // Stale but the worker is live — treat as executing to
+                            // prevent shutdown based on outdated idle status.
+                            log::debug!(
+                                "[worker] stale heartbeat for session {} but session exists (age={}s), treating as executing",
+                                session,
+                                age.num_seconds()
+                            );
+                            hb.is_idle = false;
+                            heartbeats.insert(session, hb);
+                        }
+                        (None, true) => {
+                            // Orphan: tmux answered and no live session carries this
+                            // worker — remove the file it left behind.
                             match fs::remove_file(&path) {
                                 Ok(()) => log::info!(
                                     "[worker] removed orphaned heartbeat for session {} at {} (session not in tmux, age={}s)",
@@ -610,20 +774,20 @@ fn read_heartbeats_with_sessions(
                                 ),
                             }
                             // Excluded from the returned map either way — the session is gone.
-                            continue;
                         }
-
-                        // Session exists but heartbeat is stale — treat as executing to prevent
-                        // shutdown based on outdated idle status
-                        log::debug!(
-                            "[worker] stale heartbeat for session {} but session exists (age={}s), treating as executing",
-                            hb.session,
-                            age.num_seconds()
-                        );
-                        hb.is_idle = false;
+                        (None, false) => {
+                            // tmux unavailable — liveness is unknowable, so keep the
+                            // heartbeat rather than delete a possibly-live worker's
+                            // file, and assume it is busy.
+                            log::debug!(
+                                "[worker] stale heartbeat for session {} (age={}s) kept: tmux unavailable, liveness unknown",
+                                hb.session,
+                                age.num_seconds()
+                            );
+                            hb.is_idle = false;
+                            heartbeats.insert(hb.session.clone(), hb);
+                        }
                     }
-
-                    heartbeats.insert(hb.session.clone(), hb);
                 }
                 Err(e) => {
                     log::debug!("[worker] invalid heartbeat {}: {}", path.display(), e);
@@ -779,7 +943,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = test_config(&temp);
 
-        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+        // No tmux snapshot and no --identifier template: membership is decided
+        // by session_prefix alone, which is all these tests exercise.
+        let count =
+            count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix, None, None);
         assert_eq!(count, 0);
     }
 
@@ -810,7 +977,8 @@ mod tests {
             format!(r#"{{"session":"other-project-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
         ).unwrap();
 
-        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+        let count =
+            count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix, None, None);
         assert_eq!(count, 2);
     }
 
@@ -829,7 +997,12 @@ mod tests {
             format!(r#"{{"session":"test-worker-1","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
         ).unwrap();
 
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            None,
+        );
 
         assert_eq!(heartbeats.len(), 1);
         let hb = heartbeats.get("test-worker-1").unwrap();
@@ -860,16 +1033,14 @@ mod tests {
             format!(r#"{{"session":"test-worker-idle","timestamp":"{}","is_idle":true,"current_task":null,"model":"sonnet"}}"#, fresh_timestamp),
         ).unwrap();
 
+        let live_sessions = live(&["test-worker-busy", "test-worker-idle"]);
         let heartbeats = read_heartbeats_with_sessions(
             &config.heartbeat_dir,
             &config.session_prefix,
-            &live(&["test-worker-busy", "test-worker-idle"]),
+            None,
+            Some(&live_sessions),
         );
-        let to_stop = select_workers_to_stop(
-            1,
-            heartbeats,
-            &live(&["test-worker-busy", "test-worker-idle"]),
-        );
+        let to_stop = select_workers_to_stop(1, heartbeats, &live_sessions);
 
         // Should prefer idle worker
         assert_eq!(to_stop, vec!["test-worker-idle"]);
@@ -900,7 +1071,8 @@ mod tests {
         let heartbeats = read_heartbeats_with_sessions(
             &config.heartbeat_dir,
             &config.session_prefix,
-            &all_sessions,
+            None,
+            Some(&all_sessions),
         );
         let to_stop = select_workers_to_stop(2, heartbeats, &all_sessions);
 
@@ -1038,8 +1210,15 @@ mod tests {
         )
         .unwrap();
 
-        // Read heartbeats - stale heartbeat should be removed since session doesn't exist in tmux
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        // Read heartbeats - stale heartbeat should be removed since session doesn't
+        // exist in tmux. The empty live set is "tmux answered, nothing is live" —
+        // exactly what list_tmux_sessions reports after the worker's session died.
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+        );
 
         // Heartbeat should be excluded (file was removed)
         assert_eq!(heartbeats.len(), 0);
@@ -1048,7 +1227,12 @@ mod tests {
         assert!(!config.heartbeat_dir.join("test-worker-stale.json").exists());
 
         // Count should reflect the removal
-        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+        let count = count_heartbeat_files(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+        );
         assert_eq!(count, 0);
     }
 
@@ -1075,17 +1259,21 @@ mod tests {
         )
         .unwrap();
 
-        // Mock tmux sessions - we need to test with the actual tmux count
-        // Since we can't easily mock tmux in this test, we'll create a test that
-        // verifies the logic by checking the heartbeat's is_idle state
+        // The worker's session is still live: the stale heartbeat must be retained
+        // (never swept) and reported as executing, so an outdated idle flag cannot
+        // make it the preferred shutdown candidate.
+        let live_sessions = live(&["test-worker-stale"]);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live_sessions),
+        );
 
-        // For this test, we'll just verify that stale heartbeats are handled
-        // by checking that the function doesn't crash and returns a consistent result
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
-
-        // Since the session doesn't exist in tmux, it should be removed
-        // (This is the same behavior as the dead session test)
-        assert_eq!(heartbeats.len(), 0);
+        assert_eq!(heartbeats.len(), 1);
+        let hb = heartbeats.get("test-worker-stale").unwrap();
+        assert!(!hb.is_idle, "stale heartbeat must be treated as executing");
+        assert!(config.heartbeat_dir.join("test-worker-stale.json").exists());
     }
 
     #[test]
@@ -1112,7 +1300,12 @@ mod tests {
         .unwrap();
 
         // Read heartbeats - fresh heartbeat should be returned as-is
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            None,
+        );
 
         assert_eq!(heartbeats.len(), 1);
 
@@ -1124,7 +1317,8 @@ mod tests {
         assert!(config.heartbeat_dir.join("test-worker-fresh.json").exists());
 
         // Count should reflect the heartbeat
-        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+        let count =
+            count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix, None, None);
         assert_eq!(count, 1);
     }
 
@@ -1168,7 +1362,12 @@ mod tests {
         .unwrap();
 
         // Read heartbeats - only fresh should remain
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+        );
 
         assert_eq!(heartbeats.len(), 1);
         assert!(heartbeats.contains_key("test-worker-fresh"));
@@ -1179,7 +1378,12 @@ mod tests {
         assert!(!config.heartbeat_dir.join("test-worker-stale.json").exists());
 
         // Count should be 1 (only fresh heartbeat)
-        let count = count_heartbeat_files(&config.heartbeat_dir, &config.session_prefix);
+        let count = count_heartbeat_files(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+        );
         assert_eq!(count, 1);
     }
 
@@ -1267,7 +1471,8 @@ mod tests {
         let heartbeats = read_heartbeats_with_sessions(
             &config.heartbeat_dir,
             &config.session_prefix,
-            &live_sessions,
+            None,
+            Some(&live_sessions),
         );
         let to_stop = select_workers_to_stop(10, heartbeats, &live_sessions);
 
@@ -1338,7 +1543,8 @@ mod tests {
         let heartbeats = read_heartbeats_with_sessions(
             &config.heartbeat_dir,
             &config.session_prefix,
-            &live_sessions,
+            None,
+            Some(&live_sessions),
         );
 
         // Both heartbeats survive the sweep (both are fresh), but only one is eligible.
@@ -1394,8 +1600,14 @@ mod tests {
         )
         .unwrap();
 
-        // Read heartbeats - threshold heartbeat should be removed (session doesn't exist in tmux)
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        // Read heartbeats - threshold heartbeat should be removed (session doesn't
+        // exist in tmux; the empty live set is "tmux answered, nothing is live")
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+        );
 
         // At exactly 60 seconds, it's stale and should be removed
         assert_eq!(heartbeats.len(), 0);
@@ -1425,10 +1637,244 @@ mod tests {
         .unwrap();
 
         // Read heartbeats - fresh heartbeat should be retained
-        let heartbeats = read_heartbeats(&config.heartbeat_dir, &config.session_prefix);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            None,
+        );
 
         assert_eq!(heartbeats.len(), 1);
         assert!(heartbeats.contains_key("test-worker-fresh"));
         assert!(config.heartbeat_dir.join("test-worker-fresh.json").exists());
+    }
+
+    /// Write a heartbeat in NEEDLE's own format (needle `src/health/mod.rs`):
+    /// the timestamp travels in `last_heartbeat`, `session` carries the bare
+    /// worker_id (the rendered `--identifier` value), the file is named by the
+    /// qualified id, and the extra NEEDLE fields ride along. Returns its path.
+    fn write_needle_heartbeat(
+        config: &WorkerConfig,
+        worker_id: &str,
+        qualified_id: &str,
+        age_secs: i64,
+        is_idle: bool,
+    ) -> PathBuf {
+        fs::create_dir_all(&config.heartbeat_dir).unwrap();
+        let heartbeat = serde_json::json!({
+            "worker_id": worker_id,
+            "qualified_id": qualified_id,
+            "pid": 424242,
+            "state": if is_idle { "IDLE" } else { "EXECUTING" },
+            "current_bead": null,
+            "workspace": "/home/coding/bead-rs",
+            "last_heartbeat": (Utc::now() - ChronoDuration::seconds(age_secs)).to_rfc3339(),
+            "started_at": (Utc::now() - ChronoDuration::seconds(age_secs + 600)).to_rfc3339(),
+            "beads_processed": 0,
+            "beads_completed": 0,
+            "session": worker_id,
+            "is_idle": is_idle,
+            "current_task": null,
+            "model": "claude-print",
+        });
+        let path = config.heartbeat_dir.join(format!("{qualified_id}.json"));
+        fs::write(&path, serde_json::to_string_pretty(&heartbeat).unwrap()).unwrap();
+        path
+    }
+
+    /// The needle-sonnet pool exactly as governor.yaml configures it: the launch
+    /// command names `--identifier cgov-sonnet-{id}` and the tmux pattern is
+    /// `needle-claude-print-cgov-sonnet-*` (from which session_prefix strips the
+    /// trailing dash).
+    fn needle_sonnet_pool(dir: &TempDir) -> WorkerConfig {
+        WorkerConfig {
+            launch_cmd: "needle run --agent claude-print --workspace /home/coding/bead-rs \
+                         --identifier cgov-sonnet-{id}"
+                .to_string(),
+            heartbeat_dir: dir.path().join("heartbeats"),
+            graceful_timeout_secs: 2,
+            session_prefix: "needle-claude-print-cgov-sonnet".to_string(),
+        }
+    }
+
+    /// Acceptance (claudego-ec3aff17): a heartbeat file named by the qualified
+    /// worker id, whose `session` is the bare worker id and whose timestamp rides
+    /// in `last_heartbeat`, is matched by the pool config — counted once and keyed
+    /// by the live tmux session so scale-down can actually signal it. This is the
+    /// exact shape NEEDLE writes; before the fix every such file failed to parse
+    /// (no `timestamp`) and every cycle logged `0 heartbeats, consistent=false`.
+    #[test]
+    fn needle_heartbeat_matches_pool_by_worker_id_prefix() {
+        let temp = TempDir::new().unwrap();
+        let config = needle_sonnet_pool(&temp);
+
+        let worker_id = "cgov-sonnet-20260921125550-0";
+        let qualified_id = format!("claude-print-{worker_id}");
+        let tmux_session = format!("needle-claude-print-{worker_id}");
+        write_needle_heartbeat(&config, worker_id, &qualified_id, 19, false);
+
+        // The fixture must reproduce the real mismatch: the worker id lives in a
+        // different name space than the tmux prefix, so prefix-matching the
+        // tmux name alone can never find it.
+        assert!(!worker_id.starts_with(&config.session_prefix));
+
+        let live_sessions = live(&[&tmux_session]);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            worker_id_prefix(&config.launch_cmd).as_deref(),
+            Some(&live_sessions),
+        );
+
+        assert_eq!(heartbeats.len(), 1, "the NEEDLE heartbeat must be matched");
+        let hb = heartbeats.get(&tmux_session).unwrap();
+        assert!(!hb.is_idle);
+        assert_eq!(hb.model, "claude-print");
+        assert!(
+            (Utc::now() - hb.timestamp).num_seconds() < STALE_HEARTBEAT_THRESHOLD,
+            "last_heartbeat must have been parsed as the timestamp"
+        );
+
+        // The same heartbeat is what the cycle counts.
+        let count = count_heartbeat_files(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            worker_id_prefix(&config.launch_cmd).as_deref(),
+            Some(&live_sessions),
+        );
+        assert_eq!(count, 1);
+    }
+
+    /// End-to-end on the real cycle path: one cgov-launched NEEDLE worker
+    /// executing (live tmux session + fresh NEEDLE-format heartbeat) counts as
+    /// 1 heartbeats / 1 tmux sessions, consistent=true — the observed-live
+    /// failure was exactly this shape logging 0/1/false.
+    #[test]
+    fn count_workers_consistent_with_one_needle_worker() {
+        let temp = TempDir::new().unwrap();
+        let config = needle_sonnet_pool(&temp);
+
+        let suffix = "20260921125550-0";
+        let worker_id = format!("cgov-sonnet-{suffix}");
+        let qualified_id = format!("claude-print-{worker_id}");
+        let tmux_session = format!("needle-claude-print-{worker_id}");
+        let Some(_tmux) = TmuxSession::new(&tmux_session) else {
+            eprintln!("skipping count_workers_consistent_with_one_needle_worker: tmux unavailable");
+            return;
+        };
+        write_needle_heartbeat(&config, &worker_id, &qualified_id, 19, false);
+
+        let count = count_workers(&config);
+
+        assert_eq!(count.tmux_count, 1);
+        assert_eq!(count.heartbeat_count, 1);
+        assert!(
+            count.consistent,
+            "live NEEDLE worker must count consistently"
+        );
+        assert_eq!(count.sessions, vec![tmux_session]);
+    }
+
+    /// A sibling pool's heartbeat sharing the directory must stay excluded.
+    /// Production passes only this pool's tmux sessions (list_tmux_sessions
+    /// filters by session_prefix), so the opus worker matches neither the
+    /// identifier prefix, the tmux prefix, nor a live session.
+    #[test]
+    fn foreign_pool_heartbeat_not_matched() {
+        let temp = TempDir::new().unwrap();
+        let config = needle_sonnet_pool(&temp);
+
+        write_needle_heartbeat(
+            &config,
+            "cgov-opus-20260921130000-0",
+            "claude-print-cgov-opus-20260921130000-0",
+            5,
+            false,
+        );
+
+        let live_sessions = live(&["needle-claude-print-cgov-sonnet-20260921125550-0"]);
+        let heartbeats = read_heartbeats_with_sessions(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            worker_id_prefix(&config.launch_cmd).as_deref(),
+            Some(&live_sessions),
+        );
+
+        assert!(
+            heartbeats.is_empty(),
+            "the opus pool's heartbeat must not count for the sonnet pool"
+        );
+    }
+
+    #[test]
+    fn worker_id_prefix_comes_from_the_identifier_template() {
+        // The real governor.yaml shape.
+        assert_eq!(
+            worker_id_prefix(
+                "needle run --agent claude-print --workspace /home/coding/bead-rs \
+                 --identifier cgov-sonnet-{id}",
+            )
+            .as_deref(),
+            Some("cgov-sonnet-"),
+        );
+
+        // Glued form; quoting survives tokenization.
+        assert_eq!(
+            worker_id_prefix("tmux new -s {id} -- run --identifier='pre-{id}'").as_deref(),
+            Some("pre-"),
+        );
+    }
+
+    #[test]
+    fn worker_id_prefix_is_none_without_a_usable_template() {
+        // No --identifier flag at all.
+        assert_eq!(
+            worker_id_prefix("tmux new-session -d -s worker-{id} -- claude"),
+            None,
+        );
+        // Flag present but no {id}: every launch would collide on one id.
+        assert_eq!(worker_id_prefix("needle run --identifier static"), None);
+        // {id} is the entire value: nothing static to anchor on.
+        assert_eq!(worker_id_prefix("needle run --identifier {id}"), None);
+    }
+
+    #[test]
+    fn resolve_worker_session_maps_worker_id_to_its_tmux_session() {
+        let sessions = live(&[
+            "needle-claude-print-cgov-sonnet-20260921125550-0",
+            "needle-claude-print-cgov-sonnet-20260921125550-1",
+        ]);
+
+        // NEEDLE workers: the bare worker_id resolves to the tmux session carrying it.
+        assert_eq!(
+            resolve_worker_session("cgov-sonnet-20260921125550-0", &sessions).as_deref(),
+            Some("needle-claude-print-cgov-sonnet-20260921125550-0"),
+        );
+        // Legacy workers: the heartbeat already carries the tmux name — exact match.
+        assert_eq!(
+            resolve_worker_session(
+                "needle-claude-print-cgov-sonnet-20260921125550-1",
+                &sessions
+            )
+            .as_deref(),
+            Some("needle-claude-print-cgov-sonnet-20260921125550-1"),
+        );
+        // Unknown worker: nothing resolves, so the entry can never be swept or signalled.
+        assert_eq!(
+            resolve_worker_session("cgov-sonnet-999999999999-9", &sessions),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_worker_session_prefers_the_longest_match() {
+        // An agent name that is itself dash-suffixed could shadow a longer
+        // session name ending in the same worker id; longest wins so the most
+        // specific session is chosen.
+        let sessions = live(&["needle-agent-1", "needle-claude-print-agent-1"]);
+        assert_eq!(
+            resolve_worker_session("agent-1", &sessions).as_deref(),
+            Some("needle-claude-print-agent-1"),
+        );
     }
 }
