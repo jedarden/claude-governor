@@ -250,3 +250,51 @@ for key, label in labels.items():
 | `console.anthropic.com` web scraping | Very Low | varies | Cloudflare-protected; requires browser session |
 
 **The `/api/oauth/usage` endpoint is the only direct programmatic source** for subscription-level usage percentages.
+
+---
+
+## 10. cgov Poller Contract — Retries, Rate Limits, and Safe Fallback
+
+How cgov's poller (`src/poller.rs`) consumes the endpoint. This is the
+client-side behavior pinned by `tests/usage_polling_contract.rs`.
+
+### Authentication flow (per poll)
+
+1. Read the credentials file (§5). A missing file raises `CredentialsNotFound`;
+   unparseable JSON raises `InvalidCredentials`; a file carrying an empty
+   `accessToken`, an empty `refreshToken`, or a zero `expiresAt` is rejected as
+   corrupted **before any network call**.
+2. If `now + 300s >= expiresAt` (the 5-minute refresh threshold), POST the
+   refresh endpoint (§5) and persist the rotated credentials; the usage call
+   then carries the new bearer.
+3. `GET /api/oauth/usage` with the §2 headers.
+
+### Retries
+
+| Request | Retry policy |
+|---|---|
+| `GET /api/oauth/usage` | **Never retried client-side.** The endpoint self-rate-limits (§2), so hammering it from a retry loop only extends the lockout. Any non-200 (`ApiError`), transport failure (`ApiRequestFailed`), or unparseable body (`ParseError`) surfaces to the caller after exactly one request. |
+| `POST /v1/oauth/token` (refresh) | **Exactly one retry**, 5s after the first attempt fails. Both attempts failing increments a process-global consecutive-failure counter. |
+
+The failure counter resets to zero on any successful refresh. When it reaches
+3 consecutive failed refresh cycles (`MAX_REFRESH_FAILURES`), `attempt_refresh`
+stops retrying and returns `MaxRefreshFailures`, and
+`Poller::should_alert()` turns true — the observe path then prints
+`WARNING: OAuth token refresh failing - run: claude login` (the HUMAN
+escalation surface).
+
+### Safe fallback
+
+- **Auth-path failures degrade to stale data.** If refreshing or reading the
+  credentials fails and the poller already holds a successful reading, it
+  returns that reading with `stale: true` and its **original** reading
+  timestamp preserved — consumers can see its age, and the governor cycle
+  keeps running on old data instead of failing.
+- **No cached reading → the error propagates.** A poll that fails before any
+  successful reading exists (cold start during an outage) fails; there is
+  nothing safe to fall back to.
+- **Usage-endpoint failures do not fall back.** A failure from
+  `GET /api/oauth/usage` itself — 429 rate limit, 401, malformed body,
+  transport error — propagates to the caller **even when a cached reading
+  exists**. Only the auth path degrades to stale data; a stale reading is
+  never manufactured to paper over a fetch failure.

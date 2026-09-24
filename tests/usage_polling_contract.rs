@@ -42,6 +42,17 @@
 //!   precise boundary — absent and null fields are tolerated, a wrong-typed
 //!   present value is fatal.
 //!
+//! Contract-completion coverage (claudego-48fd3fa5), closing the two gaps the
+//! baseline left in the now-documented contract (usage-tracking.md §10):
+//!
+//! - A **partially populated** response — some windows present, others absent
+//!   outright — parses the present windows and defaults the absent ones: the
+//!   middle case between the fully documented shape and the empty object.
+//! - The **safe-fallback boundary**: a failure from the usage endpoint itself
+//!   (here the documented 429 self-rate-limit response) propagates to the
+//!   caller even when a cached reading exists — only the auth path degrades
+//!   to stale data.
+//!
 //! A local mockito server stands in for the two endpoints;
 //! [`Poller::with_endpoints`] / [`Poller::with_refresh_retry_delay`] point the
 //! poller at it. All tests serialize on one lock because the refresh-failure
@@ -1402,4 +1413,107 @@ fn wrong_typed_limits_percent_fails_the_poll() {
         ),
         "expected ParseError, got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Partial responses (claudego-48fd3fa5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partially_populated_response_parses_present_and_defaults_absent_windows() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // five_hour present; seven_day absent outright (a missing key, not a null
+    // one — both must behave the same); no limits[]. The middle case between
+    // the fully documented shape and the empty object: present windows parse
+    // through, absent ones default to non-binding, and neither contaminates
+    // the other.
+    let resets_at = (Utc::now() + chrono::Duration::seconds(7200))
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(format!(
+            r#"{{"five_hour": {{"utilization": 33.0, "resets_at": "{resets_at}"}}}}"#
+        ))
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller
+        .poll()
+        .expect("a partially populated response must parse");
+
+    usage.assert();
+    assert!(!data.stale);
+    assert_eq!(data.five_hour_utilization, 33.0);
+    assert!(
+        (1.9..=2.1).contains(&data.five_hour_hours_remaining),
+        "expected ~2h remaining, got {}",
+        data.five_hour_hours_remaining
+    );
+
+    assert_eq!(data.seven_day_utilization, 0.0);
+    assert_eq!(data.seven_day_resets_at, "");
+    assert_eq!(data.seven_day_hours_remaining, 168.0);
+    assert_eq!(data.weekly_scoped_utilization, 0.0);
+    assert_eq!(data.weekly_scoped_hours_remaining, 168.0);
+    assert!(data.weekly_scoped_model.is_none());
+    assert!(data.limits.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Safe-fallback boundary (claudego-48fd3fa5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn usage_endpoint_failure_does_not_fall_back_to_stale_data() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+    let usage_ok = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    // Poll #1: a good reading to seed the cache.
+    let mut poller = contract_poller(&creds, &server.url());
+    let fresh = poller.poll().expect("first poll must succeed");
+    usage_ok.assert();
+    assert!(!fresh.stale);
+
+    // Poll #2: the usage endpoint answers with the documented self-rate-limit
+    // response (usage-tracking.md §2/§10). A cached reading exists, but the
+    // stale fallback is auth-path only: a fetch failure must propagate rather
+    // than be papered over with stale data, and the endpoint is never retried
+    // client-side — exactly one request.
+    let usage_limited = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(429)
+        .with_body(
+            r#"{"error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}"#,
+        )
+        .expect(1)
+        .create();
+
+    let err = poller
+        .poll()
+        .expect_err("a usage-endpoint failure must propagate even with cached data");
+    let msg = err.to_string();
+    assert!(msg.contains("429"), "error must surface the status: {msg}");
+    usage_limited.assert();
 }
