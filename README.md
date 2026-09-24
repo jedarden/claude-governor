@@ -31,6 +31,20 @@ before anything is installed**; a given `vX.Y.Z` asset and its digest are
 immutable once published, so mirror lag can never swap contents under a pinned
 version. Nothing is written to the install dir until verification passes.
 
+**Zero-dependency validation.** The statically-linked claim above is enforced,
+not assumed. `make verify-release` builds the musl release binary and runs
+`scripts/verify-release-static.sh`, which fails the build unless the artifact
+is an ELF executable with no `PT_INTERP` segment (no dynamic loader) and no
+shared-library `NEEDED` entries, and — on the build host's architecture — runs
+`--version` and `--help` successfully under `env -i` from an empty working
+directory with `PATH` pointed at an empty directory (no environment, no
+libraries to resolve, no project files to read). Foreign-architecture
+artifacts (e.g. `cgov-linux-arm64` built on amd64) get the full linkage checks
+with the execution probe skipped. `cgov-ci` runs the same script over each
+built artifact before publishing, and a cargo integration test
+(`tests/release_static_validation_test.rs`) re-validates any artifact already
+on disk during `cargo test`.
+
 ### Option 1: Pre-built binary (recommended)
 
 ```bash
