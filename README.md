@@ -59,7 +59,12 @@ the mirror may lag `main`, but the *binary* digest check below guards the
 artifact either way.)
 
 The installer downloads the binary plus its published `.sha256` sidecar and
-refuses to install on any mismatch.
+refuses to install on any mismatch. The contract is enforced by tests, not
+assumed: `tests/install_sh_release_verification.rs` embeds the committed
+`install.sh` (`include_str!`, so it cannot drift) and runs it against a local
+release server, asserting the tampered-sidecar refusal, the pre-write abort on
+a wrong `CGOV_SHA256`, bare-version normalization to `vX.Y.Z`, and the
+mode-0755 install.
 
 ### Option 1a: Pinned version
 
