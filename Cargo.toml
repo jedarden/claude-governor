@@ -55,6 +55,13 @@ ctrlc = { version = "3", features = ["termination"] }
 tempfile = "3"
 mockito = "1"
 
+[profile.dev]
+# Line tables only: panics and backtraces keep file:line frames, but
+# variable/type-level DWARF is dropped (~78% of dev/test binary bytes;
+# claudego-faef32af). Lanes that need full DWARF can set
+# CARGO_PROFILE_DEV_DEBUG=2 for a single invocation.
+debug = "line-tables-only"
+
 [profile.release]
 # Optimize for size and speed
 opt-level = "z"
