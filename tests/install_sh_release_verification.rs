@@ -198,6 +198,58 @@ fn fresh_install_dir(sandbox: &TempDir) -> PathBuf {
     sandbox.path().join("bin")
 }
 
+/// Seed an installation directory before a refusal-path test. A failed
+/// verification must preserve an existing installation just as carefully as
+/// it avoids creating a new one.
+fn existing_install_dir(sandbox: &TempDir) -> PathBuf {
+    let install_dir = fresh_install_dir(sandbox);
+    fs::create_dir_all(&install_dir).expect("create existing install dir");
+    fs::write(install_dir.join("cgov"), b"existing cgov\n").expect("seed existing binary");
+    fs::write(install_dir.join("keep.txt"), b"leave me alone\n").expect("seed marker");
+    fs::set_permissions(install_dir.join("cgov"), fs::Permissions::from_mode(0o700))
+        .expect("set existing binary mode");
+    install_dir
+}
+
+fn assert_install_dir_unchanged(install_dir: &Path) {
+    assert!(
+        install_dir.is_dir(),
+        "failed install must preserve the install dir"
+    );
+    let mut entries = fs::read_dir(install_dir)
+        .expect("read preserved install dir")
+        .map(|entry| entry.expect("read preserved entry").file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            std::ffi::OsString::from("cgov"),
+            std::ffi::OsString::from("keep.txt"),
+        ],
+        "failed install must not add or remove files"
+    );
+    assert_eq!(
+        fs::read(install_dir.join("cgov")).expect("read preserved binary"),
+        b"existing cgov\n",
+        "failed install must not overwrite the existing binary"
+    );
+    assert_eq!(
+        fs::metadata(install_dir.join("cgov"))
+            .expect("stat preserved binary")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "failed install must not change the existing binary mode"
+    );
+    assert_eq!(
+        fs::read(install_dir.join("keep.txt")).expect("read preserved marker"),
+        b"leave me alone\n",
+        "failed install must preserve unrelated files"
+    );
+}
+
 /// Sandbox HOME — created so the child bash never resolves dotfiles against
 /// the worker's real home.
 fn sandbox_home(sandbox: &TempDir) -> PathBuf {
@@ -288,17 +340,14 @@ fn tampered_sidecar_refuses_and_writes_nothing() {
     );
 
     let script = materialize_installer(sandbox.path(), &server.url());
-    let install_dir = fresh_install_dir(&sandbox);
+    let install_dir = existing_install_dir(&sandbox);
     let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
     assert!(!ok, "a tampered sidecar must fail the install:\n{out}");
     assert!(
         out.contains("Checksum verification FAILED"),
         "refusal must name the checksum failure:\n{out}"
     );
-    assert!(
-        !install_dir.exists(),
-        "refused install must not create the install dir"
-    );
+    assert_install_dir_unchanged(&install_dir);
     artifact_mock.assert();
     assert_hit_once(sidecar_mock);
 }
@@ -328,7 +377,7 @@ fn wrong_pinned_digest_aborts_before_any_write() {
     // Well-formed 64-hex, deliberately not the artifact's digest.
     let wrong_digest = format!("{}1", "0".repeat(63));
     let script = materialize_installer(sandbox.path(), &server.url());
-    let install_dir = fresh_install_dir(&sandbox);
+    let install_dir = existing_install_dir(&sandbox);
     let (ok, out) = run_installer(
         &script,
         &sandbox_home(&sandbox),
@@ -340,10 +389,7 @@ fn wrong_pinned_digest_aborts_before_any_write() {
         out.contains("Checksum MISMATCH"),
         "abort must name the digest mismatch:\n{out}"
     );
-    assert!(
-        !install_dir.exists(),
-        "abort must happen before anything is written"
-    );
+    assert_install_dir_unchanged(&install_dir);
     artifact_mock.assert();
     unused_sidecar.assert();
 }
@@ -404,7 +450,7 @@ fn malformed_digest_pin_is_rejected_before_any_download() {
         .create();
 
     let script = materialize_installer(sandbox.path(), &server.url());
-    let install_dir = fresh_install_dir(&sandbox);
+    let install_dir = existing_install_dir(&sandbox);
     let (ok, out) = run_installer(
         &script,
         &sandbox_home(&sandbox),
@@ -416,10 +462,71 @@ fn malformed_digest_pin_is_rejected_before_any_download() {
         out.contains("64-character hex sha256 digest"),
         "rejection must explain the digest shape:\n{out}"
     );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+}
+
+#[test]
+fn missing_sidecar_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+
+    let mut server = mockito::Server::new();
+    let artifact_mock = server
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}").as_str(),
+        )
+        .with_status(200)
+        .with_body(bytes)
+        .create();
+    let sidecar_mock = server
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}.sha256").as_str(),
+        )
+        .with_status(404)
+        .expect(1)
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a missing sidecar must fail the install:\n{out}");
     assert!(
-        !install_dir.exists(),
-        "rejection must happen before anything is written"
+        out.contains("Digest sidecar download failed"),
+        "refusal must identify the missing sidecar:\n{out}"
     );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    sidecar_mock.assert();
+}
+
+#[test]
+fn failed_artifact_download_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+
+    let mut server = mockito::Server::new();
+    let artifact_mock = server
+        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .with_status(404)
+        .expect(1)
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(
+        !ok,
+        "a failed artifact download must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Download failed"),
+        "refusal must identify the failed artifact download:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
     artifact_mock.assert();
 }
 
