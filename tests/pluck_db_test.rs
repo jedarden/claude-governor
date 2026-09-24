@@ -13,6 +13,22 @@
 // contains a ready bead for every excluded label, so the adapter's
 // exclusion contract is pinned under exactly the condition that used to
 // break the suite, deterministically.
+//
+// Hermeticity is structural, not flag-based. The `bead` CLI discovers its
+// store by walking up from the cwd to the FIRST `.beads` directory, and a
+// valid bead-rs store above the tempdir stops that walk: `bead init` then
+// exits 0 having done nothing ("Workspace already exists at: <ancestor>")
+// and every later command mints into the foreign store — `bead init` in a
+// bare /tmp tempdir is exit-0-no-op against this host's live /tmp/.beads.
+// Five runs of this suite planted 80 beads into that store that way on
+// 2026-09-24 before anyone noticed (claudego-fb95927b). The seeding below
+// therefore builds a geometry the walk cannot escape: a config.json barrier
+// `.beads` at the tempdir root (a fingerprint is the only thing that stops
+// the walk deterministically — `--skip-foreign-workspace` exists to walk
+// *past* config-less `.beads` dirs) and a planted identity fingerprint in
+// the seeded workspace itself, so the first init rebuilds around it instead
+// of discovering anything above. A prefix tripwire on the first minted bead
+// fires if that ever regresses, on any host, poison or no poison.
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -22,10 +38,23 @@ use tempfile::TempDir;
 const PLUCK_STATE: &str = "open";
 const PLUCK_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
 
+/// Workspace identity planted before the first `bead` call.
+///
+/// Exactly the fresh-clone shape — committed `config.json`, gitignored
+/// database absent — that `bead init` rebuilds a store around, preserving
+/// the recorded identity. Deterministic values: every run gets its own
+/// tempdir, so the identities never meet across runs.
+const SEED_PREFIX: &str = "pluckseed";
+const SEEDED_IDENTITY: &str = r#"{"created_at":"2026-09-24T00:00:00Z","prefix":"pluckseed","uuid":"00000000-0000-4000-8000-000000000001","version":1}"#;
+const BARRIER_IDENTITY: &str = r#"{"created_at":"2026-09-24T00:00:00Z","prefix":"pluckbarrier","uuid":"00000000-0000-4000-8000-000000000002","version":1}"#;
+
 /// A bead workspace seeded inside its own tempdir.
 ///
 /// `_dir` must stay alive for the test's duration — dropping it removes the
-/// store. `path` is the workspace root the Pluck backend command runs in.
+/// store. `path` is the workspace root the Pluck backend command runs in: a
+/// `ws/` directory inside the tempdir, sitting above the tempdir's barrier
+/// `.beads` so no invocation made anywhere under it can discover a store
+/// outside the tempdir.
 struct SeededWorkspace {
     _dir: TempDir,
     path: PathBuf,
@@ -38,13 +67,13 @@ struct SeededWorkspace {
 
 /// Run the real `bead` CLI inside `dir`, asserting success and returning stdout.
 ///
-/// `--skip-foreign-workspace` keeps workspace discovery inside `dir` even
-/// when a foreign `.beads` (no config.json — e.g. the traces directory the
-/// CLI itself leaves in /tmp) sits on the walk-up path: without it, seeding a
-/// tempdir under /tmp fails once any bead invocation from a /tmp cwd has
-/// created /tmp/.beads, which makes the suite self-poisoning. Post-init the
-/// tempdir's own valid `.beads/config.json` is the first store discovery
-/// finds, so the flag never widens the search past the seeded workspace.
+/// Hermeticity comes from the seeded geometry (`seed_workspace`), not from
+/// this flag: workspace discovery stops at the first `.beads` on the
+/// walk-up, and only a `config.json` fingerprint stops it — a *valid* store
+/// above `dir` adopts the run silently even with the override set.
+/// `--skip-foreign-workspace` remains as defense in depth for the config-less
+/// case (a foreign `.beads` such as the traces directory the CLI itself
+/// leaves in /tmp would otherwise fail the command closed from inside `dir`).
 fn run_bead(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("bead")
         .arg("--skip-foreign-workspace")
@@ -79,10 +108,43 @@ fn create_bead(dir: &Path, title: &str, labels: &[&str]) -> String {
 /// excluded label, an assigned-open bead, and an in-progress bead.
 fn seed_workspace() -> SeededWorkspace {
     let dir = TempDir::new().expect("tempdir for seeded bead workspace");
-    let path = dir.path().to_path_buf();
+    let root = dir.path();
+
+    // Barrier: a bare fingerprint at the tempdir root. Discovery stops at the
+    // FIRST `.beads` on the walk-up and only a `config.json` fingerprint stops
+    // it deterministically, so no `bead` invocation made anywhere under the
+    // tempdir can discover a workspace outside it — whatever the host keeps
+    // above $TMPDIR (this box keeps a live store at /tmp/.beads). The barrier
+    // itself is an uninitialized fingerprint: stray discovery that lands on
+    // it reports that path rather than adopting anything real.
+    std::fs::create_dir_all(root.join(".beads")).expect("create barrier .beads");
+    std::fs::write(root.join(".beads/config.json"), BARRIER_IDENTITY)
+        .expect("write barrier config.json");
+
+    // The seeded workspace carries its fingerprint before the first `bead`
+    // call. Without it the first init is the poisoned step: a valid store
+    // above the tempdir makes `bead init` exit 0 having done nothing, and
+    // every later command mints into that store.
+    let path = root.join("ws");
+    std::fs::create_dir_all(path.join(".beads")).expect("create seeded .beads");
+    std::fs::write(path.join(".beads/config.json"), SEEDED_IDENTITY)
+        .expect("write seeded config.json");
+
     run_bead(&path, &["init"]);
+    assert!(
+        path.join(".beads/beads.db").exists(),
+        "bead init must build the store inside the seeded workspace, not adopt one above it"
+    );
 
     let clean_labeled = create_bead(&path, "clean labeled candidate", &["codinghome"]);
+    // Tripwire: the minted prefix proves which store served the create. If
+    // discovery ever escapes again, the ID carries the foreign store's
+    // prefix and this fires before any assertion runs against the wrong
+    // frontier.
+    assert!(
+        clean_labeled.starts_with(&format!("{SEED_PREFIX}-")),
+        "seeding escaped the isolated workspace: {clean_labeled} was not minted under {SEED_PREFIX}-"
+    );
     let clean_unlabelled = create_bead(&path, "clean unlabelled candidate", &[]);
     let human = create_bead(
         &path,
