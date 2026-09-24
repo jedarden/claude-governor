@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the hysteresis implementation and scaling behavior in Claude Governor (cgov): current behavior, the convergence guarantees, and the improvements that remain open.
+This document describes the hysteresis implementation and scaling behavior in Claude Governor (cgov): current behavior, the convergence guarantees, and the improvements that remain open — each of which is tracked as a bead (see [Remaining Improvements](#remaining-improvements-not-implemented)).
 
 ## Current Implementation
 
@@ -19,9 +19,13 @@ pub fn apply_scaling(
     hysteresis_band: f64,
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
+    emergency_brake_active: bool,
 ) -> ScalingDecision {
-    // Emergency brake: target is 0
-    if target == 0 && current > 0 {
+    // Emergency brake: a real >= 98% usage window drove the target to 0. A
+    // computed Some(0) verdict with no such window falls through to the
+    // graceful scale-down below — that is a duty-cycle withdrawal, not an
+    // emergency (claudego-1138ab78).
+    if emergency_brake_active && target == 0 && current > 0 {
         return ScalingDecision::EmergencyBrake;
     }
 
@@ -37,6 +41,7 @@ pub fn apply_scaling(
 
         // The band applies here and only here: a target within the band
         // below current holds, so forecast noise cannot shed workers.
+        // (Manual overrides pass bypass_scale_down_hysteresis = true.)
         if delta.abs() <= hysteresis {
             return ScalingDecision::NoChange;
         }
@@ -50,6 +55,8 @@ pub fn apply_scaling(
     ScalingDecision::ScaleUp(scale)
 }
 ```
+
+This is the decision flow of `apply_scaling_with_policy` (in `src/governor.rs`), which `apply_scaling` delegates to with `bypass_scale_down_hysteresis = false`.
 
 **Why asymmetric**: cgov is a use-or-lose subscription governor. Capacity below target is capacity that resets unused, so every deficit closes immediately — a symmetric band turned a 1-worker deficit into a permanent strand one worker short of target (with band 1.0 and integer worker counts, `|delta| == 1` was never actionable). A surplus above the soft target, by contrast, is tolerated up to the band: the forecast jitters, an extra worker burns quota productively, and the hard protection (the emergency brake, a window actually at/above 98%) still overrides regardless — including a computed `safe_worker_count = Some(0)`, which without such a window is an ordinary band-damped withdrawal (claudego-1138ab78). The scale-down band is the noise cushion; the scale-up path is the convergence guarantee.
 
@@ -159,13 +166,15 @@ A target jittering ±1 around the fleet produces no churn: the first deficit clo
 
 ## Remaining Improvements (Not Implemented)
 
-### Option B: Exponential Decay
+Both open items are tracked as beads. They are serialized (`claudego-71a82180` blocked by `claudego-b9195f5a`) because both touch `src/governor.rs` and `src/config.rs` and extend the same test file.
+
+### Option B: Exponential Decay — [claudego-b9195f5a]
 
 Close a fixed fraction of the remaining gap per cycle (e.g. 30%), for a smooth asymptotic approach. The progressive tier function already approximates this for large gaps; true exponential scaling remains a proposal.
 
-### Option C: Adaptive Timing
+### Option C: Adaptive Timing — [claudego-71a82180]
 
-Shorten the polling interval while far from target (e.g. 1/3 interval when gap > 5). Faster convergence without touching per-cycle limits. Not implemented — the 300s loop interval is also the burn-rate sampling granularity (see `DaemonConfig::loop_interval_secs`).
+Shorten the polling interval while far from target (e.g. 1/3 interval when gap > 5). Faster convergence without touching per-cycle limits. Not implemented — the 300s loop interval is also the burn-rate sampling granularity (see `DaemonConfig::loop_interval_secs`), so the design must keep observation/sampling on the fixed cadence or explicitly test the changed semantics.
 
 ## Configuration Examples
 
@@ -253,3 +262,4 @@ let new_count = (current as i32 + scale_delta)
 - Identified gaps in smooth scaling transitions
 - Proposed progressive, exponential, and adaptive improvements
 - **2026-09-16** (claudego-44b1f4f5): Hysteresis made **asymmetric** — the band damps scale-down only, so every deficit closes and the fleet converges exactly to target (the 5→10 example no longer stops at 9). Added opt-in **progressive scaling** (`daemon.progressive_scaling` + `progressive_scale_cap`): per-cycle caps widen with the remaining gap (3x/2x/1x tiers), clamped to the gap. Decision-log trigger text updated to match; exponential and adaptive-timing options remain open proposals.
+- **2026-09-24** (claudego-4c0f2ae9): Tracked the two open proposals as beads — Option B → claudego-b9195f5a, Option C → claudego-71a82180 (blocked by B; shared `governor.rs`/`config.rs`/test-file footprint). Synced the "Current Implementation" snippet with the live `apply_scaling` signature (`emergency_brake_active` param; the brake fires only on a real ≥98% window, not on a computed zero).
