@@ -1749,12 +1749,26 @@ mod tests {
     /// executing (live tmux session + fresh NEEDLE-format heartbeat) counts as
     /// 1 heartbeats / 1 tmux sessions, consistent=true — the observed-live
     /// failure was exactly this shape logging 0/1/false.
+    ///
+    /// The pool's tmux pattern carries a per-run unique segment: this test
+    /// queries the real tmux server, so the production pattern verbatim would
+    /// count every live cgov-sonnet worker on the host too (claudego-a4b2ab38:
+    /// `left: 4, right: 1` wherever the sonnet fleet is up). Only the pattern
+    /// gains the segment; the identifier template — and with it the worker-id
+    /// namespace the heartbeat matching rides on — stays as governor.yaml has
+    /// it, and the tmux name remains `needle-claude-print-{worker_id}`.
     #[test]
     fn count_workers_consistent_with_one_needle_worker() {
         let temp = TempDir::new().unwrap();
-        let config = needle_sonnet_pool(&temp);
+        let mut config = needle_sonnet_pool(&temp);
 
-        let suffix = "20260921125550-0";
+        // Digits so the fixture keeps the production id shape; timestamp+pid so
+        // two concurrent extractions of the same commit (close-gate
+        // re-verification) never share a tag.
+        let tag = format!("{}{}", Utc::now().timestamp(), std::process::id());
+        config.session_prefix = format!("needle-claude-print-cgov-sonnet-{tag}");
+
+        let suffix = format!("{tag}-0");
         let worker_id = format!("cgov-sonnet-{suffix}");
         let qualified_id = format!("claude-print-{worker_id}");
         let tmux_session = format!("needle-claude-print-{worker_id}");
