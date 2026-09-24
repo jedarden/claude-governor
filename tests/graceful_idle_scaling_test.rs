@@ -42,6 +42,17 @@
 //! order; and whatever the pool-level order says, a pool's own shed still
 //! takes its idle workers before its busy ones.
 //!
+//! Section 9 pins the reclaim path's failure and timeout edges
+//! (claudego-b24eb184): a worker that ignores the graceful SIGINT is
+//! force-killed only after `graceful_timeout_secs` — busy workers still never
+//! touched; a failed SIGINT escalates to the same force-kill; a failed
+//! force-kill is reported in `ScaleDownResult` rather than crashing or
+//! hanging; a tmux that cannot answer sheds nobody and sweeps nothing; and
+//! the accounting (signaled / graceful / force_killed) adds up for a mixed
+//! outcome. Section 10 pins the role dimension of repeated scaling cycles:
+//! busy workers spared by one cycle are legitimate candidates the moment
+//! their own heartbeat flips idle, across a down → up → down sequence.
+//!
 //! Every test that swaps PATH / CGOV_DECISIONS_PATH holds [`ENV_LOCK`] for
 //! its whole body (tests in one binary share a process and run in threads).
 
@@ -57,6 +68,7 @@ use claude_governor::config::{
 };
 use claude_governor::governor::{apply_scaling, run_act_cycle, ScalingDecision};
 use claude_governor::state;
+use claude_governor::worker::{scale_down_graceful, WorkerConfig};
 
 /// Serializes every test that swaps PATH / CGOV_DECISIONS_PATH.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1364,4 +1376,427 @@ fn busy_worker_sheds_only_when_no_idle_candidate_exists_in_its_pool() {
          worker sheds; the idle workers of the protected pool survive"
     );
     assert!(killed(&h.calls_log).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 9. The reclaim path's failure and timeout edges (claudego-b24eb184)
+// ---------------------------------------------------------------------------
+
+/// A second `tmux` fake, layered over the plain one by overwriting `bin/tmux`
+/// after [`harness`]. With both control files empty it behaves identically to
+/// [`install_fake_tmux`]; the tests below arm it:
+///
+/// - a session named in the **immune** file receives `send-keys C-c`, logs
+///   the call, and KEEPS RUNNING — a worker that ignores the graceful
+///   shutdown request, the shape the timeout exists for;
+/// - a verb named in the **faults** file exits 1 after logging — a reclaim
+///   failure (`send-keys` cannot reach the session, `kill-session` cannot
+///   kill it, or `list-sessions` cannot enumerate at all).
+///
+/// `has-session` still reads the stopped/sessions files, so a force-killed
+/// immune session is dead to every later probe.
+fn install_fault_injecting_tmux(
+    bin_dir: &Path,
+    sessions_file: &Path,
+    calls_log: &Path,
+    stopped_file: &Path,
+    immune_file: &Path,
+    faults_file: &Path,
+) {
+    write_executable(
+        bin_dir,
+        "tmux",
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{calls}'\n\
+             case \"$1\" in\n\
+             \x20 list-sessions)\n\
+             \x20   if grep -Fxq 'list-sessions' '{faults}' 2>/dev/null; then exit 1; fi\n\
+             \x20   cat '{sessions}' 2>/dev/null; exit 0;;\n\
+             \x20 has-session)\n\
+             \x20   if grep -Fxq \"$3\" '{stopped}' 2>/dev/null; then exit 1; fi\n\
+             \x20   if grep -Fxq \"$3\" '{sessions}' 2>/dev/null; then exit 0; fi\n\
+             \x20   exit 1;;\n\
+             \x20 send-keys)\n\
+             \x20   if grep -Fxq 'send-keys' '{faults}' 2>/dev/null; then exit 1; fi\n\
+             \x20   if grep -Fxq \"$3\" '{immune}' 2>/dev/null; then exit 0; fi\n\
+             \x20   printf '%s\\n' \"$3\" >> '{stopped}'; exit 0;;\n\
+             \x20 kill-session)\n\
+             \x20   if grep -Fxq 'kill-session' '{faults}' 2>/dev/null; then exit 1; fi\n\
+             \x20   printf '%s\\n' \"$3\" >> '{stopped}'; exit 0;;\n\
+             esac\nexit 0",
+            calls = calls_log.display(),
+            sessions = sessions_file.display(),
+            stopped = stopped_file.display(),
+            immune = immune_file.display(),
+            faults = faults_file.display(),
+        ),
+    );
+}
+
+/// Re-arm [`harness`]'s tmux with the fault-injecting fake and return the
+/// paths of its two control files (immune first, faults second).
+fn arm_fault_injecting_tmux(h: &Harness) -> (PathBuf, PathBuf) {
+    let env = h.state_path.parent().unwrap().to_path_buf();
+    let bin = env.join("bin");
+    let immune = env.join("sigint-immune.txt");
+    let faults = env.join("tmux-faults.txt");
+    std::fs::write(&immune, "").expect("empty immune list");
+    std::fs::write(&faults, "").expect("empty faults list");
+    install_fault_injecting_tmux(
+        &bin,
+        &h.sessions_file,
+        &h.calls_log,
+        &env.join("stopped.txt"),
+        &immune,
+        &faults,
+    );
+    (immune, faults)
+}
+
+impl Harness {
+    fn bin_dir(&self) -> PathBuf {
+        self.state_path.parent().unwrap().join("bin")
+    }
+}
+
+/// A `WorkerConfig` shaped like `WorkerConfig::from_agent_config`'s product —
+/// same launch_cmd family, same heartbeat dir, same session prefix (note
+/// `session_prefix()` also strips the trailing `-`, so production runs
+/// `cgidle`, not `cgidle-`) — with the graceful timeout under the test's
+/// control. The integration tests keep the production 30 s; the direct
+/// reclaim tests shorten it to keep the suite fast while exercising the
+/// identical loop.
+fn direct_worker_config(h: &Harness, graceful_timeout_secs: u64) -> WorkerConfig {
+    let env = h._env.as_ref().expect("harness env dir");
+    WorkerConfig {
+        launch_cmd: launch_cmd_for(&env.path().join("bin"), env.path(), &h.launch_log),
+        heartbeat_dir: h.hb_dir.clone(),
+        graceful_timeout_secs,
+        session_prefix: PREFIX.to_string(),
+    }
+}
+
+/// The documented guarantee's teeth (claudego-b24eb184): a worker that
+/// receives the graceful SIGINT and IGNORES it is not left running forever and
+/// not killed on the spot — it is force-killed only after the production
+/// `graceful_timeout_secs` (30, hard-coded by `WorkerConfig::from_agent_config`
+/// — this test pays that wall clock on purpose). The worker that honoured the
+/// request shuts down inside the window and is never kill-sessions'd, and the
+/// mid-task workers are untouched by either verb: the force-kill is scoped to
+/// the worker that was asked to stop and didn't, never widened to the busy.
+///
+/// The window itself is pinned by two load-robust observations — the cycle's
+/// wall clock reaches the full 30 s (a deleted or zeroed wait would
+/// force-kill instantly and produce the identical calls log), and the
+/// executor's 2 s liveness poll of the stubborn session runs at least ten
+/// ticks. Both can only grow under a loaded box, so neither bound flakes.
+#[test]
+fn worker_ignoring_sigint_is_force_killed_after_the_timeout_busy_workers_never_touched() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let (immune, _faults) = arm_fault_injecting_tmux(&h);
+
+    std::fs::write(&immune, "cgidle-idle-stubborn\n").expect("arm immune list");
+
+    h.worker("idle-stubborn", 5, true);
+    h.worker("idle-quick", 4, true);
+    h.worker("busy-a", 20, false);
+    h.worker("busy-b", 19, false);
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+    let started = std::time::Instant::now();
+    let decision = cycle_with_target(&h, &agents, 2, 1.0, 10, 10);
+
+    assert_eq!(decision, ScalingDecision::ScaleDown(2));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-idle-quick", "cgidle-idle-stubborn"]),
+        "both idle workers receive the graceful SIGINT first"
+    );
+    assert_eq!(
+        killed(&h.calls_log),
+        sorted(&["cgidle-idle-stubborn"]),
+        "only the worker that ignored the request is force-killed, and only \
+         after the timeout window closed"
+    );
+    assert!(
+        started.elapsed().as_secs() >= 28,
+        "the force-kill landed at {:?}, before the production 30 s graceful \
+         window had been waited out",
+        started.elapsed()
+    );
+    let stubborn_probes = sessions_from_calls(&h.calls_log, "has-session")
+        .iter()
+        .filter(|s| *s == "cgidle-idle-stubborn")
+        .count();
+    assert!(
+        stubborn_probes >= 10,
+        "the executor probed the stubborn session only {} times — the 2 s \
+         liveness poll did not run the 30 s window out",
+        stubborn_probes
+    );
+    assert!(
+        !signalled(&h.calls_log)
+            .iter()
+            .any(|s| s.starts_with("cgidle-busy")),
+        "a mid-task worker is never even asked to stop, let alone force-killed"
+    );
+    assert!(
+        !killed(&h.calls_log)
+            .iter()
+            .any(|s| s.starts_with("cgidle-busy")),
+        "the timeout force-kill never widens to a busy worker"
+    );
+}
+
+/// A reclaim failure on the graceful leg does not abandon the worker: the
+/// `send-keys` that cannot reach the session is logged as failed
+/// (`result.signaled` stays 0), the worker is still awaited for the full
+/// window, and at the timeout it is force-killed — escalation, not a silently
+/// half-shed fleet. The direct `scale_down_graceful` call is the same executor
+/// the ScaleDown arm invokes; the shortened timeout keeps the loop at one tick.
+#[test]
+fn a_failed_sigint_still_escalates_to_force_kill_after_the_timeout() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let (_immune, faults) = arm_fault_injecting_tmux(&h);
+    std::fs::write(&faults, "send-keys\n").expect("fault send-keys");
+
+    h.worker("solo", 5, true);
+
+    let result = scale_down_graceful(1, &direct_worker_config(&h, 2), false);
+
+    assert_eq!(result.targeted, 1);
+    assert_eq!(
+        result.signaled, 0,
+        "the failed send-keys is not counted as delivered"
+    );
+    assert_eq!(
+        result.graceful, 0,
+        "a worker that was never signalled cannot shut down gracefully"
+    );
+    assert_eq!(
+        result.force_killed, 1,
+        "the un-reclaimed worker escalates to the force-kill at the timeout"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-solo"]),
+        "the SIGINT was attempted (and logged) even though tmux rejected it"
+    );
+    assert_eq!(
+        killed(&h.calls_log),
+        sorted(&["cgidle-solo"]),
+        "the escalation kill-session is attempted once the window closes"
+    );
+}
+
+/// The mirror reclaim failure: the force-kill itself cannot reach the session.
+/// The attempt is logged, `result.force_killed` stays 0 — the accounting must
+/// report what actually happened, not what was attempted — and the loop
+/// terminates at the timeout instead of hanging on a worker it cannot reap.
+#[test]
+fn a_failed_force_kill_is_reported_and_terminates_at_the_timeout() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let (immune, faults) = arm_fault_injecting_tmux(&h);
+    std::fs::write(&immune, "cgidle-solo\n").expect("arm immune list");
+    std::fs::write(&faults, "kill-session\n").expect("fault kill-session");
+
+    h.worker("solo", 5, true);
+
+    let result = scale_down_graceful(1, &direct_worker_config(&h, 2), false);
+
+    assert_eq!(result.signaled, 1, "the graceful SIGINT was delivered");
+    assert_eq!(result.graceful, 0, "the immune worker never shut down");
+    assert_eq!(
+        result.force_killed, 0,
+        "a kill-session tmux rejected is not counted as killed"
+    );
+    assert_eq!(
+        killed(&h.calls_log),
+        sorted(&["cgidle-solo"]),
+        "the force-kill was attempted even though it failed"
+    );
+}
+
+/// A shed that lands on one compliant and one stubborn worker accounts for
+/// both outcomes in one `ScaleDownResult` — and the busy worker that made the
+/// cut possible appears in neither verb's log.
+#[test]
+fn a_mixed_shed_reports_graceful_and_forced_and_never_touches_the_busy() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+    let (immune, _faults) = arm_fault_injecting_tmux(&h);
+    std::fs::write(&immune, "cgidle-stubborn\n").expect("arm immune list");
+
+    h.worker("quick", 5, true);
+    h.worker("stubborn", 4, true);
+    h.worker("busy", 20, false);
+
+    let result = scale_down_graceful(2, &direct_worker_config(&h, 2), false);
+
+    assert_eq!(result.targeted, 2);
+    assert_eq!(
+        result.signaled, 2,
+        "both idle candidates were asked to stop"
+    );
+    assert_eq!(
+        result.graceful, 1,
+        "the compliant worker shut down inside the window"
+    );
+    assert_eq!(
+        result.force_killed, 1,
+        "the stubborn worker was force-killed at the timeout"
+    );
+    assert_eq!(
+        result.sessions,
+        vec!["cgidle-quick".to_string(), "cgidle-stubborn".to_string()],
+        "the shed list names the two idle workers, idle-status ordered"
+    );
+    assert!(
+        !signalled(&h.calls_log).contains(&"cgidle-busy".to_string()),
+        "the busy worker absorbs nothing"
+    );
+}
+
+/// The failure mode that must shed NOBODY: tmux cannot be consulted at all
+/// (the binary does not resolve on PATH). Selection refuses to guess —
+/// "signalling a session we failed to enumerate is how the wrong worker gets
+/// interrupted" — so nothing is signalled, nothing is killed, and even the
+/// STALE heartbeat is left on disk, because with no census "no live session"
+/// is unknowable rather than false. The contrast shape answers with an empty
+/// census (`list-sessions` fails the way real tmux does when it has no
+/// sessions): liveness is then KNOWABLE, the stale heartbeat is swept as an
+/// orphan, the fresh one is kept, and still nobody is signalled — an answer,
+/// even an empty one, is what licenses acting on the fleet.
+#[test]
+fn a_tmux_that_cannot_answer_sheds_nobody_and_sweeps_nothing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Shape one: no tmux anywhere on PATH — spawn fails, liveness unknowable.
+    let h = harness();
+    let bin = h.bin_dir();
+    std::fs::remove_file(bin.join("tmux")).expect("remove the fake tmux");
+    std::env::set_var("PATH", &bin); // bin only: no inherited PATH to find a real tmux in
+
+    h.worker("stale-idle", 300, true); // would be swept if tmux answered
+    h.worker("fresh-idle", 5, true);
+
+    let result = scale_down_graceful(2, &direct_worker_config(&h, 2), false);
+
+    assert_eq!(result.signaled, 0);
+    assert_eq!(result.graceful, 0);
+    assert_eq!(result.force_killed, 0);
+    assert!(
+        result.sessions.is_empty(),
+        "an unconsultable tmux sheds nobody"
+    );
+    assert!(killed(&h.calls_log).is_empty());
+    assert!(
+        h.hb_dir.join("cgidle-stale-idle.json").exists(),
+        "with liveness unknowable even the stale heartbeat is kept, not swept"
+    );
+    assert!(h.hb_dir.join("cgidle-fresh-idle.json").exists());
+
+    // Shape two: tmux answers, but its census is empty (the way real tmux
+    // reports "no sessions"): exit 1, not a spawn failure. Liveness is now
+    // knowable — every heartbeat is an orphan or a survivor with no session.
+    let h2 = harness();
+    let (_immune2, faults2) = arm_fault_injecting_tmux(&h2);
+    std::fs::write(&faults2, "list-sessions\n").expect("fault list-sessions");
+
+    h2.worker("stale-idle", 300, true);
+    h2.worker("fresh-idle", 5, true);
+
+    let result2 = scale_down_graceful(2, &direct_worker_config(&h2, 2), false);
+
+    assert_eq!(result2.signaled, 0);
+    assert!(result2.sessions.is_empty());
+    assert!(signalled(&h2.calls_log).is_empty());
+    assert!(killed(&h2.calls_log).is_empty());
+    assert!(
+        !h2.hb_dir.join("cgidle-stale-idle.json").exists(),
+        "an answerable tmux, even with an empty census, licenses the orphan sweep"
+    );
+    assert!(
+        h2.hb_dir.join("cgidle-fresh-idle.json").exists(),
+        "a fresh heartbeat is never swept, whatever the census says"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Role changes across repeated scaling cycles (claudego-b24eb184)
+// ---------------------------------------------------------------------------
+
+/// Busy-protection is per-cycle heartbeat state, not a sticky pardon. The same
+/// pair of workers runs through a full down → up → down sequence: cycle one
+/// spares them mid-task while the idle pool absorbs the cut; demand returns
+/// and the fleet grows back; then the pair — now idle, their heartbeats
+/// flipped — is the shed's first choice, while freshly launched busy workers
+/// inherit exactly the protection the pair just gave up. No cycle ever
+/// signals a worker that was busy at that cycle's census, and no already-dead
+/// session is signalled twice.
+#[test]
+fn busy_workers_spared_in_one_cycle_are_shed_once_idle_in_a_later_cycle() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    h.worker("busy-a", 50, false);
+    h.worker("busy-b", 49, false);
+    h.worker("idle-a", 5, true);
+    h.worker("idle-b", 4, true);
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    // Cycle one: cut 4 → 2. The idle pair absorbs it; the mid-task pair survives.
+    let first = cycle_with_target(&h, &agents, 2, 1.0, 10, 10);
+    assert_eq!(first, ScalingDecision::ScaleDown(2));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-idle-a", "cgidle-idle-b"]),
+        "the busy pair is never asked to stop while it holds a task"
+    );
+    h.reap(&["cgidle-idle-a", "cgidle-idle-b"]);
+
+    // The survivors finish their tasks: their heartbeats flip busy → idle.
+    write_heartbeat(&h.hb_dir, "cgidle-busy-a", 8, true);
+    write_heartbeat(&h.hb_dir, "cgidle-busy-b", 6, true);
+
+    // Cycle two: demand returns, target 4 against 2 running — the fleet grows.
+    let second = cycle_with_target(&h, &agents, 4, 0.5, 10, 10);
+    assert_eq!(second, ScalingDecision::ScaleUp(2));
+    assert_eq!(
+        std::fs::read_to_string(&h.launch_log)
+            .expect("read launch log")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count(),
+        2,
+        "the up-move really launches"
+    );
+
+    // The two launches register as new, mid-task workers.
+    h.worker("new-a", 3, false);
+    h.worker("new-b", 2, false);
+
+    // Cycle three: cut 4 → 2 again. Yesterday's protected pair is now the
+    // idle pool and sheds first; the brand-new busy workers inherit the
+    // protection, and the workers shed in cycle one are gone, not re-signalled.
+    let third = cycle_with_target(&h, &agents, 2, 0.5, 10, 10);
+    assert_eq!(third, ScalingDecision::ScaleDown(2));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&[
+            "cgidle-idle-a",
+            "cgidle-idle-b",
+            "cgidle-busy-a",
+            "cgidle-busy-b"
+        ]),
+        "the flipped pair sheds exactly once each; the new busy workers are untouched"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "every cycle of the sequence takes the graceful path"
+    );
 }
