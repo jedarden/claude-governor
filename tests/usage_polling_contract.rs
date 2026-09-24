@@ -19,6 +19,29 @@
 //!   while a failed token refresh retries exactly once before surfacing, and
 //!   sustained refresh failures escalate to an alert.
 //!
+//! Failure-mode and boundary coverage pinned on top of that baseline
+//! (claudego-06974a01):
+//!
+//! - Credentials-file failure modes: a missing file and malformed JSON fail
+//!   with their own `PollerError`s, the corrupted-credential guards (empty
+//!   tokens, zero expiry) reject the file before any request is attempted,
+//!   and a file that vanishes after a good reading degrades to the stale
+//!   fallback like any other auth failure.
+//! - Fully expired (past-dated) tokens refresh exactly like near-expiry ones.
+//! - The 5-minute refresh threshold itself (usage-tracking.md §5: refresh
+//!   when `now + 300_000 >= expiresAt`): 305s out no refresh fires, 295s out
+//!   exactly one does.
+//! - A refresh endpoint answering 200 with a malformed body is a refresh
+//!   failure, not a pass: retried once, failure counter incremented.
+//! - Window boundaries: 0% / 100% / over-saturation utilization pass through
+//!   unclamped; `resets_at` exactly now computes ~0h and both documented ISO
+//!   shapes (`...Z` and `...+00:00`) compute identically; an empty response
+//!   object leaves every window non-binding; the legacy top-level
+//!   `weekly_scoped` field is ignored in favour of the authoritative
+//!   `limits[]` entry; and the `limits[]` additive-tolerance contract has a
+//!   precise boundary — absent and null fields are tolerated, a wrong-typed
+//!   present value is fatal.
+//!
 //! A local mockito server stands in for the two endpoints;
 //! [`Poller::with_endpoints`] / [`Poller::with_refresh_retry_delay`] point the
 //! poller at it. All tests serialize on one lock because the refresh-failure
@@ -56,6 +79,15 @@ fn write_credentials(dir: &Path, access: &str, refresh: &str, expires_at_ms: i64
         }
     });
     std::fs::write(&path, body.to_string()).expect("write credentials file");
+    path.to_string_lossy().into_owned()
+}
+
+/// Credentials file with an arbitrary body, for malformed/corrupted-file
+/// fixtures that must exercise the poller's own validation rather than
+/// serde's.
+fn write_raw_credentials(dir: &Path, body: &str) -> String {
+    let path = dir.join(".credentials.json");
+    std::fs::write(&path, body).expect("write raw credentials file");
     path.to_string_lossy().into_owned()
 }
 
@@ -804,4 +836,570 @@ fn sustained_refresh_failures_escalate_to_alert() {
 
     // Crossing the threshold arms the HUMAN alert.
     assert!(poller.should_alert());
+}
+
+// ---------------------------------------------------------------------------
+// Credentials-file failure modes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn missing_credentials_file_fails_with_credentials_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = dir.path().join("does-not-exist").join(".credentials.json");
+
+    // Dead endpoints: if the poller somehow reached the network anyway, the
+    // error would be ApiRequestFailed, not the variant asserted below.
+    let dead = dead_endpoint_url();
+    let mut poller = Poller::with_credentials_path(Some(creds.to_string_lossy().into_owned()))
+        .expect("a valid credentials path should build a poller")
+        .with_endpoints(dead.clone(), dead)
+        .with_refresh_retry_delay(Duration::ZERO);
+
+    let err = poller
+        .poll()
+        .expect_err("a missing credentials file must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::CredentialsNotFound(_))
+        ),
+        "expected CredentialsNotFound, got: {err}"
+    );
+}
+
+#[test]
+fn malformed_credentials_json_fails_with_invalid_credentials() {
+    let _guard = lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_raw_credentials(dir.path(), "{not json");
+
+    let dead = dead_endpoint_url();
+    let mut poller = Poller::with_credentials_path(Some(creds))
+        .expect("a valid credentials path should build a poller")
+        .with_endpoints(dead.clone(), dead)
+        .with_refresh_retry_delay(Duration::ZERO);
+
+    let err = poller
+        .poll()
+        .expect_err("unparseable credentials JSON must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::InvalidCredentials(_))
+        ),
+        "expected InvalidCredentials, got: {err}"
+    );
+}
+
+#[test]
+fn corrupted_credentials_are_rejected_before_any_network_call() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The three guards from read_credentials: empty access token, empty
+    // refresh token, zero expiry. Each is valid JSON, so serde alone would
+    // accept it — the poller's own validation must catch it before any
+    // request is attempted. Dead endpoints prove that: had the poller gone
+    // to the network, the error would be a connection failure, not the
+    // corruption message asserted below.
+    let corrupted_bodies = [
+        (
+            "empty access token",
+            r#"{"claudeAiOauth": {"accessToken": "", "refreshToken": "r", "expiresAt": 123}}"#,
+        ),
+        (
+            "empty refresh token",
+            r#"{"claudeAiOauth": {"accessToken": "a", "refreshToken": "", "expiresAt": 123}}"#,
+        ),
+        (
+            "zero expiry",
+            r#"{"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "expiresAt": 0}}"#,
+        ),
+    ];
+
+    for (case, body) in corrupted_bodies {
+        let creds = write_raw_credentials(dir.path(), body);
+        let dead = dead_endpoint_url();
+        let mut poller = Poller::with_credentials_path(Some(creds))
+            .expect("a valid credentials path should build a poller")
+            .with_endpoints(dead.clone(), dead)
+            .with_refresh_retry_delay(Duration::ZERO);
+
+        let err = match poller.poll() {
+            Ok(data) => panic!("{case}: poll must fail, but succeeded with {data:?}"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Credentials corrupted"),
+            "{case}: expected the corruption guard, got: {msg}"
+        );
+    }
+}
+
+#[test]
+fn missing_credentials_file_serves_stale_data_when_cached_reading_exists() {
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    // Poll #1: a good reading to seed the cache.
+    let mut poller = contract_poller(&creds, &server.url());
+    let fresh = poller.poll().expect("first poll must succeed");
+    usage.assert();
+    assert!(!fresh.stale);
+
+    // The credentials file then vanishes (e.g. wiped by a concurrent login).
+    // A credential read failure is still a PollerError, so the poll must
+    // degrade to the stale fallback exactly like a refresh failure — not
+    // fail the cycle and not hit the network again.
+    std::fs::remove_file(&creds).expect("remove credentials file");
+    let stale = poller
+        .poll()
+        .expect("credential loss must fall back to cached data");
+    assert!(stale.stale);
+    assert_eq!(stale.five_hour_utilization, fresh.five_hour_utilization);
+    assert_eq!(stale.timestamp, fresh.timestamp);
+}
+
+// ---------------------------------------------------------------------------
+// Expired tokens (past-dated, not merely near expiry)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expired_token_triggers_refresh_end_to_end() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Expired 10 minutes ago: a stronger trigger than the 60s-out case in
+    // expiring_token_triggers_refresh_and_new_token_is_used. The dead bearer
+    // must never reach the usage endpoint.
+    let creds = write_credentials(
+        dir.path(),
+        "expired-access-token",
+        "stored-refresh-token",
+        Utc::now().timestamp_millis() - 600_000,
+    );
+
+    let refresh = server
+        .mock("POST", "/v1/oauth/token")
+        .match_header("content-type", "application/json")
+        .match_body(mockito::Matcher::JsonString(
+            r#"{"grantType":"refresh_token","refreshToken":"stored-refresh-token"}"#.to_string(),
+        ))
+        .with_status(200)
+        .with_body(refresh_response_body())
+        .expect(1)
+        .create();
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .match_header("authorization", "Bearer fresh-access-token")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller.poll().expect("expired token must refresh and poll");
+
+    refresh.assert();
+    usage.assert();
+    assert!(!data.stale);
+
+    // The rotated credentials replaced the expired ones on disk.
+    let persisted = std::fs::read_to_string(&creds).expect("reread credentials file");
+    assert!(persisted.contains("fresh-access-token"));
+    assert!(!persisted.contains("expired-access-token"));
+}
+
+// ---------------------------------------------------------------------------
+// Refresh threshold boundary (usage-tracking.md §5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_threshold_boundary_end_to_end() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Phase A: 305s out — outside the documented 300s threshold. No refresh
+    // may fire: the refresh mock expects zero hits and the usage call is
+    // matched against the un-refreshed bearer only.
+    let creds = write_credentials(
+        dir.path(),
+        "outside-threshold-token",
+        "outside-refresh-token",
+        Utc::now().timestamp_millis() + 305_000,
+    );
+    let no_refresh = server
+        .mock("POST", "/v1/oauth/token")
+        .with_status(200)
+        .with_body(refresh_response_body())
+        .expect(0)
+        .create();
+    let usage_a = server
+        .mock("GET", "/api/oauth/usage")
+        .match_header("authorization", "Bearer outside-threshold-token")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    poller.poll().expect("poll 305s out must not refresh");
+
+    no_refresh.assert(); // zero hits
+    usage_a.assert();
+
+    // Phase B: 295s out — inside the threshold. Exactly one refresh fires
+    // and the rotated bearer is the one that reaches the usage endpoint.
+    let creds = write_credentials(
+        dir.path(),
+        "inside-threshold-token",
+        "inside-refresh-token",
+        Utc::now().timestamp_millis() + 295_000,
+    );
+    let one_refresh = server
+        .mock("POST", "/v1/oauth/token")
+        .match_body(mockito::Matcher::JsonString(
+            r#"{"grantType":"refresh_token","refreshToken":"inside-refresh-token"}"#.to_string(),
+        ))
+        .with_status(200)
+        .with_body(refresh_response_body())
+        .expect(1)
+        .create();
+    let usage_b = server
+        .mock("GET", "/api/oauth/usage")
+        .match_header("authorization", "Bearer fresh-access-token")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    poller.poll().expect("poll 295s out must refresh");
+
+    one_refresh.assert(); // exactly one hit
+    usage_b.assert();
+}
+
+// ---------------------------------------------------------------------------
+// Malformed refresh responses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_endpoint_200_with_malformed_body_is_a_refresh_failure() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Phase A: normalize the process-global failure counter to zero.
+    let creds = write_credentials(
+        dir.path(),
+        "warmup-access-token",
+        "warmup-refresh-token",
+        expiring_soon_expiry_ms(),
+    );
+    let warmup_refresh = server
+        .mock("POST", "/v1/oauth/token")
+        .with_status(200)
+        .with_body(refresh_response_body())
+        .create();
+    let warmup_usage = server
+        .mock("GET", "/api/oauth/usage")
+        .match_header("authorization", "Bearer fresh-access-token")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+    let mut poller = contract_poller(&creds, &server.url());
+    poller.poll().expect("warmup refresh must succeed");
+    warmup_refresh.assert();
+    warmup_usage.assert();
+
+    // Phase B: the refresh endpoint answers 200 but with a body that cannot
+    // parse as rotated credentials. That is a refresh failure, not a pass:
+    // both attempts hit the endpoint (expect 2), the failure counter
+    // increments, and the poll surfaces TokenRefreshFailed.
+    let creds = write_credentials(
+        dir.path(),
+        "doomed-access-token",
+        "doomed-refresh-token",
+        expiring_soon_expiry_ms(),
+    );
+    let malformed_refresh = server
+        .mock("POST", "/v1/oauth/token")
+        .with_status(200)
+        .with_body("{not json")
+        .expect(2)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let err = poller
+        .poll()
+        .expect_err("a malformed refresh body with no cached data must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::TokenRefreshFailed(_))
+        ),
+        "expected TokenRefreshFailed, got: {err}"
+    );
+    malformed_refresh.assert(); // initial attempt + one retry
+    assert_eq!(Poller::refresh_failure_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Window boundaries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn utilization_boundaries_pass_through_verbatim() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // 0% (window never used), 100% (window exhausted) and 137.5% (the API
+    // reporting past its cap). The governor's cutoff logic consumes these
+    // raw, so any clamping or normalization at the poller would hide real
+    // boundary conditions — all three must survive verbatim.
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(
+            r#"{
+                "five_hour": {"utilization": 0.0, "resets_at": "2026-03-18T13:59:59Z"},
+                "seven_day": {"utilization": 100.0, "resets_at": "2026-03-20T03:00:00Z"},
+                "limits": [
+                    {"kind": "weekly_scoped", "percent": 137.5,
+                     "resets_at": "2026-03-20T03:59:59Z",
+                     "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}}}
+                ]
+            }"#,
+        )
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller.poll().expect("boundary utilizations must parse");
+
+    usage.assert();
+    assert_eq!(data.five_hour_utilization, 0.0);
+    assert_eq!(data.seven_day_utilization, 100.0);
+    assert_eq!(data.weekly_scoped_utilization, 137.5);
+    assert_eq!(data.weekly_scoped_model.as_deref(), Some("Fable"));
+}
+
+#[test]
+fn resets_at_boundary_forms_and_exactly_now_compute_hours() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // Both documented ISO shapes must compute identically (§2/§6: an ISO 8601
+    // datetime with timezone offset — the API sends `+00:00` micros form and
+    // `Z` second form), and a reset exactly at poll time must compute ~0h
+    // remaining, not an error.
+    let now = Utc::now();
+    let exactly_now_offset_form = now.to_rfc3339_opts(SecondsFormat::Micros, false);
+    let one_hour_out_z_form =
+        (now + chrono::Duration::seconds(3600)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let body = format!(
+        r#"{{"five_hour": {{"utilization": 50.0, "resets_at": "{exactly_now_offset_form}"}},
+            "seven_day": {{"utilization": 50.0, "resets_at": "{one_hour_out_z_form}"}}}}"#
+    );
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(body)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller.poll().expect("boundary reset timestamps must parse");
+
+    usage.assert();
+    let five_hour = data.five_hour_hours_remaining;
+    assert!(
+        (-0.1..=0.1).contains(&five_hour),
+        "a reset exactly now must yield ~0h, got {five_hour}"
+    );
+    let seven_day = data.seven_day_hours_remaining;
+    assert!(
+        (0.9..=1.1).contains(&seven_day),
+        "the Z-suffix form must yield ~1h, got {seven_day}"
+    );
+}
+
+#[test]
+fn empty_response_object_yields_all_windows_non_binding() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // The degenerate schema: no window keys at all. serde's field defaults
+    // must absorb it exactly like explicit nulls.
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body("{}")
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller.poll().expect("an empty object must parse");
+
+    usage.assert();
+    assert!(!data.stale);
+    assert_eq!(data.five_hour_utilization, 0.0);
+    assert_eq!(data.five_hour_hours_remaining, 168.0);
+    assert_eq!(data.seven_day_utilization, 0.0);
+    assert_eq!(data.seven_day_hours_remaining, 168.0);
+    assert_eq!(data.weekly_scoped_utilization, 0.0);
+    assert_eq!(data.weekly_scoped_hours_remaining, 168.0);
+    assert!(data.weekly_scoped_model.is_none());
+    assert!(data.limits.is_empty());
+}
+
+#[test]
+fn legacy_top_level_weekly_scoped_is_ignored_in_favor_of_limits() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // poll() never reads the legacy top-level weekly_scoped window: the
+    // limits[] weekly_scoped entry is the authoritative model-agnostic
+    // source (poller.rs poll()). A response carrying only the legacy field
+    // must therefore leave weekly_scoped non-binding, not adopt the stale
+    // legacy value.
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(
+            r#"{
+                "weekly_scoped": {"utilization": 99.0, "resets_at": "2026-03-20T03:59:59Z"},
+                "five_hour": {"utilization": 10.0, "resets_at": "2026-03-18T13:59:59Z"},
+                "limits": [
+                    {"kind": "session", "percent": 10,
+                     "resets_at": "2026-03-18T13:59:59Z", "scope": null}
+                ]
+            }"#,
+        )
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller
+        .poll()
+        .expect("the legacy field must parse without affecting weekly_scoped");
+
+    usage.assert();
+    assert_eq!(data.five_hour_utilization, 10.0); // sanity: other windows survive
+    assert_eq!(data.weekly_scoped_utilization, 0.0);
+    assert_eq!(data.weekly_scoped_hours_remaining, 168.0);
+    assert!(data.weekly_scoped_model.is_none());
+    assert_eq!(data.limits.len(), 1);
+}
+
+#[test]
+fn weekly_scoped_entry_with_null_percent_is_found_but_zero() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // A weekly_scoped limits[] entry whose percent is null is still found —
+    // the model label resolves and the reset carries through — but its
+    // utilization degrades to 0.0. Found-but-zero is distinct from absent:
+    // the scoped cap exists this period, the API just did not quantify it.
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(
+            r#"{
+                "limits": [
+                    {"kind": "weekly_scoped", "percent": null,
+                     "resets_at": "2026-03-20T03:59:59Z",
+                     "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}}}
+                ]
+            }"#,
+        )
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let data = poller
+        .poll()
+        .expect("a null percent must not fail the poll");
+
+    usage.assert();
+    assert_eq!(data.weekly_scoped_utilization, 0.0);
+    assert_eq!(data.weekly_scoped_model.as_deref(), Some("Fable"));
+    assert_eq!(data.weekly_scoped_resets_at, "2026-03-20T03:59:59Z");
+}
+
+#[test]
+fn wrong_typed_limits_percent_fails_the_poll() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // The precise boundary of the limits[] additive-tolerance contract:
+    // absent and null fields are tolerated (see the two tests above), but a
+    // present value of the wrong type is a hard parse failure — serde only
+    // applies the field default when the key is missing. If tolerance for
+    // wrong-typed entries is ever added, this test and the UsageLimit doc
+    // comment claiming "never fails the whole poll" must be updated together.
+    let _usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(r#"{"limits": [{"kind": "weekly_scoped", "percent": "high"}]}"#)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let err = poller
+        .poll()
+        .expect_err("a string percent must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::ParseError(_))
+        ),
+        "expected ParseError, got: {err}"
+    );
 }

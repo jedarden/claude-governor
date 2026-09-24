@@ -819,6 +819,26 @@ mod tests {
     }
 
     #[test]
+    fn test_needs_refresh_at_exact_threshold_triggers_refresh() {
+        // usage-tracking.md §5: refresh when now + 300_000 >= expiresAt. The
+        // boundary itself must refresh, and the >= comparison is monotone-safe
+        // here: any clock advance between the two lines keeps it true.
+        let poller = Poller::new().unwrap();
+        let at_threshold = Utc::now().timestamp_millis() + REFRESH_THRESHOLD_SECS * 1000;
+        assert!(poller.needs_refresh(at_threshold));
+    }
+
+    #[test]
+    fn test_needs_refresh_just_outside_threshold_skips_refresh() {
+        // 1s outside the threshold must not refresh. This could only flip if
+        // more than a second elapsed between the arithmetic and the check,
+        // which cannot happen for two adjacent lines.
+        let poller = Poller::new().unwrap();
+        let outside_threshold = Utc::now().timestamp_millis() + (REFRESH_THRESHOLD_SECS + 1) * 1000;
+        assert!(!poller.needs_refresh(outside_threshold));
+    }
+
+    #[test]
     fn test_credentials_parsing() {
         let temp_dir = TempDir::new().unwrap();
         let creds_path =
