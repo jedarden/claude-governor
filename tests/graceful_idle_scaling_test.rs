@@ -67,6 +67,7 @@ use claude_governor::config::{
     AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, GovernorConfig, PricingConfig,
 };
 use claude_governor::governor::{apply_scaling, run_act_cycle, ScalingDecision};
+use claude_governor::narrator::{read_last_decisions_from_path, ScaleAction};
 use claude_governor::state;
 use claude_governor::worker::{scale_down_graceful, WorkerConfig};
 
@@ -575,6 +576,92 @@ fn scale_down_honors_per_cycle_cap_on_every_consecutive_cycle_regression() {
         killed(&h.calls_log).is_empty(),
         "a capped graceful scale-down never kill-sessions, in any cycle"
     );
+}
+
+/// A mixed fleet must scale down gracefully across cycles: the first cut is
+/// capped even though more workers are wanted, and both cuts choose idle
+/// workers while active workers remain live. The persisted target and audit
+/// entries make the governor's bounded decision observable beyond tmux calls.
+#[test]
+fn mixed_active_and_idle_scale_down_is_capped_idle_only_and_recorded() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    // Make active workers older than the idle workers so an age-only sort would
+    // interrupt work. The idle tier must win before heartbeat age is compared.
+    h.worker("idle-old", 40, true);
+    h.worker("idle-new", 10, true);
+    h.worker("idle-youngest", 5, true);
+    h.worker("active-old", 50, false);
+    h.worker("active-young", 49, false);
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    // The target is two, so three workers must eventually leave. The first
+    // cycle is capped at two and removes only the two oldest idle workers.
+    let first = cycle_with_target(&h, &agents, 2, 0.0, 10, 2);
+    assert_eq!(first, ScalingDecision::ScaleDown(2));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-idle-old", "cgidle-idle-new"]),
+        "the first cycle honors the cap and signals idle workers only"
+    );
+
+    // Let the signalled sessions exit. The second cycle still has one idle and
+    // both active workers; it should remove the last idle worker, not either
+    // active session, and remain within the same per-cycle cap.
+    h.reap(&["cgidle-idle-old", "cgidle-idle-new"]);
+    let second = cycle_with_target(&h, &agents, 2, 0.0, 10, 2);
+    assert_eq!(second, ScalingDecision::ScaleDown(1));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&[
+            "cgidle-idle-old",
+            "cgidle-idle-new",
+            "cgidle-idle-youngest"
+        ]),
+        "both cycles remove only idle workers and never signal active workers"
+    );
+    assert!(killed(&h.calls_log).is_empty());
+
+    // State exposes the live census taken at the start of the second cycle
+    // and the bounded target selected for it: three workers entered the cycle
+    // (two active plus one idle), and the target was two.
+    let after = state::load_state(&h.state_path).expect("reload persisted state");
+    let pool = after.workers.get("pool").expect("pool tracked in state");
+    assert_eq!(
+        pool.current, 3,
+        "the second cycle census saw three live sessions"
+    );
+    assert_eq!(pool.target, 2, "state records the bounded scale-down target");
+
+    // The decision log records both bounded requests and their actual graceful
+    // outcomes, making the idle-only scale-down auditable by cgov explain.
+    let decisions_path = h.state_path.parent().unwrap().join("decisions.jsonl");
+    let decisions = read_last_decisions_from_path(2, &decisions_path)
+        .expect("read scale-down decision audit log");
+    assert_eq!(decisions.len(), 2);
+    assert!(
+        decisions
+            .iter()
+            .all(|entry| entry.action == ScaleAction::ScaleDown)
+    );
+    assert_eq!((decisions[0].from, decisions[0].to), (3, 2));
+    assert_eq!((decisions[1].from, decisions[1].to), (5, 3));
+    assert_eq!(
+        decisions[0].context.as_ref().unwrap()["actual_removed"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        decisions[1].context.as_ref().unwrap()["actual_removed"],
+        serde_json::json!(2)
+    );
+    for entry in decisions {
+        assert_eq!(
+            entry.context.as_ref().unwrap()["max_down_per_cycle"],
+            serde_json::json!(2)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
