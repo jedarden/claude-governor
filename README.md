@@ -45,6 +45,26 @@ built artifact before publishing, and a cargo integration test
 (`tests/release_static_validation_test.rs`) re-validates any artifact already
 on disk during `cargo test`.
 
+**Publication gate.** Nothing reaches a GitHub Release until
+`scripts/publish-release.sh` proves, in order, that: the release dir is a
+clone of the Forgejo source of truth and the `v<VERSION>` tag points exactly
+at the built commit **and** resolves to that commit on Forgejo itself (a
+purely local tag proves nothing — the GitHub mirror is never trusted for
+provenance); every architecture artifact (`cgov-linux-amd64`,
+`cgov-linux-arm64`) exists and passes `scripts/verify-release-static.sh` — a
+broken artifact on any architecture refuses the release; and each artifact
+has an `<artifact>.sha256` sidecar in exactly the `sha256sum -c` format
+`install.sh` consumes whose digest equals the artifact's actual digest.
+Sidecars are validated, never generated: a published digest is immutable once
+the release is cut, so it is checked, not rewritten. Any validation failure
+exits 1 before anything is uploaded. After `gh release create` publishes both
+binaries and both sidecars, the published asset list is re-fetched and must
+pair every binary with its sidecar — an unpaired asset in either direction
+fails the run, because a live-but-incomplete release must never pass
+silently. `--dry-run` runs every check without publishing. The whole
+contract is pinned by `tests/release_publication_gate_test.rs` during
+`cargo test` (which `cgov-ci` already runs as its first release step).
+
 ### Option 1: Pre-built binary (recommended)
 
 ```bash
