@@ -1,5 +1,20 @@
 # Claude Governor Deployment - July 2026
 
+> **ARCHIVED SNAPSHOT — 2026-07-09. Do not use this file as a current-state
+> reference.** Everything below was captured once, on one host, at one moment.
+> The mutable fields — PIDs, binary version/build-timestamp/size, token
+> expiry, disk percentage, sample counts — were stale the moment they were
+> written and are now pure history; the `burn_rate_samples` FAIL recorded
+> here was restart-transient and resolved on its own within 30 minutes, as
+> the note itself predicted. Keeping point-in-time evidence out of this file
+> is impossible (it *is* point-in-time evidence for bead bf-48qtz), so it is
+> fenced off instead.
+>
+> **The reproducible, non-rotting verification procedure lives in
+> [deployment-verification.md](deployment-verification.md).** Run it whenever
+> you need to know whether the governor is deployed and healthy; run
+> `git log` on this file if you need to know what July looked like.
+
 **Bead:** bf-48qtz
 **Date:** 2026-07-09
 **Status:** Already Deployed (bead evidence was stale)
