@@ -53,6 +53,17 @@
 //! busy workers spared by one cycle are legitimate candidates the moment
 //! their own heartbeat flips idle, across a down → up → down sequence.
 //!
+//! Section 11 pins the availability dimension (claudego-eaf7ba95): the census
+//! counts tmux sessions but shutdown selection is heartbeat-keyed, so a live
+//! session that has written no heartbeat is part of the fleet total yet can
+//! never be a candidate — the cycle defers the cut rather than signalling a
+//! session it cannot identify, the deferred cut retries and lands the moment
+//! the worker reports in, and a partially-identified fleet spends its
+//! identifiable idle worker first instead of guessing at the unidentified
+//! session's name. The closing test runs the loop past the last shed:
+//! cycles at target hold and touch nobody, so convergence is exact — the
+//! oldest shed, the survivors match the target, no cycle overshoots it.
+//!
 //! Every test that swaps PATH / CGOV_DECISIONS_PATH holds [`ENV_LOCK`] for
 //! its whole body (tests in one binary share a process and run in threads).
 
@@ -1885,5 +1896,177 @@ fn busy_workers_spared_in_one_cycle_are_shed_once_idle_in_a_later_cycle() {
     assert!(
         killed(&h.calls_log).is_empty(),
         "every cycle of the sequence takes the graceful path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Availability: unidentified workers defer, retry, and converge (claudego-eaf7ba95)
+// ---------------------------------------------------------------------------
+
+/// Register a live tmux session with NO heartbeat. The census counts the
+/// session toward the fleet total, but shutdown selection is heartbeat-keyed
+/// (`find_workers_to_stop` reads heartbeats and filters against the live
+/// set), so this worker can never be identified as idle — nor as busy, nor
+/// as anything at all.
+fn seed_unidentified_worker(sessions_file: &Path, name: &str) {
+    use std::io::Write;
+    let session = format!("{PREFIX}-{name}");
+    let mut sessions = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sessions_file)
+        .expect("open sessions file");
+    writeln!(sessions, "{session}").expect("append session");
+}
+
+/// One live session, no heartbeat anywhere: the census counts it, the target
+/// wants it gone, and the cycle must not signal it — an unidentified session
+/// might be mid-task, and the governor only ever stops workers it can
+/// identify from their own reporting. The cut defers, whole. The retry half
+/// is pinned in the same sequence: the moment the worker writes its first
+/// (idle) heartbeat, the SAME target retries the deferred cut, lands on it,
+/// and the following cycle — the fleet now at target — holds and touches
+/// nobody. Defer, retry, converge: one loop, no lost shutdown.
+#[test]
+fn an_unidentified_worker_is_never_signalled_and_the_deferred_cut_retries_when_it_reports() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    seed_unidentified_worker(&h.sessions_file, "late-report");
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    // Cycle one: current 1 (census), target 0, band 0.5 — a wanted shed of 1.
+    // No heartbeat exists, so no candidate is identifiable: the executor
+    // signals nobody rather than signalling the session by name.
+    let first = cycle_with_target(&h, &agents, 0, 0.5, 10, 10);
+    assert_eq!(
+        first,
+        ScalingDecision::ScaleDown(1),
+        "the census counts the unidentified worker, so the cut is computed"
+    );
+    assert!(
+        signalled(&h.calls_log).is_empty(),
+        "an unidentified worker is never signalled by name — the cut defers"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "deferral takes the patient path, never kill-session"
+    );
+
+    // The worker reports in: its first heartbeat lands, claiming idle.
+    write_heartbeat(&h.hb_dir, "cgidle-late-report", 3, true);
+
+    // Cycle two: same target, same census. The previously unavailable worker
+    // is now an identifiable idle candidate, so the deferred cut retries and
+    // lands on exactly it.
+    let second = cycle_with_target(&h, &agents, 0, 0.5, 10, 10);
+    assert_eq!(
+        second,
+        ScalingDecision::ScaleDown(1),
+        "the deferred cut is retried, not forgotten"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-late-report"]),
+        "the retried cut lands on the worker that just reported in"
+    );
+
+    // It exits. Cycle three: the fleet is at target — a hold that touches
+    // nobody, closing the loop without a stray signal.
+    h.reap(&["cgidle-late-report"]);
+    let third = cycle_with_target(&h, &agents, 0, 0.5, 10, 10);
+    assert_eq!(third, ScalingDecision::NoChange, "the fleet is at target");
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-late-report"]),
+        "the hold cycle adds no signal: only the retry cycle ever touched it"
+    );
+}
+
+/// A fleet the census counts as two but selection can identify as one: the
+/// identifiable idle worker absorbs the cut, and the unidentified session —
+/// live, counted, but with no heartbeat — keeps running untouched. The
+/// within-pool rule "idle first" can only spend candidates selection can
+/// SEE; a worker that has never reported is not a quiet back-bencher the
+/// shed may skim, it is invisible, and invisibility protects it.
+#[test]
+fn a_partial_fleet_spends_the_identifiable_idle_worker_and_leaves_the_unidentified_running() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    h.worker("known", 40, true);
+    seed_unidentified_worker(&h.sessions_file, "maverick");
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    let decision = cycle_with_target(&h, &agents, 1, 0.5, 10, 10);
+    assert_eq!(
+        decision,
+        ScalingDecision::ScaleDown(1),
+        "current 2 against target 1 wants one worker gone"
+    );
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-known"]),
+        "the identifiable idle worker absorbs the cut; the unidentified \
+         session is never signalled"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "the graceful path has no fallback that guesses session names"
+    );
+}
+
+/// The whole loop, run past the last shed with a tight cap: a 4 → 2 cut at
+/// `max_down_per_cycle = 1` takes exactly two cycles (oldest first), and
+/// every cycle after the fleet reaches target is a hold that signals
+/// nobody. Convergence is exact — no cycle overshoots the target, the two
+/// youngest workers survive indefinitely, and nothing is ever re-signalled
+/// or kill-sessioned along the way.
+#[test]
+fn repeated_cycles_converge_exactly_to_target_and_then_hold() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let h = harness();
+
+    h.worker("ancient", 40, true);
+    h.worker("old", 30, true);
+    h.worker("young", 20, true);
+    h.worker("youngest", 10, true);
+
+    let agents = single_agent(h.launch_cmd(), &h.hb_dir);
+
+    // Cycle one: wanted shed of 2, capped at 1 — the oldest goes.
+    let first = cycle_with_target(&h, &agents, 2, 0.5, 10, 1);
+    assert_eq!(first, ScalingDecision::ScaleDown(1));
+    assert_eq!(signalled(&h.calls_log), sorted(&["cgidle-ancient"]));
+    h.reap(&["cgidle-ancient"]);
+
+    // Cycle two: the same cut resumes at the new census — the next-oldest
+    // goes, and the fleet is at target.
+    let second = cycle_with_target(&h, &agents, 2, 0.5, 10, 1);
+    assert_eq!(second, ScalingDecision::ScaleDown(1));
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-ancient", "cgidle-old"])
+    );
+    h.reap(&["cgidle-old"]);
+
+    // At target: every further cycle holds and touches nobody. Two hold
+    // cycles in a row prove the steady state is stable, not a one-cycle
+    // coincidence.
+    let third = cycle_with_target(&h, &agents, 2, 0.5, 10, 1);
+    assert_eq!(third, ScalingDecision::NoChange, "at target: hold");
+    let fourth = cycle_with_target(&h, &agents, 2, 0.5, 10, 1);
+    assert_eq!(fourth, ScalingDecision::NoChange, "still at target: hold");
+
+    assert_eq!(
+        signalled(&h.calls_log),
+        sorted(&["cgidle-ancient", "cgidle-old"]),
+        "convergence is exact: the cut stops the moment the target is met"
+    );
+    assert!(
+        killed(&h.calls_log).is_empty(),
+        "no cycle of the converge-and-hold loop ever kill-sessions"
     );
 }
