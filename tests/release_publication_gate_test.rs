@@ -17,7 +17,13 @@
 //!   digest, and after `gh release create` the published asset list is
 //!   re-fetched and must pair every binary with its sidecar;
 //! * "publication fails when any validation or sidecar check fails": every
-//!   refusal path below asserts the `gh release create` call was NEVER made.
+//!   refusal path below asserts the `gh release create` call was NEVER made;
+//! * "an artifact that never ran does not ship" (claudego-7c747ffb): the
+//!   validator downgrades to linkage-only evidence, exit 0, when the host
+//!   has NO way to execute a foreign-architecture artifact — the gate
+//!   converts that skipped execution probe into a refusal, and only the
+//!   explicit `CGOV_ALLOW_SKIPPED_PROBE=1` override (loudly noted in the
+//!   output) may publish on linkage evidence alone.
 //!
 //! The tests execute both shipped scripts (`include_str!`-embedded at
 //! compile time, following the repo's gate pattern — tests/adapter_var_sync.rs
@@ -28,7 +34,12 @@
 //! are hand-assembled static ELF64 binaries (x86-64 and AArch64, no
 //! interpreter, no NEEDED entries) that genuinely pass it, so the refusal
 //! paths prove the gate wires the validator's verdict into the publish
-//! decision. Nothing here reaches the network.
+//! decision. The sandbox `bin/` also carries `qemu-*-static` doubles for
+//! BOTH architectures, so whichever artifact is foreign on this host runs
+//! its execution probes under "an emulator" — the deterministic stand-in
+//! for the `qemu-user-static` package cgov-ci installs; the skip path is
+//! exercised deliberately in the skipped-probe tests at the bottom. Nothing
+//! here reaches the network.
 //!
 //! The refusal family is complete, not sampled (claudego-719c1248): every
 //! `die` branch the gate can take is pinned somewhere below — the usage and
@@ -36,8 +47,9 @@
 //! no origin, a tag missing from the checkout (the mirror image of missing
 //! from Forgejo), an unreachable Forgejo (distinct from a Forgejo that
 //! answers with the wrong commit), a missing static validator, a missing
-//! `gh` binary at publish time, and a `gh release create` that itself
-//! fails after every preflight check passed.
+//! `gh` binary at publish time, a `gh release create` that itself
+//! fails after every preflight check passed, and the skipped foreign-
+//! architecture execution probe (claudego-7c747ffb).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -218,12 +230,59 @@ fn sidecar_bytes(digest: &str, artifact: &str) -> Vec<u8> {
     format!("{digest}  {artifact}\n").into_bytes()
 }
 
+/// This host's architecture mapped the way the validator's `host_machine`
+/// maps it — the artifact of the OTHER architecture is the foreign one.
+fn host_machine() -> String {
+    let out = Command::new("uname")
+        .arg("-m")
+        .output()
+        .expect("uname -m (the validator itself calls it)");
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "aarch64" | "arm64" => "aarch64".to_string(),
+        _ => "x86_64".to_string(),
+    }
+}
+
+fn foreign_machine() -> String {
+    if host_machine() == "aarch64" {
+        "x86_64".to_string()
+    } else {
+        "aarch64".to_string()
+    }
+}
+
+/// A `qemu-<machine>-static` test double in the sandbox `bin/` — the shape
+/// the static-validation suite uses. The validator's probe runs it under
+/// `env -i`, so it may use only shell builtins and an absolute interpreter
+/// path; it reports exit 0 with output, which is all the probe requires.
+/// It stands in for the `qemu-user-static` package cgov-ci installs, making
+/// the emulated-probe path deterministic on every host — which matters now
+/// that the gate refuses a skipped probe (claudego-7c747ffb): without a way
+/// to run the foreign artifact, every good release would be refused on an
+/// emulator-less host.
+fn install_fake_emulator(dir: &Path, machine: &str) {
+    write_executable(
+        &dir.join("bin").join(format!("qemu-{machine}-static")),
+        &format!(
+            r#"#!/bin/sh
+# Test double for qemu-{machine}-static: builtins only (the probe runs it
+# under env -i); success with output is all the probe requires.
+echo "fake-qemu: executed $*"
+exit 0
+"#
+        )
+        .into_bytes(),
+    );
+}
+
 /// Build the full sandbox: both scripts materialized as siblings under
 /// `scripts/`, a one-commit git checkout whose `origin` is a local bare repo
-/// (the Forgejo stand-in), tag `TAG` at HEAD and pushed to the stand-in, and
-/// a `bin/gh` fake that appends its argv to the log file and answers
-/// `release view --json assets` from the `CGOV_FAKE_GH_ASSETS` scenario file.
-/// The release dir starts with both artifacts and matching sidecars.
+/// (the Forgejo stand-in), tag `TAG` at HEAD and pushed to the stand-in, a
+/// `bin/gh` fake that appends its argv to the log file and answers
+/// `release view --json assets` from the `CGOV_FAKE_GH_ASSETS` scenario
+/// file, and `qemu-*-static` doubles for both architectures in the same
+/// `bin/` (the foreign artifact's probes run under the fake). The release
+/// dir starts with both artifacts and matching sidecars.
 fn sandbox_with_good_release() -> Sandbox {
     let dir = TempDir::new().expect("sandbox");
 
@@ -253,10 +312,9 @@ fn sandbox_with_good_release() -> Sandbox {
     git(&release_dir, &["remote", "add", "origin", &origin_url]);
 
     // Both architecture artifacts: hand-assembled static ELFs that pass the
-    // real validator (the host-arch one genuinely executes; the foreign one
-    // executes too when the host has an emulator for it — claudego-8af2d72b
-    // — and otherwise gets the linkage checks with its probe skipped. The
-    // cgov-ci workflow requires both guest smoke probes before publishing.)
+    // real validator (the host-arch one genuinely executes natively; the
+    // foreign one executes under the sandbox's emulator double below — the
+    // deterministic stand-in for the emulator cgov-ci installs).
     let msg = b"cgov 0.1.2-sandbox\n";
     write_executable(&release_dir.join("cgov-linux-amd64"), &static_elf_x86_64(msg));
     write_executable(&release_dir.join("cgov-linux-arm64"), &static_elf_aarch64(msg));
@@ -275,7 +333,6 @@ fn sandbox_with_good_release() -> Sandbox {
         &release_dir,
         &["push", "-q", "origin", &format!("refs/tags/{TAG}")],
     );
-
     // Recording gh fake. Newlines inside argv (the gate's --notes span
     // lines) are collapsed so one gh call is exactly one log line.
     let gh_log = dir.path().join("gh.log");
@@ -298,6 +355,15 @@ esac
         )
         .into_bytes(),
     );
+
+    // Emulator doubles for BOTH architectures: whichever artifact is
+    // foreign on this host runs its execution probes under the fake, so
+    // the static-validation phase exercises genuine execution everywhere.
+    // Without it the gate would (correctly) refuse every good release on
+    // an emulator-less host — the skipped-probe tests below strip these
+    // from PATH to reach exactly that state deliberately.
+    install_fake_emulator(dir.path(), "aarch64");
+    install_fake_emulator(dir.path(), "x86_64");
 
     Sandbox {
         dir,
@@ -763,31 +829,75 @@ fn bare_version_is_normalized_to_the_release_tag() {
 // ---------------------------------------------------------------------------
 
 /// A directory of symlinks to exactly the executables the gate and its
-/// static validator invoke before the publish phase — deliberately without
-/// `gh`. Tools resolve on the host (`command -v`) so the sandbox works
-/// whatever the host layout is; a tool the host lacks (`file(1)` is
-/// optional to the validator) is simply absent, exactly as the validator
-/// expects when it downgrades the file(1) cross-check.
-fn gate_tools_path_without_gh(dir: &Path) -> PathBuf {
-    let bin = dir.join("bin-no-gh");
+/// static validator invoke before the publish phase, minus the tools named
+/// in `omit` — the lever that builds a PATH missing `gh` (the publish-phase
+/// refusal) or missing the foreign-architecture emulators (the skipped-probe
+/// refusal). Host tools resolve via `command -v` so the sandbox works
+/// whatever the host layout is (a tool the host lacks, like `file(1)`, is
+/// simply absent, exactly as the validator expects when it downgrades the
+/// file(1) cross-check); the sandbox's own doubles (`gh`, the qemu fakes)
+/// are symlinked from the sandbox `bin/` unless omitted, so a stripped PATH
+/// differs from the happy path only in the named omission.
+fn gate_tools_bin(sb: &Sandbox, dest_name: &str, omit: &[&str]) -> PathBuf {
+    let bin = sb.dir.path().join(dest_name);
     fs::create_dir_all(&bin).expect("create stripped bin dir");
-    for tool in [
+    let sandbox_bin = sb.dir.path().join("bin");
+    let mut tools: Vec<String> = [
         "bash", "git", "dirname", "basename", "sed", "awk", "grep", "cut",
         "head", "tr", "cat", "mktemp", "sha256sum", "env", "uname",
         "readlink", "readelf", "objdump", "file", "rm",
-    ] {
-        let found = Command::new("sh")
-            .args(["-c", &format!("command -v {tool}")])
-            .output()
-            .expect("probe the host for a gate tool");
-        if !found.status.success() {
-            continue; // optional to the gate's pre-publish path on this host
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    // The sandbox doubles: gh plus an emulator double for either
+    // architecture — whichever artifact is foreign on this host is the one
+    // whose probes need it.
+    tools.push("gh".into());
+    tools.push("qemu-aarch64-static".into());
+    tools.push("qemu-x86_64-static".into());
+    for tool in tools {
+        if omit.contains(&tool.as_str()) {
+            continue;
         }
-        let target = PathBuf::from(String::from_utf8_lossy(&found.stdout).trim());
-        std::os::unix::fs::symlink(&target, bin.join(tool))
+        let target = if tool == "gh" || tool.starts_with("qemu-") {
+            sandbox_bin.join(&tool)
+        } else {
+            let found = Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .expect("probe the host for a gate tool");
+            if !found.status.success() {
+                continue; // optional to the gate's pre-publish path on this host
+            }
+            PathBuf::from(String::from_utf8_lossy(&found.stdout).trim())
+        };
+        std::os::unix::fs::symlink(&target, bin.join(&tool))
             .expect("symlink a gate tool into the stripped bin dir");
     }
     bin
+}
+
+/// A PATH whose bin dir holds the gate tools and the fake gh but NO emulator
+/// for the foreign architecture, plus a pinned-empty binfmt_misc dir: the
+/// validator has no way to execute the foreign artifact and must skip its
+/// probe — loudly — exactly the state production CI must never publish from.
+/// BINFMT_MISC_DIR is pinned (a validator test hook) so the outcome never
+/// depends on the host's real registrations.
+fn stripped_of_emulators(sb: &Sandbox) -> (PathBuf, PathBuf) {
+    let bin = gate_tools_bin(
+        sb,
+        "bin-no-qemu",
+        &[
+            "qemu-aarch64-static",
+            "qemu-aarch64",
+            "qemu-x86_64-static",
+            "qemu-x86_64",
+        ],
+    );
+    let binfmt_empty = sb.dir.path().join("binfmt-empty");
+    fs::create_dir_all(&binfmt_empty).expect("empty binfmt dir");
+    (bin, binfmt_empty)
 }
 
 #[test]
@@ -985,7 +1095,9 @@ fn missing_gh_cli_refuses_and_never_publishes() {
     // Every preflight phase passes, then `command -v gh` fails: the gate
     // must refuse rather than quietly skip the publish step and exit 0 —
     // a green run that published nothing would be worse than a red one.
-    let bin = gate_tools_path_without_gh(sb.dir.path());
+    // The emulator doubles stay on PATH so the static phase passes and the
+    // refusal is attributable to the missing gh alone.
+    let bin = gate_tools_bin(&sb, "bin-no-gh", &["gh"]);
     let (code, out) = run_gate_raw(
         &sb,
         &good_assets_json(),
@@ -1031,5 +1143,116 @@ fn failed_gh_create_fails_the_run_and_stops_before_the_asset_query() {
         create_calls(&sb).len(),
         1,
         "the single gh call was the create itself:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The skipped foreign-architecture execution probe (claudego-7c747ffb)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skipped_foreign_probe_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // Everything else is perfect — Forgejo provenance, both artifacts, both
+    // sidecars — but nothing on this host can EXECUTE the foreign artifact:
+    // no emulator on the (stripped) PATH and no binfmt_misc registration.
+    // The validator still exits 0, downgrading to linkage-only evidence with
+    // a loud note; the gate must convert that downgrade into a refusal,
+    // because a probe that never ran proves nothing about the bytes that
+    // would ship. This is the property cgov-ci's grep enforced from outside
+    // the gate; the gate now enforces it itself, before any gh call.
+    let (bin, binfmt_empty) = stripped_of_emulators(&sb);
+    let (code, out) = run_gate_raw(
+        &sb,
+        &good_assets_json(),
+        &[],
+        &[
+            ("PATH", bin.to_string_lossy().into_owned()),
+            (
+                "BINFMT_MISC_DIR",
+                binfmt_empty.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+    assert_eq!(
+        code, 1,
+        "a skipped foreign probe must refuse publication:\n{out}"
+    );
+    assert!(
+        out.contains("EXECUTION PROBE SKIPPED"),
+        "the validator's loud skip note must reach the gate output:\n{out}"
+    );
+    assert!(
+        out.contains("execution probe was skipped"),
+        "refusal must attribute the run's failure to the skipped probe:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "a skipped-probe refusal must make no gh call at all"
+    );
+}
+
+#[test]
+fn skipped_foreign_probe_publishes_only_under_the_explicit_override() {
+    let sb = sandbox_with_good_release();
+    // The escape hatch is deliberate and loud: the identical no-way-to-run
+    // host with CGOV_ALLOW_SKIPPED_PROBE=1 publishes on linkage evidence
+    // alone, and the output must carry the override note so a
+    // linkage-only release can never pass silently.
+    let (bin, binfmt_empty) = stripped_of_emulators(&sb);
+    let (code, out) = run_gate_raw(
+        &sb,
+        &good_assets_json(),
+        &[],
+        &[
+            ("PATH", bin.to_string_lossy().into_owned()),
+            (
+                "BINFMT_MISC_DIR",
+                binfmt_empty.to_string_lossy().into_owned(),
+            ),
+            ("CGOV_ALLOW_SKIPPED_PROBE", "1".to_string()),
+        ],
+    );
+    assert_eq!(code, 0, "the override must let the run publish:\n{out}");
+    assert!(
+        out.contains("CGOV_ALLOW_SKIPPED_PROBE=1 accepts linkage-only evidence"),
+        "the override must be loudly noted in the output:\n{out}"
+    );
+    assert_eq!(
+        create_calls(&sb).len(),
+        1,
+        "the run went on to publish exactly once:\n{out}"
+    );
+    assert!(
+        out.contains("publish-release: OK"),
+        "the overridden run completes like any other:\n{out}"
+    );
+}
+
+#[test]
+fn gate_surfaces_the_emulated_foreign_probe_before_publishing() {
+    let sb = sandbox_with_good_release();
+    // The positive control for the refusal above: with a way to run the
+    // foreign artifact — the sandbox's emulator double here, the
+    // qemu-user-static package in production — the validator reports both
+    // probes UNDER THE EMULATOR and the gate publishes. The skip refusal is
+    // wired to genuine skips only, not to emulation or foreignness itself.
+    let m = foreign_machine();
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(
+        ok,
+        "a release whose foreign probe ran under emulation must publish:\n{out}"
+    );
+    for probe in ["--version", "--help"] {
+        assert!(
+            out.contains(&format!("{probe} under qemu-{m}-static in env -i")),
+            "the gate output must show the foreign {probe} ran under the \
+             emulator, not merely that the validator exited 0:\n{out}"
+        );
+    }
+    assert_eq!(
+        create_calls(&sb).len(),
+        1,
+        "the fully-executed release publishes exactly once:\n{out}"
     );
 }

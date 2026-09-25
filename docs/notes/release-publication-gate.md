@@ -45,7 +45,12 @@ Fail-closed, in order; any failure exits 1 with nothing uploaded:
    foreign-arch artifact executes its probe too whenever the host has a way
    to run it (an emulator on PATH or a binfmt registration) — `cgov-ci`
    installs `qemu-user-static`, so there the arm64 artifact genuinely runs
-   both smoke probes — and keeps the full linkage checks either way.
+   both smoke probes — and keeps the full linkage checks either way. Since
+   claudego-7c747ffb a SKIPPED probe is a refusal too: the validator's
+   linkage-only downgrade (exit 0 with a loud note) is not acceptance, so a
+   host with no way to execute an artifact cannot publish it.
+   `CGOV_ALLOW_SKIPPED_PROBE=1` is the explicit, loudly-noted override for a
+   linkage-only rehearsal.
 4. **Sidecars.** Each artifact needs `<artifact>.sha256`, exactly one line,
    `<64-hex>␠␠<artifact>` — the `sha256sum -c` shape `install.sh` consumes —
    with a digest equal to the artifact's actual sha256. Sidecars are
@@ -95,8 +100,12 @@ builds:
   x86-64 and AArch64, ~150 bytes, no PT_INTERP, no dynamic section, real
   `write`/`exit` syscalls — so the static-validation phase is the genuine
   validator, not a mock. The host-arch artifact actually executes under the
-  script's `env -i` probe; the foreign one executes too when the host has an
-  emulator for it (claudego-8af2d72b) and otherwise exercises the skip path;
+  script's `env -i` probe; the foreign one executes under a `qemu-*-static`
+  test double in the sandbox `bin/` (both architectures covered, so the
+  suite is deterministic on any host — the stand-in for the
+  `qemu-user-static` package cgov-ci installs). The no-way-to-run skip
+  state is reached deliberately by stripping the emulators from PATH and
+  pinning `BINFMT_MISC_DIR` to an empty dir;
 - a recording `gh` fake on `PATH` that logs its argv (newlines collapsed —
   the gate's `--notes` span lines) and answers the post-publish asset query
   from a scenario file.
@@ -108,4 +117,7 @@ the strongest available form of "publication fails". Covered: happy path
 wrong artifact, malformed sidecar shape, foreign-arch artifact failing static
 validation, missing foreign-arch artifact, tag behind HEAD, tag absent from
 Forgejo, origin not Forgejo, post-publish sidecar gap, bare-version
-normalization, and the Forgejo-default pin.
+normalization, the Forgejo-default pin, and — claudego-7c747ffb — the
+skipped foreign-architecture execution probe (refused; publishes only under
+a loudly-noted `CGOV_ALLOW_SKIPPED_PROBE=1`; with a way to run the artifact,
+the emulated probe is surfaced in the gate's own output before publishing).

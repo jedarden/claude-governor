@@ -18,6 +18,9 @@
 #      build host's; foreign-arch artifacts run the execution probe under an
 #      emulator when one is available (claudego-8af2d72b) and keep the full
 #      linkage checks regardless; cgov-ci fail-closes on both smoke probes.
+#      A validator that SKIPPED the probe — no emulator and no binfmt_misc
+#      registration can run the artifact's architecture — is a refusal too
+#      (claudego-7c747ffb): an artifact that never ran does not ship.
 #   4. SIDECARS — every artifact has an <artifact>.sha256 sidecar in exactly
 #      the `sha256sum -c` format install.sh consumes, whose digest equals the
 #      artifact's actual digest. Sidecars are validated here, never
@@ -43,6 +46,11 @@
 #                     (default: the source-of-truth repo below)
 #   CGOV_GH_REPO      GitHub slug the release is published to
 #                     (default: jedarden/claude-governor)
+#   CGOV_ALLOW_SKIPPED_PROBE  set to 1 to accept a foreign-architecture
+#                     artifact whose execution probe was skipped (no
+#                     emulator, no binfmt_misc): it publishes on linkage
+#                     evidence alone, loudly. Production CI leaves it
+#                     unset.
 
 set -euo pipefail
 
@@ -171,9 +179,24 @@ done
 # ---------------------------------------------------------------------------
 # Phase 3: static validation, per architecture
 # ---------------------------------------------------------------------------
+# A validator exit of 0 is not enough: the validator also SKIPS the execution
+# probe (exit 0, loud note) when the artifact's architecture cannot be run on
+# this host. An artifact that never ran does not ship, so the skip note is a
+# refusal here — unless CGOV_ALLOW_SKIPPED_PROBE=1 says linkage-only evidence
+# is accepted for this run (a deliberate, logged override).
 for artifact in "${ARTIFACTS[@]}"; do
-    bash "${STATIC_CHECK}" "${RELEASE_DIR}/${artifact}" \
-        || die "static: ${artifact} failed scripts/verify-release-static.sh — refusing to publish a non-static artifact"
+    static_out="$(bash "${STATIC_CHECK}" "${RELEASE_DIR}/${artifact}" 2>&1)" || {
+        printf '%s\n' "${static_out:-}" >&2
+        die "static: ${artifact} failed scripts/verify-release-static.sh — refusing to publish a non-static artifact"
+    }
+    printf '%s\n' "${static_out}"
+    if grep -q 'EXECUTION PROBE SKIPPED' <<<"${static_out}"; then
+        if [ "${CGOV_ALLOW_SKIPPED_PROBE:-0}" = "1" ]; then
+            note "static: ${artifact} execution probe was skipped; CGOV_ALLOW_SKIPPED_PROBE=1 accepts linkage-only evidence for this run"
+        else
+            die "static: ${artifact} execution probe was skipped — no emulator and no binfmt_misc registration can run its architecture; install qemu-user-static, or set CGOV_ALLOW_SKIPPED_PROBE=1 to accept linkage-only evidence"
+        fi
+    fi
     pass "static: ${artifact} passes the zero-runtime-dependency checks"
 done
 

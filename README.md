@@ -59,9 +59,13 @@ at the built commit **and** resolves to that commit on Forgejo itself (a
 purely local tag proves nothing — the GitHub mirror is never trusted for
 provenance); every architecture artifact (`cgov-linux-amd64`,
 `cgov-linux-arm64`) exists and passes `scripts/verify-release-static.sh` — a
-broken artifact on any architecture refuses the release; and each artifact
-has an `<artifact>.sha256` sidecar in exactly the `sha256sum -c` format
-`install.sh` consumes whose digest equals the artifact's actual digest.
+broken artifact on any architecture refuses the release, and so does an
+artifact whose execution probe the host could not run (no emulator, no
+binfmt_misc): an artifact that never ran does not ship, unless
+`CGOV_ALLOW_SKIPPED_PROBE=1` explicitly accepts linkage-only evidence; and
+each artifact has an `<artifact>.sha256` sidecar in exactly the `sha256sum -c`
+format `install.sh` consumes whose digest equals the artifact's actual
+digest.
 Sidecars are validated, never generated: a published digest is immutable once
 the release is cut, so it is checked, not rewritten. Any validation failure
 exits 1 before anything is uploaded. After `gh release create` publishes both

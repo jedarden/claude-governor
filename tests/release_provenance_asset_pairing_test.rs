@@ -238,6 +238,28 @@ fn sidecar_bytes(digest: &str, artifact: &str) -> Vec<u8> {
     format!("{digest}  {artifact}\n").into_bytes()
 }
 
+/// A `qemu-<machine>-static` test double in the sandbox `bin/` — the shape
+/// the static-validation suite uses, builtins only because the probe runs
+/// it under `env -i`. The gate refuses a foreign-architecture artifact
+/// whose execution probe was skipped (claudego-7c747ffb), so the sandbox
+/// supplies a way to run whichever artifact is foreign on this host — the
+/// deterministic stand-in for the `qemu-user-static` package cgov-ci
+/// installs.
+fn install_fake_emulator(dir: &Path, machine: &str) {
+    write_executable(
+        &dir.join("bin").join(format!("qemu-{machine}-static")),
+        &format!(
+            r#"#!/bin/sh
+# Test double for qemu-{machine}-static: builtins only (the probe runs it
+# under env -i); success with output is all the probe requires.
+echo "fake-qemu: executed $*"
+exit 0
+"#
+        )
+        .into_bytes(),
+    );
+}
+
 /// Build the full sandbox: both scripts materialized as siblings under
 /// `scripts/`, a one-commit git checkout whose `origin` is a local bare repo
 /// (the Forgejo stand-in), `TAG` cut in `style` at HEAD and pushed to the
@@ -275,8 +297,8 @@ fn sandbox(style: TagStyle) -> Sandbox {
     git(&release_dir, &["remote", "add", "origin", &origin_url]);
 
     // Both architecture artifacts: hand-assembled static ELFs that pass the
-    // real validator (the host-arch one genuinely executes; the foreign one
-    // gets the linkage checks with its probe skipped).
+    // real validator (the host-arch one genuinely executes natively; the
+    // foreign one executes under the sandbox's emulator double below).
     let msg = b"cgov 0.1.2-sandbox\n";
     write_executable(&release_dir.join("cgov-linux-amd64"), &static_elf_x86_64(msg));
     write_executable(&release_dir.join("cgov-linux-arm64"), &static_elf_aarch64(msg));
@@ -325,6 +347,11 @@ esac
         )
         .into_bytes(),
     );
+
+    // Emulator doubles for both architectures: the foreign artifact's
+    // probes must run for the gate to publish at all (claudego-7c747ffb).
+    install_fake_emulator(dir.path(), "aarch64");
+    install_fake_emulator(dir.path(), "x86_64");
 
     Sandbox {
         dir,

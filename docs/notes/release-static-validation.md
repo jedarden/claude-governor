@@ -34,10 +34,13 @@ binary it requires:
    preferred, since under `env -i` a static emulator cannot itself need
    libraries), or directly when an enabled `binfmt_misc` registration would
    let the kernel exec it. Only with neither is the probe skipped, with a
-   loud note that the artifact ships on linkage evidence alone. `cgov-ci`
-   closes that residual for real artifacts: it installs `qemu-user-static`
-   and refuses to publish unless the arm64 artifact's `--version` and `--help`
-   probes both ran under the emulator. The contract is pinned by
+   loud note that the artifact ships on linkage evidence alone. That
+   residual is closed in two places: the publication gate
+   (`scripts/publish-release.sh`, claudego-7c747ffb) refuses to publish any
+   artifact whose probe was skipped unless `CGOV_ALLOW_SKIPPED_PROBE=1` is
+   set, and `cgov-ci` installs `qemu-user-static` and refuses to publish
+   unless the arm64 artifact's `--version` and `--help` probes both ran
+   under the emulator. The contract is pinned by
    `tests/release_static_validation_test.rs`
    (hand-assembled x86-64/AArch64 ELFs; `BINFMT_MISC_DIR` overrides the
    binfmt mountpoint so both cases are testable regardless of the host).
