@@ -31,6 +31,20 @@
 //! later gates the capacity walk on validation too (or stops gating the
 //! multiplier), this suite says so instead of letting the change drift in
 //! silently.
+//!
+//! The later section extends the same discipline to the CONSUMERS of the
+//! walk: the per-window `hours_remaining` that lands in
+//! `state.capacity_forecast` (and through it the duty-cycle
+//! `safe_worker_count` and the binding-window selection). Those scenarios
+//! place the reset time itself on the boundaries — exactly on 08:00/14:00 ET,
+//! exactly on a promotion's start/end midnight, or straddling a promotion
+//! transition inside the span — and pin the exact effective hours, the
+//! sizing decision derived from them, and the binding choice. With no
+//! workers and no burn data every forecast margin is infinite, so the risk
+//! scores tie and binding selection resolves to the last eligible window;
+//! that tie is itself pinned (it is what `state.schedule`
+//! `.effective_hours_remaining` display reads) so any change to eligibility,
+//! tie-breaking, or promotion-in-risk coupling shows up here.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -196,6 +210,19 @@ fn minimal_pricing_config() -> GovernorConfig {
 /// `seed_mirror = false` leaves the mirror empty, which is how the final test
 /// exercises the conservative validation fallback.
 fn drive_observe(now: DateTime<Utc>, resets_hrs: (i64, i64, i64), seed_mirror: bool) -> state::GovernorState {
+    drive_observe_with(now, resets_hrs, seed_mirror, &[promotion()])
+}
+
+/// [`drive_observe`] with an explicit promotion schedule. The boundary tests
+/// below drive the same instant against the real schedule and against an
+/// empty one — the only way to show a number moved BECAUSE of the promotion
+/// rather than because of the clock.
+fn drive_observe_with(
+    now: DateTime<Utc>,
+    resets_hrs: (i64, i64, i64),
+    seed_mirror: bool,
+    promotions: &[Promotion],
+) -> state::GovernorState {
     let home = TempDir::new().expect("temp home");
     let paths = CyclePaths::under(home.path());
     if seed_mirror {
@@ -214,7 +241,7 @@ fn drive_observe(now: DateTime<Utc>, resets_hrs: (i64, i64, i64), seed_mirror: b
         &paths,
         &AlertConfig::default(),
         &agents,
-        &[promotion()],
+        promotions,
         &minimal_pricing_config(),
         now,
     )
@@ -521,4 +548,266 @@ fn unvalidated_promotion_keeps_burn_multiplier_at_1x_but_capacity_still_boosts()
         4.0,
         "remaining capacity still uses the declared multiplier",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reset & promotion boundaries through the forecast (claudego-cd7cb396)
+//
+// The tests above pin the schedule state at boundary instants. These place
+// the RESET TIME itself on the boundary — exactly on 08:00/14:00 ET, exactly
+// on a promotion's start/end midnight, or straddling a promotion transition
+// inside the span — so the forecast walk has to attribute the boundary
+// minute correctly, and follow the numbers into the decisions that consume
+// them: `capacity_forecast.<window>.hours_remaining`, the duty-cycle
+// `safe_worker_count` derived from it, and the binding-window selection.
+//
+// This harness has no workers and no burn history, so every
+// `fleet_pct_per_hour` is 0, predicted exhaustion is infinite, and every
+// `margin_hrs` is infinite: all three risk scores tie at -Inf and binding
+// selection resolves to the last eligible window. That makes every number
+// below exact and hand-computed against the defaults the cycle actually
+// uses: ceiling 90 (DaemonConfig default), sizing rate 1.5%/worker/hr
+// (baseline fallback at zero workers), utilizations 20/40/30 → remaining
+// 70/50/60.
+// ---------------------------------------------------------------------------
+
+/// A reset span straddling the promotion's END midnight: Tue 22:00 ET + 4h
+/// crosses 2026-03-25 00:00 ET, so the walk is 2h at 2x (Tuesday, promo still
+/// on) + 2h at 1x (Wednesday, promo over) = 6.0 effective hours over 4.0
+/// wall hours. The forecast must consume the mixed value — not the raw 4.0
+/// and not the flat 2x 8.0 — even though the burn side still shows 2x at
+/// `now`.
+#[test]
+fn forecast_crossing_the_promo_end_midnight_mixes_both_multipliers() {
+    let now = et(2026, 3, 24, 22, 0); // Tuesday evening, the promo's last day
+    let st = drive_observe(now, (1, 2, 4), true);
+
+    assert!(!st.schedule.is_peak_hour);
+    assert!(
+        st.schedule.is_promo_active,
+        "22:00 ET Tuesday is still inside the promo"
+    );
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        2.0,
+        "burn attribution is 2x at now",
+    );
+
+    assert_close(st.schedule.raw_hours_remaining, 4.0, "wall-clock hours to reset");
+    assert_close(
+        st.schedule.effective_hours_remaining_weekly_scoped,
+        6.0,
+        "2h at 2x + 2h at 1x across the promo end",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        6.0,
+        "the forecast consumed the mixed walk",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "five_hour walk is raw (not in applies_to) even across the boundary",
+    );
+    assert_close(
+        st.capacity_forecast.seven_day.hours_remaining,
+        2.0,
+        "seven_day's reset lands exactly on the promo-end midnight; its raw \
+         walk stops there at 1x",
+    );
+}
+
+/// Mirror image: Sat 22:00 ET + 4h crosses the promotion's START midnight, so
+/// the walk is 2h at 1x (Saturday, before start_date) + 2h at 2x (Sunday, the
+/// promo's first day — no peak block on a weekend) = 6.0. At `now` the promo
+/// has not started, so the instantaneous burn multiplier is still 1.0: the
+/// deliberate disagreement between attribution (where the account is) and
+/// forecast (where the window is going).
+#[test]
+fn forecast_crossing_the_promo_start_midnight_picks_up_the_boost() {
+    let now = et(2026, 3, 14, 22, 0); // Saturday evening, before start_date
+    let st = drive_observe(now, (1, 2, 4), true);
+
+    assert!(!st.schedule.is_peak_hour, "Saturday night is off-peak");
+    assert!(!st.schedule.is_promo_active, "Saturday precedes start_date");
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        1.0,
+        "burn attribution is still 1x at now",
+    );
+
+    assert_close(st.schedule.raw_hours_remaining, 4.0, "wall-clock hours to reset");
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        6.0,
+        "2h at 1x + 2h at 2x across the promo start",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "five_hour stays raw across the promo start",
+    );
+}
+
+/// The reset lands exactly ON 14:00 ET. The peak window is half-open
+/// ([08:00, 14:00)) and the walk is half-open ([now, reset)), so a
+/// 13:00 → 14:00 span is ALL peak minutes: exactly 1.0 effective hour even
+/// though the very next minute would be boosted 2x. A walk that stepped one
+/// minute too far, or gave the boundary minute to the wrong band, reads 2.0.
+#[test]
+fn reset_exactly_on_peak_end_counts_only_peak_minutes() {
+    let now = et(2026, 3, 16, 13, 0); // Monday 13:00 ET, inside peak
+    let st = drive_observe(now, (1, 1, 1), true);
+
+    assert!(st.schedule.is_peak_hour);
+    assert!(st.schedule.is_promo_active);
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        1.0,
+        "13:00 -> 14:00 is exactly one peak hour; the 14:00 minute must not leak in",
+    );
+    assert_close(
+        st.schedule.effective_hours_remaining_weekly_scoped,
+        1.0,
+        "schedule and forecast agree on the boundary-exact walk",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "same span, same 1.0 for a window the promo does not apply to",
+    );
+}
+
+/// The mirror: a 07:00 → 08:00 span is ALL off-peak minutes inside the promo,
+/// so the boosted window reads exactly 2.0 — the 08:00 peak minute is the
+/// first one excluded. Reads 1.0 if the boundary minute flips bands.
+#[test]
+fn reset_exactly_on_peak_start_counts_only_offpeak_minutes() {
+    let now = et(2026, 3, 16, 7, 0); // Monday 07:00 ET, pre-peak
+    let st = drive_observe(now, (1, 1, 1), true);
+
+    assert!(!st.schedule.is_peak_hour);
+    assert!(st.schedule.is_promo_active);
+    assert_close(st.schedule.promo_multiplier_weekly_scoped, 2.0, "off-peak, promo on");
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        2.0,
+        "07:00 -> 08:00 is one boosted hour; the 08:00 peak minute must not leak in",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "same span stays raw for a window the promo does not apply to",
+    );
+}
+
+/// The boosted window's reset lands exactly ON the promotion's end midnight:
+/// Tue 23:00 ET + 1h stops at 2026-03-25 00:00 ET. Every walked minute is
+/// still Tuesday at 2x, so the span is exactly 2.0 — the first 1x minute
+/// would only arrive after the reset.
+#[test]
+fn reset_exactly_on_the_promo_end_midnight_keeps_the_boost() {
+    let now = et(2026, 3, 24, 23, 0);
+    let st = drive_observe(now, (1, 2, 1), true);
+
+    assert!(!st.schedule.is_peak_hour);
+    assert!(st.schedule.is_promo_active);
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        2.0,
+        "23:00 -> 00:00 is one boosted hour; expiry must not clip the walked minutes",
+    );
+}
+
+/// And the span that STARTS on the end date: Wed 00:00 ET + 1h is entirely
+/// post-promo off-peak, so the boosted window reads exactly 1.0. This is the
+/// end-exclusive contract expressed in the walk rather than in a single
+/// instant: 00:00 on end_date is the first inactive minute.
+#[test]
+fn span_starting_on_the_end_date_is_entirely_flat() {
+    let now = et(2026, 3, 25, 0, 0);
+    let st = drive_observe(now, (1, 2, 1), true);
+
+    assert!(!st.schedule.is_peak_hour);
+    assert!(!st.schedule.is_promo_active, "00:00 on end_date is already out");
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        1.0,
+        "off-peak but post-expiry",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        1.0,
+        "an off-peak hour after expiry is one raw hour",
+    );
+}
+
+/// The documented 2x capacity effect, followed into the sizing decision. The
+/// same instant and readings are driven twice — once with the promotion, once
+/// with an empty schedule. The spans are all off-peak, so the boosted
+/// window's effective hours are exactly double (4.0 vs 2.0), and in the
+/// whole-worker regime the duty-cycle budget math halves the sustainable
+/// count: 60% remaining ÷ (1.5%/hr × 4 effective hrs) = 10 workers with the
+/// promo, 60 ÷ (1.5 × 2) = 20 without. The windows the promotion does not
+/// list (70%/1h → 46, 50%/2h → 16) must be identical across both cycles.
+#[test]
+fn doubled_effective_hours_halve_the_whole_worker_safe_count() {
+    let now = et(2026, 3, 16, 20, 0); // Monday evening, all-off-peak spans
+
+    let boosted = drive_observe(now, (1, 2, 2), true);
+    let flat = drive_observe_with(now, (1, 2, 2), false, &[]);
+
+    assert_close(
+        boosted.capacity_forecast.weekly_scoped.hours_remaining,
+        4.0,
+        "2 wall hours × 2x",
+    );
+    assert_close(
+        flat.capacity_forecast.weekly_scoped.hours_remaining,
+        2.0,
+        "raw wall hours with no promotion",
+    );
+
+    assert_eq!(
+        boosted.capacity_forecast.weekly_scoped.safe_worker_count,
+        Some(10),
+        "60% / (1.5%/hr × 4 effective hrs) sustains 10 continuous workers",
+    );
+    assert_eq!(
+        flat.capacity_forecast.weekly_scoped.safe_worker_count,
+        Some(20),
+        "the same budget over half the effective hours sustains exactly twice as many",
+    );
+
+    // Unboosted windows are untouched by the promotion on both cycles.
+    assert_eq!(boosted.capacity_forecast.five_hour.safe_worker_count, Some(46));
+    assert_eq!(flat.capacity_forecast.five_hour.safe_worker_count, Some(46));
+    assert_eq!(boosted.capacity_forecast.seven_day.safe_worker_count, Some(16));
+    assert_eq!(flat.capacity_forecast.seven_day.safe_worker_count, Some(16));
+
+    // No fleet burn here → every margin is infinite → the risk scores tie and
+    // binding resolves to the last eligible window on BOTH cycles: the
+    // promotion alone must not perturb binding selection.
+    assert_eq!(
+        boosted.capacity_forecast.binding_window, "weekly_scoped",
+        "tie-break pin: no-burn margins tie, the last eligible window binds",
+    );
+    assert_eq!(flat.capacity_forecast.binding_window, "weekly_scoped");
+    // The display effective-hours field reads the BINDING window's walk, so
+    // it doubles exactly when the binding window is the boosted one.
+    assert_close(
+        boosted.schedule.effective_hours_remaining,
+        4.0,
+        "display reads the binding window's boosted walk",
+    );
+    assert_close(
+        flat.schedule.effective_hours_remaining,
+        2.0,
+        "display reads the binding window's raw walk",
+    );
+
+    // And the boundary must not manufacture urgency: with zero fleet burn,
+    // exhaustion is never predicted inside any span, boosted or not.
+    assert!(!boosted.capacity_forecast.weekly_scoped.cutoff_risk);
+    assert!(!flat.capacity_forecast.weekly_scoped.cutoff_risk);
 }
