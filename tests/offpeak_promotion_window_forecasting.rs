@@ -10,7 +10,12 @@
 //!
 //! - **Subscription window** (`applies_to`): a promotion listing only
 //!   `weekly_scoped` must leave `five_hour` and `seven_day` at 1.0 / raw
-//!   wall-clock, even while `weekly_scoped` is boosted.
+//!   wall-clock, even while `weekly_scoped` is boosted. One scenario inverts
+//!   the listing — `five_hour` and `seven_day` boosted, `weekly_scoped` left
+//!   out — so each window's multiplier is pinned to its OWN name, not merely
+//!   to "not `weekly_scoped`": the cycle computes the three multipliers in
+//!   three separate arms, and a window name swapped between two of them
+//!   would otherwise stay green.
 //! - **Time window**: off-peak hours inside the promotion's date range only —
 //!   peak hours get nothing even mid-promotion, minutes before `start_date`
 //!   get nothing, and the date bounds are Eastern calendar dates
@@ -336,6 +341,140 @@ fn offpeak_during_promo_boosts_only_the_listed_window() {
         st.schedule.raw_hours_remaining,
         2.0,
         "raw hours are wall-clock regardless of promotions",
+    );
+}
+
+/// A promotion listing MORE than one subscription window boosts each listed
+/// window under its own name — and the cycle computes those multipliers in
+/// three separate arms, so this is the only scenario that tells them apart.
+/// Every other test here lists only `weekly_scoped`: that pins each arm's
+/// *rejection* of `"weekly_scoped"`, but a `"five_hour"`/`"seven_day"`
+/// window-name swap between the two unboosted arms would keep all of them
+/// green. Here the listing moves to the OTHER two windows, so both arms must
+/// match their own name (and not each other's) while the unlisted window
+/// stays raw — on the burn side, in the capacity walk, and in the sizing
+/// each walk feeds: 70% ÷ (1.5%/hr × 2 effective hrs) = 23.33 → 23, and
+/// 50% ÷ (1.5 × 4) = 8.33 → 8, each exactly half the unboosted cycle. A
+/// five_hour-only listing then closes the matrix: it is the scenario a
+/// five_hour/seven_day arm swap would fail.
+#[test]
+fn promotion_listing_several_windows_boosts_each_listed_window() {
+    let now = et(2026, 3, 16, 20, 0); // Monday evening, all-off-peak spans
+    let mut multi = promotion();
+    multi.applies_to = vec!["five_hour".to_string(), "seven_day".to_string()];
+
+    let boosted = drive_observe_with(now, (1, 2, 2), true, &[multi]);
+    let flat = drive_observe_with(now, (1, 2, 2), false, &[]);
+
+    assert!(!boosted.schedule.is_peak_hour);
+    assert!(boosted.schedule.is_promo_active);
+    assert!(
+        boosted.burn_rate.promotion_validated,
+        "the mirror still validates — a 1.0 below is an applies_to miss, not a fallback"
+    );
+
+    // Burn side: exactly the two listed windows move, each under its own name.
+    assert_close(
+        boosted.schedule.promo_multiplier_five_hour,
+        2.0,
+        "five_hour burn multiplier (listed)",
+    );
+    assert_close(
+        boosted.schedule.promo_multiplier_seven_day,
+        2.0,
+        "seven_day burn multiplier (listed) — pins this arm against a \
+         five_hour name swap",
+    );
+    assert_close(
+        boosted.schedule.promo_multiplier_weekly_scoped,
+        1.0,
+        "weekly_scoped burn multiplier (NOT listed)",
+    );
+    assert_close(
+        boosted.schedule.promo_multiplier,
+        2.0,
+        "display multiplier is the max across windows",
+    );
+
+    // Capacity side: each listed window's walk doubles, the unlisted stays raw.
+    assert_close(
+        boosted.capacity_forecast.five_hour.hours_remaining,
+        2.0,
+        "1 raw hour × 2x",
+    );
+    assert_close(
+        boosted.capacity_forecast.seven_day.hours_remaining,
+        4.0,
+        "2 raw hours × 2x",
+    );
+    assert_close(
+        boosted.capacity_forecast.weekly_scoped.hours_remaining,
+        2.0,
+        "the unlisted window keeps its raw wall-clock walk",
+    );
+
+    // Sizing: the duty-cycle budget over the doubled effective hours.
+    assert_eq!(
+        boosted.capacity_forecast.five_hour.safe_worker_count,
+        Some(23),
+        "70% / (1.5%/hr × 2 effective hrs) = 23.33 → 23, exactly half the flat 46",
+    );
+    assert_eq!(
+        boosted.capacity_forecast.seven_day.safe_worker_count,
+        Some(8),
+        "50% / (1.5%/hr × 4 effective hrs) = 8.33 → 8, exactly half the flat 16",
+    );
+    assert_eq!(
+        boosted.capacity_forecast.weekly_scoped.safe_worker_count,
+        Some(20),
+        "the unlisted window's count matches the no-promotion cycle",
+    );
+    assert_eq!(flat.capacity_forecast.five_hour.safe_worker_count, Some(46));
+    assert_eq!(flat.capacity_forecast.seven_day.safe_worker_count, Some(16));
+    assert_eq!(flat.capacity_forecast.weekly_scoped.safe_worker_count, Some(20));
+
+    // No burn here → margins tie → binding still resolves to the LAST eligible
+    // window, which this listing leaves UNBOOSTED. The display effective-hours
+    // field therefore reads the raw 2.0 walk — proving it follows the binding
+    // window, not the largest boost (the doubled-effect test pins the mirrored
+    // case, where the binding window IS the boosted one).
+    assert_eq!(boosted.capacity_forecast.binding_window, "weekly_scoped");
+    assert_close(
+        boosted.schedule.effective_hours_remaining,
+        2.0,
+        "display reads the binding window's raw walk, not the boost",
+    );
+
+    // Completing the arm-to-name proof: this scenario cannot catch a
+    // five_hour/seven_day NAME SWAP between the two boosted arms (both names
+    // are listed, so either arm matches either). Listing only ONE of the pair
+    // can: under a swap, the listed window's own arm reads 1.0 and the
+    // unlisted one wrongly picks up the boost.
+    let mut single = promotion();
+    single.applies_to = vec!["five_hour".to_string()];
+    let st = drive_observe_with(now, (1, 2, 2), true, &[single]);
+
+    assert_close(
+        st.schedule.promo_multiplier_five_hour,
+        2.0,
+        "the five_hour arm answers a five_hour-only listing",
+    );
+    assert_close(
+        st.schedule.promo_multiplier_seven_day,
+        1.0,
+        "the seven_day arm must NOT answer a five_hour listing — a name swap \
+         between the two arms reads 2.0 here",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        2.0,
+        "the listed window's capacity walk doubles",
+    );
+    assert_close(
+        st.capacity_forecast.seven_day.hours_remaining,
+        2.0,
+        "the unlisted window stays at its raw 2h walk — a name swap would \
+         boost this to 4.0",
     );
 }
 
