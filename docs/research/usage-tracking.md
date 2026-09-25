@@ -88,6 +88,65 @@ The `anthropic-beta: oauth-2025-04-20` header is mandatory — requests without 
 - `resets_at`: ISO 8601 datetime string with timezone offset
 - Fields are `null` when not applicable for the current plan
 
+### The generic `limits[]` array
+
+Alongside the legacy top-level windows, the response carries a generic
+`limits[]` array of the account's active limits, each tagged with a `kind`
+(`session`, `weekly_all`, and `weekly_scoped` have been observed):
+
+```json
+"limits": [
+  {"kind": "session", "group": "default", "percent": 14,
+   "severity": "low", "resets_at": "2026-03-18T13:59:59Z",
+   "scope": null, "is_active": true},
+  {"kind": "weekly_scoped", "percent": 79,
+   "resets_at": "2026-03-20T03:59:59Z",
+   "scope": {"model": {"id": "claude-fable-5", "display_name": "Fable"}},
+   "is_active": true}
+]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string, optional | which limit class the entry describes |
+| `percent` | float, optional | utilization 0–100 for that limit |
+| `resets_at` | string, optional | same ISO 8601 shape as the top-level windows |
+| `severity` | string, optional | e.g. `"low"` |
+| `scope.model.id` / `scope.model.display_name` | string, optional | which model a model-scoped cap applies to |
+| `is_active` | bool, optional | **only `false` means structurally inactive**; absent or `null` is treated as active |
+
+Contract rules, pinned by `tests/usage_polling_contract.rs`:
+
+- **Additive tolerance.** cgov parses `limits[]` alongside the legacy windows.
+  Absent and `null` fields inside an entry are tolerated (per-field serde
+  defaults), so one odd or forward-incompatible entry never fails the whole
+  poll. The precise boundary: a field that is *present but wrong-typed* is a
+  hard parse failure — a serde default only applies to a missing key. Unknown
+  `kind` values and unknown fields parse fine and are simply not consumed.
+- **`weekly_scoped` authority.** For the weekly-scoped cap, the `limits[]`
+  entry with `kind == "weekly_scoped"` is the authoritative model-agnostic
+  source: its `percent` / `resets_at` / `scope.model.display_name` are what
+  cgov consumes. The legacy top-level `weekly_scoped` window is parsed for
+  compatibility but deliberately ignored by the poller.
+- **Null windows are non-binding.** A window that is `null` or absent
+  (top-level or inside `limits[]`) is treated as a limit the API did not
+  report as active: 0% utilization, no reset, excluded from binding-window
+  candidacy. It must never fail the poll.
+
+### `resets_at`, off-peak hours, and effective time remaining
+
+`resets_at` is wall-clock time. cgov never consumes it raw: each window's
+remaining time is converted to *effective* hours through the promotion-aware
+schedule (`schedule::effective_hours_remaining_from`), so during an active
+off-peak promotion the same wall-clock remainder burns up to the declared
+multiplier faster, and a promotion's per-window `applies_to` listing decides
+which windows get the boost (see `docs/notes/offpeak-promotion-windows.md`
+and the `offpeak_promotion_window_forecasting` suite). The contract-critical
+consequence for this endpoint: a window whose `resets_at` is missing or
+unparseable has **no** effective time either — it is data-absent, and
+data-absent windows are excluded from binding-window selection rather than
+defaulted to any headroom figure.
+
 **Note:** The endpoint is self-rate-limited. Calling it too frequently returns:
 ```json
 {"error": {"type": "rate_limit_error", "message": "Rate limited. Please try again later."}}
@@ -298,3 +357,28 @@ escalation surface).
   transport error — propagates to the caller **even when a cached reading
   exists**. Only the auth path degrades to stale data; a stale reading is
   never manufactured to paper over a fetch failure.
+
+### Fleet-level scaling safety
+
+The poller-level behaviors above exist to guarantee one fleet-level property,
+pinned end to end by `tests/usage_contract_scaling_safety.rs` (real poller →
+real observe cycle → real act cycle against a materializing fake fleet):
+**no usage-poll failure class can move a fleet that has already converged
+onto its last good reading.**
+
+| Failure class | What the poll returns | What the fleet does |
+|---|---|---|
+| Transport error, 429 self-rate-limit, malformed body | Poll fails; last good reading retained verbatim; `token_refresh_failing` stays `false` (the OAuth token is not the problem) | Does not grow |
+| Credential loss / refresh failure (auth path) | Cached reading served with `stale: true`; `token_refresh_failing` flags `true` | Does not grow |
+| Incomplete-but-parsing response (`{}`) | Poll **succeeds** as a fresh, non-stale reading — all windows 0% with no reset times, i.e. textually infinite headroom that *replaces* the good reading | Does not move in either direction: data-absent windows cannot bind |
+
+The third row is the dangerous one, because the reading is valid. The defense
+is data presence at binding selection: a window contributes to the scaling
+decision only if its `resets_at` parses (it appears in the per-window
+`hours_remaining` map), it has not been consecutively absent for
+`MIN_CONSECUTIVE_ABSENT` polls, and some enabled pool consumes it. A response
+of `{}` leaves every window data-absent, so no window binds — the phantom
+0%-utilization / infinite-headroom reading can neither launch workers on fake
+headroom nor shed a converged fleet on a fake zero-risk forecast. The
+`binding_window` in the persisted forecast is empty in that state, which is
+the observable signature of "the API told us nothing usable this cycle".

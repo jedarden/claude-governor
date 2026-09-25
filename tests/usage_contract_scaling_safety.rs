@@ -506,3 +506,78 @@ fn credential_loss_degrades_to_stale_data_and_cannot_grow_the_fleet() {
     assert_eq!(cycle.state.usage.five_hour_pct, 55.0);
     assert_eq!(cycle.state.usage.weekly_scoped_pct, 60.0);
 }
+
+/// The incomplete-but-parsing response is the failure class the other
+/// scenarios cannot cover: `{}` parses as a valid, NON-stale reading whose
+/// windows all read 0% with no reset times — textually infinite headroom —
+/// and because the poll SUCCEEDS it *replaces* the good reading in state
+/// instead of retaining it. The defense under test: a window with no
+/// parseable reset timestamp is data-absent, and data-absent windows cannot
+/// bind the scaling decision (`select_binding_window` only considers windows
+/// present in the parsed `hours_remaining` map). Phantom headroom must
+/// therefore move a converged fleet in neither direction: no growth on the
+/// fake headroom, and no shed on the fake zero-risk forecast.
+#[test]
+fn empty_usage_response_is_data_absent_and_cannot_move_a_converged_fleet() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = TempDir::new().unwrap();
+    let fleet = FakeFleet::spawn(&dir, 2);
+    let creds = write_credentials(&dir);
+    let mut server = mockito::Server::new();
+    let server_url = server.url();
+
+    let agents = agent_map();
+    let config = pricing_config(&agents);
+    let mut now = Utc::now();
+
+    let mut poller =
+        poller_with_endpoints(&creds, &server_url, &format!("{server_url}/v1/oauth/token"));
+    converge_onto_good_data(&mut server, &mut poller, &dir, &agents, &config, &mut now);
+    let fleet_at_convergence = fleet.live_sessions();
+    assert!(
+        fleet_at_convergence > 0,
+        "harness bug: the fleet must hold workers for the no-movement assertion to mean anything"
+    );
+
+    // The usage endpoint answers 200 with `{}`: every window absent. Fresh
+    // credentials, so no refresh interferes — the single request is the
+    // usage poll itself.
+    let mock = mock_usage_once(&mut server, "{}");
+    let cycle = drive_cycle(&mut poller, &dir, &agents, &config, now);
+    mock.assert();
+
+    assert!(
+        !matches!(cycle.decision, ScalingDecision::ScaleUp(_)),
+        "phantom infinite headroom must not scale up; got {:?}",
+        cycle.decision
+    );
+    assert!(
+        !matches!(cycle.decision, ScalingDecision::ScaleDown(_)),
+        "data absence must not shed a converged fleet; got {:?}",
+        cycle.decision
+    );
+    assert_eq!(
+        fleet.live_sessions(),
+        fleet_at_convergence,
+        "no launch or kill may be executed off a data-absent reading"
+    );
+
+    // The mechanism, not just the outcome: with no parseable resets_at, every
+    // window is excluded from binding selection and NO window binds.
+    assert_eq!(
+        cycle.state.capacity_forecast.binding_window, "",
+        "a data-absent reading must leave the binding selection empty"
+    );
+    // The empty response is a valid reading — it must be treated as fresh
+    // (and it is the failure class that replaces, rather than retains, the
+    // good reading), while remaining cleanly distinguished from the auth
+    // failure path.
+    assert!(
+        !cycle.state.usage.stale,
+        "a parseable 200 must not be misflagged as stale"
+    );
+    assert!(
+        !cycle.state.token_refresh_failing,
+        "a parseable 200 is not a token failure"
+    );
+}
