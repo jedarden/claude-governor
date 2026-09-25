@@ -208,13 +208,16 @@ treating configured agents as fungible.
   needle-322a3953, 2026-09-24) and install via `fleet/lab/apply-lab-fleet.sh
   --install-cargo-wrapper`; `wrapper-drift.timer` re-compares the deployed bytes
   against origin/main every 30 min on both hosts (exit 1 = drift, 2 = blind
-  detector). The lab's `cargo-remote` carries both scope hardenings since the
-  2026-09-25 installer run — `--slice="$(current_slice)"` (2026-08-24) and
-  `-p RuntimeMaxSec=14400` (needle-3d5c65d8, reaps hung scopes after 4h) —
-  verified live 2026-09-25 (claudego-adfbc8e9): the dirty-tree fallback from a
+  detector). Both wrappers carry both scope hardenings on both hosts —
+  `--slice="$(current_slice)"` and `-p RuntimeMaxSec=14400` (needle-3d5c65d8,
+  reaps hung scopes after 4h). `cargo-remote` since the 2026-09-25 installer run,
+  verified live that day (claudego-adfbc8e9): the dirty-tree fallback from a
   needle.slice caller produced a scope in needle.slice with RuntimeMaxUSec=4h, not
-  an unbounded app.slice one. Residual gap: `bin/cargo`'s own `local_limited`
-  fallback (non-test commands) still lacks `--slice` on both hosts, so a
-  non-offloadable `cargo build` lands its scope in app.slice (bounded at 4h)
-  rather than the caller's slice. The adapter sync gates are unaffected — they
-  run under any `cargo test`, including NEEDLE's close-gate re-extraction.
+  an unbounded app.slice one. `bin/cargo`'s own `local_limited` fallback (every
+  non-test command: `build`, `check`, `metadata`, …) closed the same gap
+  2026-09-25 (claudego-4746d945, NEEDLE 65fc66ad; `fleet/lab/test.sh` now pins
+  both hardenings on both wrappers) — verified live on both hosts the same way: a
+  non-test command from a needle.slice caller produces a scope in needle.slice
+  with RuntimeMaxUSec=4h, not an app.slice one. The adapter sync gates are
+  unaffected — they run under any `cargo test`, including NEEDLE's close-gate
+  re-extraction.
