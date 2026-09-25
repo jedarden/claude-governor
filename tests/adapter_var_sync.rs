@@ -22,7 +22,9 @@
 //! * the committed fragments pass, printing SYNC-OK;
 //! * one extra variable in a bash array fails the gate and is named in the
 //!   drift report;
-//! * one removed variable fails the gate the same way.
+//! * one removed variable fails the gate the same way;
+//! * the four-way drill runs both real gates against isolated Rust-side and
+//!   Bash-side additions/removals and checks their diagnostics.
 //!
 //! The installer script itself is NEVER executed — it writes
 //! `~/.config/needle/adapters` and links binaries, which a test must not do.
@@ -31,6 +33,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -50,6 +53,54 @@ const INSTALLER: &str = "deploy/install-claude-print-adapters.sh";
 /// embedded file still triggers a fresh build.
 const INSTALLER_SH: &str = include_str!("../deploy/install-claude-print-adapters.sh");
 const ADAPTER_VERIFY_SRC: &str = include_str!("../src/adapter_verify.rs");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
+const CARGO_LOCK: &str = include_str!("../Cargo.lock");
+const ADAPTER_OPUS_YAML: &str = include_str!("../deploy/needle-adapters/claude-print-opus.yaml");
+const ADAPTER_FABLE_YAML: &str = include_str!("../deploy/needle-adapters/claude-print-fable.yaml");
+const CONFIG_GOVERNOR_YAML: &str = include_str!("../config/governor.yaml");
+
+/// The library target needs every module declared by `src/lib.rs`. Keeping
+/// these files embedded avoids reading a possibly stale checkout when cargo
+/// reuses this integration-test binary from its shared target directory.
+const LIB_SOURCES: &[(&str, &str)] = &[
+    ("src/lib.rs", include_str!("../src/lib.rs")),
+    ("src/adapter_verify.rs", ADAPTER_VERIFY_SRC),
+    ("src/alerts.rs", include_str!("../src/alerts.rs")),
+    ("src/burn_rate.rs", include_str!("../src/burn_rate.rs")),
+    ("src/calibrator.rs", include_str!("../src/calibrator.rs")),
+    (
+        "src/capacity_summary.rs",
+        include_str!("../src/capacity_summary.rs"),
+    ),
+    ("src/collector.rs", include_str!("../src/collector.rs")),
+    ("src/config.rs", include_str!("../src/config.rs")),
+    ("src/db.rs", include_str!("../src/db.rs")),
+    ("src/doctor.rs", include_str!("../src/doctor.rs")),
+    ("src/governor.rs", include_str!("../src/governor.rs")),
+    (
+        "src/ledger_yield.rs",
+        include_str!("../src/ledger_yield.rs"),
+    ),
+    ("src/narrator.rs", include_str!("../src/narrator.rs")),
+    ("src/poller.rs", include_str!("../src/poller.rs")),
+    ("src/pricing.rs", include_str!("../src/pricing.rs")),
+    ("src/schedule.rs", include_str!("../src/schedule.rs")),
+    ("src/simulator.rs", include_str!("../src/simulator.rs")),
+    (
+        "src/snapshot_fixtures.rs",
+        include_str!("../src/snapshot_fixtures.rs"),
+    ),
+    ("src/state.rs", include_str!("../src/state.rs")),
+    (
+        "src/status_display.rs",
+        include_str!("../src/status_display.rs"),
+    ),
+    ("src/worker.rs", include_str!("../src/worker.rs")),
+    (
+        "src/worker_attribution.rs",
+        include_str!("../src/worker_attribution.rs"),
+    ),
+];
 
 /// Marker the harness prints only when the sourced gate returned success.
 const OK_MARKER: &str = "SYNC-OK";
@@ -79,7 +130,12 @@ fn extract_array(src: &str, name: &str) -> String {
             }
         }
     }
-    assert!(!lines.is_empty(), "no {}=( declaration found in {}", name, INSTALLER);
+    assert!(
+        !lines.is_empty(),
+        "no {}=( declaration found in {}",
+        name,
+        INSTALLER
+    );
     lines.join("\n")
 }
 
@@ -104,7 +160,12 @@ fn extract_function(src: &str, name: &str) -> String {
             lines.push(line);
         }
     }
-    assert!(!lines.is_empty(), "no {}() {{ definition found in {}", name, INSTALLER);
+    assert!(
+        !lines.is_empty(),
+        "no {}() {{ definition found in {}",
+        name,
+        INSTALLER
+    );
     lines.join("\n")
 }
 
@@ -124,9 +185,15 @@ enum Mutation {
     /// Leave the extracted fragments exactly as committed.
     Clean,
     /// Append `var` to one array's elements — one side of a copy-paste edit.
-    Extra { array: &'static str, var: &'static str },
+    Extra {
+        array: &'static str,
+        var: &'static str,
+    },
     /// Drop `var` from one array's elements — the other side of the same edit.
-    Missing { array: &'static str, var: &'static str },
+    Missing {
+        array: &'static str,
+        var: &'static str,
+    },
 }
 
 /// Apply `mutation` to `decl` when it declares `this_array`; otherwise return
@@ -147,9 +214,12 @@ fn mutate_decl(decl: &str, mutation: &Mutation, this_array: &str) -> String {
         this_array,
         decl
     );
-    let open = base
-        .find('(')
-        .unwrap_or_else(|| panic!("{} declaration has no opening paren: {:?}", this_array, decl));
+    let open = base.find('(').unwrap_or_else(|| {
+        panic!(
+            "{} declaration has no opening paren: {:?}",
+            this_array, decl
+        )
+    });
     let name = &base[..open];
     let vars: Vec<&str> = base[open + 1..base.len() - 1].split_whitespace().collect();
     if extra {
@@ -192,25 +262,57 @@ fn write_sandbox(dir: &Path, mutation: &Mutation) -> PathBuf {
 
     let mut script = String::new();
     writeln!(&mut script, "#!/usr/bin/env bash").unwrap();
-    writeln!(&mut script, "# Sandbox assembled by tests/adapter_var_sync.rs from fragments of").unwrap();
-    writeln!(&mut script, "# {} — extraction only; the installer itself never runs.", INSTALLER).unwrap();
+    writeln!(
+        &mut script,
+        "# Sandbox assembled by tests/adapter_var_sync.rs from fragments of"
+    )
+    .unwrap();
+    writeln!(
+        &mut script,
+        "# {} — extraction only; the installer itself never runs.",
+        INSTALLER
+    )
+    .unwrap();
     writeln!(&mut script, "REPO_DIR='{}'", repo_dir).unwrap();
     writeln!(&mut script, "{}", extract_color_vars(&installer)).unwrap();
     writeln!(
         &mut script,
         "{}",
-        mutate_decl(&extract_array(&installer, "RULE3_IDE_VARS"), mutation, "RULE3_IDE_VARS")
+        mutate_decl(
+            &extract_array(&installer, "RULE3_IDE_VARS"),
+            mutation,
+            "RULE3_IDE_VARS"
+        )
     )
     .unwrap();
     writeln!(
         &mut script,
         "{}",
-        mutate_decl(&extract_array(&installer, "RULE5_API_VARS"), mutation, "RULE5_API_VARS")
+        mutate_decl(
+            &extract_array(&installer, "RULE5_API_VARS"),
+            mutation,
+            "RULE5_API_VARS"
+        )
     )
     .unwrap();
-    writeln!(&mut script, "{}", extract_function(&installer, "rust_rule_vars")).unwrap();
-    writeln!(&mut script, "{}", extract_function(&installer, "bash_rule_vars")).unwrap();
-    writeln!(&mut script, "{}", extract_function(&installer, "check_var_list_sync")).unwrap();
+    writeln!(
+        &mut script,
+        "{}",
+        extract_function(&installer, "rust_rule_vars")
+    )
+    .unwrap();
+    writeln!(
+        &mut script,
+        "{}",
+        extract_function(&installer, "bash_rule_vars")
+    )
+    .unwrap();
+    writeln!(
+        &mut script,
+        "{}",
+        extract_function(&installer, "check_var_list_sync")
+    )
+    .unwrap();
 
     let path = dir.join("installer-fragments.sh");
     fs::write(&path, script).unwrap_or_else(|e| panic!("cannot write {}: {}", path.display(), e));
@@ -238,6 +340,286 @@ fn run_gate(sandbox: &Path) -> (bool, String) {
     (output.status.success(), text)
 }
 
+/// One single-sided edit from the manually recorded four-way drill.
+#[derive(Clone, Copy)]
+enum DrillMutation {
+    RustAddition,
+    RustRemoval,
+    BashAddition,
+    BashRemoval,
+}
+
+impl DrillMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RustAddition => "Rust-side addition",
+            Self::RustRemoval => "Rust-side removal",
+            Self::BashAddition => "Bash-side addition",
+            Self::BashRemoval => "Bash-side removal",
+        }
+    }
+
+    fn variable(self) -> &'static str {
+        match self {
+            Self::RustAddition | Self::BashAddition => "VSCODE_DRILL_PROBE",
+            Self::RustRemoval => "VSCODE_CWD",
+            Self::BashRemoval => "ANTHROPIC_SMALL_FAST_MODEL",
+        }
+    }
+
+    fn array(self) -> &'static str {
+        match self {
+            Self::RustAddition | Self::RustRemoval | Self::BashAddition => "RULE3_IDE_VARS",
+            Self::BashRemoval => "RULE5_API_VARS",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::RustAddition | Self::RustRemoval | Self::BashAddition => "IDE_ENV_VARS",
+            Self::BashRemoval => "API_ROUTING_ENV_VARS",
+        }
+    }
+
+    /// The `diff` direction emitted by the installer: `<` is the Rust side,
+    /// `>` is the Bash array side.
+    fn installer_diff_marker(self) -> &'static str {
+        match self {
+            Self::RustAddition | Self::BashRemoval => "<",
+            Self::RustRemoval | Self::BashAddition => ">",
+        }
+    }
+
+    fn all() -> [Self; 4] {
+        [
+            Self::RustAddition,
+            Self::RustRemoval,
+            Self::BashAddition,
+            Self::BashRemoval,
+        ]
+    }
+}
+
+fn mutate_rust_constants(src: &str, mutation: DrillMutation) -> String {
+    let (old, replacement) = match mutation {
+        DrillMutation::RustAddition => (
+            "    \"VSCODE_CWD\",\n];",
+            "    \"VSCODE_CWD\",\n    \"VSCODE_DRILL_PROBE\",\n];",
+        ),
+        DrillMutation::RustRemoval => ("    \"VSCODE_CWD\",\n", ""),
+        DrillMutation::BashAddition | DrillMutation::BashRemoval => return src.to_string(),
+    };
+    assert_eq!(
+        src.matches(old).count(),
+        1,
+        "Rust drill anchor is not unique"
+    );
+    src.replacen(old, replacement, 1)
+}
+
+fn mutate_installer_source(src: &str, mutation: DrillMutation) -> String {
+    let edit = match mutation {
+        DrillMutation::BashAddition => Mutation::Extra {
+            array: "RULE3_IDE_VARS",
+            var: "VSCODE_DRILL_PROBE",
+        },
+        DrillMutation::BashRemoval => Mutation::Missing {
+            array: "RULE5_API_VARS",
+            var: "ANTHROPIC_SMALL_FAST_MODEL",
+        },
+        DrillMutation::RustAddition | DrillMutation::RustRemoval => return src.to_string(),
+    };
+    let array = mutation.array();
+    let declaration = extract_array(src, array);
+    let mutated = mutate_decl(&declaration, &edit, array);
+    assert_eq!(
+        src.matches(&declaration).count(),
+        1,
+        "Bash drill anchor is not unique"
+    );
+    src.replacen(&declaration, &mutated, 1)
+}
+
+fn write_file(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)
+}
+
+/// Materialize enough of the repository to run the real Rust unit gate and
+/// the real installer. No mutation is ever applied to the test checkout.
+fn write_drill_copy(root: &Path, mutation: DrillMutation) {
+    write_file(&root.join("Cargo.toml"), CARGO_TOML).unwrap();
+    write_file(&root.join("Cargo.lock"), CARGO_LOCK).unwrap();
+    write_file(
+        &root.join("src/adapter_verify.rs"),
+        &mutate_rust_constants(ADAPTER_VERIFY_SRC, mutation),
+    )
+    .unwrap();
+    for (relative, contents) in LIB_SOURCES {
+        if *relative == "src/adapter_verify.rs" {
+            continue;
+        }
+        write_file(&root.join(relative), contents).unwrap();
+    }
+    write_file(&root.join("config/governor.yaml"), CONFIG_GOVERNOR_YAML).unwrap();
+
+    let installer = mutate_installer_source(INSTALLER_SH, mutation);
+    write_file(&root.join(INSTALLER), &installer).unwrap();
+
+    // The committed adapters name a machine-global absolute binary. Point
+    // the isolated copy at a path inside this temp directory so even the
+    // installer's symlink-establishment step cannot write outside it.
+    let safe_binary = root.join("adapter-bin/claude-print");
+    let safe_binary = safe_binary.to_str().expect("temp path is valid UTF-8");
+    for (relative, contents) in [
+        (
+            "deploy/needle-adapters/claude-print-opus.yaml",
+            ADAPTER_OPUS_YAML,
+        ),
+        (
+            "deploy/needle-adapters/claude-print-fable.yaml",
+            ADAPTER_FABLE_YAML,
+        ),
+    ] {
+        let isolated = contents.replace("/home/coding/.local/bin/claude-print", safe_binary);
+        write_file(&root.join(relative), &isolated).unwrap();
+    }
+}
+
+fn command_text(output: std::process::Output) -> (bool, String) {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
+fn run_cargo_sync_gate(root: &Path) -> (bool, String) {
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args([
+            "test",
+            "--lib",
+            "adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants",
+            "--",
+            "--exact",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("{}: could not run cargo sync gate: {}", root.display(), e));
+    command_text(output)
+}
+
+fn make_fake_claude_print(home: &Path) -> PathBuf {
+    let binary = home.join(".cargo/bin/claude-print");
+    write_file(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo claude-print-drill\n  exit 0\nfi\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+    }
+    binary
+}
+
+fn run_installer_sync_gate(root: &Path) -> (bool, String) {
+    let home = root.join("home");
+    let fake_binary = make_fake_claude_print(&home);
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!(
+        "{}:{}",
+        fake_binary.parent().unwrap().display(),
+        inherited_path
+    );
+    let output = Command::new("bash")
+        .current_dir(root)
+        .arg(root.join(INSTALLER))
+        .arg("--skip-live")
+        .env("HOME", &home)
+        .env("PATH", path)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: could not run installer sync gate: {}",
+                root.display(),
+                e
+            )
+        });
+    command_text(output)
+}
+
+#[test]
+fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
+    for mutation in DrillMutation::all() {
+        let temp = TempDir::new().unwrap();
+        write_drill_copy(temp.path(), mutation);
+
+        let (cargo_ok, cargo_output) = run_cargo_sync_gate(temp.path());
+        assert!(
+            !cargo_ok,
+            "{} cargo gate unexpectedly passed:\n{}",
+            mutation.label(),
+            cargo_output
+        );
+        assert!(
+            cargo_output.contains("installer_bash_variable_lists_match_the_rust_constants"),
+            "{} cargo output did not identify the synchronization test:\n{}",
+            mutation.label(),
+            cargo_output
+        );
+        assert!(
+            cargo_output.contains(mutation.array()) && cargo_output.contains(mutation.rust_name()),
+            "{} cargo diagnostic omitted the drifted list pair:\n{}",
+            mutation.label(),
+            cargo_output
+        );
+        assert!(
+            cargo_output.contains(mutation.variable()),
+            "{} cargo diagnostic omitted {}:\n{}",
+            mutation.label(),
+            mutation.variable(),
+            cargo_output
+        );
+
+        let (installer_ok, installer_output) = run_installer_sync_gate(temp.path());
+        assert!(
+            !installer_ok,
+            "{} installer gate unexpectedly passed:\n{}",
+            mutation.label(),
+            installer_output
+        );
+        assert!(
+            installer_output.contains("Install incomplete."),
+            "{} installer output omitted the failing-install diagnostic:\n{}",
+            mutation.label(),
+            installer_output
+        );
+        assert!(
+            installer_output.contains("variable-list drift")
+                && installer_output.contains(mutation.array())
+                && installer_output.contains(mutation.rust_name())
+                && installer_output.contains(mutation.variable()),
+            "{} installer diagnostic omitted the drift details:\n{}",
+            mutation.label(),
+            installer_output
+        );
+        assert!(
+            installer_output.contains(&format!(
+                "{} {}",
+                mutation.installer_diff_marker(),
+                mutation.variable()
+            )),
+            "{} installer diagnostic omitted the expected diff direction:\n{}",
+            mutation.label(),
+            installer_output
+        );
+    }
+}
+
 #[test]
 fn clean_tree_sync_gate_passes() {
     let tmp = TempDir::new().unwrap();
@@ -250,7 +632,12 @@ fn clean_tree_sync_gate_passes() {
          stale:\n{}",
         out
     );
-    assert!(out.contains(OK_MARKER), "harness output lacked {}:\n{}", OK_MARKER, out);
+    assert!(
+        out.contains(OK_MARKER),
+        "harness output lacked {}:\n{}",
+        OK_MARKER,
+        out
+    );
 }
 
 #[test]
@@ -261,7 +648,10 @@ fn sync_gate_flags_an_extra_bash_variable() {
     let tmp = TempDir::new().unwrap();
     let sandbox = write_sandbox(
         tmp.path(),
-        &Mutation::Extra { array: "RULE3_IDE_VARS", var: "CGOV_DRIFT_EXTRA" },
+        &Mutation::Extra {
+            array: "RULE3_IDE_VARS",
+            var: "CGOV_DRIFT_EXTRA",
+        },
     );
     let (ok, out) = run_gate(&sandbox);
     assert!(
@@ -290,7 +680,10 @@ fn sync_gate_flags_a_removed_bash_variable() {
     let tmp = TempDir::new().unwrap();
     let sandbox = write_sandbox(
         tmp.path(),
-        &Mutation::Missing { array: "RULE5_API_VARS", var: "ANTHROPIC_SMALL_FAST_MODEL" },
+        &Mutation::Missing {
+            array: "RULE5_API_VARS",
+            var: "ANTHROPIC_SMALL_FAST_MODEL",
+        },
     );
     let (ok, out) = run_gate(&sandbox);
     assert!(
