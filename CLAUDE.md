@@ -17,7 +17,7 @@ worker fleet to fit.
 | Component | Location | Notes |
 |---|---|---|
 | `cgov` binary | `~/.local/bin/cgov` | built from this repo (`cargo build --release`, target redirects to `~/target/release/cgov`) |
-| Governor config | `~/.config/claude-governor/governor.yaml` | agents, daemon, pricing; **not** in the repo (machine-specific) |
+| Governor config | `~/.config/claude-governor/governor.yaml` | agents, daemon, pricing; **not** in the repo (machine-specific). The repo's `config/governor.yaml` is only the checked-in **seed template** — `src/config.rs` bakes it in with `include_str!` and copies it to the live path on first run (`GovernorConfig::config_paths`/`create_default_config`). Edit live values on the machine path and verify with `cgov config`; never cite the repo copy as running configuration (claudego-3648483e) |
 | `claude-print` binary | `~/.local/bin/claude-print` | PTY wrapper that keeps sessions on the subscription pool. **Establish this path with `deploy/install-claude-print-adapters.sh`** — the adapters call it by absolute path and nothing else creates it (claudego-49195ba4) |
 | NEEDLE adapters | `~/.config/needle/adapters/claude-print-{opus,fable}.yaml` | copies committed under `deploy/needle-adapters/` |
 

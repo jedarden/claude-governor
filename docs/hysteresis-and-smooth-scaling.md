@@ -60,7 +60,17 @@ This is the decision flow of `apply_scaling_with_policy` (in `src/governor.rs`),
 
 **Why asymmetric**: cgov is a use-or-lose subscription governor. Capacity below target is capacity that resets unused, so every deficit closes immediately — a symmetric band turned a 1-worker deficit into a permanent strand one worker short of target (with band 1.0 and integer worker counts, `|delta| == 1` was never actionable). A surplus above the soft target, by contrast, is tolerated up to the band: the forecast jitters, an extra worker burns quota productively, and the hard protection (the emergency brake, a window actually at/above 98%) still overrides regardless — including a computed `safe_worker_count = Some(0)`, which without such a window is an ordinary band-damped withdrawal (claudego-1138ab78). The scale-down band is the noise cushion; the scale-up path is the convergence guarantee.
 
-**Configuration**: `config/governor.yaml`
+**Configuration**: the live file is `~/.config/claude-governor/governor.yaml` (or
+`$XDG_CONFIG_HOME/claude-governor/governor.yaml`) — machine-specific, not in the
+repo. `config/governor.yaml` in this repo is only the checked-in **seed template**:
+`src/config.rs` bakes it into the binary with `include_str!` and copies it to the
+live path when no config exists (`GovernorConfig::config_paths`,
+`GovernorConfig::create_default_config`). Hosts edit tuning keys in the live file,
+so it drifts from the template by design — treat the values below as **template
+defaults, not running values**. Read what is actually running with `cgov config`,
+which prints the config file it loaded and every `daemon` key.
+
+Template defaults (`config/governor.yaml`):
 ```yaml
 daemon:
   hysteresis_band: 1.0          # Scale-down damping band
@@ -178,6 +188,11 @@ Shorten the polling interval while far from target (e.g. 1/3 interval when gap >
 
 ## Configuration Examples
 
+These examples are edits to the live `~/.config/claude-governor/governor.yaml`
+(machine-specific). The repo's `config/governor.yaml` is only the seed template
+the binary is built with; loader precedence lives in `src/config.rs`
+(`GovernorConfig::config_paths`). Verify applied values with `cgov config`.
+
 ### Default (binary per-cycle caps)
 
 ```yaml
@@ -252,7 +267,7 @@ let new_count = (current as i32 + scale_delta)
 ## References
 
 - **Source code**: `src/governor.rs` (`apply_scaling`, `progressive_scale_cap`, `run_act_cycle` step 5)
-- **Configuration**: `config/governor.yaml` (`daemon.progressive_scaling`), `src/config.rs` (`DaemonConfig`)
+- **Configuration**: live `~/.config/claude-governor/governor.yaml` (machine-specific; verify with `cgov config`), seeded from the checked-in template `config/governor.yaml` (`daemon.progressive_scaling`); loader: `src/config.rs` (`DaemonConfig`, `GovernorConfig::config_paths`)
 - **Tests**: `tests/hysteresis_smooth_scaling_test.rs`, `tests/explain_decisions_test.rs`, `tests/governor_cycle_snapshot_test.rs`
 - **Related modules**: `src/burn_rate.rs`, `src/worker.rs`, `src/calibrator.rs`
 
@@ -263,3 +278,4 @@ let new_count = (current as i32 + scale_delta)
 - Proposed progressive, exponential, and adaptive improvements
 - **2026-09-16** (claudego-44b1f4f5): Hysteresis made **asymmetric** — the band damps scale-down only, so every deficit closes and the fleet converges exactly to target (the 5→10 example no longer stops at 9). Added opt-in **progressive scaling** (`daemon.progressive_scaling` + `progressive_scale_cap`): per-cycle caps widen with the remaining gap (3x/2x/1x tiers), clamped to the gap. Decision-log trigger text updated to match; exponential and adaptive-timing options remain open proposals.
 - **2026-09-24** (claudego-4c0f2ae9): Tracked the two open proposals as beads — Option B → claudego-b9195f5a, Option C → claudego-71a82180 (blocked by B; shared `governor.rs`/`config.rs`/test-file footprint). Synced the "Current Implementation" snippet with the live `apply_scaling` signature (`emergency_brake_active` param; the brake fires only on a real ≥98% window, not on a computed zero).
+- **2026-09-25** (claudego-3648483e): Resolved the canonical config-path reference. This doc previously headed its tuning keys with `config/governor.yaml` as if that were the configuration; that file is the checked-in seed template (`include_str!`-baked in `src/config.rs`), while the live machine config (`~/.config/claude-governor/governor.yaml`) is authoritative and drifts from the template by design. The Configuration block now names both roles and points live-value verification at `cgov config`; CLAUDE.md §1 says the same.
