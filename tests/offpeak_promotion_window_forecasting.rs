@@ -45,6 +45,14 @@
 //! that tie is itself pinned (it is what `state.schedule`
 //! `.effective_hours_remaining` display reads) so any change to eligibility,
 //! tie-breaking, or promotion-in-risk coupling shows up here.
+//!
+//! The final section drives the same cycle under EST and across the DST
+//! fall-back hour. Every scenario above runs in March (EDT, UTC-4); a
+//! hardcoded EDT offset or a UTC-date activation would keep every number
+//! above green while drifting exactly at the January start midnight (05:00Z,
+//! not 04:00Z), the 13:00–19:00Z winter peak band, and the repeated 01:00
+//! local hour of November's fall-back Sunday. The schedule unit tests pin
+//! those instants in isolation; these prove they survive the observe cycle.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -810,4 +818,189 @@ fn doubled_effective_hours_halve_the_whole_worker_safe_count() {
     // exhaustion is never predicted inside any span, boosted or not.
     assert!(!boosted.capacity_forecast.weekly_scoped.cutoff_risk);
     assert!(!flat.capacity_forecast.weekly_scoped.cutoff_risk);
+}
+
+// ---------------------------------------------------------------------------
+// Timezone & DST through the forecast
+//
+// The schedule module's unit tests pin the EST peak band
+// (`peak_boundaries_pinned_in_utc_during_est`) and the DST-transition Sunday
+// (`dst_transition_sundays_are_off_peak_all_day`) in isolation. These
+// scenarios prove the same discipline survives the real observe cycle under
+// the OTHER offset and across the fall-back hour itself — the two places a
+// hardcoded EDT offset or a wall-clock-naive walk would drift while every
+// March scenario above stayed green.
+// ---------------------------------------------------------------------------
+
+/// January 20–22, 2026 (Tue–Thu): the March promo's exact shape, but in EST
+/// (UTC-5) — so the start midnight is 05:00Z and the peak band is
+/// 13:00–19:00Z.
+fn january_promotion() -> Promotion {
+    Promotion {
+        name: "January 2026 2x off-peak".to_string(),
+        start_date: "2026-01-20".to_string(),
+        end_date: "2026-01-22".to_string(),
+        peak_start_hour_et: 8,
+        peak_end_hour_et: 14,
+        offpeak_multiplier: MULTIPLIER,
+        applies_to: vec!["weekly_scoped".to_string()],
+    }
+}
+
+/// November 1–3, 2026: the promotion's first day is the fall-back Sunday
+/// (02:00 EDT → 01:00 EST at 06:00Z), its second the following Monday.
+fn november_promotion() -> Promotion {
+    Promotion {
+        name: "November 2026 2x off-peak".to_string(),
+        start_date: "2026-11-01".to_string(),
+        end_date: "2026-11-03".to_string(),
+        peak_start_hour_et: 8,
+        peak_end_hour_et: 14,
+        offpeak_multiplier: MULTIPLIER,
+        applies_to: vec!["weekly_scoped".to_string()],
+    }
+}
+
+/// EST activation and walks. `2026-01-20T04:59Z` is 23:59 Jan 19 in New York:
+/// the UTC calendar already reads start_date but the ET date does not, so the
+/// promotion must still be dormant — activation computed from UTC dates (or a
+/// hardcoded EDT offset, which reads 00:59 Jan 20 at this instant) lights it
+/// up early. One real hour later, 05:00Z is exactly Jan 20 00:00 ET: active
+/// at last, and a +2h reset walks 00:00–02:00 ET, all off-peak, for exactly
+/// 4.0 effective hours. The mixed walk then pins the winter peak band itself:
+/// a 12:00 ET +4h reset spends 12:00–14:00 at 1x and 14:00–16:00 at 2x =
+/// 6.0. With the band hardcoded at the EDT offsets (12:00–18:00Z) the same
+/// UTC span walks 1.0 + 6.0 = 7.0 instead.
+#[test]
+fn est_promotion_activates_and_walks_on_the_eastern_clock() {
+    // One minute before the EST start midnight: dormant on the ET date.
+    let before = Utc.with_ymd_and_hms(2026, 1, 20, 4, 59, 0)
+        .single()
+        .unwrap();
+    let st = drive_observe_with(before, (1, 2, 2), true, &[january_promotion()]);
+    assert!(!st.schedule.is_peak_hour, "23:59 ET Monday is off-peak");
+    assert!(
+        !st.schedule.is_promo_active,
+        "ET date is Jan 19 — 04:59Z must not activate a promo computed on \
+         UTC dates or a hardcoded EDT offset"
+    );
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        1.0,
+        "no burn boost at 23:59 Jan 19 ET",
+    );
+
+    // 05:00Z is exactly Jan 20 00:00 ET — the promo's first minute.
+    let start = et(2026, 1, 20, 0, 0);
+    assert_eq!(
+        start,
+        Utc.with_ymd_and_hms(2026, 1, 20, 5, 0, 0).single().unwrap(),
+        "Jan 20 00:00 ET is 05:00Z in EST, not the 04:00Z an EDT hardcode reads"
+    );
+    let st = drive_observe_with(start, (1, 2, 2), true, &[january_promotion()]);
+    assert!(!st.schedule.is_peak_hour);
+    assert!(st.schedule.is_promo_active, "00:00 ET Jan 20 is start_date");
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        2.0,
+        "boosted at the EST midnight",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        4.0,
+        "00:00–02:00 ET is two boosted hours",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "five_hour stays raw across the EST start midnight",
+    );
+
+    // The winter peak band: 12:00 ET is 17:00Z in EST.
+    let noon = et(2026, 1, 20, 12, 0);
+    let st = drive_observe_with(noon, (1, 2, 4), true, &[january_promotion()]);
+    assert!(
+        st.schedule.is_peak_hour,
+        "12:00 ET Jan 20 is peak — 13:00–19:00Z, not the 12:00–18:00Z EDT band"
+    );
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        1.0,
+        "the peak gate holds under EST too",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        6.0,
+        "12:00–14:00 peak at 1x + 14:00–16:00 off-peak at 2x = 6.0; an EDT \
+         hardcode walks this same UTC span as 7.0",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "12:00–13:00 ET is one peak hour",
+    );
+}
+
+/// The fall-back hour through the walk. DST-transition Sundays are off-peak
+/// all day by design, so a reset span crossing the repeated hour is ALL
+/// boosted minutes: Nov 1 00:30 EDT + 3 wall hours = 6.0 effective — a walk
+/// that double-counted or dropped the repeated local hour cannot land there.
+/// And the repeated hour itself stays Sunday: 01:30 ET (EDT) + 1 real hour
+/// reads 01:30 EST, still off-peak, exactly 2.0.
+#[test]
+fn dst_fall_back_sunday_walks_as_one_boosted_stretch() {
+    // 04:30Z = 00:30 EDT Sunday. +3h crosses the 06:00Z fall-back.
+    let now = et(2026, 11, 1, 0, 30);
+    assert_eq!(
+        now,
+        Utc.with_ymd_and_hms(2026, 11, 1, 4, 30, 0).single().unwrap(),
+        "00:30 ET on Nov 1 2026 is still EDT (04:30Z)"
+    );
+    let st = drive_observe_with(now, (1, 2, 3), true, &[november_promotion()]);
+    assert!(
+        !st.schedule.is_peak_hour,
+        "the DST-transition Sunday is off-peak all day"
+    );
+    assert!(st.schedule.is_promo_active, "Nov 1 is start_date");
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        2.0,
+        "Sunday off-peak, promo on",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        6.0,
+        "3 wall hours across the repeated hour are all boosted minutes",
+    );
+    assert_close(
+        st.capacity_forecast.five_hour.hours_remaining,
+        1.0,
+        "five_hour stays raw across the fall-back",
+    );
+    assert_close(
+        st.capacity_forecast.seven_day.hours_remaining,
+        2.0,
+        "seven_day stays raw across the fall-back",
+    );
+
+    // The repeated local hour: 05:30Z is 01:30 EDT; one real hour later,
+    // 06:30Z reads 01:30 EST — the same wall clock, one hour older.
+    let now = Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0)
+        .single()
+        .unwrap();
+    let st = drive_observe_with(now, (1, 2, 1), true, &[november_promotion()]);
+    assert!(
+        !st.schedule.is_peak_hour,
+        "the repeated 01:00 hour is still Sunday, still off-peak"
+    );
+    assert_close(
+        st.schedule.promo_multiplier_weekly_scoped,
+        2.0,
+        "the repeated hour keeps the boost",
+    );
+    assert_close(
+        st.capacity_forecast.weekly_scoped.hours_remaining,
+        2.0,
+        "01:30 EDT → 01:30 EST is one boosted real hour",
+    );
 }
