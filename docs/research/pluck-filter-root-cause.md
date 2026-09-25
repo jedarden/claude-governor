@@ -63,6 +63,13 @@ agree on the root cause.
 
 ## Correct configuration
 
+> Historical values (2026-08-21): the example below predates two later
+> changes — the deployment's `exclude_labels` is now empty (effective set is
+> needle 0.6.13's built-in default five), and
+> `persistent_starvation_records` is now `true`, writing to
+> `state/starvation_events.jsonl`. The workspace-path guidance is unchanged.
+> Run `scripts/verify-pluck-config.sh` for live values.
+
 For a worker dedicated to this repository, use an absolute workspace path. Do
 not rely on `.` or on a global default that points at another repository:
 

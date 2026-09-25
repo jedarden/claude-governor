@@ -1,7 +1,7 @@
 # Pluck Query Results
 
 **Status:** current `bead-rs` result reference with historical SQL notes
-**Verified:** 2026-08-21
+**Verified:** 2026-09-25 (contract re-checked against needle 0.6.13 / bead 0.2.6)
 **Scope:** NEEDLE Pluck in this workspace
 
 > For the current NEEDLE/`bead-rs` implementation, use
@@ -55,10 +55,13 @@ filter: Pluck configures no required labels, and a label such as `rust` or
 
 After parsing the JSONL, Pluck removes records with an excluded label and
 defensively removes an `in_progress` record or an assigned `open` record if a
-backend ever returns one. The active exclusion list for this deployment is
-`deferred`, `human`, `blocked`, and `starvation-alert`; matching is exact and
-case-sensitive. See [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md)
-for the complete filter pipeline and ordering behavior.
+backend ever returns one. The configured `exclude_labels` list for this
+deployment is empty, so the effective exclusion set is NEEDLE's built-in
+default — `deferred`, `human`, `blocked`, `escalation`, `alert` as of needle
+0.6.13; matching is exact and case-sensitive. See
+[`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md)
+for the complete filter pipeline and ordering behavior, and run
+`scripts/verify-pluck-config.sh` for the live snapshot.
 
 ### Inspecting and consuming results
 

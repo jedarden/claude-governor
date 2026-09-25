@@ -6,6 +6,23 @@ For the complete filter inventory, see
 [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md). The older
 bead-forge pages in this repository are historical investigation notes; do not
 use their SQL or commands to infer the current ready predicate.
+[`docs/notes/bf-2bxsv.md`](notes/bf-2bxsv.md) is one of these historical
+notes — its 2026-07-06 configuration claims (config path, default workspace,
+store layout) are all superseded.
+
+## Authoritative verification
+
+Configuration claims in prose drift. `scripts/verify-pluck-config.sh` is the
+one authoritative workflow for the current state: it checks the backend
+binding, the active config path, the resolved default workspace, the bead-rs
+store layout, the CLI output contract, and the live `strands.pluck` values,
+and exits non-zero on any mismatch. Run it first whenever a claim below
+disagrees with what you observe, and reconcile the documentation against its
+output rather than from memory:
+
+```bash
+scripts/verify-pluck-config.sh
+```
 
 ## The visibility contract
 
@@ -22,7 +39,8 @@ resolved workspace
 ```
 
 The current target workspace is `/home/coding/claude-governor`. The active
-global Pluck configuration is `/home/coding/.config/needle/config.yaml`:
+global Pluck configuration is `/home/coding/.config/needle/config.yaml`
+(verified 2026-09-25, needle 0.6.13):
 
 ```yaml
 workspace:
@@ -31,29 +49,26 @@ workspace:
 
 strands:
   pluck:
-    exclude_labels:
-      - deferred
-      - human
-      - blocked
-      - starvation-alert
+    exclude_labels: []
+    split_after_failures: 3
+    persistent_starvation_records: true
 ```
 
 `workspace.default` selects the bead workspace. `workspace.home` is NEEDLE's
 state directory for logs, heartbeats, and optional diagnostics; it is not a
-bead store.
+bead store. The block above shows the configured file, not the effective
+filter: `exclude_labels: []` means PluckStrand substitutes its built-in
+default set, described next.
 
 ## Correct `exclude_labels` patterns
 
-`exclude_labels` is a YAML sequence of exact label strings:
+`exclude_labels` is a YAML sequence of exact label strings. This deployment
+configures an empty list, so the built-in default set applies:
 
 ```yaml
 strands:
   pluck:
-    exclude_labels:
-      - deferred
-      - human
-      - blocked
-      - starvation-alert
+    exclude_labels: []
 ```
 
 A bead is excluded when any one of its labels exactly matches an entry. The
@@ -73,16 +88,21 @@ label, including punctuation and case. A generated label such as
 `failure-count:3` is not covered by `failure-count:*`; it is handled by Pluck's
 failure-count ordering and split logic instead.
 
-The built-in fallback is only:
+When the configured list is empty or omitted, PluckStrand substitutes NEEDLE's
+built-in default set. As of needle 0.6.13 that set is
+(`DEFAULT_EXCLUDE_LABELS`, `src/strand/pluck.rs`):
 
 ```text
-deferred, human, blocked
+deferred, human, blocked, escalation, alert
 ```
 
-An omitted or empty `exclude_labels` list uses that fallback; it does not mean
-"exclude nothing." A non-empty configured list replaces the fallback rather
-than merging with it. Therefore, a custom list must repeat the three built-in
-labels when they should remain excluded:
+`escalation` marks work the fleet already failed to move (N-T60), and `alert`
+is the starvation-alert escalation marker. (If the whole `strands.pluck`
+section is absent, `PluckConfig::default()` supplies only the first four —
+without `alert`.) An empty `exclude_labels` therefore does not mean "exclude
+nothing." A non-empty configured list replaces the default set rather than
+merging with it, so a custom list must repeat these five labels when they
+should remain excluded:
 
 ```yaml
 # Correct: retain the defaults and add a deployment-specific label.
@@ -90,8 +110,14 @@ exclude_labels:
   - deferred
   - human
   - blocked
+  - escalation
+  - alert
   - starvation-alert
 ```
+
+Note the practical consequence for this deployment: because the configured
+list is empty, a bead carrying only `starvation-alert` is **not** excluded —
+that label was in an earlier configuration snapshot but is not active now.
 
 Labels including `rust`, `documentation`, and `failure-count:3` are not
 excluded unless their exact values are added. Pluck has no configured required
@@ -266,9 +292,15 @@ transient worker-local exclusion can hide an ID briefly even though the bead
 is still ready. Restarting a single unhealthy worker may clear that transient
 state; changing global labels will not.
 
-The current deployment sets `persistent_starvation_records: false`, so the
-absence of a starvation-record file is not evidence that starvation did not
-occur. Use NEEDLE telemetry and worker logs as the durable evidence source.
+The current deployment sets `persistent_starvation_records: true` (explicit
+since 2026-09-07; it is also the needle 0.6.x default), so no-candidate
+selection snapshots are appended to
+`~/.needle/state/starvation_events.jsonl`. The setting's name and the older
+`starvation-records.jsonl` filename are historical — that legacy path no
+longer receives writes. The stream is size-bounded (64 MiB rotation, at most
+8 files retained). Treat these snapshots as selection diagnostics, not
+terminal starvation verdicts, and cross-check NEEDLE telemetry and worker
+logs as well.
 
 ### 5. Verify the repair
 
@@ -298,6 +330,8 @@ zero, return to step 3 instead of repeatedly changing labels.
 
 ## Related references
 
+- `scripts/verify-pluck-config.sh` — the authoritative live-state check; run
+  it before trusting any snapshot in the pages below.
 - [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md) — current
   filter and candidate inventory.
 - [`docs/pluck-workspace-paths.md`](pluck-workspace-paths.md) — path resolution
@@ -306,3 +340,5 @@ zero, return to step 3 instead of repeatedly changing labels.
   result contract, followed by historical query notes.
 - [`docs/research/pluck-filter-root-cause.md`](research/pluck-filter-root-cause.md)
   — incident evidence and reproduction history.
+- [`docs/notes/bf-2bxsv.md`](notes/bf-2bxsv.md) — historical 2026-07-06
+  evidence; every configuration claim in it is superseded.

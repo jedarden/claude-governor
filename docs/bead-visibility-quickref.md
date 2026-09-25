@@ -6,6 +6,9 @@ The current workspace uses NEEDLE Pluck with the `bead-rs` backend.
 
 ## Current configuration
 
+Verified 2026-09-25 against `/home/coding/.config/needle/config.yaml` and
+needle 0.6.13:
+
 ```yaml
 workspace:
   default: /home/coding/claude-governor
@@ -13,17 +16,33 @@ workspace:
 
 strands:
   pluck:
-    exclude_labels:
-      - deferred
-      - human
-      - blocked
-      - starvation-alert
+    exclude_labels: []              # empty -> built-in default set applies
+    split_after_failures: 3
+    persistent_starvation_records: true
 ```
 
 `exclude_labels` entries are exact, case-sensitive strings. They do not support
 globs, `%`, regular expressions, or prefix matching. An omitted or empty list
-uses the built-in fallback `deferred`, `human`, `blocked`; a non-empty list
-replaces that fallback, so repeat the defaults when adding a custom label.
+makes PluckStrand substitute NEEDLE's built-in default set — `deferred`,
+`human`, `blocked`, `escalation`, `alert` as of needle 0.6.13; a non-empty
+list replaces that default set, so repeat the defaults when adding a custom
+label. This deployment's effective exclusion set is therefore the five
+defaults, not any explicitly configured list.
+
+## Authoritative verification
+
+Documentation snapshots of live configuration drift. When any claim on this
+page disagrees with what you observe, do not reconcile from memory — run the
+one authoritative check:
+
+```bash
+scripts/verify-pluck-config.sh
+```
+
+It verifies the backend binding, the active config path, the resolved default
+workspace, the bead-rs store layout, the CLI output contract, and the live
+`strands.pluck` values, and exits non-zero on any mismatch. The rest of this
+page summarizes what it reports.
 
 ## Workspace rule
 

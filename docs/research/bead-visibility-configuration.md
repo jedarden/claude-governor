@@ -4,8 +4,19 @@
 **Target workspace:** `/home/coding/claude-governor`
 **Backend selected by the target:** `bead-rs`
 
-This is the current configuration map for the NEEDLE Pluck strand. It replaces
-the older `bf`/`br`-era descriptions in this repository. “Visibility” means
+> **HISTORICAL — structure still valid, values superseded 2026-09-25.** The
+> two-path model below (home Pluck + Explore) is still how visibility works,
+> but the specific values recorded here have drifted: the deployment's
+> `exclude_labels` is now empty (effective set is needle 0.6.13's built-in
+> default `deferred`, `human`, `blocked`, `escalation`, `alert`),
+> `persistent_starvation_records` is now `true`, and Explore's exclusion
+> behavior may differ in 0.6.x. For current values run
+> `scripts/verify-pluck-config.sh` and read
+> [`docs/plan/pluck-configuration.md`](../plan/pluck-configuration.md).
+
+The configuration map below was accurate for the NEEDLE Pluck strand as of
+2026-08-21. It replaced the older `bf`/`br`-era descriptions in this
+repository. “Visibility” means
 “can enter Pluck’s candidate list”; it does not mean that a bead is present in
 the database or that a worker successfully claims it.
 

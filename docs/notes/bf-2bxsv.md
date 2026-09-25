@@ -4,6 +4,23 @@
 **Date:** 2026-07-06  
 **Workspace:** `/home/coding/claude-governor`
 
+> **HISTORICAL EVIDENCE — superseded 2026-09-25.** This page was accurate when
+> written, in the bead-forge (`bf`) era, against the v1 config layout. Every
+> configuration claim below is now obsolete. Do not configure or diagnose
+> Pluck from this page: run `scripts/verify-pluck-config.sh` for the live
+> snapshot and read
+> [`docs/bead-visibility-troubleshooting.md`](../bead-visibility-troubleshooting.md)
+> for the current procedures. The body is retained verbatim as the historical
+> record. Claim by claim:
+>
+> | This page says | Current reality (verified 2026-09-25) |
+> | --- | --- |
+> | NEEDLE config at `/home/coding/.needle/config.yaml` | The loader reads `/home/coding/.config/needle/config.yaml`. `~/.needle/config.yaml` still exists but carries an in-file marker that it is legacy v1 and is not read. |
+> | Default workspace `/home/coding/NEEDLE` | `workspace.default` is `/home/coding/claude-governor`. (`/home/coding/NEEDLE` is the NEEDLE source checkout, not a bead workspace.) |
+> | Strand enablement `pluck: auto` at `~/.needle/config.yaml:71` | No `pluck: auto` shorthand exists in the current schema; Pluck is configured by explicit keys under `strands:` → `pluck:`. |
+> | JSONL checkpoint `/home/coding/claude-governor/.beads/issues.jsonl` | The bead-rs store is `.beads/beads.db` (SQLite live store) plus the `.beads/checkpoint/` directory (`current.json`, `previous.json`, `forensic.jsonl`, `objects/*.jsonl`). There is no flat `issues.jsonl`. |
+> | Store "contains: beads.db, issues.jsonl, and backups" | See check 4 of `scripts/verify-pluck-config.sh` for the authoritative layout. |
+
 ## Summary
 
 Pluck workspace path configuration is correct and matches the actual workspace location.
