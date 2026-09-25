@@ -12,9 +12,16 @@ to the canonical Rust constants (`IDE_ENV_VARS` / `API_ROUTING_ENV_VARS` in
 | **cargo-test parse gate** — `installer_bash_variable_lists_match_the_rust_constants` | every `cargo test` (the installer is `include_str!`ed into `src/adapter_verify.rs`) | panic, exit 101 |
 | **bash gate** — `check_var_list_sync` (installer section 4) | every install run, before anything is trusted | `Install incomplete.`, exit 1 |
 
-A third, passive layer — the pinning tests in `tests/adapter_var_sync.rs`
+A third layer — the pinning tests in `tests/adapter_var_sync.rs`
 (claudego-385e691f) — extracts the bash gate into a sandbox and asserts it
-still detects drift; it *reports* the same drift text as the bash gate.
+still detects drift. That file is no longer passive: since 79d01bc
+(2026-09-24) it also *runs* this drill —
+`four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies`
+applies all four mutations to isolated copies on every `cargo test` and
+drives both real gates against the pinned signatures (see "Automated drill"
+below). The manual procedure recorded here is that automation's evidence
+trail, and its fallback when you need the verbatim gate output or are
+debugging the automation itself.
 
 This drill applied four single-sided mutations to a `git archive HEAD`
 extraction in a fresh temp dir (never mutate-and-revert the shared checkout)
@@ -35,6 +42,67 @@ collateral checks, not one (see Mutation 1).
 Drill variables: added `VSCODE_DRILL_PROBE` (rule-3 list), removed
 `VSCODE_CWD` (rule-3 list), removed `ANTHROPIC_SMALL_FAST_MODEL` (rule-5
 list).
+
+---
+
+## Automated drill (2026-09-24)
+
+`cargo test --test adapter_var_sync` now performs this drill itself
+(79d01bc). `four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies`
+loops over the same four single-sided mutations, materializes an isolated
+repo copy for each from the compile-time-embedded installer and
+`src/adapter_verify.rs` (nothing in the working tree or any checkout is
+mutated — the embedded-copy approach also immunizes the run against the
+stale-shared-target defect the `git archive HEAD` extraction style is
+exposed to), then drives both real gates per copy:
+
+- the cargo-test gate, by running
+  `cargo test --lib adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants -- --exact`
+  in the copy, and
+- the installer, by running `deploy/install-claude-print-adapters.sh
+  --skip-live` in the copy under a sandboxed `$HOME`.
+
+Warm-cache cost is ~40 s (measured 2026-09-25; dominated by recompiling the
+mutated lib per mutation into the shared `/build/claude-governor` target),
+and the run needs no network with a warm cargo cache.
+
+**What "reproduces the pinned signatures" means here.** The automation
+asserts the components each signature below is built from: the gate fails;
+the cargo output names the sync test, the drifted list pair and the
+variable; the installer prints `Install incomplete.` and `variable-list
+drift` naming the pair, the variable, and the correct `diff` direction
+(`<` for Mutations 1 and 4, `>` for Mutations 2 and 3). It does not diff
+the output byte-for-byte against the transcripts below — those remain the
+verbatim evidence. A green run on 2026-09-25 confirmed every asserted
+component for all four mutations against the committed state.
+
+**Coverage differences from the manual drill** (deliberate, not drift):
+
+- **The M1 collateral is not exercised.** The automation runs only the
+  targeted sync test (`--exact`), so a Rust-side addition is caught exactly
+  once per gate. The three collateral failures recorded under Mutation 1
+  (the template-scrub test and the two doctor tests) still fire under a
+  plain `cargo test --lib` after a real Rust-side edit — the captures below
+  are their record.
+- **The M4 compounding artifact cannot occur.** Each automated mutation
+  lands in a fresh copy, so nothing compounds onto an already-mutated list
+  the way `sync_gate_flags_a_removed_bash_variable` did in the manual run.
+- **Stub binary, `--skip-live`.** The manual installer runs used a real
+  copied `claude-print`; the automation links a stub that only answers
+  `--version` and rewrites the adapters' absolute binary path into the temp
+  copy, so nothing outside it is touched. The automated install therefore
+  verifies nothing past the section-4 sync gate — which is the only thing
+  the drill is about.
+- **The direction decoding is now mechanical.** The `<`/`>` semantics
+  described in "How to read these signatures" were prose-only; the
+  automation asserts the marker per mutation, so a gate regression that
+  swaps the `diff` arguments — flipping every direction while still failing
+  — now fails a test.
+
+The sandbox sensitivity pins (`clean_tree_sync_gate_passes`,
+`sync_gate_flags_an_extra_bash_variable`,
+`sync_gate_flags_a_removed_bash_variable`) are unchanged from
+claudego-385e691f and run alongside the drill.
 
 ---
 
@@ -161,7 +229,8 @@ assertion `left == right` failed: ANTHROPIC_SMALL_FAST_MODEL is not an element o
   sorted Rust list (file 1) against the sorted bash list (file 2), so:
   `<` = only in the Rust constants, `>` = only in the bash array — the same
   decoding for all four mutations. The `a`/`d` letter is mechanical
-  (append/delete), not semantic.
+  (append/delete), not semantic. The automated drill asserts this decoding
+  per mutation, so it is no longer prose-only knowledge (see above).
 - **Both gates are set comparisons** (`sort -u` / `BTreeSet`): element order
   and duplicates never trip them; only real membership differences do.
 - **Exit codes are unambiguous**: 101 (panic) for anything under
