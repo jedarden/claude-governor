@@ -29,6 +29,15 @@
 //! interpreter, no NEEDED entries) that genuinely pass it, so the refusal
 //! paths prove the gate wires the validator's verdict into the publish
 //! decision. Nothing here reaches the network.
+//!
+//! The refusal family is complete, not sampled (claudego-719c1248): every
+//! `die` branch the gate can take is pinned somewhere below — the usage and
+//! argument-validation exits, a release dir that is not a checkout or has
+//! no origin, a tag missing from the checkout (the mirror image of missing
+//! from Forgejo), an unreachable Forgejo (distinct from a Forgejo that
+//! answers with the wrong commit), a missing static validator, a missing
+//! `gh` binary at publish time, and a `gh release create` that itself
+//! fails after every preflight check passed.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -281,7 +290,7 @@ fn sandbox_with_good_release() -> Sandbox {
 # the post-publish asset query from a scenario file.
 {{ printf '%s' "$*" | tr '\n' ' '; printf '\n'; }} >> "{log_display}"
 case " $1 $2 " in
-  *" release create "*) exit 0 ;;
+  *" release create "*) exit "${{CGOV_FAKE_GH_CREATE_RC:-0}}" ;;
   *" release view "*) cat "${{CGOV_FAKE_GH_ASSETS:?}}"; exit 0 ;;
   *) echo "fake gh: unexpected call: $*" >&2; exit 64 ;;
 esac
@@ -307,24 +316,57 @@ fn good_assets_json() -> String {
 /// Run the materialized gate. `PATH` is prefixed with the sandbox `bin/`
 /// (the fake gh), `CGOV_FORGEJO_URL` points provenance at the stand-in.
 fn run_gate(sb: &Sandbox, assets_json: &str, extra_args: &[&str]) -> (bool, String) {
+    let (code, text) = run_gate_raw(sb, assets_json, extra_args, &[]);
+    (code == 0, text)
+}
+
+/// `run_gate` with per-call environment overrides and the raw exit code —
+/// the shape the refusal tests need (a different Forgejo URL, a failing
+/// fake gh, a PATH without gh). `extra_args` may carry a second
+/// `--release-dir`: the gate's parser keeps the last occurrence of a
+/// repeated flag, so it overrides the sandbox default.
+fn run_gate_raw(
+    sb: &Sandbox,
+    assets_json: &str,
+    extra_args: &[&str],
+    envs: &[(&str, String)],
+) -> (i32, String) {
+    let release_arg = sb.release_dir.to_string_lossy().into_owned();
+    let mut args: Vec<&str> = vec!["--version", TAG, "--release-dir", &release_arg];
+    args.extend_from_slice(extra_args);
+    run_gate_args(sb, assets_json, &args, envs)
+}
+
+/// Low-level gate runner with complete argv control: the usage-error tests
+/// pass their own flags (or none), so there is no default preamble here.
+/// The fake-gh scenario file is written from `assets_json`; the standard
+/// sandbox environment is applied first and `envs` after, so a per-call
+/// override wins. Returns the raw exit code (the gate's usage errors are
+/// 2, its validation refusals 1) and the combined output.
+fn run_gate_args(
+    sb: &Sandbox,
+    assets_json: &str,
+    args: &[&str],
+    envs: &[(&str, String)],
+) -> (i32, String) {
     let assets_file = sb.dir.path().join("assets.json");
     fs::write(&assets_file, assets_json).expect("write fake gh assets scenario");
     let fake_bin = sb.dir.path().join("bin");
     let path = std::env::var("PATH").unwrap_or_default();
-    let out = Command::new("bash")
-        .arg(sb.dir.path().join("scripts/publish-release.sh"))
-        .args(["--version", TAG, "--release-dir"])
-        .arg(&sb.release_dir)
-        .args(extra_args)
+    let mut cmd = Command::new("bash");
+    cmd.arg(sb.dir.path().join("scripts/publish-release.sh"))
+        .args(args)
         .env("CGOV_FORGEJO_URL", &sb.origin_url)
         .env("CGOV_FAKE_GH_ASSETS", &assets_file)
         .env("PATH", format!("{}:{}", fake_bin.display(), path))
-        .env_remove("CGOV_GH_REPO")
-        .output()
-        .expect("spawn bash on the sandboxed gate");
+        .env_remove("CGOV_GH_REPO");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("spawn bash on the sandboxed gate");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
-    (out.status.success(), text)
+    (out.status.code().unwrap_or(-1), text)
 }
 
 fn gh_log_lines(sb: &Sandbox) -> Vec<String> {
@@ -712,5 +754,282 @@ fn bare_version_is_normalized_to_the_release_tag() {
         creates[0].contains(TAG),
         "gh release create must target the normalized tag:\n{}",
         creates[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The refusal family, complete: every remaining `die` branch
+// (claudego-719c1248)
+// ---------------------------------------------------------------------------
+
+/// A directory of symlinks to exactly the executables the gate and its
+/// static validator invoke before the publish phase — deliberately without
+/// `gh`. Tools resolve on the host (`command -v`) so the sandbox works
+/// whatever the host layout is; a tool the host lacks (`file(1)` is
+/// optional to the validator) is simply absent, exactly as the validator
+/// expects when it downgrades the file(1) cross-check.
+fn gate_tools_path_without_gh(dir: &Path) -> PathBuf {
+    let bin = dir.join("bin-no-gh");
+    fs::create_dir_all(&bin).expect("create stripped bin dir");
+    for tool in [
+        "bash", "git", "dirname", "basename", "sed", "awk", "grep", "cut",
+        "head", "tr", "cat", "mktemp", "sha256sum", "env", "uname",
+        "readlink", "readelf", "objdump", "file", "rm",
+    ] {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .expect("probe the host for a gate tool");
+        if !found.status.success() {
+            continue; // optional to the gate's pre-publish path on this host
+        }
+        let target = PathBuf::from(String::from_utf8_lossy(&found.stdout).trim());
+        std::os::unix::fs::symlink(&target, bin.join(tool))
+            .expect("symlink a gate tool into the stripped bin dir");
+    }
+    bin
+}
+
+#[test]
+fn absent_version_argument_is_a_usage_refusal() {
+    let sb = sandbox_with_good_release();
+    // No --version at all: usage, exit 2 — the gate refuses before touching
+    // the checkout, Forgejo, or gh. Exit 2, not 1, is part of the contract:
+    // CI can tell a misconfigured invocation from a failed validation.
+    let (code, out) = run_gate_args(&sb, &good_assets_json(), &[], &[]);
+    assert_eq!(code, 2, "a bare invocation is usage, not validation:\n{out}");
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "usage errors must make no gh call at all"
+    );
+}
+
+#[test]
+fn unknown_argument_is_a_usage_refusal() {
+    let sb = sandbox_with_good_release();
+    let (code, out) = run_gate_args(&sb, &good_assets_json(), &["--frobnicate"], &[]);
+    assert_eq!(code, 2, "an unrecognized flag is usage, not validation:\n{out}");
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "usage errors must make no gh call at all"
+    );
+}
+
+#[test]
+fn version_without_a_value_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // A dangling --version is distinct from a missing one: die (exit 1),
+    // not usage (exit 2).
+    let (code, out) = run_gate_args(&sb, &good_assets_json(), &["--version"], &[]);
+    assert_eq!(code, 1, "a dangling --version dies, it does not print usage:\n{out}");
+    assert!(
+        out.contains("--version requires a value"),
+        "refusal must name the dangling flag:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "argument errors must make no gh call at all"
+    );
+}
+
+#[test]
+fn malformed_version_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // "1.2" is normalized to "v1.2" and THEN rejected: bare versions may
+    // grow a v, but partial versions may not pass as releases.
+    let (code, out) = run_gate_args(&sb, &good_assets_json(), &["--version", "1.2"], &[]);
+    assert_eq!(code, 1, "a partial version must refuse publication:\n{out}");
+    assert!(
+        out.contains("must be a vX.Y.Z release tag"),
+        "refusal must state the tag shape:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "argument errors must make no gh call at all"
+    );
+}
+
+#[test]
+fn nonexistent_release_dir_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    let missing = sb.dir.path().join("no-such-release-dir");
+    let (ok, out) = run_gate(
+        &sb,
+        &good_assets_json(),
+        &["--release-dir", missing.to_str().expect("release dir path")],
+    );
+    assert!(!ok, "a nonexistent release dir must refuse publication:\n{out}");
+    assert!(
+        out.contains("--release-dir does not exist"),
+        "refusal must name the missing dir:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "argument errors must make no gh call at all"
+    );
+}
+
+#[test]
+fn release_dir_that_is_not_a_git_checkout_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // A plain directory with artifacts but no git history: provenance
+    // cannot even be asked, let alone answered. The parser keeps the last
+    // --release-dir, so this overrides the sandbox default.
+    let plain = sb.dir.path().join("not-a-checkout");
+    fs::create_dir_all(&plain).expect("plain non-checkout dir");
+    let (ok, out) = run_gate(
+        &sb,
+        &good_assets_json(),
+        &["--release-dir", plain.to_str().expect("plain dir path")],
+    );
+    assert!(!ok, "a non-checkout release dir must refuse publication:\n{out}");
+    assert!(
+        out.contains("is not a git checkout"),
+        "refusal must name the missing git history:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "preflight failure must make no gh call at all"
+    );
+}
+
+#[test]
+fn checkout_without_origin_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // No origin remote at all: there is nothing to compare against the
+    // Forgejo source of truth, so provenance is unprovable.
+    git(&sb.release_dir, &["remote", "remove", "origin"]);
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(!ok, "an originless checkout must refuse publication:\n{out}");
+    assert!(
+        out.contains("has no origin remote"),
+        "refusal must name the missing remote:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "preflight failure must make no gh call at all"
+    );
+}
+
+#[test]
+fn local_tag_absent_from_the_checkout_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // The mirror image of tag_absent_from_forgejo: Forgejo still has the
+    // tag, but this checkout does not. The gate resolves the tag locally
+    // first, so the refusal fires before any Forgejo query — and the
+    // remote's good opinion cannot rescue a checkout that cannot name the
+    // commit its artifacts came from.
+    git(&sb.release_dir, &["tag", "-d", TAG]);
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(!ok, "a checkout without the tag must refuse publication:\n{out}");
+    assert!(
+        out.contains("does not exist in the checkout"),
+        "refusal must distinguish the local gap from the remote one:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "preflight failure must make no gh call at all"
+    );
+}
+
+#[test]
+fn unreachable_forgejo_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // A Forgejo that answers with the wrong commit is refused elsewhere;
+    // here the source of truth cannot be reached AT ALL. Both origin and
+    // CGOV_FORGEJO_URL point at a file:// URL whose repository does not
+    // exist, so the origin canon check still passes and `git ls-remote`
+    // fails instantly and deterministically — no network, no timeout.
+    let dead = format!("file://{}/forgejo-unreachable.git", sb.dir.path().display());
+    git(&sb.release_dir, &["remote", "set-url", "origin", &dead]);
+    let (code, out) = run_gate_raw(
+        &sb,
+        &good_assets_json(),
+        &[],
+        &[("CGOV_FORGEJO_URL", dead)],
+    );
+    assert_eq!(code, 1, "an unreachable Forgejo must refuse publication:\n{out}");
+    assert!(
+        out.contains("cannot reach Forgejo"),
+        "refusal must distinguish unreachable from divergent:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "preflight failure must make no gh call at all"
+    );
+}
+
+#[test]
+fn missing_static_validator_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // The gate checks sidecars but never generates them, and it validates
+    // linkage through the shipped sibling script — a sandbox without that
+    // script cannot fall back to trusting the artifacts.
+    fs::remove_file(sb.dir.path().join("scripts/verify-release-static.sh"))
+        .expect("remove the static validator");
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(!ok, "a missing validator must refuse publication:\n{out}");
+    assert!(
+        out.contains("static validator missing"),
+        "refusal must name the missing validator:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "preflight failure must make no gh call at all"
+    );
+}
+
+#[test]
+fn missing_gh_cli_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // Every preflight phase passes, then `command -v gh` fails: the gate
+    // must refuse rather than quietly skip the publish step and exit 0 —
+    // a green run that published nothing would be worse than a red one.
+    let bin = gate_tools_path_without_gh(sb.dir.path());
+    let (code, out) = run_gate_raw(
+        &sb,
+        &good_assets_json(),
+        &[],
+        &[("PATH", bin.to_string_lossy().into_owned())],
+    );
+    assert_eq!(code, 1, "a missing gh must fail the run:\n{out}");
+    assert!(
+        out.contains("gh (GitHub CLI) is required"),
+        "refusal must name the missing tool:\n{out}"
+    );
+    assert!(
+        gh_log_lines(&sb).is_empty(),
+        "no gh call can have been made without the binary"
+    );
+}
+
+#[test]
+fn failed_gh_create_fails_the_run_and_stops_before_the_asset_query() {
+    let sb = sandbox_with_good_release();
+    // Every preflight check passes, but `gh release create` itself fails
+    // (expired auth, a tag race, an API outage). The gate must fail the
+    // run, and the post-publish asset query must not run against a release
+    // that was never created — exactly one gh call, the create, may land.
+    let (code, out) = run_gate_raw(
+        &sb,
+        &good_assets_json(),
+        &[],
+        &[("CGOV_FAKE_GH_CREATE_RC", "1".to_string())],
+    );
+    assert_eq!(code, 1, "a failed create must fail the run:\n{out}");
+    assert!(
+        out.contains("gh release create failed"),
+        "failure must name the failed create:\n{out}"
+    );
+    let calls = gh_log_lines(&sb);
+    assert_eq!(
+        calls.len(),
+        1,
+        "the create was attempted once and nothing may follow it:\n{out}\ncalls: {calls:?}"
+    );
+    assert_eq!(
+        create_calls(&sb).len(),
+        1,
+        "the single gh call was the create itself:\n{out}"
     );
 }
