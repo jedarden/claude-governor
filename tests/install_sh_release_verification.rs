@@ -14,7 +14,13 @@
 //! * a wrong `CGOV_SHA256` → abort, and the install dir is never created;
 //! * a matching `CGOV_SHA256` → installs without fetching any sidecar;
 //! * a malformed digest pin → rejected before any download;
-//! * `CGOV_VERSION=0.1.1` downloads from the `v0.1.1` tag URL.
+//! * `CGOV_VERSION=0.1.1` downloads from the `v0.1.1` tag URL;
+//! * a malformed sidecar — garbage content, or a valid line naming a
+//!   different artifact — → refusal with the install dir preserved
+//!   (claudego-8bf03a00);
+//! * network failures — an unreachable release server, a 500 on the artifact,
+//!   a 500 on the sidecar — → refusal with nothing written (claudego-8bf03a00;
+//!   the 404 shapes are covered alongside the sidecar cases below).
 //!
 //! The script is embedded with `include_str!` at compile time, following the
 //! repo's gate pattern (tests/adapter_var_sync.rs): the tested text cannot
@@ -528,6 +534,175 @@ fn failed_artifact_download_refuses_and_preserves_existing_install() {
     );
     assert_install_dir_unchanged(&install_dir);
     artifact_mock.assert();
+}
+
+#[test]
+fn garbage_sidecar_content_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+
+    let mut server = mockito::Server::new();
+    // The sidecar exists (200) but its body is not a `sha256sum -c` line at
+    // all — the mirror-corruption shape where the digest file itself is
+    // garbage. `sha256sum -c` must reject it and the installer must treat
+    // that exactly like a digest mismatch: abort before any write.
+    let (artifact_mock, sidecar_mock) = serve_release(
+        &mut server,
+        "/releases/latest/download",
+        &artifact,
+        &bytes,
+        Some(b"this is not a checksum line\n".to_vec()),
+    );
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a malformed sidecar must fail the install:\n{out}");
+    assert!(
+        out.contains("Checksum verification FAILED"),
+        "refusal must name the checksum failure:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    assert_hit_once(sidecar_mock);
+}
+
+#[test]
+fn sidecar_for_a_different_artifact_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+    let other_artifact = if artifact == "cgov-linux-amd64" {
+        "cgov-linux-arm64"
+    } else {
+        "cgov-linux-amd64"
+    };
+
+    let mut server = mockito::Server::new();
+    // A second malformed shape: the sidecar carries a real digest line, but it
+    // names the *other* platform's binary. `sha256sum -c` fails on the missing
+    // file, and the installer must turn any -c failure into the same pre-write
+    // abort — not fall through to installing an unverified artifact.
+    let (artifact_mock, sidecar_mock) = serve_release(
+        &mut server,
+        "/releases/latest/download",
+        &artifact,
+        &bytes,
+        Some(sidecar_bytes(&sha256_hex(&bytes), other_artifact)),
+    );
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a sidecar for another artifact must fail the install:\n{out}");
+    assert!(
+        out.contains("Checksum verification FAILED"),
+        "refusal must name the checksum failure:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    assert_hit_once(sidecar_mock);
+}
+
+#[test]
+fn unreachable_release_server_refuses_and_creates_nothing() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let _artifact = release_artifact_name();
+
+    // The purest network failure: bind a port, capture the URL, then drop the
+    // server so curl hits connection-refused — not an HTTP error status. If a
+    // foreign service somehow re-took the ephemeral port and answered 200 with
+    // garbage, the test still holds: the run fails and nothing is written.
+    let dead_base = {
+        let server = mockito::Server::new();
+        server.url()
+    };
+
+    let script = materialize_installer(sandbox.path(), &dead_base);
+    let install_dir = fresh_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(
+        !ok,
+        "an unreachable release server must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Download failed"),
+        "refusal must identify the failed artifact download:\n{out}"
+    );
+    assert!(
+        !install_dir.exists(),
+        "failed install must never create the install dir (no mkdir -p may run)"
+    );
+}
+
+#[test]
+fn server_error_on_artifact_download_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+
+    let mut server = mockito::Server::new();
+    // 500 on the artifact itself — curl -f treats it like any non-2xx.
+    let artifact_mock = server
+        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .with_status(500)
+        .expect(1)
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(
+        !ok,
+        "a 500 on the artifact download must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Download failed"),
+        "refusal must identify the failed artifact download:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+}
+
+#[test]
+fn server_error_on_sidecar_download_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+
+    let mut server = mockito::Server::new();
+    // Artifact serves fine; its sidecar 500s. The digest gate must fail the
+    // run on the sidecar fetch alone — never install "while we have the
+    // bytes".
+    let artifact_mock = server
+        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .with_status(200)
+        .with_body(bytes)
+        .expect(1)
+        .create();
+    let sidecar_mock = server
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}.sha256").as_str(),
+        )
+        .with_status(500)
+        .expect(1)
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(
+        !ok,
+        "a 500 on the sidecar download must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Digest sidecar download failed"),
+        "refusal must identify the failed sidecar download:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    sidecar_mock.assert();
 }
 
 #[test]
