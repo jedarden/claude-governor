@@ -10,12 +10,17 @@
 #   3. it has no NEEDED entry in its dynamic section — no shared library is
 #      required (checks 2+3 are the authoritative definition of static);
 #   4. file(1) never reports it as dynamically linked;
-#   5. on this machine's architecture, `--version` and `--help` exit 0 with
-#      output when run under `env -i` from an empty working directory with
-#      PATH pointed at an empty directory — no environment, no libraries to
-#      resolve at runtime, no project files to read.
-# Binaries for a foreign architecture skip check 5 with a printed note;
-# every other check still applies (readelf/file are cross-arch).
+#   5. `--version` and `--help` exit 0 with output when run under `env -i`
+#      from an empty working directory with PATH pointed at an empty
+#      directory — no environment, no libraries to resolve at runtime, no
+#      project files to read.
+# The probe always runs for this machine's architecture. A foreign-
+# architecture binary runs it too whenever a way to execute it exists: a
+# qemu-user emulator on PATH (the -static builds preferred), or an enabled
+# binfmt_misc registration the kernel itself would use. Only with neither
+# is check 5 skipped, with a printed note — that artifact ships with the
+# linkage checks alone (readelf/file are cross-arch); every other check
+# still applies.
 #
 # Usage:
 #   scripts/verify-release-static.sh [binary ...]
@@ -53,6 +58,51 @@ host_machine() {
         aarch64|arm64) echo aarch64 ;;
         *) echo other ;;
     esac
+}
+
+# Absolute path of a user-mode emulator able to run an ELF of machine $1,
+# or "" when none is on PATH. The -static builds are preferred: the probe
+# runs under env -i, and a static emulator cannot itself need libraries.
+emulator_for() {
+    local m="$1" e
+    case "$m" in
+        x86_64)  set -- qemu-x86_64-static  qemu-x86_64  ;;
+        aarch64) set -- qemu-aarch64-static qemu-aarch64 ;;
+        *) echo ""; return ;;
+    esac
+    for e in "$@"; do
+        if command -v "$e" >/dev/null 2>&1; then
+            command -v "$e"
+            return
+        fi
+    done
+    echo ""
+}
+
+# True when the kernel would exec an ELF of machine $1 itself: an enabled
+# binfmt_misc registration whose magic carries $1's ET_EXEC + e_machine
+# pair — exactly what the qemu binfmt registrations match (their mask also
+# admits ET_DYN, so this stays a conservative "would exec" test).
+# BINFMT_MISC_DIR overrides the mountpoint so tests can pin both cases
+# regardless of the host's real registrations.
+binfmt_registered_for() {
+    local m="$1" dir f magic
+    case "$m" in
+        x86_64)  magic=02003e ;;  # ET_EXEC(02 00), EM_X86_64(3e 00), little-endian
+        aarch64) magic=0200b7 ;;  # ET_EXEC(02 00), EM_AARCH64(b7 00)
+        *) return 1 ;;
+    esac
+    dir="${BINFMT_MISC_DIR:-/proc/sys/fs/binfmt_misc}"
+    [ -d "$dir" ] || return 1
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        case "${f##*/}" in register|status) continue ;; esac
+        [ "$(head -1 "$f" 2>/dev/null)" = "enabled" ] || continue
+        if grep -q "^magic [0-9a-f]*$magic" "$f" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Existing release artifacts this repo produces, deduped by realpath.
@@ -140,10 +190,23 @@ verify_one() {
         pass "$bin: file(1): $(file -b "$bin" 2>/dev/null | cut -c1-96)"
     fi
 
-    # Execution probe: native architecture only.
+    # Execution probe. This machine's architecture runs natively. A foreign
+    # architecture runs under a user-mode emulator when one is on PATH, or
+    # directly when the kernel itself would exec it (an enabled binfmt_misc
+    # registration) — either is a genuine run of this binary's instructions.
+    # Only with neither is the probe skipped, loudly: that artifact ships
+    # with linkage checks alone.
+    local emu="" how=""
     if [ "$machine" != "$(host_machine)" ]; then
-        note "$bin: foreign architecture ($machine host $(uname -m)) — linkage verified, execution skipped"
-        return
+        emu="$(emulator_for "$machine")"
+        if [ -n "$emu" ]; then
+            how="under ${emu##*/} "
+        elif binfmt_registered_for "$machine"; then
+            how="under binfmt_misc "
+        else
+            note "$bin: foreign architecture ($machine host $(uname -m)) — linkage verified, but no $machine emulator on PATH (e.g. qemu-$machine-static) and no binfmt_misc registration: EXECUTION PROBE SKIPPED, this artifact ships with linkage checks only"
+            return
+        fi
     fi
     local tmp out rc probe abs
     tmp="$(mktemp -d)" || {
@@ -153,17 +216,21 @@ verify_one() {
     }
     abs="$(readlink -f "$bin")"
     for probe in --version --help; do
-        out="$(cd "$tmp" && env -i PATH="$tmp" HOME="$tmp" "$abs" $probe 2>&1)"
+        if [ -n "$emu" ]; then
+            out="$(cd "$tmp" && env -i PATH="$tmp" HOME="$tmp" "$emu" "$abs" "$probe" 2>&1)"
+        else
+            out="$(cd "$tmp" && env -i PATH="$tmp" HOME="$tmp" "$abs" "$probe" 2>&1)"
+        fi
         rc=$?
         if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
-            pass "$bin: $probe in env -i, empty cwd, empty PATH (exit 0: $(head -1 <<<"$out"))"
+            pass "$bin: $probe ${how}in env -i, empty cwd, empty PATH (exit 0: $(head -1 <<<"$out"))"
         else
-            printf 'FAIL: %s: %s in env -i, empty cwd, empty PATH: exit=%s output=%.200q\n' \
-                "$bin" "$probe" "$rc" "$out"
+            printf 'FAIL: %s: %s %sin env -i, empty cwd, empty PATH: exit=%s output=%.200q\n' \
+                "$bin" "$probe" "$how" "$rc" "$out"
             failures=$((failures + 1))
         fi
     done
-    rm -rf "$tmp"
+    rm -rf -- "$tmp"
 }
 
 main() {

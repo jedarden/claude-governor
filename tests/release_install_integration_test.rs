@@ -143,7 +143,12 @@ fn static_elf_x86_64(message: &[u8]) -> Vec<u8> {
 fn static_elf_aarch64(message: &[u8]) -> Vec<u8> {
     let msg_addr = 0x4000_0000u64 + 0x78 + 40; // code is 10 instructions
     let movz = |imm: u32, rd: u32| 0xd280_0000 | (imm << 5) | rd;
-    let movk = |imm: u32, shift: u32, rd: u32| 0xf280_0000 | (shift << 21) | (imm << 5) | rd;
+    // AArch64 encodes the halfword position in `hw` (shift / 16), not the
+    // byte shift itself. The foreign artifact is executed whenever qemu is
+    // available, so keep this fixture valid under the real probe.
+    let movk = |imm: u32, shift: u32, rd: u32| {
+        0xf280_0000 | ((shift / 16) << 21) | (imm << 5) | rd
+    };
     let words: Vec<u32> = vec![
         movz(1, 0),                                    // mov x0, #1 (stdout)
         movz(message.len() as u32, 2),                 // mov x2, #len

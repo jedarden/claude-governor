@@ -22,16 +22,25 @@ binary it requires:
    "dynamically linked", but its absence is only a NOTE — some hosts (this
    NixOS box, the debian build container) have no `file` package, and the
    readelf checks carry the guarantee.
-5. **Execution probe** (host architecture only): `--version` and `--help`
-   must exit 0 with output when run as
-   `env -i PATH=<empty-dir> HOME=<empty-dir> <binary>` from an empty working
-   directory. That is a genuinely minimal environment: no environment
-   variables, no PATH to resolve helpers through, no project files to read.
-   clap's `--version`/`--help` paths are config-free, so nothing but process
-   startup, the runtime, and argv parsing is exercised. Foreign-architecture
-   binaries skip the probe (readelf/file are cross-arch; the linkage
-   guarantee still fully applies) — this is what lets `cgov-ci` validate
-   `cgov-linux-arm64` from its amd64 container.
+5. **Execution probe**: `--version` and `--help` must exit 0 with output
+   when run as `env -i PATH=<empty-dir> HOME=<empty-dir> <binary>` from an
+   empty working directory. That is a genuinely minimal environment: no
+   environment variables, no PATH to resolve helpers through, no project
+   files to read. clap's `--version`/`--help` paths are config-free, so
+   nothing but process startup, the runtime, and argv parsing is exercised.
+   The probe runs natively on the build host's architecture. A
+   foreign-architecture binary (claudego-8af2d72b) runs it too — under a
+   user-mode emulator when one is on PATH (the `-static` qemu builds are
+   preferred, since under `env -i` a static emulator cannot itself need
+   libraries), or directly when an enabled `binfmt_misc` registration would
+   let the kernel exec it. Only with neither is the probe skipped, with a
+   loud note that the artifact ships on linkage evidence alone. `cgov-ci`
+   closes that residual for real artifacts: it installs `qemu-user-static`
+   and refuses to publish unless the arm64 artifact's `--version` and `--help`
+   probes both ran under the emulator. The contract is pinned by
+   `tests/release_static_validation_test.rs`
+   (hand-assembled x86-64/AArch64 ELFs; `BINFMT_MISC_DIR` overrides the
+   binfmt mountpoint so both cases are testable regardless of the host).
 
 A gnu-target release binary fails checks 2 and 3 (it carries `PT_INTERP` and
 NEEDED entries for `libgcc_s`/`libm`/`libc`) — verified as a negative control.
@@ -46,7 +55,10 @@ The musl target is load-bearing for the promise; a plain
   dir is honored) and validates it.
 - **`cgov-ci`** (`declarative-config/k8s/iad-ci/argo-workflows/cgov-ci.yaml`)
   — runs the script over `cgov-linux-amd64` and `cgov-linux-arm64` as a
-  release gate before the tag is pushed or anything is published.
+  release gate before the tag is pushed or anything is published; it
+  installs `qemu-user-static` so the arm64 probe executes under emulation,
+  and greps the validator output for the emulated run, refusing to publish
+  an artifact that was never executed.
 - **`cargo test`** — `tests/release_static_validation_test.rs` validates any
   release artifact already on disk, and SKIPS (loudly) when none exists so
   clean extractions stay green. Discovery probes `cargo metadata` three ways:

@@ -125,7 +125,13 @@ fn static_elf_x86_64(message: &[u8]) -> Vec<u8> {
 fn static_elf_aarch64(message: &[u8]) -> Vec<u8> {
     let msg_addr = 0x4000_0000u64 + 0x78 + 40; // code is 10 instructions
     let movz = |imm: u32, rd: u32| 0xd280_0000 | (imm << 5) | rd;
-    let movk = |imm: u32, shift: u32, rd: u32| 0xf280_0000 | (shift << 21) | (imm << 5) | rd;
+    // `hw` (bits 21-22) is shift/16, not the raw byte count — shifting the
+    // byte count in corrupts the opcode field and the instruction is illegal
+    // when executed. Latent until claudego-8af2d72b: the foreign-arch
+    // artifact was never executed before it gained an emulator path.
+    let movk = |imm: u32, shift: u32, rd: u32| {
+        0xf280_0000 | ((shift / 16) << 21) | (imm << 5) | rd
+    };
     let words: Vec<u32> = vec![
         movz(1, 0),                                    // mov x0, #1 (stdout)
         movz(message.len() as u32, 2),                 // mov x2, #len
@@ -239,7 +245,9 @@ fn sandbox_with_good_release() -> Sandbox {
 
     // Both architecture artifacts: hand-assembled static ELFs that pass the
     // real validator (the host-arch one genuinely executes; the foreign one
-    // gets the linkage checks with its probe skipped).
+    // executes too when the host has an emulator for it — claudego-8af2d72b
+    // — and otherwise gets the linkage checks with its probe skipped. The
+    // cgov-ci workflow requires both guest smoke probes before publishing.)
     let msg = b"cgov 0.1.2-sandbox\n";
     write_executable(&release_dir.join("cgov-linux-amd64"), &static_elf_x86_64(msg));
     write_executable(&release_dir.join("cgov-linux-arm64"), &static_elf_aarch64(msg));

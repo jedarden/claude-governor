@@ -35,15 +35,22 @@ version. Nothing is written to the install dir until verification passes.
 not assumed. `make verify-release` builds the musl release binary and runs
 `scripts/verify-release-static.sh`, which fails the build unless the artifact
 is an ELF executable with no `PT_INTERP` segment (no dynamic loader) and no
-shared-library `NEEDED` entries, and — on the build host's architecture — runs
-`--version` and `--help` successfully under `env -i` from an empty working
-directory with `PATH` pointed at an empty directory (no environment, no
-libraries to resolve, no project files to read). Foreign-architecture
-artifacts (e.g. `cgov-linux-arm64` built on amd64) get the full linkage checks
-with the execution probe skipped. `cgov-ci` runs the same script over each
-built artifact before publishing, and a cargo integration test
+shared-library `NEEDED` entries, and runs `--version` and `--help`
+successfully under `env -i` from an empty working directory with `PATH`
+pointed at an empty directory (no environment, no libraries to resolve, no
+project files to read). The execution probe always runs on the build host's
+architecture; a foreign-architecture artifact (e.g. `cgov-linux-arm64` built
+on amd64) runs it too whenever a way to execute it exists — a qemu-user
+emulator on PATH (the `qemu-user-static` builds) or an enabled `binfmt_misc`
+registration — and with neither keeps the full linkage checks while skipping
+only the probe, saying so loudly in its output. `cgov-ci` installs
+`qemu-user-static` and refuses to publish unless the arm64 artifact's
+`--version` and `--help` probes both ran under the emulator, so every
+published artifact of every architecture has executed. The same script runs over each built artifact
+before publishing, and a cargo integration test
 (`tests/release_static_validation_test.rs`) re-validates any artifact already
-on disk during `cargo test`.
+on disk during `cargo test` and pins the architecture contract the script
+implements.
 
 **Publication gate.** Nothing reaches a GitHub Release until
 `scripts/publish-release.sh` proves, in order, that: the release dir is a

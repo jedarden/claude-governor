@@ -4,8 +4,10 @@ PREFIX ?= $(HOME)/.local
 
 # Target used for the static release binary. CGOV_CI builds it for
 # x86_64-unknown-linux-musl; point MUSL_TARGET elsewhere to validate a
-# different triple (e.g. aarch64-unknown-linux-musl, execution checks skip
-# on a foreign host).
+# different triple (e.g. aarch64-unknown-linux-musl — the execution probe
+# runs under a qemu-user emulator when one is installed, and is skipped
+# with a loud note when not). cgov-ci installs qemu-user-static and fails
+# closed if the foreign probe does not report both PASS lines.
 MUSL_TARGET ?= x86_64-unknown-linux-musl
 
 build:

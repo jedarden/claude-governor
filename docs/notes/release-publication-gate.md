@@ -41,9 +41,11 @@ Fail-closed, in order; any failure exits 1 with nothing uploaded:
    the two architectures `install.sh` supports. A missing architecture is a
    failure, not a partial release.
 3. **Static.** Each artifact goes through the real
-   `scripts/verify-release-static.sh`. Foreign-arch artifacts keep the full
-   linkage checks with the execution probe skipped — so the arm64 artifact
-   is validated even from an amd64 runner.
+   `scripts/verify-release-static.sh`. Since claudego-8af2d72b the
+   foreign-arch artifact executes its probe too whenever the host has a way
+   to run it (an emulator on PATH or a binfmt registration) — `cgov-ci`
+   installs `qemu-user-static`, so there the arm64 artifact genuinely runs
+   both smoke probes — and keeps the full linkage checks either way.
 4. **Sidecars.** Each artifact needs `<artifact>.sha256`, exactly one line,
    `<64-hex>␠␠<artifact>` — the `sha256sum -c` shape `install.sh` consumes —
    with a digest equal to the artifact's actual sha256. Sidecars are
@@ -93,7 +95,8 @@ builds:
   x86-64 and AArch64, ~150 bytes, no PT_INTERP, no dynamic section, real
   `write`/`exit` syscalls — so the static-validation phase is the genuine
   validator, not a mock. The host-arch artifact actually executes under the
-  script's `env -i` probe; the foreign one exercises the skip path;
+  script's `env -i` probe; the foreign one executes too when the host has an
+  emulator for it (claudego-8af2d72b) and otherwise exercises the skip path;
 - a recording `gh` fake on `PATH` that logs its argv (newlines collapsed —
   the gate's `--notes` span lines) and answers the post-publish asset query
   from a scenario file.

@@ -15,7 +15,9 @@
 #      architecture is a failure, not a partial release.
 #   3. STATIC — every artifact passes scripts/verify-release-static.sh (the
 #      zero-runtime-dependency promise) on EACH architecture, not just the
-#      build host's; foreign-arch artifacts keep the full linkage checks.
+#      build host's; foreign-arch artifacts run the execution probe under an
+#      emulator when one is available (claudego-8af2d72b) and keep the full
+#      linkage checks regardless; cgov-ci fail-closes on both smoke probes.
 #   4. SIDECARS — every artifact has an <artifact>.sha256 sidecar in exactly
 #      the `sha256sum -c` format install.sh consumes, whose digest equals the
 #      artifact's actual digest. Sidecars are validated here, never
