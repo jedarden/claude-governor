@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"entrypoint":"cli"}
+{"type":"assistant","message":{"role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":2000,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"entrypoint":"cli"}

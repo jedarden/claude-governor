@@ -61,7 +61,7 @@ impl log::Log for RecoveryLogger {
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .unwrap()
-            .push(format!("{}", record.args()));
+            .push(format!("{} {}", record.level(), record.args()));
     }
     fn flush(&self) {}
 }
@@ -101,6 +101,13 @@ fn seed_session(paths: &CollectionPaths, name: &str, lines: &[String]) -> PathBu
     let path = paths.session_base.join("proj").join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, lines.join("\n") + "\n").unwrap();
+    path
+}
+
+fn seed_fixture(paths: &CollectionPaths, name: &str, fixture: &str) -> PathBuf {
+    let path = paths.session_base.join("proj").join(name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, fixture).unwrap();
     path
 }
 
@@ -148,15 +155,15 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
     let home = TempDir::new().unwrap();
     let paths = CollectionPaths::under(home.path());
 
-    let sess_a = seed_session(
+    let sess_a = seed_fixture(
         &paths,
         "sess-a.jsonl",
-        &[usage_line(100, 10), usage_line(200, 20)],
+        include_str!("fixtures/collector/sess-a.jsonl"),
     );
-    let sess_b = seed_session(
+    let sess_b = seed_fixture(
         &paths,
         "sess-b.jsonl",
-        &[usage_line(1000, 100), usage_line(2000, 200)],
+        include_str!("fixtures/collector/sess-b.jsonl"),
     );
 
     // Pass 1: first sight of both files — one instance row each, cursors at EOF.
@@ -188,8 +195,8 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
     // The headline assertion: the pass after the corruption COMPLETES. The
     // pre-hardening behaviour was `collector pass failed: Failed to load
     // cursors` — nothing collected until someone repaired the file by hand.
-    let pass2 = run_pass(&paths)
-        .expect("a corrupt cursor file must never fail the collection pass");
+    let pass2 =
+        run_pass(&paths).expect("a corrupt cursor file must never fail the collection pass");
     assert_eq!(pass2.instance_records, 2);
 
     // A's cursor survived the truncation: it resumes from its last good
@@ -215,8 +222,10 @@ fn truncated_cursor_recovers_surviving_offsets_and_resumes_without_recount() {
 
     // The recovery was logged as an event, naming the rebuilt store.
     let events = logs_containing("cursor recovery");
-    assert!(!events.is_empty(), "a cursor recovery event must be logged");
-    assert!(events[0].contains("cursor recovery"));
+    assert!(
+        events.iter().any(|event| event.starts_with("WARN ")),
+        "cursor recovery must be logged at WARN level: {events:?}"
+    );
 
     // The pass left a valid cursor file behind (the pass's own save), with
     // both files at their new EOFs.
@@ -265,8 +274,8 @@ fn garbage_cursor_fails_over_to_full_reread_then_resumes_incrementally() {
     append_session(&sess, &[usage_line(400, 40)]);
 
     // The pass completes; with nothing salvageable every file re-reads once.
-    let pass2 = run_pass(&paths)
-        .expect("an unsalvageable cursor file must still not fail the pass");
+    let pass2 =
+        run_pass(&paths).expect("an unsalvageable cursor file must still not fail the pass");
     assert_eq!(pass2.instance_records, 1);
 
     let rows = instance_rows(&paths, "sess-only");

@@ -13,7 +13,10 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use thiserror::Error;
 
 /// Errors that can occur during collection
@@ -248,32 +251,35 @@ impl CursorStore {
     /// Save cursor store to a JSON file atomically
     ///
     /// Writes to a per-process temp file first, then renames to the final path.
-    /// The temp filename includes the PID and a random component (see ADR-002):
-    /// two writers racing on a *shared* temp filename can each open/truncate/write
-    /// it independently, and their writes can interleave at the byte level before
-    /// either rename runs — this is how the cursor file got corrupted (multiple
-    /// governor instances restarting and saving concurrently). `fs::rename` itself
-    /// is atomic at the filesystem level, so as long as each writer's temp file is
-    /// unique, the final file is always a complete, valid write from exactly one
-    /// writer — whichever rename lands last simply wins outright, never a byte-level
-    /// splice.
+    /// The temp filename includes the PID, a monotonic per-process sequence, and
+    /// the current time (see ADR-002): two writers racing on a shared temp
+    /// filename can each open/truncate/write it independently, and their writes
+    /// can interleave at the byte level before either rename runs — this is how
+    /// the cursor file got corrupted (multiple governor instances restarting and
+    /// saving concurrently). `fs::rename` itself is atomic at the filesystem
+    /// level, so as long as each writer's temp file is unique, the final file is
+    /// always a complete, valid write from exactly one writer — whichever rename
+    /// lands last simply wins outright, never a byte-level splice.
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // Include both PID and nanos for uniqueness: PID prevents cross-process
-        // collisions, nanos prevents rapid sequential saves within the same process
-        // (e.g. a hot loop or manually-triggered collections) from colliding.
+        // Include the PID, a monotonic sequence, and nanos for uniqueness. The
+        // sequence is what makes concurrent saves in one process distinct even
+        // when the clock has the same resolution as both calls.
         let pid = std::process::id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .subsec_nanos();
-        let tmp_path = path.with_extension(format!("tmp.{}.{}", pid, nanos));
+            .as_nanos();
+        let sequence = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{}.{}", pid, nanos, sequence));
 
         // Write to temp file
         {
@@ -1762,12 +1768,12 @@ mod tests {
     }
 
     #[test]
-    fn cursor_save_uses_unique_temp_file_with_pid_and_nanos() {
+    fn cursor_save_uses_unique_temp_file_with_pid_sequence_and_nanos() {
         // ADR-002: two writers racing on a *shared* .tmp filename can interleave
         // their writes at the byte level before either rename runs — this is how
         // the real cursor file got corrupted in production. save() must derive a
-        // temp filename that includes the PID and nanos so concurrent writers
-        // never share one, even within the same process (rapid sequential saves).
+        // temp filename that includes the PID, a monotonic sequence, and nanos so
+        // concurrent writers never share one, even within the same process.
         let temp_dir = TempDir::new().unwrap();
         let cursor_path = temp_dir.path().join("cursors.json");
         let store = CursorStore::default();
@@ -1942,37 +1948,78 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_save_calls_do_not_corrupt_output() {
+    fn concurrent_save_calls_never_publish_partial_output() {
         // ADR-002: simulate concurrent writers (e.g., manual one-shot collection
         // racing the daemon) by having two CursorStore instances save to the same
-        // path. With unique tmp filenames (PID + nanos), they must not interleave
-        // or corrupt each other's output — the final file must be valid JSON.
-        use std::sync::{Arc, Mutex};
+        // path. With unique temp filenames and rename, readers must see either
+        // the old complete file or the new complete file, never an interleaved
+        // or partially written JSON document.
+        use std::io::ErrorKind;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
         use std::thread;
 
         let temp_dir = TempDir::new().unwrap();
         let cursor_path = Arc::new(temp_dir.path().join("cursors.json"));
+        CursorStore::default().save(&cursor_path).unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
+        let stop_reader = Arc::new(AtomicBool::new(false));
 
-        // Spawn two threads that save different cursor stores concurrently
+        let reader_path = Arc::clone(&cursor_path);
+        let reader_errors = Arc::clone(&errors);
+        let reader_stop = Arc::clone(&stop_reader);
+        let reader = thread::spawn(move || {
+            while !reader_stop.load(Ordering::Acquire) {
+                match fs::read(&*reader_path) {
+                    Ok(bytes) => {
+                        if let Err(error) = serde_json::from_slice::<CursorStore>(&bytes) {
+                            reader_errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("reader saw partial cursor JSON: {error}"));
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        reader_errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("reader failed to read cursor JSON: {error}"));
+                        break;
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+
+        // Keep the destination busy long enough for the reader to observe many
+        // rename boundaries. Each store is deliberately large so a non-atomic
+        // destination write has a useful window in which to be observed.
         let mut handles = vec![];
-        for i in 0..2 {
+        for i in 0..4 {
             let path_clone = Arc::clone(&cursor_path);
             let errors_clone = Arc::clone(&errors);
             let handle = thread::spawn(move || {
-                let mut store = CursorStore::default();
-                // Each store writes different data
-                let file_path = PathBuf::from(format!("/worker/file{}.jsonl", i));
-                store.set_offset(file_path, i * 1000);
+                for iteration in 0..32 {
+                    let mut store = CursorStore::default();
+                    for entry in 0..128 {
+                        let file_path = PathBuf::from(format!(
+                            "/worker/{i}/{iteration}/{entry}/{}{}.jsonl",
+                            "x".repeat(32),
+                            "y".repeat(32)
+                        ));
+                        store.set_offset(file_path, (i * 1000 + iteration + entry) as u64);
+                    }
 
-                // Small delay to increase chance of concurrent write
-                std::thread::sleep(std::time::Duration::from_millis(10));
-
-                if let Err(e) = store.save(&path_clone) {
-                    errors_clone
-                        .lock()
-                        .unwrap()
-                        .push(format!("thread {} save failed: {}", i, e));
+                    if let Err(error) = store.save(&path_clone) {
+                        errors_clone
+                            .lock()
+                            .unwrap()
+                            .push(format!("thread {i} save failed: {error}"));
+                    }
                 }
             });
             handles.push(handle);
@@ -1982,12 +2029,14 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        stop_reader.store(true, Ordering::Release);
+        reader.join().unwrap();
 
-        // No save errors should have occurred
+        // No save errors or partial destination reads should have occurred.
         let errors_lock = errors.lock().unwrap();
         assert!(
             errors_lock.is_empty(),
-            "concurrent saves should not error, got: {:?}",
+            "concurrent saves should not error or publish partial JSON, got: {:?}",
             errors_lock
         );
 
