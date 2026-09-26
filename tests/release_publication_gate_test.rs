@@ -673,6 +673,45 @@ fn static_validation_failure_on_any_architecture_refuses_and_never_publishes() {
 }
 
 #[test]
+fn unexecutable_artifact_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // Strip the exec bit from the amd64 artifact (claudego-eb2394ce). The
+    // bytes are untouched, so the sidecar digest stays correct and the
+    // gate's own existence check passes — only the validator's
+    // executable-regular-file check stands between this release and
+    // publication. amd64 is broken here because the sibling test above
+    // breaks arm64: together the two pin "on any architecture".
+    let amd64 = sb.release_dir.join("cgov-linux-amd64");
+    fs::set_permissions(&amd64, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+    let sidecar = fs::read_to_string(sb.release_dir.join("cgov-linux-amd64.sha256"))
+        .expect("read sidecar");
+    assert_eq!(
+        sidecar.split_whitespace().next().unwrap(),
+        sha256_hex(&amd64),
+        "chmod must not disturb the bytes: the sidecar still matches, so \
+         the refusal below is attributable to executability alone"
+    );
+
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(
+        !ok,
+        "an artifact without its exec bit must refuse publication:\n{out}"
+    );
+    assert!(
+        out.contains("not an executable regular file"),
+        "the validator's diagnosis must surface through the gate:\n{out}"
+    );
+    assert!(
+        out.contains("static: cgov-linux-amd64 failed"),
+        "refusal must attribute the failure to the amd64 artifact:\n{out}"
+    );
+    assert!(
+        create_calls(&sb).is_empty(),
+        "refused publication must not call gh release create"
+    );
+}
+
+#[test]
 fn missing_foreign_architecture_artifact_refuses_and_never_publishes() {
     let sb = sandbox_with_good_release();
     fs::remove_file(sb.release_dir.join("cgov-linux-arm64")).expect("remove arm64 artifact");

@@ -186,6 +186,55 @@ fn release_binaries_hold_the_zero_runtime_dependency_promise() {
     assert!(!artifacts.is_empty());
 }
 
+#[test]
+fn non_executable_artifact_is_refused_until_the_exec_bit_is_restored() {
+    // An artifact whose exec bit was stripped — the classic shape of an
+    // archive extraction that dropped permissions — has byte-identical
+    // content and therefore a valid digest, so every content check would
+    // pass it. The validator must refuse it on the executable-regular-file
+    // check alone, and accept the very same bytes again once the bit is
+    // back — pinning the mode as the only defect (claudego-eb2394ce).
+    let sb = ArchSandbox::new();
+    let msg = b"cgov 0.1.2-mode-probe\n";
+    let artifact = sb.dir.path().join("cgov-noexec");
+    fs::write(&artifact, artifact_for(host_machine(), msg, 0)).expect("write artifact");
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+
+    let (ok, out) = sb.run(&artifact, &sb.binfmt_empty(), false);
+    assert!(
+        !ok,
+        "a regular file without its exec bit must fail the validator:\n{out}"
+    );
+    assert!(
+        out.contains("not an executable regular file"),
+        "the refusal must name the executable-regular-file check:\n{out}"
+    );
+    assert!(
+        out.contains("FAILED (1 check(s) failed)"),
+        "exactly the executability check may have failed:\n{out}"
+    );
+    assert!(
+        !out.contains("EXECUTION PROBE SKIPPED"),
+        "a refused artifact must not be reported as a probe skip — \
+         it was never eligible to run:\n{out}"
+    );
+
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let (ok, out) = sb.run(&artifact, &sb.binfmt_empty(), false);
+    assert!(
+        ok,
+        "the same bytes with the exec bit restored must pass:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("ELF EXEC for {}", host_machine())),
+        "the linkage checks must run once the artifact is executable:\n{out}"
+    );
+    assert!(
+        out.contains("--version in env -i, empty cwd, empty PATH"),
+        "restoring the bit must restore the execution probe:\n{out}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The architecture contract (claudego-8af2d72b). The README documents the
 // script's per-architecture behavior; these tests pin it against hand-built
