@@ -41,6 +41,11 @@
 //!   `limits[]` entry; and the `limits[]` additive-tolerance contract has a
 //!   precise boundary — absent and null fields are tolerated, a wrong-typed
 //!   present value is fatal.
+//! - Missing required fields inside a window that *is* present (claudego-0840eab5):
+//!   a window object without `utilization` or without `resets_at` fails the
+//!   poll. The dangerous direction is a future `#[serde(default)]` on
+//!   `utilization`: absence would silently read as 0%, i.e. manufactured
+//!   headroom the fleet could scale up on.
 //!
 //! Contract-completion coverage (claudego-48fd3fa5), closing the two gaps the
 //! baseline left in the now-documented contract (usage-tracking.md §10):
@@ -496,6 +501,86 @@ fn wrong_typed_window_field_fails_the_poll() {
             Some(PollerError::ParseError(_))
         ),
         "expected ParseError, got: {err}"
+    );
+}
+
+#[test]
+fn window_missing_utilization_fails_the_poll() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // The missing-field boundary the null/wrong-typed tests leave open: a
+    // window object present but without its required `utilization` field.
+    // This must stay a hard parse failure — a `#[serde(default)]` on
+    // `UsageWindow::utilization` would silently read absence as 0%, i.e.
+    // manufactured headroom the scaling decision could act on. Same shape as
+    // wrong-typed: an absent or null window is tolerated, a broken one is not.
+    let _usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(r#"{"five_hour": {"name": "five_hour", "resets_at": "2026-03-18T13:59:59Z"}}"#)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let err = poller
+        .poll()
+        .expect_err("a window missing utilization must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::ParseError(_))
+        ),
+        "expected ParseError, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("utilization"),
+        "the error must name the missing field so the log is diagnosable: {err}"
+    );
+}
+
+#[test]
+fn window_missing_resets_at_fails_the_poll() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // `resets_at` is the other required window field. Unparseable resets_at is
+    // tolerated as zero hours (see unparseable_resets_at_is_tolerated_as_
+    // zero_hours), but the key being absent outright is a missing field and
+    // must fail the poll rather than parse to an empty string.
+    let _usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(r#"{"five_hour": {"name": "five_hour", "utilization": 55.0}}"#)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let err = poller
+        .poll()
+        .expect_err("a window missing resets_at must fail the poll");
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::ParseError(_))
+        ),
+        "expected ParseError, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("resets_at"),
+        "the error must name the missing field so the log is diagnosable: {err}"
     );
 }
 

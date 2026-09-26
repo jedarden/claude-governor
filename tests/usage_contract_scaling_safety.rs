@@ -14,10 +14,11 @@
 //! The pinned property, per failure class:
 //!
 //! - **Transport error, 429 self-rate-limit, 5xx server error, malformed
-//!   body** — the poll fails, the last good reading is retained, the error
-//!   classifies as token-healthy (`token_refresh_failing` stays false: the
-//!   OAuth token is not the problem), and a fleet already converged onto the
-//!   last good reading's target does not grow.
+//!   body, window missing a required field (claudego-0840eab5)** — the poll
+//!   fails, the last good reading is retained, the error classifies as
+//!   token-healthy (`token_refresh_failing` stays false: the OAuth token is
+//!   not the problem), and a fleet already converged onto the last good
+//!   reading's target does not grow.
 //! - **Hung endpoint (request timeout)** — the same class as a transport
 //!   error once the poller's request timeout (claudego-0840eab5) bounds it:
 //!   the poll fails instead of blocking the observe cycle forever, the last
@@ -357,6 +358,12 @@ enum Failure {
     ServerError,
     /// A 200 whose body is not JSON.
     Malformed,
+    /// A 200 whose five_hour window object is present but missing its
+    /// required `utilization` field — the missing-field half of the same
+    /// parse-failure class. The dangerous direction this pins: a
+    /// `#[serde(default)]` on `UsageWindow::utilization` would turn the
+    /// absence into 0% headroom and let the parse *succeed*.
+    MissingField,
 }
 
 impl Failure {
@@ -406,6 +413,18 @@ impl Failure {
                     .with_status(503)
                     .with_body(
                         r#"{"error":{"type":"overloaded_error","message":"Service unavailable"}}"#,
+                    )
+                    .expect(1)
+                    .create();
+                (poller, Some(mock), None)
+            }
+            Failure::MissingField => {
+                let poller = poller_with_endpoints(creds, server_url, &format!("{server_url}/v1/oauth/token"));
+                let mock = server
+                    .mock("GET", "/api/oauth/usage")
+                    .with_status(200)
+                    .with_body(
+                        r#"{"five_hour": {"name": "five_hour", "resets_at": "2026-03-18T13:59:59Z"}}"#,
                     )
                     .expect(1)
                     .create();
@@ -533,6 +552,15 @@ fn malformed_poll_cannot_grow_a_converged_fleet() {
 #[test]
 fn server_error_poll_cannot_grow_a_converged_fleet() {
     assert_failed_poll_cannot_grow_a_converged_fleet(Failure::ServerError);
+}
+
+/// The missing-field class (claudego-0840eab5): a window present without its
+/// required `utilization` is a parse failure, not a silent zero — the poll
+/// must fail and the fleet must treat it exactly like every other API-side
+/// failure: no growth, reading retained verbatim, token classified healthy.
+#[test]
+fn missing_field_poll_cannot_grow_a_converged_fleet() {
+    assert_failed_poll_cannot_grow_a_converged_fleet(Failure::MissingField);
 }
 
 /// The hung-endpoint class: before the poller's request timeout this did not
