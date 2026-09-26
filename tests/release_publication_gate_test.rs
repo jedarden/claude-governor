@@ -207,6 +207,26 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// `git()` for commands whose stdout the test needs (`rev-parse`): same
+/// identity and config isolation, stdout trimmed and returned.
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn write_executable(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).expect("write file");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
@@ -479,6 +499,26 @@ fn delete_tag_on_standin(sb: &Sandbox) {
     );
 }
 
+/// Move `TAG` on the bare Forgejo stand-in to `commit` (which must already
+/// exist in the stand-in's object store) — the checkout's own ref is
+/// untouched, exactly the shape of a Forgejo-side tag re-cut.
+fn move_tag_on_standin(sb: &Sandbox, commit: &str) {
+    let bare = sb.dir.path().join("forgejo-standin.git");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["update-ref", &format!("refs/tags/{TAG}"), commit])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("spawn git update-ref on the stand-in");
+    assert!(
+        out.status.success(),
+        "moving the tag on the stand-in failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The contract
 // ---------------------------------------------------------------------------
@@ -731,6 +771,35 @@ fn missing_foreign_architecture_artifact_refuses_and_never_publishes() {
 }
 
 #[test]
+fn missing_host_architecture_artifact_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // The mirror of missing_foreign_architecture_artifact: the build host's
+    // OWN architecture is the absent one. amd64 heads the gate's artifact
+    // list, so this is the loop's first iteration — a partial release is a
+    // refusal whichever architecture is missing, including the one the
+    // validating host could have run itself.
+    fs::remove_file(sb.release_dir.join("cgov-linux-amd64")).expect("remove amd64 artifact");
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(
+        !ok,
+        "a missing host architecture must refuse publication — no partial \
+         releases:\n{out}"
+    );
+    assert!(
+        out.contains("cgov-linux-amd64 is missing"),
+        "refusal must name the absent amd64 artifact:\n{out}"
+    );
+    assert!(
+        out.contains("every supported architecture"),
+        "refusal must state the every-architecture rule:\n{out}"
+    );
+    assert!(
+        create_calls(&sb).is_empty(),
+        "refused publication must not call gh release create"
+    );
+}
+
+#[test]
 fn tag_not_pointing_at_head_refuses_and_never_publishes() {
     let sb = sandbox_with_good_release();
     // Move HEAD past the tagged commit: the artifacts were built from a
@@ -771,6 +840,73 @@ fn tag_absent_from_forgejo_refuses_and_never_publishes() {
     assert!(
         create_calls(&sb).is_empty(),
         "refused publication must not call gh release create"
+    );
+}
+
+#[test]
+fn forgejo_tag_pointing_elsewhere_refuses_and_never_publishes() {
+    let sb = sandbox_with_good_release();
+    // The branch the module header calls distinct from an unreachable
+    // Forgejo: the source of truth was REACHED and its tag names a
+    // different commit than the one the artifacts were built from — a
+    // Forgejo-side tag re-cut onto a divergent commit. Every local check
+    // passes (the checkout's tag still points exactly at HEAD), so only
+    // Forgejo's own answer can expose that the release would not be built
+    // from the commit its Forgejo tag names.
+    git(&sb.release_dir, &["checkout", "-q", "-b", "divergent"]);
+    fs::write(sb.release_dir.join("README.md"), "a divergent commit\n").expect("dirty the tree");
+    git(&sb.release_dir, &["commit", "-qam", "divergent commit"]);
+    let divergent = git_out(&sb.release_dir, &["rev-parse", "HEAD"]);
+    git(&sb.release_dir, &["checkout", "-q", "main"]);
+    git(&sb.release_dir, &["push", "-q", "origin", "divergent"]);
+    move_tag_on_standin(&sb, &divergent);
+
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(
+        !ok,
+        "a Forgejo tag naming another commit must refuse publication:\n{out}"
+    );
+    assert!(
+        out.contains("not the built commit"),
+        "refusal must name the Forgejo/HEAD divergence (distinct from the \
+         local tag check's wording):\n{out}"
+    );
+    assert!(
+        create_calls(&sb).is_empty(),
+        "refused publication must not call gh release create"
+    );
+}
+
+#[test]
+fn annotated_forgejo_tag_proves_provenance_through_the_peel() {
+    let sb = sandbox_with_good_release();
+    // Releases can be cut with annotated tags: ls-remote then lists TWO
+    // entries, `refs/tags/vX.Y.Z` — whose sha is the TAG OBJECT, not a
+    // commit — and `refs/tags/vX.Y.Z^{}`, the peeled commit. Only the peel
+    // can equal the built HEAD, so provenance that compared the raw entry
+    // would refuse every correctly-cut annotated release. Recut the
+    // sandbox tag as annotated and pin the peel as the answer.
+    git(&sb.release_dir, &["tag", "-d", TAG]);
+    delete_tag_on_standin(&sb);
+    git(&sb.release_dir, &["tag", "-a", TAG, "-m", "Claude Governor v0.1.2"]);
+    git(
+        &sb.release_dir,
+        &["push", "-q", "origin", &format!("refs/tags/{TAG}")],
+    );
+
+    let (ok, out) = run_gate(&sb, &good_assets_json(), &[]);
+    assert!(
+        ok,
+        "an annotated Forgejo tag at the built commit must publish:\n{out}"
+    );
+    assert!(
+        out.contains("Forgejo resolves"),
+        "provenance must pass on Forgejo's own peeled resolution:\n{out}"
+    );
+    assert_eq!(
+        create_calls(&sb).len(),
+        1,
+        "the annotated-tag release publishes exactly once:\n{out}"
     );
 }
 
