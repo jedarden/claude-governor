@@ -1,7 +1,7 @@
 # Pluck Query Results
 
 **Status:** current `bead-rs` result reference with historical SQL notes
-**Verified:** 2026-09-25 (contract re-checked against needle 0.6.13 / bead 0.2.6)
+**Verified:** 2026-09-25 (contract re-checked against needle 0.6.14 / bead 0.2.6; pinned by `tests/bead_rs_contract_test.rs`)
 **Scope:** NEEDLE Pluck in this workspace
 
 > For the current NEEDLE/`bead-rs` implementation, use

@@ -36,7 +36,15 @@ use std::process::Command;
 use tempfile::TempDir;
 
 const PLUCK_STATE: &str = "open";
-const PLUCK_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "starvation-alert"];
+/// The exclusion set this deployment's Pluck strand effectively applies: the
+/// live config carries `exclude_labels: []`, so PluckStrand substitutes
+/// NEEDLE's built-in default set — `DEFAULT_EXCLUDE_LABELS` in NEEDLE
+/// `src/strand/pluck.rs`, verified at needle 0.6.14. Pinned independently by
+/// `tests/bead_rs_contract_test.rs` (label set + version tripwires); the two
+/// constants must not drift apart. `starvation-alert` is deliberately NOT in
+/// this list: it is a deployment-specific label from earlier needle versions'
+/// effective sets, kept in the seed below to prove non-default labels survive.
+const PLUCK_EXCLUDE_LABELS: &[&str] = &["deferred", "human", "blocked", "escalation", "alert"];
 
 /// Workspace identity planted before the first `bead` call.
 ///
@@ -153,6 +161,10 @@ fn seed_workspace() -> SeededWorkspace {
     );
     let deferred = create_bead(&path, "deferred-label candidate", &["deferred"]);
     let blocked = create_bead(&path, "blocked-label candidate", &["blocked"]);
+    let escalation = create_bead(&path, "escalation-label candidate", &["escalation"]);
+    let alert = create_bead(&path, "alert-label candidate", &["alert"]);
+    // Not a default exclusion label — proves a non-default label survives the
+    // adapter's exclusion and its bead stays a candidate.
     let starved = create_bead(&path, "starvation-alert candidate", &["starvation-alert"]);
     let assigned = create_bead(&path, "assigned open candidate", &[]);
     let in_progress = create_bead(&path, "in-progress candidate", &[]);
@@ -168,8 +180,8 @@ fn seed_workspace() -> SeededWorkspace {
     SeededWorkspace {
         _dir: dir,
         path,
-        clean_ids: vec![clean_labeled, clean_unlabelled],
-        excluded_ids: vec![human, deferred, blocked, starved],
+        clean_ids: vec![clean_labeled, clean_unlabelled, starved],
+        excluded_ids: vec![human, deferred, blocked, escalation, alert],
     }
 }
 
@@ -359,9 +371,9 @@ fn carries_excluded_label(bead: &serde_json::Value, exclude_labels: &[&str]) -> 
 }
 
 /// Label exclusion is deterministic JSONL filtering, independent of any
-/// particular frontier: every configured exclude label drops its bead, and
+/// particular frontier: every default exclude label drops its bead, and
 /// only a bead carrying none of them reaches Pluck's candidate set.
-/// Exercises all four configured labels plus multi-label mixes so the
+/// Exercises all five built-in default labels plus multi-label mixes so the
 /// contract is pinned without needing a store at all.
 #[test]
 fn test_label_exclusion_drops_excluded_label_candidates() {
@@ -370,10 +382,14 @@ fn test_label_exclusion_drops_excluded_label_candidates() {
         ("claudego-deferred", &["deferred"]),
         ("claudego-human", &["codinghome", "human", "quota"]),
         ("claudego-blocked", &["blocked"]),
+        ("claudego-escalation", &["escalation"]),
+        ("claudego-alert", &["alert"]),
+        // Not a default exclusion label — survives, as the seeded
+        // starvation-alert candidate above also proves.
         ("claudego-starved", &["starvation-alert"]),
         (
             "claudego-every-exclusion",
-            &["deferred", "human", "blocked", "starvation-alert"],
+            &["deferred", "human", "blocked", "escalation", "alert"],
         ),
     ];
 
@@ -386,7 +402,7 @@ fn test_label_exclusion_drops_excluded_label_candidates() {
         .map(|(id, _)| *id)
         .collect();
 
-    assert_eq!(survivors, ["claudego-clean"]);
+    assert_eq!(survivors, ["claudego-clean", "claudego-starved"]);
 
     // The adapter's parse yields a labels array for every bead; a missing one
     // (malformed JSON) is treated as unlabelled and kept, not a crash.
@@ -467,8 +483,8 @@ fn test_pluck_database_connectivity() {
     );
     assert!(test_results.schema_valid, "Database schema must be valid");
 
-    // Deterministic seeded-store counts. The seed holds 2 clean candidates,
-    // 4 excluded-label beads, 1 assigned-open bead, and 1 in-progress bead.
+    // Deterministic seeded-store counts. The seed holds 3 clean candidates,
+    // 5 excluded-label beads, 1 assigned-open bead, and 1 in-progress bead.
     let seeded_total = (ws.clean_ids.len() + ws.excluded_ids.len() + 2) as i64;
     assert_eq!(
         test_results.total_issues, seeded_total,
@@ -481,8 +497,8 @@ fn test_pluck_database_connectivity() {
     );
     assert_eq!(
         test_results.issues_with_labels,
-        ws.excluded_ids.len() as i64 + 1,
-        "only the labeled clean bead and the excluded-label beads carry labels"
+        ws.excluded_ids.len() as i64 + 2,
+        "only the two labeled clean beads (codinghome and starvation-alert) and the excluded-label beads carry labels"
     );
     assert_eq!(
         test_results.claimable_count,
@@ -759,14 +775,22 @@ fn test_database_connection(
         }
     }
 
-    // Test 8: Test actual label filtering.
-    let exclude_query = "
+    // Test 8: Test actual label filtering. Built from the same constant the
+    // constructed Pluck query uses, so the two cannot drift apart again.
+    let label_list = PLUCK_EXCLUDE_LABELS
+        .iter()
+        .map(|label| format!("'{label}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let exclude_query = format!(
+        "
         SELECT COUNT(DISTINCT issue_id)
         FROM labels
-        WHERE label IN ('deferred', 'human', 'blocked', 'starvation-alert')
-    ";
+        WHERE label IN ({label_list})
+    "
+    );
 
-    match conn.query_row(exclude_query, [], |row| row.get::<_, i64>(0)) {
+    match conn.query_row(&exclude_query, [], |row| row.get::<_, i64>(0)) {
         Ok(excluded_count) => {
             println!("Issues excluded by Pluck filters: {}", excluded_count);
             results.excluded_by_labels = Some(excluded_count);
