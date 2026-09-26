@@ -134,6 +134,28 @@ sha256sum -c cgov-linux-amd64.sha256        # must print: cgov-linux-amd64: OK
 install -m 0755 cgov-linux-amd64 ~/.local/bin/cgov
 ```
 
+### Upgrades and rollback
+
+Re-running the installer is the upgrade: it replaces exactly one file
+(`~/.local/bin/cgov`, mode `0755`) and touches nothing else — configuration
+(`~/.config/claude-governor/governor.yaml`), daemon state
+(`governor-state.json`), systemd units, and NEEDLE adapters all survive
+byte-for-byte. Download and digest verification happen in a temp dir before
+the install dir is touched, so every failure — truncated/interrupted
+transfer, missing sidecar, checksum mismatch, wrong `CGOV_SHA256` — leaves
+the prior version installed and running. Rolling back is the same operation
+with an older tag and, for a verified version, that release's published
+digest:
+
+```bash
+curl --netrc -fsSL https://git.ardenone.com/jedarden/claude-governor/raw/branch/main/install.sh \
+  | CGOV_VERSION=v0.1.1 CGOV_SHA256=<64-hex-digest-from-that-release> bash
+```
+
+The full behavioral specification — per-phase interruption semantics, the
+refusal table, and which tests pin each guarantee — is
+[`docs/notes/installer-upgrade-and-rollback.md`](docs/notes/installer-upgrade-and-rollback.md).
+
 ### Option 2: Build from source (Forgejo)
 
 Requires a current stable Rust toolchain (`rustup` is the easiest source); the
