@@ -332,7 +332,7 @@ client-side behavior pinned by `tests/usage_polling_contract.rs`.
 
 | Request | Retry policy |
 |---|---|
-| `GET /api/oauth/usage` | **Never retried client-side.** The endpoint self-rate-limits (§2), so hammering it from a retry loop only extends the lockout. Any non-200 (`ApiError`), transport failure (`ApiRequestFailed`), or unparseable body (`ParseError`) surfaces to the caller after exactly one request. |
+| `GET /api/oauth/usage` | **Never retried client-side.** The endpoint self-rate-limits (§2), so hammering it from a retry loop only extends the lockout. Any non-200 — 401 auth rejection, 429 self-rate-limit, 5xx server error (`ApiError`) — transport failure (`ApiRequestFailed`), or unparseable body (`ParseError`) surfaces to the caller after exactly one request. |
 | `POST /v1/oauth/token` (refresh) | **Exactly one retry**, 5s after the first attempt fails. Both attempts failing increments a process-global consecutive-failure counter. |
 
 The failure counter resets to zero on any successful refresh. When it reaches
@@ -353,10 +353,12 @@ escalation surface).
   successful reading exists (cold start during an outage) fails; there is
   nothing safe to fall back to.
 - **Usage-endpoint failures do not fall back.** A failure from
-  `GET /api/oauth/usage` itself — 429 rate limit, 401, malformed body,
-  transport error — propagates to the caller **even when a cached reading
-  exists**. Only the auth path degrades to stale data; a stale reading is
-  never manufactured to paper over a fetch failure.
+  `GET /api/oauth/usage` itself — 401, 429 rate limit, 5xx server error,
+  malformed body, transport error — propagates to the caller **even when a
+  cached reading exists**. Only the auth path degrades to stale data; a stale
+  reading is never manufactured to paper over a fetch failure. A 5xx is
+  deliberately held to this same rule: the server's "try again later" is the
+  API's problem to recover from, not something the poller masks with old data.
 
 ### Fleet-level scaling safety
 
@@ -368,7 +370,7 @@ onto its last good reading.**
 
 | Failure class | What the poll returns | What the fleet does |
 |---|---|---|
-| Transport error, 429 self-rate-limit, malformed body | Poll fails; last good reading retained verbatim; `token_refresh_failing` stays `false` (the OAuth token is not the problem) | Does not grow |
+| Transport error, 429 self-rate-limit, 5xx server error, malformed body | Poll fails; last good reading retained verbatim; `token_refresh_failing` stays `false` (the OAuth token is not the problem) | Does not grow |
 | Credential loss / refresh failure (auth path) | Cached reading served with `stale: true`; `token_refresh_failing` flags `true` | Does not grow |
 | Incomplete-but-parsing response (`{}`) | Poll **succeeds** as a fresh, non-stale reading — all windows 0% with no reset times, i.e. textually infinite headroom that *replaces* the good reading | Does not move in either direction: data-absent windows cannot bind |
 

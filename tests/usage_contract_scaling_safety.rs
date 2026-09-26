@@ -13,11 +13,11 @@
 //!
 //! The pinned property, per failure class:
 //!
-//! - **Transport error, 429 self-rate-limit, malformed body** — the poll
-//!   fails, the last good reading is retained, the error classifies as
-//!   token-healthy (`token_refresh_failing` stays false: the OAuth token is
-//!   not the problem), and a fleet already converged onto the last good
-//!   reading's target does not grow.
+//! - **Transport error, 429 self-rate-limit, 5xx server error, malformed
+//!   body** — the poll fails, the last good reading is retained, the error
+//!   classifies as token-healthy (`token_refresh_failing` stays false: the
+//!   OAuth token is not the problem), and a fleet already converged onto the
+//!   last good reading's target does not grow.
 //! - **Hung endpoint (request timeout)** — the same class as a transport
 //!   error once the poller's request timeout (claudego-0840eab5) bounds it:
 //!   the poll fails instead of blocking the observe cycle forever, the last
@@ -341,6 +341,9 @@ enum Failure {
     Timeout,
     /// The documented 429 self-rate-limit response.
     RateLimit,
+    /// The usage endpoint answers 5xx (here 503): the API itself is failing,
+    /// which is no more a token problem than a rate limit is.
+    ServerError,
     /// A 200 whose body is not JSON.
     Malformed,
 }
@@ -381,6 +384,18 @@ impl Failure {
                     .mock("GET", "/api/oauth/usage")
                     .with_status(200)
                     .with_body("{not json")
+                    .expect(1)
+                    .create();
+                (poller, Some(mock), None)
+            }
+            Failure::ServerError => {
+                let poller = poller_with_endpoints(creds, server_url, &format!("{server_url}/v1/oauth/token"));
+                let mock = server
+                    .mock("GET", "/api/oauth/usage")
+                    .with_status(503)
+                    .with_body(
+                        r#"{"error":{"type":"overloaded_error","message":"Service unavailable"}}"#,
+                    )
                     .expect(1)
                     .create();
                 (poller, Some(mock), None)
@@ -485,7 +500,7 @@ fn assert_failed_poll_cannot_grow_a_converged_fleet(failure: Failure) {
     // path keys on must stay down.
     assert_eq!(
         cycle.state.token_refresh_failing, false,
-        "transport/timeout/429/parse failures are not token failures"
+        "transport/timeout/429/5xx/parse failures are not token failures"
     );
 }
 
@@ -502,6 +517,11 @@ fn rate_limited_poll_cannot_grow_a_converged_fleet() {
 #[test]
 fn malformed_poll_cannot_grow_a_converged_fleet() {
     assert_failed_poll_cannot_grow_a_converged_fleet(Failure::Malformed);
+}
+
+#[test]
+fn server_error_poll_cannot_grow_a_converged_fleet() {
+    assert_failed_poll_cannot_grow_a_converged_fleet(Failure::ServerError);
 }
 
 /// The hung-endpoint class: before the poller's request timeout this did not

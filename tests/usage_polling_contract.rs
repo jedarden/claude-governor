@@ -14,10 +14,10 @@
 //! - Token refresh against `POST https://platform.claude.com/v1/oauth/token`
 //!   once `expiresAt` falls within the refresh threshold, with the rotated
 //!   credentials persisted back to the credentials file.
-//! - Malformed bodies, 401/429 and network failures surface as poll errors;
-//!   the usage endpoint is never retried client-side (it self-rate-limits),
-//!   while a failed token refresh retries exactly once before surfacing, and
-//!   sustained refresh failures escalate to an alert.
+//! - Malformed bodies, 401/429/5xx and network failures surface as poll
+//!   errors; the usage endpoint is never retried client-side (it
+//!   self-rate-limits), while a failed token refresh retries exactly once
+//!   before surfacing, and sustained refresh failures escalate to an alert.
 //!
 //! Failure-mode and boundary coverage pinned on top of that baseline
 //! (claudego-06974a01):
@@ -500,7 +500,7 @@ fn wrong_typed_window_field_fails_the_poll() {
 }
 
 // ---------------------------------------------------------------------------
-// 401 / 429 responses
+// 401 / 429 / 5xx responses
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -559,6 +559,80 @@ fn rate_limited_429_surfaces_error_without_retry() {
 
     // Surfaced to the governor cycle, not retried in-process.
     usage.assert();
+}
+
+#[test]
+fn server_error_500_surfaces_error_without_retry() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // A 5xx from the usage endpoint (here 500 with the Anthropic-style error
+    // body) is the server's failure, not the client's. Like every non-200 it
+    // surfaces as an error carrying the status, and the endpoint is never
+    // retried client-side — retrying a server-side failure only hammers a
+    // struggling API.
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(500)
+        .with_body(r#"{"error":{"type":"api_error","message":"Internal server error"}}"#)
+        .create();
+
+    let mut poller = contract_poller(&creds, &server.url());
+    let err = poller.poll().expect_err("500 must fail the poll");
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "error must surface the status: {msg}");
+
+    usage.assert(); // exactly one request
+}
+
+#[test]
+fn service_unavailable_503_does_not_fall_back_to_stale_data() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+    let usage_ok = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    // Poll #1: a good reading to seed the cache.
+    let mut poller = contract_poller(&creds, &server.url());
+    let fresh = poller.poll().expect("first poll must succeed");
+    usage_ok.assert();
+    assert!(!fresh.stale);
+
+    // Poll #2: the usage endpoint 503s (gateway/overload). The stale fallback
+    // is auth-path only, so the error must propagate even though a cached
+    // reading exists — and the endpoint is never retried client-side. A fresh
+    // 5xx would otherwise be tempting to paper over, precisely because the
+    // server said "temporary".
+    let usage_unavailable = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(503)
+        .with_body(r#"{"error":{"type":"overloaded_error","message":"Service unavailable"}}"#)
+        .expect(1)
+        .create();
+
+    let err = poller
+        .poll()
+        .expect_err("a 503 must propagate even with cached data");
+    let msg = err.to_string();
+    assert!(msg.contains("503"), "error must surface the status: {msg}");
+    usage_unavailable.assert();
 }
 
 // ---------------------------------------------------------------------------
