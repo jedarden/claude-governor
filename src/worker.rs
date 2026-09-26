@@ -698,8 +698,26 @@ fn read_heartbeats_with_sessions(
     id_prefix: Option<&str>,
     live_sessions: Option<&HashSet<String>>,
 ) -> HashMap<String, Heartbeat> {
+    read_heartbeats_with_sessions_at(dir, session_prefix, id_prefix, live_sessions, Utc::now())
+}
+
+/// [`read_heartbeats_with_sessions`] with the reading clock injected.
+///
+/// The wrapper above is what production calls; this form exists so the
+/// staleness boundary can be pinned by stepping a fixed clock instead of
+/// racing the real one. A heartbeat written from `Utc::now()` and read back
+/// through the wrapper ages by the writer→reader gap, so a test that writes
+/// "one second below the threshold" and reads a scheduling delay later has
+/// silently crossed it — that race is exactly how
+/// `test_one_second_below_threshold_not_stale` used to flake under load.
+fn read_heartbeats_with_sessions_at(
+    dir: &Path,
+    session_prefix: &str,
+    id_prefix: Option<&str>,
+    live_sessions: Option<&HashSet<String>>,
+    now: DateTime<Utc>,
+) -> HashMap<String, Heartbeat> {
     let mut heartbeats = HashMap::new();
-    let now = Utc::now();
     let stale_threshold = ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD);
 
     if !dir.exists() {
@@ -918,17 +936,21 @@ mod tests {
         }
     }
 
-    /// Write a heartbeat `age_secs` old for `session`; returns its path.
-    fn write_heartbeat(
+    /// Write a heartbeat bearing `timestamp` for `session`; returns its path.
+    ///
+    /// `to_rfc3339` keeps sub-second precision — the format NEEDLE actually
+    /// writes — which is what makes the exact staleness boundary representable
+    /// in the injected-clock tests below.
+    fn write_heartbeat_at(
         config: &WorkerConfig,
         session: &str,
-        age_secs: i64,
+        timestamp: DateTime<Utc>,
         is_idle: bool,
     ) -> PathBuf {
         fs::create_dir_all(&config.heartbeat_dir).unwrap();
         let heartbeat = serde_json::json!({
             "session": session,
-            "timestamp": (Utc::now() - ChronoDuration::seconds(age_secs)).to_rfc3339(),
+            "timestamp": timestamp.to_rfc3339(),
             "is_idle": is_idle,
             "current_task": null,
             "model": "sonnet",
@@ -936,6 +958,21 @@ mod tests {
         let path = config.heartbeat_dir.join(format!("{session}.json"));
         fs::write(&path, serde_json::to_string_pretty(&heartbeat).unwrap()).unwrap();
         path
+    }
+
+    /// Write a heartbeat `age_secs` old for `session`; returns its path.
+    fn write_heartbeat(
+        config: &WorkerConfig,
+        session: &str,
+        age_secs: i64,
+        is_idle: bool,
+    ) -> PathBuf {
+        write_heartbeat_at(
+            config,
+            session,
+            Utc::now() - ChronoDuration::seconds(age_secs),
+            is_idle,
+        )
     }
 
     #[test]
@@ -1579,64 +1616,101 @@ mod tests {
 
     #[test]
     fn test_stale_threshold_boundary() {
+        // Both sides of the staleness boundary, pinned by stepping an injected
+        // clock over one heartbeat file. The pre-fix form wrote
+        // `Utc::now() - 60s` truncated to whole seconds; truncation only ever
+        // makes the heartbeat *older*, so it always sat strictly past the
+        // threshold and could exercise just the stale side — while claiming in
+        // its comment that "exactly 60 seconds" is stale. It is not: the
+        // reader's comparison is inclusive (`age <= stale_threshold`, matching
+        // "heartbeats *older* than STALE_HEARTBEAT_THRESHOLD are considered
+        // stale"), and a whole-second file format is what made the exact
+        // boundary unrepresentable. `to_rfc3339` (what NEEDLE writes) fixes
+        // that; the injected clock makes both assertions load-proof
+        // (claudego-2132b699).
         let temp = TempDir::new().unwrap();
         let config = test_config(&temp);
 
-        fs::create_dir_all(&config.heartbeat_dir).unwrap();
+        let t0 = Utc::now();
+        let path = write_heartbeat_at(&config, "test-worker-threshold", t0, true);
 
-        // Create a heartbeat exactly at the threshold (60 seconds old) - should be considered stale
-        let threshold_timestamp = Utc::now() - ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD);
-        let threshold_heartbeat = serde_json::json!({
-            "session": "test-worker-threshold",
-            "timestamp": threshold_timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            "is_idle": true,
-            "current_task": null,
-            "model": "sonnet"
-        });
-
-        fs::write(
-            config.heartbeat_dir.join("test-worker-threshold.json"),
-            serde_json::to_string_pretty(&threshold_heartbeat).unwrap(),
-        )
-        .unwrap();
-
-        // Read heartbeats - threshold heartbeat should be removed (session doesn't
-        // exist in tmux; the empty live set is "tmux answered, nothing is live")
-        let heartbeats = read_heartbeats_with_sessions(
+        // Exactly at the threshold: still fresh — retained, file intact. The
+        // empty live set is "tmux answered, nothing is live"; freshness needs
+        // no tmux consultation at all.
+        let heartbeats = read_heartbeats_with_sessions_at(
             &config.heartbeat_dir,
             &config.session_prefix,
             None,
             Some(&live(&[])),
+            t0 + ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD),
         );
+        assert_eq!(heartbeats.len(), 1);
+        assert!(heartbeats.contains_key("test-worker-threshold"));
+        assert!(path.exists());
 
-        // At exactly 60 seconds, it's stale and should be removed
+        // One millisecond beyond the threshold: stale, and with tmux answered
+        // and no live session the orphan sweep removes the file.
+        let heartbeats = read_heartbeats_with_sessions_at(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            Some(&live(&[])),
+            t0 + ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD)
+                + ChronoDuration::milliseconds(1),
+        );
         assert_eq!(heartbeats.len(), 0);
+        assert!(!path.exists());
     }
 
     #[test]
     fn test_one_second_below_threshold_not_stale() {
+        // Hermetic form of the original: the heartbeat's timestamp and the
+        // reading clock are both explicit, so the age is exactly one second
+        // below the threshold instead of "59s plus the truncation the old
+        // whole-second format applied plus however long the writer→reader gap
+        // happened to be" — under load that gap crossed the threshold, swept
+        // the heartbeat, and failed the suite (the load flake this test is
+        // named for; claudego-2132b699).
         let temp = TempDir::new().unwrap();
         let config = test_config(&temp);
 
-        fs::create_dir_all(&config.heartbeat_dir).unwrap();
+        let t0 = Utc::now();
+        let path = write_heartbeat_at(&config, "test-worker-fresh", t0, true);
 
-        // Create a heartbeat 1 second below the threshold (59 seconds old) - should NOT be stale
-        let fresh_timestamp = Utc::now() - ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD - 1);
-        let fresh_heartbeat = serde_json::json!({
-            "session": "test-worker-fresh",
-            "timestamp": fresh_timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            "is_idle": true,
-            "current_task": null,
-            "model": "sonnet"
-        });
+        // Read with the clock stepped to exactly one second below the
+        // threshold: fresh, retained, file intact. `None` live sessions, as
+        // before — freshness never consults tmux.
+        let heartbeats = read_heartbeats_with_sessions_at(
+            &config.heartbeat_dir,
+            &config.session_prefix,
+            None,
+            None,
+            t0 + ChronoDuration::seconds(STALE_HEARTBEAT_THRESHOLD - 1),
+        );
 
-        fs::write(
-            config.heartbeat_dir.join("test-worker-fresh.json"),
-            serde_json::to_string_pretty(&fresh_heartbeat).unwrap(),
-        )
-        .unwrap();
+        assert_eq!(heartbeats.len(), 1);
+        assert!(heartbeats.contains_key("test-worker-fresh"));
+        assert!(path.exists());
+    }
 
-        // Read heartbeats - fresh heartbeat should be retained
+    /// The public wall-clock path stays covered: a heartbeat half the
+    /// threshold old reads back fresh through the real `Utc::now()` wrapper.
+    /// Thirty seconds of headroom dwarfs both the read's own duration and any
+    /// scheduling delay a loaded runner can produce, so this exercises the
+    /// real clock without racing it — the exact-boundary cases live in the
+    /// injected-clock tests above.
+    #[test]
+    fn wall_clock_reader_keeps_a_heartbeat_well_inside_the_window() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(&temp);
+
+        write_heartbeat(
+            &config,
+            "test-worker-well-inside",
+            STALE_HEARTBEAT_THRESHOLD / 2,
+            true,
+        );
+
         let heartbeats = read_heartbeats_with_sessions(
             &config.heartbeat_dir,
             &config.session_prefix,
@@ -1645,8 +1719,11 @@ mod tests {
         );
 
         assert_eq!(heartbeats.len(), 1);
-        assert!(heartbeats.contains_key("test-worker-fresh"));
-        assert!(config.heartbeat_dir.join("test-worker-fresh.json").exists());
+        assert!(heartbeats.contains_key("test-worker-well-inside"));
+        assert!(config
+            .heartbeat_dir
+            .join("test-worker-well-inside.json")
+            .exists());
     }
 
     /// Write a heartbeat in NEEDLE's own format (needle `src/health/mod.rs`):
