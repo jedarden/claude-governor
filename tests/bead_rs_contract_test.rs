@@ -31,6 +31,11 @@
 //! - exclusion labels — the exact built-in default set
 //!   (`deferred, human, blocked, escalation, alert`), plus version tripwires
 //!   so a needle or bead upgrade forces this file to be re-verified
+//! - version tripwires resolve the deployed binaries (`~/.local/bin` first,
+//!   PATH fallback) — cargo puts its own bin dir on spawned PATHs, and on
+//!   this host that dir carries a stale needle build
+//! - label case — labels round-trip the ready JSONL byte-exact, the CLI fact
+//!   NEEDLE's case-sensitive exclusion matching rides on
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +54,11 @@ impl PinnedContract {
     /// `needle --version` this contract was verified against (the default
     /// exclusion set below is `DEFAULT_EXCLUDE_LABELS` in NEEDLE
     /// `src/strand/pluck.rs` at this version).
-    const NEEDLE: &'static str = "0.6.14";
+    ///
+    /// 0.6.14 → 0.6.16 (claudego-fddf5c3f, 2026-09-26): re-verified from the
+    /// deployed binary's exact release commit (3eaf0e83, the v0.6.16 bump) —
+    /// `DEFAULT_EXCLUDE_LABELS` is still the same five labels.
+    const NEEDLE: &'static str = "0.6.16";
 
     /// `bead --version` this contract was verified against (store layout,
     /// JSONL shapes, dep/readiness semantics).
@@ -57,7 +66,7 @@ impl PinnedContract {
 
     /// The built-in exclusion set PluckStrand substitutes when the configured
     /// `exclude_labels` is empty or omitted — this deployment's live case
-    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.14
+    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.16
     /// `DEFAULT_EXCLUDE_LABELS`, `src/strand/pluck.rs`. A non-empty
     /// configured list *replaces* this set rather than merging with it.
     ///
@@ -437,12 +446,91 @@ fn the_default_exclusion_label_set_is_pinned() {
     );
 }
 
+/// The CLI fact NEEDLE's exact, case-sensitive label matching rides on:
+/// labels round-trip the store and the ready JSONL byte-exact. A bead-rs
+/// release that normalized case (or expanded glob-shaped labels) would turn a
+/// case variant of an exclusion label into an exact match, and Pluck would
+/// silently start dropping those beads — that drift must fail here, at review
+/// time, not in production dispatch. The matching rule itself is pinned on
+/// the adapter side in `tests/pluck_db_test.rs`; this pins the CLI contract
+/// that rule trusts.
+#[test]
+fn exclusion_labels_round_trip_byte_exact_through_the_ready_jsonl() {
+    let ws = ContractWorkspace::new();
+    // A case variant of every default exclusion label, plus glob-shaped
+    // literals: all documented as inert (docs/bead-visibility-quickref.md —
+    // "exact, case-sensitive ... no globs, `%`, regular expressions, or
+    // prefix matching"), and all dangerous to normalize away.
+    let variants = [
+        "Deferred", "HUMAN", "Blocked", "Escalation", "Alert", //
+        "defer*", "human?", "aler.*",
+    ];
+    let id = ws.create("label-case contract bead", &variants);
+
+    let output = run_bead(
+        &ws.path,
+        &["list", "--ready", "--json", "--limit", "999999"],
+    );
+    let bead = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("ready stdout must be pure JSONL, got {line:?}: {e}"))
+        })
+        .find(|bead| bead["id"].as_str() == Some(id.as_str()))
+        .expect("the case-variant bead must surface in --ready: the backend ready query has no label filter — label exclusion is NEEDLE's post-query job");
+
+    let labels: Vec<&str> = bead["labels"]
+        .as_array()
+        .expect("ready JSONL must carry a labels array")
+        .iter()
+        .map(|value| value.as_str().expect("every label is a string"))
+        .collect();
+    for variant in variants {
+        assert!(
+            labels.contains(&variant),
+            "label {variant:?} must round-trip byte-exact through the ready JSONL, \
+             got {labels:?} — case-normalizing it would turn it into an exact \
+             exclusion match and silently hide the bead from Pluck"
+        );
+    }
+    assert!(
+        !labels
+            .iter()
+            .any(|label| PinnedContract::DEFAULT_EXCLUDE_LABELS.contains(label)),
+        "no label may have been normalized into a default exclusion label's exact \
+         form ({labels:?}) — NEEDLE's case-sensitive match would then drop this \
+         bead from the candidate set"
+    );
+}
+
+/// Resolve a fleet CLI the way the deployment installs it, not by whatever
+/// PATH the invoking context happens to carry. This host keeps two `needle`
+/// binaries: the deployed one at `~/.local/bin/needle` and a stale
+/// 2026-08-29 build at `~/.cargo/bin/needle` — and cargo puts its own bin
+/// dir on the PATH of every process it spawns, so a test run under a
+/// non-interactive PATH (systemd unit, the NEEDLE close gate) resolves the
+/// stale one while an interactive shell resolves the deployed one. The
+/// version pins must measure the binary production actually runs, so prefer
+/// the fleet's install location and fall back to PATH where no deployed
+/// copy exists (e.g. `bead` ships only in `~/.cargo/bin` today).
+fn fleet_cli(name: &str) -> Command {
+    if let Some(home) = std::env::var_os("HOME") {
+        let deployed = Path::new(&home).join(".local/bin").join(name);
+        if deployed.is_file() {
+            return Command::new(deployed);
+        }
+    }
+    Command::new(name)
+}
+
 #[test]
 fn needle_version_pin_is_current() {
-    let version = Command::new("needle")
+    let version = fleet_cli("needle")
         .arg("--version")
         .output()
-        .expect("needle CLI must be on PATH");
+        .expect("needle CLI must be resolvable (deployed ~/.local/bin or PATH)");
     let stdout = String::from_utf8_lossy(&version.stdout).into_owned();
     let current = stdout
         .split_whitespace()
@@ -465,10 +553,10 @@ fn needle_version_pin_is_current() {
 
 #[test]
 fn bead_version_pin_is_current() {
-    let version = Command::new("bead")
+    let version = fleet_cli("bead")
         .arg("--version")
         .output()
-        .expect("bead CLI must be on PATH");
+        .expect("bead CLI must be resolvable (deployed ~/.local/bin or PATH)");
     let stdout = String::from_utf8_lossy(&version.stdout).into_owned();
     let current = stdout
         .split_whitespace()

@@ -39,7 +39,8 @@ const PLUCK_STATE: &str = "open";
 /// The exclusion set this deployment's Pluck strand effectively applies: the
 /// live config carries `exclude_labels: []`, so PluckStrand substitutes
 /// NEEDLE's built-in default set — `DEFAULT_EXCLUDE_LABELS` in NEEDLE
-/// `src/strand/pluck.rs`, verified at needle 0.6.14. Pinned independently by
+/// `src/strand/pluck.rs`, re-verified unchanged at needle 0.6.16 (2026-09-26;
+/// previously 0.6.14). Pinned independently by
 /// `tests/bead_rs_contract_test.rs` (label set + version tripwires); the two
 /// constants must not drift apart. `starvation-alert` is deliberately NOT in
 /// this list: it is a deployment-specific label from earlier needle versions'
@@ -373,8 +374,10 @@ fn carries_excluded_label(bead: &serde_json::Value, exclude_labels: &[&str]) -> 
 /// Label exclusion is deterministic JSONL filtering, independent of any
 /// particular frontier: every default exclude label drops its bead, and
 /// only a bead carrying none of them reaches Pluck's candidate set.
-/// Exercises all five built-in default labels plus multi-label mixes so the
-/// contract is pinned without needing a store at all.
+/// Exercises all five built-in default labels, multi-label mixes, and the
+/// exact/case-sensitive boundary — case variants and glob-shaped literals of
+/// the defaults must survive — so the contract is pinned without needing a
+/// store at all.
 #[test]
 fn test_label_exclusion_drops_excluded_label_candidates() {
     let candidates: &[(&str, &[&str])] = &[
@@ -391,6 +394,17 @@ fn test_label_exclusion_drops_excluded_label_candidates() {
             "claudego-every-exclusion",
             &["deferred", "human", "blocked", "escalation", "alert"],
         ),
+        // Matching is exact and case-sensitive (docs/bead-visibility-quickref.md:
+        // "no globs, `%`, regular expressions, or prefix matching"), so a case
+        // variant or glob-shaped literal of a default label is inert. The
+        // `starvation-alert` survivor above already rules out substring
+        // matching; these rule out case-folding and wildcard expansion.
+        ("claudego-case-deferred", &["Deferred"]),
+        ("claudego-case-human", &["HUMAN"]),
+        ("claudego-case-blocked", &["Blocked"]),
+        ("claudego-case-escalation", &["Escalation"]),
+        ("claudego-case-alert", &["Alert"]),
+        ("claudego-glob-shaped", &["defer*", "human?", "aler.*"]),
     ];
 
     let survivors: Vec<&str> = candidates
@@ -402,7 +416,19 @@ fn test_label_exclusion_drops_excluded_label_candidates() {
         .map(|(id, _)| *id)
         .collect();
 
-    assert_eq!(survivors, ["claudego-clean", "claudego-starved"]);
+    assert_eq!(
+        survivors,
+        [
+            "claudego-clean",
+            "claudego-starved",
+            "claudego-case-deferred",
+            "claudego-case-human",
+            "claudego-case-blocked",
+            "claudego-case-escalation",
+            "claudego-case-alert",
+            "claudego-glob-shaped",
+        ]
+    );
 
     // The adapter's parse yields a labels array for every bead; a missing one
     // (malformed JSON) is treated as unlabelled and kept, not a crash.

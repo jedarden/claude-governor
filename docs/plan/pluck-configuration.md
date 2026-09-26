@@ -1,7 +1,8 @@
 # Pluck filter and label settings
 
 **Status:** authoritative current-state reference
-**Verified:** 2026-09-25 (needle 0.6.13, bead 0.2.6)
+**Verified:** 2026-09-25 (needle 0.6.13, bead 0.2.6); the built-in default
+label set was re-verified unchanged at needle 0.6.16 on 2026-09-26
 **Scope:** NEEDLE Pluck using this workspace's `bead-rs` backend
 
 `scripts/verify-pluck-config.sh` re-derives every live value below from the
