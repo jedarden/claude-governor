@@ -174,7 +174,7 @@ treating configured agents as fungible.
 - **governor.rs `NoChange` arm** — reconciles the per-agent allocation even when the
   aggregate total is unchanged, so a pinned pool launches at a steady total instead of
   the daemon only ever acting on aggregate deltas.
-- **governor.rs `safe_worker_count_or_max`** — `Some(0) → 0` (was `→ current_total`):
+- **governor.rs `safe_worker_count_or_max`** (renamed `safe_worker_count_or_hold`; pinned by `tests/governor_scaling_fixes.rs`) — `Some(0) → 0` (was `→ current_total`):
   when the binding window can't afford even one worker, cgov now actually scales to 0
   instead of holding capacity that would drive the shared window to a platform cutoff.
   This is what makes "allow scaling to 0" real for a use-or-lose utilisation governor.

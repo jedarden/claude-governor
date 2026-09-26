@@ -228,6 +228,22 @@ daemon:
 
 End-to-end wiring through a real act cycle (decision-log entries for a closed deficit and a suppressed at-target hold) lives in `tests/explain_decisions_test.rs` (`act_cycle_closes_one_worker_deficit_despite_band`, `act_cycle_at_target_records_nothing`).
 
+### The CLAUDE.md §4 allocation guarantees — named tests at each boundary
+
+The four allocation guarantees this design rests on are each pinned by a named
+test that fails on revert; `tests/governor_scaling_fixes.rs` documents the
+mutation-checked one-to-one mapping back to CLAUDE.md §4, and
+`tests/scaling_invariants_test.rs` sweeps the parameter space each invariant
+quantifies over. This section is the doc→test pointer so the linkage stays
+bidirectional (the test files cite this doc as their source of truth):
+
+| Guarantee (CLAUDE.md §4) | Regression pin | Boundary / sweep |
+|---|---|---|
+| `distribute_workers_by_cost_priority` guarantees each agent's `min_workers` floor before cost-distributing the remainder | `governor_scaling_fixes.rs::min_workers_floor_expensive_pool_wins_slot_regression` | `src/governor.rs` `distribute_enforces_min_workers_for_expensive_pool` (unit); `scaling_invariants_test.rs::invariant_4_min_workers_floor_survives_cost_priority` (floor funded out of the cheap pool's cost-priority share) |
+| The `NoChange` arm still reconciles the per-agent allocation at an unchanged aggregate total — a pinned pool launches at a steady total | `governor_scaling_fixes.rs::no_change_still_reconciles_per_agent_allocation_regression` (live executor: the below-floor pool launches while the total holds) | `scaling_invariants_test.rs::invariant_6_nochange_cycle_still_rewrites_per_agent_targets` (persisted per-agent targets; the executor half rides on the same distribution call pinned above) |
+| `safe_worker_count_or_hold` (named `safe_worker_count_or_max` in §4) maps `Some(0)` → 0, so an unaffordable binding window actually scales to 0 | `governor_scaling_fixes.rs::safe_worker_count_some_zero_scales_to_zero_regression` | `src/governor.rs` `safe_worker_count_some_zero_scales_to_zero` and the `None`-holds siblings (unit); `scaling_invariants_test.rs::invariant_5_safe_count_zero_targets_zero_workers` (incl. the configured-floor clamp) |
+| A computed `Some(0)` verdict without a real ≥98% window is a band-damped duty-cycle withdrawal, not an `EmergencyBrake` | `src/governor.rs` `computed_zero_without_brake_window_takes_graceful_scale_down` / `computed_zero_with_brake_window_still_takes_emergency_brake` | `emergency_brake_distinction_test.rs` (98.0% threshold boundary: `brake_engages_at_exactly_98_percent` / `brake_stays_off_just_below_98_percent`; classification under a real cycle: `computed_zero_without_a_brake_window_is_a_graceful_scale_down` / `same_zero_target_with_a_real_98_window_takes_the_brake`); `scaling_invariants_test.rs::invariant_2_computed_zero_without_brake_window_scales_down_gracefully` |
+
 ## Safety Considerations
 
 ### Hysteresis Placement
@@ -268,7 +284,7 @@ let new_count = (current as i32 + scale_delta)
 
 - **Source code**: `src/governor.rs` (`apply_scaling`, `progressive_scale_cap`, `run_act_cycle` step 5)
 - **Configuration**: live `~/.config/claude-governor/governor.yaml` (machine-specific; verify with `cgov config`), seeded from the checked-in template `config/governor.yaml` (`daemon.progressive_scaling`); loader: `src/config.rs` (`DaemonConfig`, `GovernorConfig::config_paths`)
-- **Tests**: `tests/hysteresis_smooth_scaling_test.rs`, `tests/explain_decisions_test.rs`, `tests/governor_cycle_snapshot_test.rs`
+- **Tests**: `tests/hysteresis_smooth_scaling_test.rs`, `tests/explain_decisions_test.rs`, `tests/governor_cycle_snapshot_test.rs`; the CLAUDE.md §4 guarantee layer — `tests/governor_scaling_fixes.rs` (one named test per §4 fix), `tests/scaling_invariants_test.rs` (one enumerative test per invariant), `tests/emergency_brake_distinction_test.rs` (brake threshold and computed-zero classification), and the `#[cfg(test)]` module in `src/governor.rs` (see the table above)
 - **Related modules**: `src/burn_rate.rs`, `src/worker.rs`, `src/calibrator.rs`
 
 ## Version History
@@ -279,3 +295,4 @@ let new_count = (current as i32 + scale_delta)
 - **2026-09-16** (claudego-44b1f4f5): Hysteresis made **asymmetric** — the band damps scale-down only, so every deficit closes and the fleet converges exactly to target (the 5→10 example no longer stops at 9). Added opt-in **progressive scaling** (`daemon.progressive_scaling` + `progressive_scale_cap`): per-cycle caps widen with the remaining gap (3x/2x/1x tiers), clamped to the gap. Decision-log trigger text updated to match; exponential and adaptive-timing options remain open proposals.
 - **2026-09-24** (claudego-4c0f2ae9): Tracked the two open proposals as beads — Option B → claudego-b9195f5a, Option C → claudego-71a82180 (blocked by B; shared `governor.rs`/`config.rs`/test-file footprint). Synced the "Current Implementation" snippet with the live `apply_scaling` signature (`emergency_brake_active` param; the brake fires only on a real ≥98% window, not on a computed zero).
 - **2026-09-25** (claudego-3648483e): Resolved the canonical config-path reference. This doc previously headed its tuning keys with `config/governor.yaml` as if that were the configuration; that file is the checked-in seed template (`include_str!`-baked in `src/config.rs`), while the live machine config (`~/.config/claude-governor/governor.yaml`) is authoritative and drifts from the template by design. The Configuration block now names both roles and points live-value verification at `cgov config`; CLAUDE.md §1 says the same.
+- **2026-09-26** (claudego-e76bcced): Linked the CLAUDE.md §4 allocation-guarantee test layer into this doc. The four §4 guarantees were already pinned (one regression test per fix in `tests/governor_scaling_fixes.rs`, one enumerative test per invariant in `tests/scaling_invariants_test.rs`, the 98%-threshold boundary in `tests/emergency_brake_distinction_test.rs`, unit boundaries in `src/governor.rs`) — the Testing Strategy section now maps each guarantee to its pins so the doc↔test linkage is bidirectional, and the References list names the three suites. CLAUDE.md §4's `safe_worker_count_or_max` bullet now notes the function's current name, `safe_worker_count_or_hold`.
