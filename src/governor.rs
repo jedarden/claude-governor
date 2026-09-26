@@ -12779,6 +12779,333 @@ mod tests {
         assert_eq!(decision, ScalingDecision::NoChange);
     }
 
+    // -------------------------------------------------------------------------
+    // Scaling decision table (claudego-11c4439e)
+    //
+    // `apply_scaling_with_policy` is the single funnel every scaling path goes
+    // through: the act cycle (`apply_scaling`), manual overrides
+    // (`apply_manual_override_scaling`), and the emergency brake all resolve
+    // here. The cycle-shaped tests above pin the wired behaviour end to end;
+    // the tables below pin the pure decision function row by row — every
+    // branch, both sides of every boundary, and each place a per-cycle cap
+    // binds. Rows that a dedicated test above already covers end to end carry
+    // a pointer to it rather than replacing it.
+    // -------------------------------------------------------------------------
+
+    /// One row per branch of the decision funnel, including both sides of every
+    /// boundary: zero delta, one-worker deficits, scale-down band equality and
+    /// just-past-it, fractional-band truncation, per-cycle caps binding in both
+    /// directions, the ordinary target-zero withdrawal, and the brake's exact
+    /// scope.
+    #[test]
+    fn scaling_decision_table() {
+        struct Row {
+            name: &'static str,
+            target: u32,
+            current: u32,
+            band: f64,
+            max_up: u32,
+            max_down: u32,
+            brake: bool,
+            expected: ScalingDecision,
+        }
+
+        let rows = vec![
+            // -- Zero delta: at target, nothing to do, whatever the band or
+            //    the brake flag say.
+            Row {
+                name: "zero_delta_holds",
+                target: 5,
+                current: 5,
+                band: 1.0,
+                max_up: 1,
+                max_down: 1,
+                brake: false,
+                expected: ScalingDecision::NoChange,
+            },
+            Row {
+                name: "zero_delta_at_zero_workers_holds",
+                target: 0,
+                current: 0,
+                band: 2.0,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::NoChange,
+            },
+            // -- One-worker deficits (claudego-44b1f4f5): the band damps
+            //    scale-DOWN only. A 1-worker deficit always closes — this is
+            //    the exact shape the old symmetric band swallowed forever and
+            //    left the fleet permanently one worker short of target.
+            Row {
+                name: "one_worker_deficit_scales_up_despite_band",
+                target: 6,
+                current: 5,
+                band: 1.0,
+                max_up: 1,
+                max_down: 1,
+                brake: false,
+                expected: ScalingDecision::ScaleUp(1),
+            },
+            Row {
+                name: "one_worker_deficit_wide_band_still_scales_up",
+                target: 6,
+                current: 5,
+                band: 3.0,
+                max_up: 2,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::ScaleUp(1),
+            },
+            //    The mirrored 1-worker surplus is exactly what the band exists
+            //    to absorb.
+            Row {
+                name: "one_worker_surplus_inside_band_holds",
+                target: 4,
+                current: 5,
+                band: 1.0,
+                max_up: 1,
+                max_down: 1,
+                brake: false,
+                expected: ScalingDecision::NoChange,
+            },
+            // -- Scale-down boundary equality: |delta| == band holds; one past
+            //    it acts, and with cap 2 the step lands the fleet exactly at
+            //    the band edge (5 - 2 = 3, one inside the band of target 2),
+            //    where the next cycle holds.
+            Row {
+                name: "scale_down_at_band_equality_holds",
+                target: 2,
+                current: 4,
+                band: 2.0,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::NoChange,
+            },
+            Row {
+                name: "scale_down_just_outside_band_scales_to_band_edge",
+                target: 2,
+                current: 5,
+                band: 2.0,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            //    Fractional bands truncate (hysteresis_band as i32), so 2.9
+            //    behaves as 2: a 2-worker surplus holds, a 3-worker surplus
+            //    sheds. Pinning this because the truncation direction is a
+            //    decision, not an accident anyone signed off on.
+            Row {
+                name: "fractional_band_2_9_truncates_holds_at_two",
+                target: 3,
+                current: 5,
+                band: 2.9,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::NoChange,
+            },
+            Row {
+                name: "fractional_band_2_9_truncates_acts_at_three",
+                target: 2,
+                current: 5,
+                band: 2.9,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            // -- Per-cycle caps: each direction pinned where the cap actually
+            //    binds and where the whole move fits under it.
+            Row {
+                name: "scale_up_cap_binds",
+                target: 10,
+                current: 5,
+                band: 1.0,
+                max_up: 2,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::ScaleUp(2),
+            },
+            Row {
+                name: "scale_up_under_cap_moves_full_deficit",
+                target: 7,
+                current: 5,
+                band: 1.0,
+                max_up: 3,
+                max_down: 3,
+                brake: false,
+                expected: ScalingDecision::ScaleUp(2),
+            },
+            Row {
+                name: "scale_down_cap_binds",
+                target: 0,
+                current: 5,
+                band: 1.0,
+                max_up: 3,
+                max_down: 2,
+                brake: false,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            Row {
+                name: "scale_down_under_cap_moves_full_surplus",
+                target: 3,
+                current: 5,
+                band: 1.0,
+                max_up: 3,
+                max_down: 3,
+                brake: false,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            // -- Ordinary target-zero withdrawal (claudego-1138ab78): the
+            //    cap-binding row above IS the graceful withdrawal; its end-to-
+            //    end form is
+            //    `computed_zero_without_brake_window_takes_graceful_scale_down`
+            //    and the band-damped form is
+            //    `computed_zero_within_hysteresis_band_holds`.
+            //
+            //    The brake rows: the violent arm needs a >= 98% window AND a
+            //    zero target AND workers to kill — end to end:
+            //    `computed_zero_with_brake_window_still_takes_emergency_brake`
+            //    and `emergency_brake_with_no_workers_running_is_no_change`.
+            Row {
+                name: "brake_target_zero_with_workers",
+                target: 0,
+                current: 5,
+                band: 2.0,
+                max_up: 3,
+                max_down: 2,
+                brake: true,
+                expected: ScalingDecision::EmergencyBrake,
+            },
+            Row {
+                name: "brake_target_zero_without_workers_is_nothing_to_kill",
+                target: 0,
+                current: 0,
+                band: 2.0,
+                max_up: 3,
+                max_down: 2,
+                brake: true,
+                expected: ScalingDecision::NoChange,
+            },
+            //    The brake arm is scoped to target == 0: with a nonzero target
+            //    the flag changes nothing and the ordinary path runs. Unreachable
+            //    through the act cycle (`compute_target_workers` returns 0 under
+            //    any brake window and overrides are `SuspendedByBrake`), but the
+            //    funnel is `pub` — pin the guard's exact shape.
+            Row {
+                name: "brake_flag_is_scoped_to_zero_target",
+                target: 5,
+                current: 3,
+                band: 1.0,
+                max_up: 3,
+                max_down: 2,
+                brake: true,
+                expected: ScalingDecision::ScaleUp(2),
+            },
+        ];
+
+        for r in &rows {
+            let got = apply_scaling(r.target, r.current, r.band, r.max_up, r.max_down, r.brake);
+            assert_eq!(
+                got,
+                r.expected.clone(),
+                "row `{}` (target {} current {} band {} caps up {}/down {} brake {})",
+                r.name,
+                r.target,
+                r.current,
+                r.band,
+                r.max_up,
+                r.max_down,
+                r.brake
+            );
+        }
+    }
+
+    /// Manual hysteresis bypass (claudego-11c4439e): an operator pin funnels
+    /// through the same decision code with the scale-down band disabled, so a
+    /// move the computed path would damp still executes — while the per-cycle
+    /// caps keep bounding it in both directions and a manual target of 0 lands
+    /// on the graceful [`ScalingDecision::ScaleDown`] arm, never the brake
+    /// (an override cannot coincide with a brake window: `resolve_manual_override`
+    /// returns `SuspendedByBrake` first).
+    #[test]
+    fn manual_override_bypasses_band_but_keeps_caps_and_graceful_zero() {
+        // The identical shape the computed path holds inside the band...
+        assert_eq!(
+            apply_scaling(3, 5, 2.0, 3, 2, false),
+            ScalingDecision::NoChange,
+            "sanity: a 2-worker surplus inside a 2.0 band is damped on the computed path"
+        );
+        // ...the override executes.
+        assert_eq!(
+            apply_manual_override_scaling(3, 5, 3, 2),
+            ScalingDecision::ScaleDown(2),
+            "a deliberate operator pin must bypass the scale-down band"
+        );
+
+        // The bypass is scale-down-only in spirit: caps still bound every
+        // override move, up and down.
+        assert_eq!(
+            apply_manual_override_scaling(10, 5, 2, 2),
+            ScalingDecision::ScaleUp(2),
+            "override scale-up still respects max_up_per_cycle"
+        );
+        assert_eq!(
+            apply_manual_override_scaling(0, 5, 3, 2),
+            ScalingDecision::ScaleDown(2),
+            "override scale-down still respects max_down_per_cycle"
+        );
+
+        // A manual zero is a manual scale-down, not the emergency brake —
+        // there is no kill-sessions on the override path by construction.
+        assert_ne!(
+            apply_manual_override_scaling(0, 5, 3, 2),
+            ScalingDecision::EmergencyBrake,
+            "manual target 0 must stay on the graceful arm"
+        );
+
+        // At target, nothing to do either way.
+        assert_eq!(
+            apply_manual_override_scaling(4, 4, 3, 2),
+            ScalingDecision::NoChange
+        );
+    }
+
+    /// Per-cycle caps under `daemon.progressive_scaling` (claudego-44b1f4f5,
+    /// table added claudego-11c4439e): `progressive_scale_cap` widens the base
+    /// cap with the remaining gap — 3x beyond a gap of 5, 2x beyond 3, 1x
+    /// otherwise — but never past the gap itself, and a disabled cap (0) stays
+    /// 0 at every tier. Every tier boundary and both clamp directions pinned.
+    #[test]
+    fn progressive_scale_cap_decision_table() {
+        // (name, base cap, gap, expected)
+        let rows: &[(&str, u32, u32, u32)] = &[
+            ("tier_1x_single_worker_gap", 1, 1, 1),
+            ("tier_1x_boundary_gap_3", 1, 3, 1),
+            ("tier_2x_boundary_gap_4", 1, 4, 2),
+            ("tier_2x_gap_5", 1, 5, 2),
+            ("tier_3x_boundary_gap_6", 1, 6, 3),
+            ("tier_3x_large_gap", 2, 12, 6),
+            ("clamp_never_overshoots_gap_small_cap", 5, 4, 4),
+            ("clamp_binds_wide_cap", 4, 6, 6),
+            ("disabled_cap_stays_zero", 0, 9, 0),
+            ("zero_gap_moves_nothing", 3, 0, 0),
+        ];
+        for &(name, cap, gap, expected) in rows {
+            assert_eq!(
+                progressive_scale_cap(cap, gap),
+                expected,
+                "row `{}` (base cap {}, gap {})",
+                name,
+                cap,
+                gap
+            );
+        }
+    }
+
     /// Test governor cycle with scaling decision within hysteresis band.
     ///
     /// Verifies that when the target is within the hysteresis band of current,
