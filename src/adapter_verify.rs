@@ -16,20 +16,34 @@
 //!   the watchdog kills it, or answers while billing a proxy pool instead of
 //!   the subscription
 //!
-//! This module mechanises the checks CLAUDE.md previously prescribed by hand:
-//! a static check that each installed template still unsets both variable
-//! sets, plus a live run of the template's `invoke_template` verbatim with a
-//! trivial prompt, requiring exit 0. Shared by `cgov doctor` (check
-//! `claude_print_adapters`) and `deploy/install-claude-print-adapters.sh`,
-//! which mirrors the same variable lists in bash.
+//! A third class is invisible to a live probe: a template that drops the
+//! prompt redirection, `--pretrust-cwd`, `--output-format stream-json` or
+//! `--no-inherit-hooks` still answers a trivial prompt with plain output and
+//! exit 0 — it only fails in production dispatch, where the output transform
+//! needs stream-json, a never-trusted workspace needs the pretrust flag, the
+//! strand must not inherit the invoking shell's hooks, and the prompt must
+//! actually reach claude-print. The per-adapter `timeout_secs` backstop
+//! belongs to the same class: NEEDLE's stuck-detection is blind during a
+//! run, so `timeout_secs` is the only thing that kills a hung strand.
 //!
-//! The bash mirror is enforced, not trusted: a `cargo test` parse of the
-//! installer's two arrays fails on divergence from the constants below
-//! (`installer_bash_variable_lists_match_the_rust_constants`), and the
-//! installer cross-checks these same constants at run time. A variable added
+//! This module mechanises the checks CLAUDE.md previously prescribed by hand:
+//! static checks that each installed template still unsets both variable
+//! sets, still carries every required invoke flag, and still pins
+//! `timeout_secs` to its documented per-adapter value — plus a live run of
+//! the template's `invoke_template` verbatim with a trivial prompt,
+//! requiring exit 0. Shared by `cgov doctor` (check `claude_print_adapters`)
+//! and `deploy/install-claude-print-adapters.sh`, which mirrors the same
+//! constants in bash.
+//!
+//! The bash mirror is enforced, not trusted: `cargo test` parses of the
+//! installer's arrays fail on divergence from the constants below
+//! (`installer_bash_variable_lists_match_the_rust_constants`,
+//! `installer_bash_flag_and_timeout_pins_match_the_rust_constants`), and the
+//! installer cross-checks these same constants at run time. A constant added
 //! to one copy without the other therefore fails loudly in both places,
 //! instead of silently shrinking the check to exactly the variables that
-//! caused the incidents. New variables go into both lists together.
+//! caused the incidents. New variables, flags and timeout pins go into both
+//! lists together.
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -68,6 +82,47 @@ pub const API_ROUTING_ENV_VARS: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
+/// The substrings every `invoke_template` must carry — the parts of the
+/// dispatch contract CLAUDE.md §2 learned the hard way, and that a trivial
+/// live probe cannot see (a plain-text answer exits 0 with none of them):
+///
+/// - `< {prompt_file}` — rule 1. Without the redirection claude-print
+///   launches with no prompt, produces nothing and exits instantly, while
+///   NEEDLE's re-dispatch loop churns real beads into stuck `in_progress`.
+/// - `--pretrust-cwd` — rule 4. Without it, a claude that has never trusted
+///   the workspace renders its trust dialog with the *refusing* option
+///   highlighted; claude-print confirms whatever is highlighted and the
+///   strand dies as a misleading `internal_error` before doing any work.
+/// - `--output-format stream-json` — `needle-transform-claude` parses this
+///   format and nothing else.
+/// - `--no-inherit-hooks` — isolation: the dispatched strand must not run
+///   the invoking shell's hooks (claude-print still installs its own Stop
+///   hook).
+///
+/// Matched as substrings on purpose: the template is a one-line shell
+/// command, and a rewrite that no longer contains the exact flag text is
+/// precisely the drift this gate exists to stop.
+pub const REQUIRED_INVOKE_FLAGS: &[&str] = &[
+    "< {prompt_file}",
+    "--pretrust-cwd",
+    "--output-format stream-json",
+    "--no-inherit-hooks",
+];
+
+/// The exact `timeout_secs` each adapter must pin, by adapter name — the
+/// tight backstops CLAUDE.md §2 records (opus 1200s, fable 600s). Equality,
+/// not a ceiling: a silently raised value is a worker wedged that much
+/// longer on a hung strand, and a silently lowered one starts killing
+/// legitimate strands, so changing a pin must be a deliberate act — edit
+/// both copies (this constant and `ADAPTER_TIMEOUT_PINS` in
+/// `deploy/install-claude-print-adapters.sh`); the sync gates fail until
+/// they agree. An adapter whose name has no pin here fails the check loudly
+/// rather than inheriting one.
+pub const ADAPTER_TIMEOUT_PINS: &[(&str, u64)] = &[
+    ("claude-print-fable", 600),
+    ("claude-print-opus", 1200),
 ];
 
 /// Upper bound on the live probe. A trivial prompt normally finishes in well
@@ -182,7 +237,10 @@ pub fn scrubbed_vars(invoke_template: &str) -> BTreeSet<String> {
         .split("&&")
         .filter_map(|segment| {
             let mut tokens = segment.split_whitespace();
-            let first = tokens.next()?.trim_start_matches('"').trim_start_matches('\'');
+            let first = tokens
+                .next()?
+                .trim_start_matches('"')
+                .trim_start_matches('\'');
             if first == "unset" {
                 Some(tokens)
             } else {
@@ -209,22 +267,63 @@ pub fn missing_scrub_vars(invoke_template: &str) -> Vec<(EnvClass, &'static str)
     IDE_ENV_VARS
         .iter()
         .map(|v| (EnvClass::Ide, *v))
-        .chain(API_ROUTING_ENV_VARS.iter().map(|v| (EnvClass::ApiRouting, *v)))
+        .chain(
+            API_ROUTING_ENV_VARS
+                .iter()
+                .map(|v| (EnvClass::ApiRouting, *v)),
+        )
         .filter(|(_, var)| !scrubbed.contains(*var))
         .collect()
+}
+
+/// Required invoke flags the template does NOT carry. Substring match — see
+/// [`REQUIRED_INVOKE_FLAGS`] for why that is exact here rather than loose.
+pub fn missing_invoke_flags(invoke_template: &str) -> Vec<&'static str> {
+    REQUIRED_INVOKE_FLAGS
+        .iter()
+        .copied()
+        .filter(|flag| !invoke_template.contains(flag))
+        .collect()
+}
+
+/// Why the adapter's `timeout_secs` violates its pin, if it does. `None`
+/// means the value matches [`ADAPTER_TIMEOUT_PINS`] exactly.
+pub fn timeout_violation(adapter_name: &str, timeout_secs: Option<u64>) -> Option<String> {
+    let pinned = ADAPTER_TIMEOUT_PINS
+        .iter()
+        .find(|(name, _)| *name == adapter_name)
+        .map(|(_, secs)| *secs);
+    let Some(pinned) = pinned else {
+        return Some(format!(
+            "no timeout_secs pin for this adapter name — add it to ADAPTER_TIMEOUT_PINS in \
+             src/adapter_verify.rs and deploy/install-claude-print-adapters.sh (both copies)"
+        ));
+    };
+    match timeout_secs {
+        None => Some(format!(
+            "omits timeout_secs — NEEDLE's stuck-detection is blind during a run, so \
+             timeout_secs is the only killer of a hung strand; the pin is {pinned}s"
+        )),
+        Some(actual) if actual != pinned => Some(format!(
+            "timeout_secs is {actual}s, pinned at {pinned}s — edit both copies to change a pin"
+        )),
+        Some(_) => None,
+    }
 }
 
 /// One bash array's elements out of an installer-source text, in declaration
 /// order.
 ///
 /// The installer declares the rule-3/rule-5 lists as flat arrays of bare
-/// env-var names (`RULE3_IDE_VARS=(CLAUDECODE …)`). The parse anchors on a
+/// env-var names (`RULE3_IDE_VARS=(CLAUDECODE …)`) and the invoke/timeout
+/// pins as quoted or `name=value` elements
+/// (`REQUIRED_INVOKE_FLAGS=("< {prompt_file}" …)`). The parse anchors on a
 /// declaration line — the name at the start of a line (leading whitespace
 /// allowed), immediately followed by `=(` — so a comment that merely mentions
 /// the array cannot satisfy it, and reads to the first `)`, which is exact
-/// for bare-element arrays across wrapped lines. Quoting is stripped but not
-/// interpreted: an element that stops being a bare identifier is precisely
-/// the drift the sync checks exist to flag.
+/// for these arrays across wrapped lines. Quoting is stripped but not
+/// interpreted: an element that stops being a bare identifier or a plain
+/// quoted string is precisely the drift the sync checks exist to flag.
 #[cfg(test)]
 fn bash_array_vars(installer_src: &str, array_name: &str) -> Result<Vec<String>, String> {
     let marker = format!("{}=(", array_name);
@@ -245,15 +344,48 @@ fn bash_array_vars(installer_src: &str, array_name: &str) -> Result<Vec<String>,
     let close = body
         .find(')')
         .ok_or_else(|| format!("{} is never closed", array_name))?;
-    let vars: Vec<String> = body[..close]
-        .split_whitespace()
-        .map(|token| token.trim_matches('"').trim_matches('\'').to_string())
-        .filter(|token| !token.is_empty())
-        .collect();
+    let vars: Vec<String> = bash_array_words(&body[..close]);
     if vars.is_empty() {
         return Err(format!("{} declares no variables", array_name));
     }
     Ok(vars)
+}
+
+/// Whitespace-split of a bash array body that keeps a double- or
+/// single-quoted run whole and strips the quotes — needed because the flag
+/// list carries elements with spaces (`"< {prompt_file}"`). Bare elements
+/// parse through the same path, so the variable arrays behave exactly as
+/// before.
+#[cfg(test)]
+fn bash_array_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words.into_iter().filter(|w| !w.is_empty()).collect()
 }
 
 /// Values planted in the probe child's environment for every rule-3/rule-5
@@ -324,9 +456,7 @@ fn find_unrendered_placeholder(s: &str) -> Option<String> {
             if let Some(rel_end) = s[i + 1..].find('}') {
                 let inner = &s[i + 1..i + 1 + rel_end];
                 let looks_like_placeholder = !inner.is_empty()
-                    && inner
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                 if looks_like_placeholder {
                     return Some(inner.to_string());
                 }
@@ -367,8 +497,10 @@ impl RunOutcome {
             );
         }
         match self.exit_code {
-            Some(0) => "exit 0 but no output — the silent-empty-output signature of a broken dispatch"
-                .to_string(),
+            Some(0) => {
+                "exit 0 but no output — the silent-empty-output signature of a broken dispatch"
+                    .to_string()
+            }
             Some(code) => format!("exit code {}", code),
             None => "terminated by signal".to_string(),
         }
@@ -466,7 +598,12 @@ pub fn live_probe_in(adapter: &InstalledAdapter, workspace: &Path) -> Result<Dur
         .map_err(|e| format!("cannot write {}: {}", prompt_file.display(), e))?;
 
     let model = adapter.adapter.model.as_deref().unwrap_or("claude");
-    let rendered = render_invoke_template(&adapter.adapter.invoke_template, workspace, model, &prompt_file)?;
+    let rendered = render_invoke_template(
+        &adapter.adapter.invoke_template,
+        workspace,
+        model,
+        &prompt_file,
+    )?;
 
     let timeout = Duration::from_secs(
         adapter
@@ -529,17 +666,25 @@ mod tests {
             .join(" ")
     }
 
-    #[test]
-    fn committed_adapter_templates_scrub_both_variable_sets() {
-        // Materialize the embedded committed templates under their committed
-        // names (see INSTALLER_SH for why they are embedded rather than read
-        // from the checkout) and load them through the production loader.
+    /// The committed adapters, materialized under their committed names (see
+    /// INSTALLER_SH for why they are embedded rather than read from the
+    /// checkout) and loaded through the production loader. Shared by the
+    /// three committed-template gates below.
+    fn committed_adapters() -> Vec<InstalledAdapter> {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(tmp.path().join("claude-print-opus.yaml"), ADAPTER_OPUS_YAML)
             .expect("write opus adapter");
-        std::fs::write(tmp.path().join("claude-print-fable.yaml"), ADAPTER_FABLE_YAML)
-            .expect("write fable adapter");
-        let adapters = load_installed_adapters(tmp.path()).expect("repo adapters must load");
+        std::fs::write(
+            tmp.path().join("claude-print-fable.yaml"),
+            ADAPTER_FABLE_YAML,
+        )
+        .expect("write fable adapter");
+        load_installed_adapters(tmp.path()).expect("repo adapters must load")
+    }
+
+    #[test]
+    fn committed_adapter_templates_scrub_both_variable_sets() {
+        let adapters = committed_adapters();
 
         assert!(
             adapters.len() >= 2,
@@ -555,6 +700,47 @@ mod tests {
                 missing.iter().map(|(_, v)| *v).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// The dispatch contract a trivial live probe cannot see (see the
+    /// REQUIRED_INVOKE_FLAGS doc): a hand-edited template that drops one of
+    /// these still answers the probe with plain output and exit 0, and fails
+    /// only in production dispatch.
+    #[test]
+    fn committed_adapter_templates_carry_required_invoke_flags() {
+        for adapter in committed_adapters() {
+            let missing = missing_invoke_flags(&adapter.adapter.invoke_template);
+            assert!(
+                missing.is_empty(),
+                "{} drops required invoke flags {:?} — dispatch needs them even though \
+                 the live probe cannot miss them",
+                adapter.adapter.name,
+                missing
+            );
+        }
+    }
+
+    /// timeout_secs is the only killer of a hung strand (NEEDLE's
+    /// stuck-detection is blind during a run), so each adapter's value is
+    /// pinned exactly, and an unpinned adapter name must fail rather than
+    /// inherit a ceiling.
+    #[test]
+    fn committed_adapter_templates_pin_timeout_secs() {
+        let adapters = committed_adapters();
+        for adapter in &adapters {
+            if let Some(violation) =
+                timeout_violation(&adapter.adapter.name, adapter.adapter.timeout_secs)
+            {
+                panic!("{}: {}", adapter.adapter.name, violation);
+            }
+        }
+        // Every committed adapter is covered by a pin — no name slipped in
+        // without one.
+        assert_eq!(
+            adapters.len(),
+            ADAPTER_TIMEOUT_PINS.len(),
+            "an adapter was added without a timeout_secs pin, or a pin lost its adapter"
+        );
     }
 
     #[test]
@@ -581,9 +767,61 @@ mod tests {
     #[test]
     fn missing_scrub_reports_each_failure_class() {
         let missing = missing_scrub_vars("cd {workspace} && /usr/bin/claude-print < {prompt_file}");
-        assert_eq!(missing.len(), IDE_ENV_VARS.len() + API_ROUTING_ENV_VARS.len());
+        assert_eq!(
+            missing.len(),
+            IDE_ENV_VARS.len() + API_ROUTING_ENV_VARS.len()
+        );
         assert!(missing.contains(&(EnvClass::Ide, "CLAUDECODE")));
         assert!(missing.contains(&(EnvClass::ApiRouting, "ANTHROPIC_BASE_URL")));
+    }
+
+    #[test]
+    fn missing_invoke_flags_detects_a_dropped_flag_and_names_it() {
+        // The recorded rule-4 shape: a template that lost --pretrust-cwd but
+        // kept everything else.
+        let template = "cd {workspace} && /usr/bin/claude-print --output-format stream-json \
+                        --no-inherit-hooks < {prompt_file}";
+        let missing = missing_invoke_flags(template);
+        assert_eq!(missing, vec!["--pretrust-cwd"]);
+
+        // A bare template drops everything, each named exactly as it must
+        // appear in the template.
+        let all = missing_invoke_flags("cd {workspace} && /usr/bin/claude-print");
+        assert_eq!(all.len(), REQUIRED_INVOKE_FLAGS.len());
+        assert!(all.contains(&"< {prompt_file}"));
+    }
+
+    #[test]
+    fn timeout_violation_flags_absent_unpinned_and_drifted_values() {
+        // A raised pin silently lengthens how long a hung strand wedges a
+        // worker; a lowered one starts killing legitimate strands. Both are
+        // drift — the pin is exact, not a ceiling.
+        let raised = timeout_violation("claude-print-opus", Some(9600)).expect("raised pin drifts");
+        assert!(raised.contains("9600s"), "msg: {}", raised);
+        assert!(raised.contains("pinned at 1200s"), "msg: {}", raised);
+
+        let lowered =
+            timeout_violation("claude-print-fable", Some(60)).expect("lowered pin drifts");
+        assert!(lowered.contains("pinned at 600s"), "msg: {}", lowered);
+
+        let absent = timeout_violation("claude-print-opus", None).expect("absent timeout drifts");
+        assert!(absent.contains("omits timeout_secs"), "msg: {}", absent);
+
+        let unpinned =
+            timeout_violation("claude-print-sonnet", Some(1200)).expect("unpinned name drifts");
+        assert!(
+            unpinned.contains("no timeout_secs pin"),
+            "msg: {}",
+            unpinned
+        );
+        assert!(
+            unpinned.contains("both copies"),
+            "the remedy must name the mirror: {}",
+            unpinned
+        );
+
+        assert_eq!(timeout_violation("claude-print-opus", Some(1200)), None);
+        assert_eq!(timeout_violation("claude-print-fable", Some(600)), None);
     }
 
     #[test]
@@ -595,7 +833,10 @@ mod tests {
         assert!(scrubbed.contains("CLAUDECODE"));
         assert!(scrubbed.contains("VSCODE_PID"));
         assert!(scrubbed.contains("ANTHROPIC_BASE_URL"), "quoted var counts");
-        assert!(!scrubbed.contains("NOT_A_SCRUB"), "echoed text is not an unset");
+        assert!(
+            !scrubbed.contains("NOT_A_SCRUB"),
+            "echoed text is not an unset"
+        );
         assert!(!scrubbed.contains("run"));
     }
 
@@ -657,7 +898,8 @@ mod tests {
         assert!(!silent.is_success());
         assert!(silent.failure_reason().contains("no output"));
 
-        let failed = run_probe("echo boom >&2; exit 3", Duration::from_secs(30)).expect("probe spawns");
+        let failed =
+            run_probe("echo boom >&2; exit 3", Duration::from_secs(30)).expect("probe spawns");
         assert_eq!(failed.exit_code, Some(3));
         assert!(failed.failure_reason().contains("3"));
     }
@@ -702,7 +944,10 @@ mod tests {
         assert!(duration.as_secs() < 60);
 
         let seen = std::fs::read_to_string(&seen).unwrap().trim().to_string();
-        assert_eq!(seen, "0", "poisoned ANTHROPIC_BASE_URL leaked through the unset");
+        assert_eq!(
+            seen, "0",
+            "poisoned ANTHROPIC_BASE_URL leaked through the unset"
+        );
     }
 
     #[test]
@@ -756,12 +1001,10 @@ mod tests {
         );
         let mid_line = "echo the RULE5_API_VARS=(is not a decl here)\n";
         assert!(bash_array_vars(mid_line, "RULE5_API_VARS").is_err());
-        assert!(
-            bash_array_vars("nothing here", "RULE5_API_VARS")
-                .err()
-                .unwrap()
-                .contains("no RULE5_API_VARS=(")
-        );
+        assert!(bash_array_vars("nothing here", "RULE5_API_VARS")
+            .err()
+            .unwrap()
+            .contains("no RULE5_API_VARS=("));
     }
 
     /// The installer's bash mirror of the rule-3/rule-5 constants must stay
@@ -806,5 +1049,67 @@ mod tests {
                 extra
             );
         }
+    }
+
+    /// The installer's bash mirrors of [`REQUIRED_INVOKE_FLAGS`] and
+    /// [`ADAPTER_TIMEOUT_PINS`] must stay identical to the constants — the
+    /// same two-gate rule as the variable lists above. Without it, a flag or
+    /// pin added to one copy would leave the installer's static template
+    /// check covering a different invoke contract than `cgov doctor`'s, and
+    /// neither would fail. `check_flag_and_timeout_sync` in the installer
+    /// cross-checks these same constants at run time.
+    #[test]
+    fn installer_bash_flag_and_timeout_pins_match_the_rust_constants() {
+        let installer = installer_source();
+
+        let bash_flag_vec =
+            bash_array_vars(&installer, "REQUIRED_INVOKE_FLAGS")
+                .expect("REQUIRED_INVOKE_FLAGS must be declared in the installer");
+        let bash_flags: BTreeSet<&str> = bash_flag_vec.iter().map(String::as_str).collect();
+        let rust_flags: BTreeSet<&str> = REQUIRED_INVOKE_FLAGS.iter().copied().collect();
+        assert_eq!(
+            bash_flags, rust_flags,
+            "REQUIRED_INVOKE_FLAGS in deploy/install-claude-print-adapters.sh diverges \
+             from src/adapter_verify.rs (bash-only: {:?}, rust-only: {:?}) — update \
+             both copies together; the installer's own sync check fails the install \
+             on the same drift.",
+            bash_flags
+                .difference(&rust_flags)
+                .collect::<Vec<_>>(),
+            rust_flags
+                .difference(&bash_flags)
+                .collect::<Vec<_>>(),
+        );
+
+        let mut bash_pins: Vec<(String, u64)> =
+            bash_array_vars(&installer, "ADAPTER_TIMEOUT_PINS")
+                .expect("ADAPTER_TIMEOUT_PINS must be declared in the installer")
+                .into_iter()
+                .map(|element| match element.split_once('=') {
+                    Some((name, secs)) => secs.parse::<u64>().map(|secs| (name.to_string(), secs)).unwrap_or_else(
+                        |_| {
+                            panic!(
+                                "ADAPTER_TIMEOUT_PINS element {element:?} does not end in \
+                                 =<seconds>"
+                            )
+                        },
+                    ),
+                    None => panic!("ADAPTER_TIMEOUT_PINS element {element:?} is not name=value"),
+                })
+                .collect();
+        bash_pins.sort();
+        let mut rust_pins: Vec<(String, u64)> = ADAPTER_TIMEOUT_PINS
+            .iter()
+            .map(|(name, secs)| ((*name).to_string(), *secs))
+            .collect();
+        rust_pins.sort();
+        assert_eq!(
+            bash_pins, rust_pins,
+            "ADAPTER_TIMEOUT_PINS in deploy/install-claude-print-adapters.sh diverges \
+             from src/adapter_verify.rs (bash: {:?}, rust: {:?}) — update both copies \
+             together; the installer's own sync check fails the install on the same \
+             drift.",
+            bash_pins, rust_pins,
+        );
     }
 }

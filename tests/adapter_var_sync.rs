@@ -26,6 +26,16 @@
 //! * the four-way drill runs both real gates against isolated Rust-side and
 //!   Bash-side additions/removals and checks their diagnostics.
 //!
+//! The invoke-contract mirror (`REQUIRED_INVOKE_FLAGS` /
+//! `ADAPTER_TIMEOUT_PINS`, enforced by `check_flag_and_timeout_sync` and the
+//! cargo-test parse
+//! `installer_bash_flag_and_timeout_pins_match_the_rust_constants`) is drilled
+//! the same way: an isolated copy whose committed adapter drops
+//! `--pretrust-cwd`, or inflates its `timeout_secs` past its pin, must fail
+//! both the cargo-side per-template gate and the installer's static template
+//! check — drift the live probe cannot see, since it exits 0 with output
+//! either way (claudego-fef165c5).
+//!
 //! The installer script itself is NEVER executed — it writes
 //! `~/.config/needle/adapters` and links binaries, which a test must not do.
 //! Extraction is anchor-based, not line-number-based, so edits elsewhere in
@@ -36,6 +46,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 const INSTALLER: &str = "deploy/install-claude-print-adapters.sh";
@@ -440,6 +451,57 @@ fn mutate_installer_source(src: &str, mutation: DrillMutation) -> String {
     src.replacen(&declaration, &mutated, 1)
 }
 
+/// How the isolated copy's committed opus adapter diverges from the shipped
+/// one. These mutations leave every sync list intact — the variable-list
+/// gates all pass — so only the per-installed-template invoke-contract check
+/// can catch them, in either gate.
+#[derive(Clone, Copy)]
+enum AdapterMutation {
+    /// The committed opus adapter, byte for byte.
+    Committed,
+    /// Drop `--pretrust-cwd` from the opus invoke_template — the recorded
+    /// rule-4 regression (claudepr-fe3d3160), invisible in any pre-trusted
+    /// cwd and to a live probe that exits 0 either way.
+    FlagRemoval,
+    /// Inflate the opus `timeout_secs` past its 1200s pin — a silently
+    /// raised backstop wedges a worker that much longer on a hung strand.
+    TimeoutDrift,
+}
+
+impl AdapterMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Committed => "committed adapter",
+            Self::FlagRemoval => "flag removal",
+            Self::TimeoutDrift => "timeout drift",
+        }
+    }
+}
+
+fn mutate_adapter_yaml(src: &str, mutation: AdapterMutation) -> String {
+    match mutation {
+        AdapterMutation::Committed => src.to_string(),
+        AdapterMutation::FlagRemoval => {
+            let old = " --pretrust-cwd";
+            assert_eq!(
+                src.matches(old).count(),
+                1,
+                "flag drill anchor is not unique"
+            );
+            src.replacen(old, "", 1)
+        }
+        AdapterMutation::TimeoutDrift => {
+            let old = "timeout_secs: 1200";
+            assert_eq!(
+                src.matches(old).count(),
+                1,
+                "timeout drill anchor is not unique"
+            );
+            src.replacen(old, "timeout_secs: 9600", 1)
+        }
+    }
+}
+
 fn write_file(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -449,14 +511,21 @@ fn write_file(path: &Path, contents: &str) -> io::Result<()> {
 
 /// Materialize enough of the repository to run the real Rust unit gate and
 /// the real installer. No mutation is ever applied to the test checkout.
-fn write_drill_copy(root: &Path, mutation: DrillMutation) {
+/// `mutation` (None keeps the committed variable lists) drives the
+/// variable-list drills; `adapter_mutation` drives the invoke-contract
+/// drills.
+fn write_drill_copy(
+    root: &Path,
+    mutation: Option<DrillMutation>,
+    adapter_mutation: AdapterMutation,
+) {
     write_file(&root.join("Cargo.toml"), CARGO_TOML).unwrap();
     write_file(&root.join("Cargo.lock"), CARGO_LOCK).unwrap();
-    write_file(
-        &root.join("src/adapter_verify.rs"),
-        &mutate_rust_constants(ADAPTER_VERIFY_SRC, mutation),
-    )
-    .unwrap();
+    let verify_src = match mutation {
+        Some(m) => mutate_rust_constants(ADAPTER_VERIFY_SRC, m),
+        None => ADAPTER_VERIFY_SRC.to_string(),
+    };
+    write_file(&root.join("src/adapter_verify.rs"), &verify_src).unwrap();
     for (relative, contents) in LIB_SOURCES {
         if *relative == "src/adapter_verify.rs" {
             continue;
@@ -465,7 +534,10 @@ fn write_drill_copy(root: &Path, mutation: DrillMutation) {
     }
     write_file(&root.join("config/governor.yaml"), CONFIG_GOVERNOR_YAML).unwrap();
 
-    let installer = mutate_installer_source(INSTALLER_SH, mutation);
+    let installer = match mutation {
+        Some(m) => mutate_installer_source(INSTALLER_SH, m),
+        None => INSTALLER_SH.to_string(),
+    };
     write_file(&root.join(INSTALLER), &installer).unwrap();
 
     // The committed adapters name a machine-global absolute binary. Point
@@ -476,11 +548,11 @@ fn write_drill_copy(root: &Path, mutation: DrillMutation) {
     for (relative, contents) in [
         (
             "deploy/needle-adapters/claude-print-opus.yaml",
-            ADAPTER_OPUS_YAML,
+            mutate_adapter_yaml(ADAPTER_OPUS_YAML, adapter_mutation),
         ),
         (
             "deploy/needle-adapters/claude-print-fable.yaml",
-            ADAPTER_FABLE_YAML,
+            ADAPTER_FABLE_YAML.to_string(),
         ),
     ] {
         let isolated = contents.replace("/home/coding/.local/bin/claude-print", safe_binary);
@@ -494,19 +566,48 @@ fn command_text(output: std::process::Output) -> (bool, String) {
     (output.status.success(), text)
 }
 
-fn run_cargo_sync_gate(root: &Path) -> (bool, String) {
-    let output = Command::new("cargo")
+/// Sequence number for per-leg isolated target dirs (unique within this
+/// test process; combined with the pid for uniqueness across processes).
+static DRILL_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn run_cargo_gate(root: &Path, test_name: &str) -> (bool, String) {
+    // The cargo wrapper forces CARGO_TARGET_DIR to the repo-wide
+    // /build/<repo> for every drill copy — the copies are not git repos, so
+    // the wrapper maps them by package name — and concurrent drill legs then
+    // race: one leg's rebuild replaces the shared test binary between
+    // another leg's build and its exec, and that leg asserts against the
+    // wrong binary's result. A subdir of the repo target is the wrapper's
+    // sanctioned isolation (needle-d6b685b4 allows subdirs of /build/<repo>),
+    // so each leg builds in its own, removed afterwards. Under plain cargo
+    // (no wrapper env), the copy's own target/ is already per-copy.
+    let isolated = std::env::var("CARGO_TARGET_DIR").ok().map(|shared| {
+        let n = DRILL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(shared)
+            .join(format!("adapter-drill-{}-{}", std::process::id(), n));
+        fs::create_dir_all(&dir).expect("create isolated drill target dir");
+        dir
+    });
+    let mut command = Command::new("cargo");
+    command
         .current_dir(root)
-        .args([
-            "test",
-            "--lib",
-            "adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants",
-            "--",
-            "--exact",
-        ])
+        .args(["test", "--lib", test_name, "--", "--exact"]);
+    if let Some(dir) = &isolated {
+        command.env("CARGO_TARGET_DIR", dir);
+    }
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("{}: could not run cargo sync gate: {}", root.display(), e));
+    if let Some(dir) = isolated {
+        let _ = fs::remove_dir_all(dir);
+    }
     command_text(output)
+}
+
+fn run_cargo_sync_gate(root: &Path) -> (bool, String) {
+    run_cargo_gate(
+        root,
+        "adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants",
+    )
 }
 
 fn make_fake_claude_print(home: &Path) -> PathBuf {
@@ -556,7 +657,7 @@ fn run_installer_sync_gate(root: &Path) -> (bool, String) {
 fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
     for mutation in DrillMutation::all() {
         let temp = TempDir::new().unwrap();
-        write_drill_copy(temp.path(), mutation);
+        write_drill_copy(temp.path(), Some(mutation), AdapterMutation::Committed);
 
         let (cargo_ok, cargo_output) = run_cargo_sync_gate(temp.path());
         assert!(
@@ -615,6 +716,73 @@ fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
             )),
             "{} installer diagnostic omitted the expected diff direction:\n{}",
             mutation.label(),
+            installer_output
+        );
+    }
+}
+
+/// The invoke-contract counterpart of the four-way drill: a committed
+/// adapter that drops `--pretrust-cwd`, or inflates its `timeout_secs` past
+/// its pin, must fail the cargo-side per-template gate AND the installer's
+/// static template check. Neither the live probe (exit 0 with output either
+/// way) nor any variable-list sync sees this drift, so without these gates a
+/// hand-edited installed template would fail only in production dispatch.
+#[test]
+fn invoke_contract_drills_fire_both_real_gates_in_isolated_copies() {
+    for (adapter_mutation, lib_test, expected) in [
+        (
+            AdapterMutation::FlagRemoval,
+            "adapter_verify::tests::committed_adapter_templates_carry_required_invoke_flags",
+            "--pretrust-cwd",
+        ),
+        (
+            AdapterMutation::TimeoutDrift,
+            "adapter_verify::tests::committed_adapter_templates_pin_timeout_secs",
+            "pinned at 1200s",
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+        write_drill_copy(temp.path(), None, adapter_mutation);
+
+        let (cargo_ok, cargo_output) = run_cargo_gate(temp.path(), lib_test);
+        assert!(
+            !cargo_ok,
+            "{} cargo gate unexpectedly passed:\n{}",
+            adapter_mutation.label(),
+            cargo_output
+        );
+        assert!(
+            cargo_output.contains(lib_test),
+            "{} cargo output did not identify the per-template gate:\n{}",
+            adapter_mutation.label(),
+            cargo_output
+        );
+        assert!(
+            cargo_output.contains(expected),
+            "{} cargo diagnostic omitted {}:\n{}",
+            adapter_mutation.label(),
+            expected,
+            cargo_output
+        );
+
+        let (installer_ok, installer_output) = run_installer_sync_gate(temp.path());
+        assert!(
+            !installer_ok,
+            "{} installer gate unexpectedly passed:\n{}",
+            adapter_mutation.label(),
+            installer_output
+        );
+        assert!(
+            installer_output.contains("Install incomplete."),
+            "{} installer output omitted the failing-install diagnostic:\n{}",
+            adapter_mutation.label(),
+            installer_output
+        );
+        assert!(
+            installer_output.contains(expected),
+            "{} installer diagnostic omitted {}:\n{}",
+            adapter_mutation.label(),
+            expected,
             installer_output
         );
     }

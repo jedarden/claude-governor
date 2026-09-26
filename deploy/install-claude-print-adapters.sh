@@ -11,21 +11,28 @@
 # a dispatched strand died at exit 127 while `needle test-agent` still
 # reported READY.
 #
-# Beyond the --version check, this script now runs the two authoritative
+# Beyond the --version check, this script now runs the authoritative
 # verifications CLAUDE.md prescribes (claudego-b03e5c39), because
-# `needle test-agent` cannot catch either failure class:
+# `needle test-agent` cannot catch these failure classes:
 #   1. a static check that each template still unsets the rule-3 (inherited
 #      IDE env) and rule-5 (inherited API-routing env) variable sets
-#   2. a live run of each template's invoke_template verbatim with a trivial
+#   2. a static check that each template still carries the full invoke
+#      contract — the `< {prompt_file}` redirection, `--pretrust-cwd`,
+#      `--output-format stream-json`, `--no-inherit-hooks` — and still pins
+#      `timeout_secs` to its documented per-adapter value (opus 1200s, fable
+#      600s). A trivial live probe exits 0 with output through every one of
+#      these regressions; production dispatch does not survive them.
+#   3. a live run of each template's invoke_template verbatim with a trivial
 #      prompt and a poisoned scrub env, requiring exit 0 — one trivial
 #      subscription call per adapter
 # Use --skip-live to run only the static checks (offline, or conserving
 # subscription quota). The Rust twin of these checks lives in
 # src/adapter_verify.rs and runs as `cgov doctor`'s claude_print_adapters
-# check. Its rule-3/rule-5 variable lists are mirrored in bash below, and the
-# mirror is enforced, not manual: this script cross-checks the Rust constants
-# (section 4) before trusting its own lists, and a cargo-test parse of this
-# file fails on the same drift — add new variables to both copies.
+# check. Its rule-3/rule-5 variable lists, invoke flags and timeout pins are
+# mirrored in bash below, and the mirror is enforced, not manual: this script
+# cross-checks the Rust constants (section 4) before trusting its own lists,
+# and a cargo-test parse of this file fails on the same drift — add new
+# variables, flags or pins to both copies.
 
 set -euo pipefail
 
@@ -39,7 +46,7 @@ for arg in "$@"; do
     case "${arg}" in
         --skip-live) SKIP_LIVE=1 ;;
         -h|--help)
-            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -61,6 +68,19 @@ ADAPTER_DST="${HOME}/.config/needle/adapters"
 # drift cannot go silent: add new variables to BOTH lists.
 RULE3_IDE_VARS=(CLAUDECODE CLAUDE_CODE_SSE_PORT VSCODE_IPC_HOOK_CLI VSCODE_GIT_IPC_HANDLE VSCODE_GIT_ASKPASS_NODE VSCODE_GIT_ASKPASS_MAIN VSCODE_GIT_ASKPASS_EXTRA_ARGS VSCODE_INJECTION VSCODE_NONCE VSCODE_PID VSCODE_CWD)
 RULE5_API_VARS=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL)
+
+# The invoke tokens and per-adapter timeout_secs pins every template must
+# carry — the bash mirror of REQUIRED_INVOKE_FLAGS / ADAPTER_TIMEOUT_PINS in
+# src/adapter_verify.rs (the canonical copy). Same rule as the lists above:
+# the sync check in section 4 fails this install if the copies diverge, and a
+# cargo-test parse of this file fails the same drift — add new flags or pins
+# to BOTH lists. Flags are matched as literal substrings of the template; a
+# pin is `adapter-name=seconds`, exact (not a ceiling): a raised value wedges
+# a worker that much longer on a hung strand, a lowered one kills legitimate
+# strands, and NEEDLE's stuck-detection is blind during a run, so
+# timeout_secs is the only killer of a hung strand.
+REQUIRED_INVOKE_FLAGS=("< {prompt_file}" "--pretrust-cwd" "--output-format stream-json" "--no-inherit-hooks")
+ADAPTER_TIMEOUT_PINS=("claude-print-fable=600" "claude-print-opus=1200")
 
 # Cap on the live probe. A trivial prompt normally finishes in well under a
 # minute; the cap only bites on a hung dispatch, which is the failure class
@@ -197,6 +217,48 @@ bash_rule_vars() {  # bash_rule_vars <array-name> — one var per line, sorted
     printf '%s\n' "${array_ref[@]}" | sort -u
 }
 
+# ── invoke-contract sync helpers ────────────────────────────────────────────
+# REQUIRED_INVOKE_FLAGS / ADAPTER_TIMEOUT_PINS above are a bash mirror of the
+# canonical Rust constants, under the same two-gate rule as the variable
+# lists: this script fails its own install on divergence, and a cargo-test
+# parse of this file (installer_bash_flag_and_timeout_pins_match_the_rust_
+# constants) fails the same drift.
+
+rust_invoke_flags() {  # one flag per line, sorted
+    sed -n "/pub const REQUIRED_INVOKE_FLAGS:/,/^\];$/p" "${REPO_DIR}/src/adapter_verify.rs" \
+        | grep -oE '"[^"]+"' | tr -d '"' | sort -u
+}
+
+bash_invoke_flags() {  # one flag per line, sorted
+    printf '%s\n' "${REQUIRED_INVOKE_FLAGS[@]}" | sort -u
+}
+
+rust_timeout_pins() {  # one name=value pin per line, sorted
+    sed -n "/pub const ADAPTER_TIMEOUT_PINS:/,/^\];$/p" "${REPO_DIR}/src/adapter_verify.rs" \
+        | grep -oE '\("[^"]+", [0-9]+\)' | sed 's/^("\([^"]*\)", \([0-9]*\))$/\1=\2/' | sort -u
+}
+
+bash_timeout_pins() {  # one name=value pin per line, sorted
+    printf '%s\n' "${ADAPTER_TIMEOUT_PINS[@]}" | sort -u
+}
+
+check_flag_and_timeout_sync() {
+    local sync_fail=0 drift
+    drift="$(diff <(rust_invoke_flags) <(bash_invoke_flags) || true)"
+    if [ -n "${drift}" ]; then
+        echo -e "  ${RED}✗ invoke-flag drift: REQUIRED_INVOKE_FLAGS (this script) vs src/adapter_verify.rs${NC}"
+        sed 's/^/      /' <<<"${drift}"
+        sync_fail=1
+    fi
+    drift="$(diff <(rust_timeout_pins) <(bash_timeout_pins) || true)"
+    if [ -n "${drift}" ]; then
+        echo -e "  ${RED}✗ timeout-pin drift: ADAPTER_TIMEOUT_PINS (this script) vs src/adapter_verify.rs${NC}"
+        sed 's/^/      /' <<<"${drift}"
+        sync_fail=1
+    fi
+    return "${sync_fail}"
+}
+
 check_var_list_sync() {
     local rust_src="${REPO_DIR}/src/adapter_verify.rs"
     if [ ! -f "${rust_src}" ]; then
@@ -217,25 +279,34 @@ check_var_list_sync() {
     return "${sync_fail}"
 }
 
-# ── 4. Variable-list sync check (this script vs src/adapter_verify.rs) ──────
-# The scrub check below is only as good as the lists it checks against; fail
-# the install rather than verify against a set nobody else enforces.
+# ── 4. Sync check (installer arrays vs src/adapter_verify.rs) ───────────────
+# The static checks below are only as good as the lists they check against;
+# fail the install rather than verify against sets nobody else enforces.
 echo ""
-echo "Variable-list sync check (installer arrays vs src/adapter_verify.rs):"
+echo "Variable-list and invoke-contract sync check (installer arrays vs src/adapter_verify.rs):"
 sync_fail=0
 if ! check_var_list_sync; then
     sync_fail=1
 else
     echo -e "  ${GREEN}✓${NC} rule-3 (RULE3_IDE_VARS) and rule-5 (RULE5_API_VARS) match the Rust constants"
 fi
+if ! check_flag_and_timeout_sync; then
+    sync_fail=1
+else
+    echo -e "  ${GREEN}✓${NC} REQUIRED_INVOKE_FLAGS and ADAPTER_TIMEOUT_PINS match the Rust constants"
+fi
 
-# ── 5. Static scrub check (rules 3 and 5) ───────────────────────────────────
+# ── 5. Static template contract (scrub rules 3/5, invoke flags, timeout) ────
 # A template that stops unsetting the IDE env (rule 3) or the API-routing env
 # (rule 5) hangs or misroutes dispatches launched from interactive shells —
-# 46% of the fleet's dispatch volume at the time rule 3 was written down.
+# 46% of the fleet's dispatch volume at the time rule 3 was written down. A
+# template that drops an invoke flag or drifts timeout_secs off its pin is
+# the same shape of silent: the live probe in section 6 still sees exit 0
+# with output; only production dispatch breaks.
 echo ""
-echo "Scrub check (rule-3 IDE env, rule-5 API-routing env):"
+echo "Static template contract (scrub rules 3/5, invoke flags, timeout_secs pins):"
 scrub_fail=0
+contract_fail=0
 PROBE_TEMPLATES=()
 PROBE_MODELS=()
 PROBE_NAMES=()
@@ -254,7 +325,43 @@ for yaml_file in "${ADAPTER_DST}"/claude-print-*.yaml; do
         scrub_fail=1
         continue
     fi
-    echo -e "  ${GREEN}✓${NC} ${name} unsets all rule-3 and rule-5 variables"
+
+    missing_flags=""
+    for flag in "${REQUIRED_INVOKE_FLAGS[@]}"; do
+        case "${tmpl}" in
+            *"${flag}"*) ;;
+            *) missing_flags="${missing_flags}${flag}, " ;;
+        esac
+    done
+    if [ -n "${missing_flags}" ]; then
+        echo -e "  ${RED}✗ ${name}: invoke_template drops required dispatch flags: ${missing_flags%, } — a trivial live probe still exits 0 without them${NC}"
+        contract_fail=1
+        continue
+    fi
+
+    pin=""
+    for entry in "${ADAPTER_TIMEOUT_PINS[@]}"; do
+        if [ "${entry%%=*}" = "${name}" ]; then
+            pin="${entry##*=}"
+            break
+        fi
+    done
+    tmpl_secs="$(yaml_scalar "${yaml_file}" timeout_secs)"
+    if [ -z "${pin}" ]; then
+        echo -e "  ${RED}✗ ${name}: no timeout_secs pin for this adapter name — add it to ADAPTER_TIMEOUT_PINS in this script and src/adapter_verify.rs (both copies)${NC}"
+        contract_fail=1
+        continue
+    elif [ -z "${tmpl_secs}" ]; then
+        echo -e "  ${RED}✗ ${name}: omits timeout_secs — NEEDLE's stuck-detection is blind during a run, so timeout_secs is the only killer of a hung strand; the pin is ${pin}s${NC}"
+        contract_fail=1
+        continue
+    elif [ "${tmpl_secs}" != "${pin}" ]; then
+        echo -e "  ${RED}✗ ${name}: timeout_secs is ${tmpl_secs}s, pinned at ${pin}s — edit both copies to change a pin${NC}"
+        contract_fail=1
+        continue
+    fi
+
+    echo -e "  ${GREEN}✓${NC} ${name} unsets all rule-3 and rule-5 variables, carries every required invoke flag, pins timeout_secs at ${pin}s"
     PROBE_TEMPLATES+=("${tmpl}")
     PROBE_MODELS+=("${model}")
     PROBE_NAMES+=("${name}")
@@ -272,9 +379,9 @@ live_fail=0
 if [ "${SKIP_LIVE}" -eq 1 ]; then
     echo ""
     echo "Live dispatch probe: skipped (--skip-live); static checks only."
-elif [ "${scrub_fail}" -ne 0 ]; then
+elif [ "${scrub_fail}" -ne 0 ] || [ "${contract_fail}" -ne 0 ]; then
     echo ""
-    echo "Live dispatch probe: skipped — fix the scrub regressions first."
+    echo "Live dispatch probe: skipped — fix the static template regressions first."
 elif [ ${#PROBE_TEMPLATES[@]} -eq 0 ]; then
     echo ""
     echo "Live dispatch probe: skipped — no templates to probe."
@@ -328,7 +435,7 @@ else
     done
 fi
 
-if [ "${fail}" -ne 0 ] || [ "${scrub_fail}" -ne 0 ] || [ "${live_fail}" -ne 0 ] || [ "${sync_fail}" -ne 0 ]; then
+if [ "${fail}" -ne 0 ] || [ "${scrub_fail}" -ne 0 ] || [ "${contract_fail}" -ne 0 ] || [ "${live_fail}" -ne 0 ] || [ "${sync_fail}" -ne 0 ]; then
     echo -e "${RED}Install incomplete.${NC}"
     exit 1
 fi

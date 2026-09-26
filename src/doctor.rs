@@ -2041,17 +2041,24 @@ fn check_claude_print_installed() -> CheckResult {
 /// runs them.
 ///
 /// [`check_claude_print_installed`] above only proves a binary answers
-/// `--version`; dispatch runs each adapter's `invoke_template`, and both
+/// `--version`; dispatch runs each adapter's `invoke_template`, and the
 /// historically severe failure classes live there — a template naming a
 /// missing binary reports READY while every dispatch dies at exit 127
-/// (needle-adef2ccd), and a template that stops unsetting the rule-3 IDE env
-/// or the rule-5 API-routing env hangs or misroutes 46% of dispatches launched
-/// from an interactive shell. This check is `needle test-agent`'s missing
-/// counterpart: a static scrub check of both variable sets, plus (when
-/// `live_dispatch`) a trivial-prompt run of the template requiring exit 0 —
-/// one trivial subscription call per adapter.
+/// (needle-adef2ccd), a template that stops unsetting the rule-3 IDE env or
+/// the rule-5 API-routing env hangs or misroutes 46% of dispatches launched
+/// from an interactive shell, and a template that drops `--pretrust-cwd`,
+/// `--output-format stream-json`, `--no-inherit-hooks` or the prompt
+/// redirection — or drifts `timeout_secs` off its per-adapter pin — still
+/// passes a trivial live probe while breaking production dispatch. This check
+/// is `needle test-agent`'s missing counterpart: a static check of the scrub
+/// lists and the full invoke contract, plus (when `live_dispatch`) a
+/// trivial-prompt run of the template requiring exit 0 — one trivial
+/// subscription call per adapter.
 fn check_claude_print_adapters(live_dispatch: bool) -> CheckResult {
-    check_claude_print_adapters_in(&crate::adapter_verify::default_adapters_dir(), live_dispatch)
+    check_claude_print_adapters_in(
+        &crate::adapter_verify::default_adapters_dir(),
+        live_dispatch,
+    )
 }
 
 fn check_claude_print_adapters_in(dir: &std::path::Path, live_dispatch: bool) -> CheckResult {
@@ -2092,14 +2099,38 @@ fn check_claude_print_adapters_in(dir: &std::path::Path, live_dispatch: bool) ->
             continue;
         }
 
+        // The rest of the invoke contract is invisible to the live probe: a
+        // template that drops one of these flags still answers a trivial
+        // prompt with plain output and exit 0, and fails only in production
+        // dispatch. Static, so it runs even when the live probe is skipped.
+        let missing_flags =
+            crate::adapter_verify::missing_invoke_flags(&adapter.adapter.invoke_template);
+        if !missing_flags.is_empty() {
+            problems.push(format!(
+                "{}: invoke_template drops required dispatch flags: {} — a trivial \
+                 live probe still exits 0 without them",
+                adapter.adapter.name,
+                missing_flags.join(", ")
+            ));
+            continue;
+        }
+
+        if let Some(violation) = crate::adapter_verify::timeout_violation(
+            &adapter.adapter.name,
+            adapter.adapter.timeout_secs,
+        ) {
+            problems.push(format!("{}: {}", adapter.adapter.name, violation));
+            continue;
+        }
+
         if !live_dispatch {
-            verified.push(format!("{} (scrub only)", adapter.adapter.name));
+            verified.push(format!("{} (contract ok)", adapter.adapter.name));
             continue;
         }
 
         match crate::adapter_verify::live_probe(adapter) {
             Ok(duration) => verified.push(format!(
-                "{} (scrub + live exit-0 in {:.1}s)",
+                "{} (contract ok + live exit-0 in {:.1}s)",
                 adapter.adapter.name,
                 duration.as_secs_f64()
             )),
@@ -2960,15 +2991,38 @@ agents:
             .join(" ")
     }
 
-    fn write_adapter(dir: &std::path::Path, name: &str, invoke_template: &str) {
+    fn write_adapter(
+        dir: &std::path::Path,
+        name: &str,
+        timeout_secs: u64,
+        invoke_template: &str,
+    ) {
         fs::write(
             dir.join(format!("claude-print-{}.yaml", name)),
             format!(
-                "name: claude-print-{}\ninvoke_template: \"{}\"\nmodel: opus\ntimeout_secs: 60\n",
-                name, invoke_template
+                "name: claude-print-{}\ninvoke_template: \"{}\"\nmodel: opus\ntimeout_secs: {}\n",
+                name, invoke_template, timeout_secs
             ),
         )
         .unwrap();
+    }
+
+    /// An invoke line carrying every required flag except `dropped` (pass ""
+    /// to keep them all), derived from the shared constant rather than
+    /// retyped — a hand-copied flag list here is exactly the drift the sync
+    /// gates police elsewhere.
+    fn invoke_line(binary: &str, dropped: &str) -> String {
+        let flags: Vec<_> = crate::adapter_verify::REQUIRED_INVOKE_FLAGS
+            .iter()
+            .copied()
+            .filter(|flag| *flag != dropped)
+            .collect();
+        format!(
+            "cd {{workspace}} && unset {} && {} {}",
+            scrub_all(),
+            binary,
+            flags.join(" ")
+        )
     }
 
     #[test]
@@ -2978,7 +3032,10 @@ agents:
         let result = check_claude_print_adapters_in(&tmp.path().join("absent"), false);
 
         assert_eq!(result.status, CheckStatus::Warn);
-        assert!(result.remediation.unwrap().contains("install-claude-print-adapters.sh"));
+        assert!(result
+            .remediation
+            .unwrap()
+            .contains("install-claude-print-adapters.sh"));
     }
 
     #[test]
@@ -2988,6 +3045,7 @@ agents:
         write_adapter(
             tmp.path(),
             "regressed",
+            1200,
             "cd {workspace} && unset CLAUDECODE VSCODE_PID VSCODE_CWD && /bin/claude-print < {prompt_file}",
         );
 
@@ -2999,22 +3057,80 @@ agents:
     }
 
     #[test]
-    fn adapter_check_passes_scrub_only_when_live_is_skipped() {
+    fn adapter_check_passes_contract_only_when_live_is_skipped() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_adapter(
             tmp.path(),
             "opus",
-            format!(
-                "cd {{workspace}} && unset {} && /bin/claude-print < {{prompt_file}}",
-                scrub_all()
-            )
-            .as_str(),
+            1200,
+            &invoke_line("/bin/claude-print", ""),
         );
 
         let result = check_claude_print_adapters_in(tmp.path(), false);
 
         assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("scrub only"));
+        assert!(result.message.contains("contract ok"), "msg: {}", result.message);
+    }
+
+    /// The rule-4 regression shape (claudepr-fe3d3160): a template that lost
+    /// --pretrust-cwd scrubs perfectly and still answers the live probe with
+    /// exit 0 — only the static contract check can see the drop.
+    #[test]
+    fn adapter_check_fails_a_template_that_dropped_the_pretrust_flag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_adapter(
+            tmp.path(),
+            "opus",
+            1200,
+            &invoke_line("/bin/claude-print", "--pretrust-cwd"),
+        );
+
+        let result = check_claude_print_adapters_in(tmp.path(), false);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("--pretrust-cwd"),
+            "msg: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn adapter_check_fails_a_timeout_secs_that_drifted_from_its_pin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A raised pin silently lengthens how long a hung strand wedges a
+        // worker; the pin is exact, not a ceiling.
+        write_adapter(tmp.path(), "opus", 9600, &invoke_line("/bin/claude-print", ""));
+
+        let result = check_claude_print_adapters_in(tmp.path(), false);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("9600s") && result.message.contains("pinned at 1200s"),
+            "msg: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn adapter_check_fails_an_adapter_name_with_no_timeout_pin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A new adapter must be pinned explicitly, not inherit a ceiling.
+        write_adapter(
+            tmp.path(),
+            "sonnet",
+            1200,
+            &invoke_line("/bin/claude-print", ""),
+        );
+
+        let result = check_claude_print_adapters_in(tmp.path(), false);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("no timeout_secs pin"),
+            "msg: {}",
+            result.message
+        );
     }
 
     #[test]
@@ -3022,7 +3138,11 @@ agents:
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
         let stub = tmp.path().join("stub-answer.sh");
-        fs::write(&stub, "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"result\"}'\n").unwrap();
+        fs::write(
+            &stub,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"result\"}'\n",
+        )
+        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&stub).unwrap().permissions();
@@ -3031,18 +3151,18 @@ agents:
         }
         write_adapter(
             workspace.path(),
-            "stub",
-            format!(
-                "cd {{workspace}} && unset {} && {} < {{prompt_file}}",
-                scrub_all(),
-                stub.display()
-            )
-            .as_str(),
+            "opus",
+            1200,
+            &invoke_line(&stub.display().to_string(), ""),
         );
 
         let result = check_claude_print_adapters_in(workspace.path(), true);
 
         assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("live exit-0"), "msg: {}", result.message);
+        assert!(
+            result.message.contains("live exit-0"),
+            "msg: {}",
+            result.message
+        );
     }
 }

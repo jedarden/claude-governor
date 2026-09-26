@@ -46,20 +46,26 @@ binary path back out of the installed templates, links it to whichever real
 > `needle-adef2ccd`). The authoritative checks are automated in two places
 > (claudego-b03e5c39): the installer and `cgov doctor` (check
 > `claude_print_adapters`) both statically verify each template still unsets
-> the rule-3 and rule-5 variable sets, and both run the `invoke_template`
-> verbatim with a trivial prompt against a poisoned rule-3/rule-5
-> environment, requiring exit 0 with output (one trivial subscription call
-> per adapter; `--skip-live` on the installer, `cgov doctor --skip-live` on
-> the doctor, skip the static-only case). The logic lives in
-> `src/adapter_verify.rs`, mirrored in bash inside the installer; the mirror
-> is enforced by two gates, not maintained manually. The cargo test
-> `installer_bash_variable_lists_match_the_rust_constants` in
+> the rule-3 and rule-5 variable sets, still carries the full invoke contract
+> (`< {prompt_file}`, `--pretrust-cwd`, `--output-format stream-json`,
+> `--no-inherit-hooks` — claudego-fef165c5), and still pins `timeout_secs` to
+> its documented per-adapter value (opus 1200s, fable 600s — exact, not a
+> ceiling), and both run the `invoke_template` verbatim with a trivial prompt
+> against a poisoned rule-3/rule-5 environment, requiring exit 0 with output
+> (one trivial subscription call per adapter; `--skip-live` on the installer,
+> `cgov doctor --skip-live` on the doctor, skip the static-only case). The
+> logic lives in `src/adapter_verify.rs`, mirrored in bash inside the
+> installer; the mirror is enforced by two gates, not maintained manually.
+> The cargo test `installer_bash_variable_lists_match_the_rust_constants` in
 > `src/adapter_verify.rs` and installer section 4's `check_var_list_sync` in
 > `deploy/install-claude-print-adapters.sh` both compare the rule-3 pair
 > (`IDE_ENV_VARS` ↔ `RULE3_IDE_VARS`) and the rule-5 pair
 > (`API_ROUTING_ENV_VARS` ↔ `RULE5_API_VARS`) in both directions, catching
-> variables missing from either copy or extra in either copy. Add new variables
-> to **both** copies; both gates fail until you do.
+> variables missing from either copy or extra in either copy.
+> `installer_bash_flag_and_timeout_pins_match_the_rust_constants` and the
+> installer's `check_flag_and_timeout_sync` do the same for
+> `REQUIRED_INVOKE_FLAGS` and `ADAPTER_TIMEOUT_PINS`. Add new variables, flags
+> and pins to **both** copies; both gates fail until you do.
 
 Three rules make these work under NEEDLE dispatch (all learned the hard way):
 
