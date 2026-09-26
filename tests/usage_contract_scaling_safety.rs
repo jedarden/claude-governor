@@ -31,6 +31,17 @@
 //!   headroom. The defense under test: a window with no parseable reset
 //!   timestamp is data-absent, and data-absent windows cannot bind the
 //!   scaling decision.
+//! - **The stale-timestamped 200** (claudego-c6fed548) sits between the two:
+//!   the poll SUCCEEDS, so the reading replaces the last good one, and the
+//!   windows ARE data-present — their timestamps parse, so they enter
+//!   binding candidacy — but every timestamp is already in the past, so
+//!   each window's effective hours clamp to 0.0 (a past reset is not
+//!   negative time). The defenses under test: zero remaining hours can
+//!   neither authorize a size (`safe_worker_count` requires hours > 0, and
+//!   `None` holds at the current total) nor manufacture cutoff risk
+//!   (`cutoff_risk` needs exhaustion BEFORE the reset, and nothing exhausts
+//!   before an instant that has already passed), so a converged fleet must
+//!   hold.
 //!
 //! On top of the failure classes, one **fixture-driven off-peak scenario**
 //! closes the seam this suite's failure scenarios sit next to: the raw
@@ -659,6 +670,109 @@ fn empty_usage_response_is_data_absent_and_cannot_move_a_converged_fleet() {
     assert!(
         !cycle.state.token_refresh_failing,
         "a parseable 200 is not a token failure"
+    );
+}
+
+/// The stale-timestamped 200: every window present with parseable — but
+/// already past — `resets_at`. This is the failure class neither half of the
+/// suite pinned before: the poll succeeds (so, like `{}`, the reading
+/// REPLACES the good one in state rather than being retained), yet unlike
+/// `{}` the windows are data-present and therefore binding-eligible. The
+/// utilization figures deliberately differ from the converged good reading
+/// so the replacement is observable, and the fleet must still not move: no
+/// growth off clamped-to-zero hours, no shed either, no emergency brake
+/// (55-70% is nowhere near the 98% brake threshold, and stale data must not
+/// manufacture one).
+#[test]
+fn stale_timestamped_poll_cannot_move_a_converged_fleet() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = TempDir::new().unwrap();
+    let fleet = FakeFleet::spawn(&dir, 2);
+    let creds = write_credentials(&dir);
+    let mut server = mockito::Server::new();
+    let server_url = server.url();
+
+    let agents = agent_map();
+    let config = pricing_config(&agents);
+    let mut now = Utc::now();
+
+    let mut poller =
+        poller_with_endpoints(&creds, &server_url, &format!("{server_url}/v1/oauth/token"));
+    converge_onto_good_data(&mut server, &mut poller, &dir, &agents, &config, &mut now);
+    let fleet_at_convergence = fleet.live_sessions();
+    assert!(
+        fleet_at_convergence > 0,
+        "harness bug: the fleet must hold workers for the no-movement assertion to mean anything"
+    );
+
+    // A lagged/cached API layer hands back a well-formed response whose
+    // reset timestamps are all an hour old: the windows read as if their
+    // periods already ended. Utilizations differ from the good reading so
+    // the state assertion below can tell replacement from retention.
+    let past = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+    let stale_body = format!(
+        r#"{{"five_hour": {{"utilization": 70.0, "resets_at": "{past}"}},
+            "seven_day": {{"utilization": 50.0, "resets_at": "{past}"}},
+            "limits": [{{"kind": "weekly_scoped", "percent": 65, "resets_at": "{past}",
+                         "scope": {{"model": {{"id": "claude-fable-5", "display_name": "Fable"}}}},
+                         "is_active": true}}]}}"#
+    );
+    let mock = mock_usage_once(&mut server, &stale_body);
+    let cycle = drive_cycle(&mut poller, &dir, &agents, &config, now);
+    mock.assert();
+
+    // The poll succeeded, so the stale reading replaced the good one — this
+    // class cannot be caught by the retain-the-last-good-reading defense,
+    // which is exactly why the forecast defenses matter.
+    assert_eq!(
+        cycle.state.usage.five_hour_pct, 70.0,
+        "a parseable 200 replaces the good reading even when its timestamps are stale"
+    );
+    assert!(
+        !cycle.state.usage.stale,
+        "a parseable 200 must not be misflagged as stale"
+    );
+    assert!(
+        !cycle.state.token_refresh_failing,
+        "a parseable 200 is not a token failure"
+    );
+
+    // The fleet holds: no growth, no shed, no brake.
+    assert!(
+        matches!(cycle.decision, ScalingDecision::NoChange),
+        "a stale-timestamped reading must not move a converged fleet; got {:?}",
+        cycle.decision
+    );
+    assert_eq!(
+        fleet.live_sessions(),
+        fleet_at_convergence,
+        "no launch or kill may be executed off a stale-timestamped reading"
+    );
+
+    // The mechanism, not just the outcome: the stale windows are
+    // data-present, so one of them DOES bind — but it binds with zero
+    // remaining hours, which authorizes no size and asserts no cutoff risk.
+    let binding = cycle.state.capacity_forecast.binding_window.clone();
+    assert!(
+        matches!(binding.as_str(), "five_hour" | "seven_day" | "weekly_scoped"),
+        "data-present windows must enter binding candidacy; got {binding:?}"
+    );
+    let forecast = match binding.as_str() {
+        "five_hour" => &cycle.state.capacity_forecast.five_hour,
+        "seven_day" => &cycle.state.capacity_forecast.seven_day,
+        _ => &cycle.state.capacity_forecast.weekly_scoped,
+    };
+    assert_eq!(
+        forecast.hours_remaining, 0.0,
+        "a past resets_at must clamp to zero remaining hours, not negative time"
+    );
+    assert_eq!(
+        forecast.safe_worker_count, None,
+        "zero remaining hours must authorize no worker count"
+    );
+    assert!(
+        !forecast.cutoff_risk,
+        "nothing exhausts before a reset that already happened — no cutoff risk off stale data"
     );
 }
 
