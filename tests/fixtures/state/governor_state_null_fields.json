@@ -1,0 +1,222 @@
+{
+  "updated_at": "2026-09-26T04:00:00Z",
+  "usage": {
+    "weekly_scoped_pct": 79.0,
+    "sonnet_pct": 72.4,
+    "all_models_pct": 81.2,
+    "five_hour_pct": 14.3,
+    "sonnet_resets_at": "2026-09-26T03:00:00Z",
+    "seven_day_resets_at": "2026-09-26T03:00:00Z",
+    "five_hour_resets_at": "2026-09-26T01:30:00Z",
+    "stale": false,
+    "weekly_scoped_model": "Fable"
+  },
+  "last_fleet_aggregate": {
+    "t0": "2026-09-26T03:55:00Z",
+    "t1": "2026-09-26T04:00:00Z",
+    "sonnet_workers": 3,
+    "sonnet_usd_total": 0.4102,
+    "sonnet_p75_usd_hr": 2.981,
+    "sonnet_std_usd_hr": 0.402,
+    "window_pct_deltas": {
+      "five_hour": 0.4,
+      "seven_day": 0.3,
+      "weekly_scoped": 0.5
+    },
+    "fleet_cache_eff": 0.0,
+    "cache_eff_p25": 0.0,
+    "cli_tokens": 131000,
+    "cli_cost": 0.31,
+    "sdk_tokens": 42000,
+    "sdk_cost": 0.05
+  },
+  "capacity_forecast": {
+    "five_hour": {
+      "target_ceiling": 85.0,
+      "current_utilization": 14.3,
+      "remaining_pct": 70.7,
+      "hours_remaining": 1.5,
+      "fleet_pct_per_hour": 7.92,
+      "exogenous_pct_per_hour": 0.2,
+      "predicted_exhaustion_hours": null,
+      "cutoff_risk": false,
+      "margin_hrs": null,
+      "binding": false,
+      "safe_worker_count": 4,
+      "safe_worker_count_p75": 3,
+      "exh_hrs_p25": null,
+      "exh_hrs_p50": null,
+      "exh_hrs_p75": null,
+      "cone_ratio": 1.35,
+      "risk_score": null,
+      "pace_target_pct": 12.1,
+      "pace_delta_pct": 2.2,
+      "hard_limit_remaining_pct": 85.7,
+      "hard_limit_margin_hrs": null,
+      "estimate_quality": "Calibrated"
+    },
+    "seven_day": {
+      "target_ceiling": 90.0,
+      "current_utilization": 81.2,
+      "remaining_pct": 8.8,
+      "hours_remaining": 37.5,
+      "fleet_pct_per_hour": 6.48,
+      "exogenous_pct_per_hour": 0.1,
+      "predicted_exhaustion_hours": null,
+      "cutoff_risk": true,
+      "margin_hrs": null,
+      "binding": false,
+      "safe_worker_count": 1,
+      "safe_worker_count_p75": 1,
+      "exh_hrs_p25": null,
+      "exh_hrs_p50": null,
+      "exh_hrs_p75": null,
+      "cone_ratio": null,
+      "risk_score": null,
+      "pace_target_pct": 45.0,
+      "pace_delta_pct": -36.2,
+      "hard_limit_remaining_pct": 18.8,
+      "hard_limit_margin_hrs": null,
+      "estimate_quality": "Calibrated"
+    },
+    "weekly_scoped": {
+      "target_ceiling": 90.0,
+      "current_utilization": 79.0,
+      "remaining_pct": 11.0,
+      "hours_remaining": 37.5,
+      "fleet_pct_per_hour": 9.0,
+      "exogenous_pct_per_hour": 0.1,
+      "predicted_exhaustion_hours": null,
+      "cutoff_risk": true,
+      "margin_hrs": null,
+      "binding": true,
+      "safe_worker_count": 2,
+      "safe_worker_count_p75": 2,
+      "exh_hrs_p25": null,
+      "exh_hrs_p50": null,
+      "exh_hrs_p75": null,
+      "cone_ratio": 1.1,
+      "risk_score": null,
+      "pace_target_pct": 45.0,
+      "pace_delta_pct": -34.0,
+      "hard_limit_remaining_pct": 21.0,
+      "hard_limit_margin_hrs": null,
+      "estimate_quality": "Calibrated"
+    },
+    "binding_window": "weekly_scoped",
+    "dollars_per_pct_7d_s": 1.648,
+    "estimated_remaining_dollars": 46.1
+  },
+  "schedule": {
+    "is_peak_hour": false,
+    "is_promo_active": true,
+    "promo_multiplier_five_hour": 2.0,
+    "promo_multiplier_seven_day": 1.0,
+    "promo_multiplier_weekly_scoped": 1.0,
+    "promo_multiplier": 2.0,
+    "effective_hours_remaining_five_hour": 3.0,
+    "effective_hours_remaining_seven_day": 37.5,
+    "effective_hours_remaining_weekly_scoped": 37.5,
+    "effective_hours_remaining": 37.5,
+    "raw_hours_remaining": 37.5
+  },
+  "workers": {
+    "claude-anthropic-sonnet": {
+      "current": 3,
+      "target": 3,
+      "min": 0,
+      "max": 5
+    }
+  },
+  "burn_rate": {
+    "by_model": {
+      "claude-sonnet-4-20250514": {
+        "pct_per_worker_per_hour": 1.35,
+        "dollars_per_worker_per_hour": 5.54,
+        "samples": 214
+      },
+      "claude-fable-5": {
+        "pct_per_worker_per_hour": 3.8,
+        "dollars_per_worker_per_hour": 9.21,
+        "samples": 36
+      }
+    },
+    "tokens_per_pct_peak": 69780,
+    "tokens_per_pct_offpeak": 141350,
+    "offpeak_ratio_observed": 2.03,
+    "offpeak_ratio_expected": 2.0,
+    "promotion_validated": true,
+    "promotion_peak_samples": 12,
+    "promotion_offpeak_samples": 9,
+    "last_sample_at": "2026-09-26T03:45:00Z",
+    "calibration": {
+      "predictions_scored": 96,
+      "median_error_7ds": -3.2,
+      "auto_tuned_alpha": 0.22,
+      "auto_tuned_hysteresis": 1.0,
+      "last_tuned_at": "2026-09-26T03:00:00Z"
+    },
+    "fleet_pct_hr_ema": {
+      "five_hour": 6.9,
+      "seven_day": 1.84,
+      "weekly_scoped": 2.41
+    },
+    "usd_per_pct_ema_five_hour": 0.71,
+    "usd_per_pct_ema_seven_day": 0.84,
+    "usd_per_pct_ema_weekly_scoped": 0.62,
+    "fleet_pct_ema_samples": 118,
+    "fleet_ema_idle_paused": false,
+    "prev_usage_snapshot": {
+      "taken_at": "2026-09-26T03:55:00Z",
+      "five_hour_pct": 13.9,
+      "seven_day_pct": 80.9,
+      "weekly_scoped_pct": 78.5
+    }
+  },
+  "alerts": [
+    {
+      "type": "cutoff_risk",
+      "window": "weekly_scoped",
+      "message": "Binding window at risk of exceeding target"
+    }
+  ],
+  "safe_mode": {
+    "active": false,
+    "entered_at": null,
+    "trigger": null,
+    "median_error_at_entry": null,
+    "predictions_since_entry": 0,
+    "scored_at_entry": 0
+  },
+  "alert_cooldown": {
+    "last_fired": {
+      "cutoff_imminent": "2026-09-26T02:00:00Z"
+    }
+  },
+  "open_alert_beads": {},
+  "token_refresh_failing": false,
+  "low_cache_eff_consecutive": 0,
+  "alert_fp_telemetry": {
+    "outcomes": {
+      "cutoff_imminent": [true, false, true]
+    },
+    "window_size": 100,
+    "total_recorded": 3,
+    "total_false_positives": 1
+  },
+  "pending_predictions": {
+    "seven_day": {
+      "prediction_time": "2026-09-26T03:00:00Z",
+      "predicted_final_pct": 84.5,
+      "starting_pct": 80.9
+    }
+  },
+  "previous_api_snapshot": null,
+  "current_api_snapshot": null,
+  "p5h_delta": null,
+  "p7d_delta": null,
+  "p7ds_delta": null,
+  "baseline_burn_rates": {},
+  "consecutive_absent_polls": {},
+  "manual_override": null
+}
