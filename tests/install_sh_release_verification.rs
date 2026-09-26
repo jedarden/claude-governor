@@ -10,8 +10,10 @@
 //!
 //! * happy path (latest release, published sidecar) installs a mode-0755
 //!   binary whose bytes equal the artifact and which actually runs;
-//! * a tampered sidecar → refusal, and the install dir is never created;
-//! * a wrong `CGOV_SHA256` → abort, and the install dir is never created;
+//! * a tampered sidecar → refusal: an existing install is preserved
+//!   byte-for-byte, and on a fresh host the install dir is never even
+//!   created (claudego-8bb2b383);
+//! * a wrong `CGOV_SHA256` → abort, nothing written to the install dir;
 //! * a matching `CGOV_SHA256` → installs without fetching any sidecar;
 //! * a malformed digest pin → rejected before any download;
 //! * `CGOV_VERSION=0.1.1` downloads from the `v0.1.1` tag URL;
@@ -20,7 +22,11 @@
 //!   (claudego-8bf03a00);
 //! * network failures — an unreachable release server, a 500 on the artifact,
 //!   a 500 on the sidecar — → refusal with nothing written (claudego-8bf03a00;
-//!   the 404 shapes are covered alongside the sidecar cases below).
+//!   the 404 shapes are covered alongside the sidecar cases below);
+//! * a missing sidecar (404) → refusal with the same fresh-host atomicity:
+//!   the sidecar fetch fails before the verification gate that guards
+//!   `mkdir -p`, so the install dir never comes into existence
+//!   (claudego-8bb2b383).
 //!
 //! The script is embedded with `include_str!` at compile time, following the
 //! repo's gate pattern (tests/adapter_var_sync.rs): the tested text cannot
@@ -48,16 +54,28 @@ const INSTALL_SH: &str = include_str!("../install.sh");
 /// must be Linux (the script refuses anything else) and the arch maps exactly
 /// the way the script's own case statement maps it.
 fn release_artifact_name() -> String {
-    let os = String::from_utf8_lossy(&Command::new("uname").arg("-s").output().expect("uname -s").stdout)
-        .trim()
-        .to_string();
+    let os = String::from_utf8_lossy(
+        &Command::new("uname")
+            .arg("-s")
+            .output()
+            .expect("uname -s")
+            .stdout,
+    )
+    .trim()
+    .to_string();
     assert!(
         os.starts_with("Linux"),
         "install.sh only installs on Linux; this host reports {os}"
     );
-    let arch = String::from_utf8_lossy(&Command::new("uname").arg("-m").output().expect("uname -m").stdout)
-        .trim()
-        .to_string();
+    let arch = String::from_utf8_lossy(
+        &Command::new("uname")
+            .arg("-m")
+            .output()
+            .expect("uname -m")
+            .stdout,
+    )
+    .trim()
+    .to_string();
     match arch.as_str() {
         "x86_64" | "amd64" => "cgov-linux-amd64".to_string(),
         "aarch64" | "arm64" => "cgov-linux-arm64".to_string(),
@@ -191,7 +209,9 @@ fn run_installer(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    let out = cmd.output().expect("spawn bash on the sandboxed install.sh");
+    let out = cmd
+        .output()
+        .expect("spawn bash on the sandboxed install.sh");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text)
@@ -359,6 +379,44 @@ fn tampered_sidecar_refuses_and_writes_nothing() {
 }
 
 #[test]
+fn tampered_sidecar_never_creates_a_fresh_install_dir() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+
+    let mut server = mockito::Server::new();
+    let (artifact_mock, sidecar_mock) = serve_release(
+        &mut server,
+        "/releases/latest/download",
+        &artifact,
+        &bytes,
+        Some(sidecar_bytes(&sha256_hex(b"tampered payload"), &artifact)),
+    );
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = fresh_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a tampered sidecar must fail the install:\n{out}");
+    assert!(
+        out.contains("Checksum verification FAILED"),
+        "refusal must name the checksum failure:\n{out}"
+    );
+    // The preserve-existing twin above proves a failed verification leaves a
+    // live installation untouched; this proves the same gate on a virgin
+    // host. `mkdir -p` lives *after* verification in install.sh, so a
+    // checksum failure must not even bring the install dir into existence
+    // (claudego-8bb2b383).
+    assert!(
+        !install_dir.exists(),
+        "failed verification on a fresh install must not create the install dir"
+    );
+    // Both downloads happened exactly once — the refusal came after real
+    // verification of real bytes, not from a short-circuit before them.
+    artifact_mock.assert();
+    assert_hit_once(sidecar_mock);
+}
+
+#[test]
 fn wrong_pinned_digest_aborts_before_any_write() {
     let sandbox = TempDir::new().expect("sandbox");
     let artifact = release_artifact_name();
@@ -375,7 +433,10 @@ fn wrong_pinned_digest_aborts_before_any_write() {
         None,
     );
     let unused_sidecar = server
-        .mock("GET", format!("/releases/download/v0.1.1/{artifact}.sha256").as_str())
+        .mock(
+            "GET",
+            format!("/releases/download/v0.1.1/{artifact}.sha256").as_str(),
+        )
         .with_status(404)
         .expect(0) // assert() below enforces: never fetched
         .create();
@@ -416,7 +477,10 @@ fn matching_pinned_digest_installs_without_sidecar() {
         None,
     );
     let unused_sidecar = server
-        .mock("GET", format!("/releases/download/v0.1.1/{artifact}.sha256").as_str())
+        .mock(
+            "GET",
+            format!("/releases/download/v0.1.1/{artifact}.sha256").as_str(),
+        )
         .with_status(404)
         .expect(0) // assert() below enforces: never fetched
         .create();
@@ -449,7 +513,10 @@ fn malformed_digest_pin_is_rejected_before_any_download() {
     // The validation must run before any download: publish the artifact with
     // an expected-hit count of zero, so assert() fails if it was fetched.
     let artifact_mock = server
-        .mock("GET", format!("/releases/download/v0.1.1/{artifact}").as_str())
+        .mock(
+            "GET",
+            format!("/releases/download/v0.1.1/{artifact}").as_str(),
+        )
         .with_status(200)
         .with_body(bytes.clone())
         .expect(0)
@@ -510,13 +577,61 @@ fn missing_sidecar_refuses_and_preserves_existing_install() {
 }
 
 #[test]
+fn missing_sidecar_never_creates_a_fresh_install_dir() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+
+    let mut server = mockito::Server::new();
+    let artifact_mock = server
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}").as_str(),
+        )
+        .with_status(200)
+        .with_body(bytes)
+        .expect(1)
+        .create();
+    let sidecar_mock = server
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}.sha256").as_str(),
+        )
+        .with_status(404)
+        .expect(1)
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = fresh_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a missing sidecar must fail the install:\n{out}");
+    assert!(
+        out.contains("Digest sidecar download failed"),
+        "refusal must identify the missing sidecar:\n{out}"
+    );
+    // The sidecar *fetch* failure path must be exactly as pre-installational
+    // as the checksum-failure one: it exits before `mkdir -p`, so a host that
+    // has never installed must end the run with no install dir at all — no
+    // empty directory, no partial state (claudego-8bb2b383).
+    assert!(
+        !install_dir.exists(),
+        "a missing sidecar on a fresh install must not create the install dir"
+    );
+    artifact_mock.assert();
+    sidecar_mock.assert();
+}
+
+#[test]
 fn failed_artifact_download_refuses_and_preserves_existing_install() {
     let sandbox = TempDir::new().expect("sandbox");
     let artifact = release_artifact_name();
 
     let mut server = mockito::Server::new();
     let artifact_mock = server
-        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}").as_str(),
+        )
         .with_status(404)
         .expect(1)
         .create();
@@ -595,7 +710,10 @@ fn sidecar_for_a_different_artifact_refuses_and_preserves_existing_install() {
     let script = materialize_installer(sandbox.path(), &server.url());
     let install_dir = existing_install_dir(&sandbox);
     let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
-    assert!(!ok, "a sidecar for another artifact must fail the install:\n{out}");
+    assert!(
+        !ok,
+        "a sidecar for another artifact must fail the install:\n{out}"
+    );
     assert!(
         out.contains("Checksum verification FAILED"),
         "refusal must name the checksum failure:\n{out}"
@@ -644,7 +762,10 @@ fn server_error_on_artifact_download_refuses_and_preserves_existing_install() {
     let mut server = mockito::Server::new();
     // 500 on the artifact itself — curl -f treats it like any non-2xx.
     let artifact_mock = server
-        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}").as_str(),
+        )
         .with_status(500)
         .expect(1)
         .create();
@@ -675,7 +796,10 @@ fn server_error_on_sidecar_download_refuses_and_preserves_existing_install() {
     // run on the sidecar fetch alone — never install "while we have the
     // bytes".
     let artifact_mock = server
-        .mock("GET", format!("/releases/latest/download/{artifact}").as_str())
+        .mock(
+            "GET",
+            format!("/releases/latest/download/{artifact}").as_str(),
+        )
         .with_status(200)
         .with_body(bytes)
         .expect(1)
