@@ -55,10 +55,10 @@ impl PinnedContract {
     /// exclusion set below is `DEFAULT_EXCLUDE_LABELS` in NEEDLE
     /// `src/strand/pluck.rs` at this version).
     ///
-    /// 0.6.14 → 0.6.16 (claudego-fddf5c3f, 2026-09-26): re-verified from the
-    /// deployed binary's exact release commit (3eaf0e83, the v0.6.16 bump) —
+    /// 0.6.16 → 0.6.17 (claudego-13dc4929, 2026-09-26): re-verified from the
+    /// deployed binary's exact release commit (13d0e2e, the v0.6.17 bump) —
     /// `DEFAULT_EXCLUDE_LABELS` is still the same five labels.
-    const NEEDLE: &'static str = "0.6.16";
+    const NEEDLE: &'static str = "0.6.17";
 
     /// `bead --version` this contract was verified against (store layout,
     /// JSONL shapes, dep/readiness semantics).
@@ -66,16 +66,15 @@ impl PinnedContract {
 
     /// The built-in exclusion set PluckStrand substitutes when the configured
     /// `exclude_labels` is empty or omitted — this deployment's live case
-    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.16
+    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.17
     /// `DEFAULT_EXCLUDE_LABELS`, `src/strand/pluck.rs`. A non-empty
     /// configured list *replaces* this set rather than merging with it.
     ///
     /// Needle nuance (documented, not CLI-observable from here): if the whole
     /// `strands.pluck` section is absent, `PluckConfig::default()` supplies
     /// only the first four — without `alert`.
-    const DEFAULT_EXCLUDE_LABELS: &[&str] = &[
-        "deferred", "human", "blocked", "escalation", "alert",
-    ];
+    const DEFAULT_EXCLUDE_LABELS: &[&str] =
+        &["deferred", "human", "blocked", "escalation", "alert"];
 }
 
 /// Workspace identity planted before the first `bead` call — the fresh-clone
@@ -192,8 +191,9 @@ fn ready_ids_from_jsonl(output: &str) -> Vec<String> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let bead: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("list --json stdout must be pure JSONL, got {line:?}: {e}"));
+            let bead: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("list --json stdout must be pure JSONL, got {line:?}: {e}")
+            });
             bead["id"]
                 .as_str()
                 .expect("every listed bead carries an id")
@@ -298,10 +298,7 @@ fn list_json_stdout_is_pure_jsonl_and_limit_is_honored() {
     let _b = ws.create("jsonl contract b", &[]);
     let _c = ws.create("jsonl contract c", &[]);
 
-    let output = run_bead(
-        &ws.path,
-        &["list", "--ready", "--json", "--limit", "2"],
-    );
+    let output = run_bead(&ws.path, &["list", "--ready", "--json", "--limit", "2"]);
 
     // Exactly `--limit` objects, one per line — never a top-level array.
     // (verify-pluck-config.sh pipes the first line through `jq -e 'type ==
@@ -317,15 +314,19 @@ fn list_json_stdout_is_pure_jsonl_and_limit_is_honored() {
         "--limit 2 must yield exactly two JSONL lines, got {lines:?}"
     );
     for line in &lines {
-        let bead: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("each list line must be one JSON object, got {line:?}: {e}"));
+        let bead: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!("each list line must be one JSON object, got {line:?}: {e}")
+        });
         assert!(
             bead.is_object(),
             "list --json emits JSONL objects, not array elements: {line:?}"
         );
 
         // The fields Pluck's adapter reads on every candidate.
-        assert!(bead["id"].is_string(), "listed bead must carry id: {line:?}");
+        assert!(
+            bead["id"].is_string(),
+            "listed bead must carry id: {line:?}"
+        );
         assert!(
             bead["status"].is_string(),
             "listed bead must carry status: {line:?}"
@@ -432,9 +433,7 @@ fn the_default_exclusion_label_set_is_pinned() {
     // under this deployment's `exclude_labels: []`.
     let mut pinned: Vec<&str> = PinnedContract::DEFAULT_EXCLUDE_LABELS.to_vec();
     pinned.sort_unstable();
-    let mut expected = vec![
-        "alert", "blocked", "deferred", "escalation", "human",
-    ];
+    let mut expected = vec!["alert", "blocked", "deferred", "escalation", "human"];
     expected.sort_unstable();
     assert_eq!(
         pinned, expected,
@@ -462,8 +461,14 @@ fn exclusion_labels_round_trip_byte_exact_through_the_ready_jsonl() {
     // "exact, case-sensitive ... no globs, `%`, regular expressions, or
     // prefix matching"), and all dangerous to normalize away.
     let variants = [
-        "Deferred", "HUMAN", "Blocked", "Escalation", "Alert", //
-        "defer*", "human?", "aler.*",
+        "Deferred",
+        "HUMAN",
+        "Blocked",
+        "Escalation",
+        "Alert", //
+        "defer*",
+        "human?",
+        "aler.*",
     ];
     let id = ws.create("label-case contract bead", &variants);
 

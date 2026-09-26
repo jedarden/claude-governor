@@ -1,7 +1,7 @@
 # Pluck Query Results
 
 **Status:** current `bead-rs` result reference with historical SQL notes
-**Verified:** 2026-09-26 (contract re-checked against needle 0.6.16 / bead 0.2.6; pinned by `tests/bead_rs_contract_test.rs`; previously 2026-09-25 at needle 0.6.14)
+**Verified:** 2026-09-26 (contract re-checked against needle 0.6.17 / bead 0.2.6; pinned by `tests/bead_rs_contract_test.rs`; previously 2026-09-26 at needle 0.6.16)
 **Scope:** NEEDLE Pluck in this workspace
 
 > For the current NEEDLE/`bead-rs` implementation, use
@@ -58,7 +58,7 @@ defensively removes an `in_progress` record or an assigned `open` record if a
 backend ever returns one. The configured `exclude_labels` list for this
 deployment is empty, so the effective exclusion set is NEEDLE's built-in
 default — `deferred`, `human`, `blocked`, `escalation`, `alert` as of needle
-0.6.16; matching is exact and case-sensitive. See
+0.6.17; matching is exact and case-sensitive. See
 [`docs/plan/pluck-configuration.md`](plan/pluck-configuration.md)
 for the complete filter pipeline and ordering behavior, and run
 `scripts/verify-pluck-config.sh` for the live snapshot.

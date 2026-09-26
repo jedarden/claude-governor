@@ -8,7 +8,7 @@ The current workspace uses NEEDLE Pluck with the `bead-rs` backend.
 
 Verified 2026-09-25 against `/home/coding/.config/needle/config.yaml` and
 needle 0.6.14; the built-in default set below was re-verified unchanged at
-needle 0.6.16 (2026-09-26, pinned by `tests/bead_rs_contract_test.rs`):
+needle 0.6.17 (2026-09-26, pinned by `tests/bead_rs_contract_test.rs`):
 
 ```yaml
 workspace:
@@ -25,7 +25,7 @@ strands:
 `exclude_labels` entries are exact, case-sensitive strings. They do not support
 globs, `%`, regular expressions, or prefix matching. An omitted or empty list
 makes PluckStrand substitute NEEDLE's built-in default set — `deferred`,
-`human`, `blocked`, `escalation`, `alert` as of needle 0.6.16; a non-empty
+`human`, `blocked`, `escalation`, `alert` as of needle 0.6.17; a non-empty
 list replaces that default set, so repeat the defaults when adding a custom
 label. This deployment's effective exclusion set is therefore the five
 defaults, not any explicitly configured list.
