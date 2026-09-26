@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
-use ureq::Agent;
+use ureq::{Agent, AgentBuilder};
 
 /// Anthropic OAuth credentials file location
 const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
@@ -26,6 +26,17 @@ const REFRESH_RETRY_DELAY_SECS: u64 = 5;
 
 /// Maximum consecutive refresh failures before escalation
 const MAX_REFRESH_FAILURES: u32 = 3;
+
+/// Overall per-request timeout (connect + request + response read).
+///
+/// ureq does not time out response reads by default — a server that accepts
+/// the connection but never answers would block `poll()` forever, and with it
+/// the governor's whole observe cycle. These endpoints answer with a few
+/// hundred bytes of JSON, so 30 seconds (ureq's own connect default) bounds
+/// the hang without ever firing on a healthy response. A timed-out request
+/// surfaces as `ApiRequestFailed` and flows into the same failure classes as
+/// any other transport failure (tests/usage_contract_scaling_safety.rs).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// API endpoints
 const API_BASE: &str = "https://api.anthropic.com";
@@ -326,6 +337,11 @@ impl UsageData {
 /// Consecutive refresh failure counter
 static mut REFRESH_FAILURE_COUNT: u32 = 0;
 
+/// Build the ureq agent with the given overall request timeout.
+fn build_agent(timeout: std::time::Duration) -> Agent {
+    AgentBuilder::new().timeout(timeout).build()
+}
+
 /// Usage Poller
 pub struct Poller {
     credentials_path: PathBuf,
@@ -341,6 +357,10 @@ pub struct Poller {
     /// [`REFRESH_RETRY_DELAY_SECS`]; contract tests set zero so retry paths
     /// don't sleep.
     refresh_retry_delay: std::time::Duration,
+    /// Overall per-request timeout. Defaults to [`REQUEST_TIMEOUT_SECS`];
+    /// contract tests shorten it so hung-endpoint scenarios fail fast instead
+    /// of waiting out the production bound.
+    request_timeout: std::time::Duration,
 }
 
 impl Poller {
@@ -375,8 +395,9 @@ impl Poller {
             home_dir.join(CREDENTIALS_PATH)
         };
 
-        // Build ureq agent with rustls TLS
-        let agent = Agent::new();
+        // Build ureq agent with rustls TLS, bounded by the overall request
+        // timeout (ureq does not time out response reads on its own).
+        let agent = build_agent(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS));
 
         Ok(Self {
             credentials_path,
@@ -385,6 +406,7 @@ impl Poller {
             api_base: API_BASE.to_string(),
             token_endpoint: TOKEN_ENDPOINT.to_string(),
             refresh_retry_delay: std::time::Duration::from_secs(REFRESH_RETRY_DELAY_SECS),
+            request_timeout: std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -416,6 +438,17 @@ impl Poller {
     /// set zero so retry paths complete without sleeping.
     pub fn with_refresh_retry_delay(mut self, delay: std::time::Duration) -> Self {
         self.refresh_retry_delay = delay;
+        self
+    }
+
+    /// Override the overall per-request timeout (see [`REQUEST_TIMEOUT_SECS`]).
+    ///
+    /// The agent is rebuilt because ureq bakes the timeout in at build time.
+    /// Contract tests shorten this so hung-endpoint scenarios fail in
+    /// milliseconds instead of the production 30 seconds.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self.agent = build_agent(timeout);
         self
     }
 

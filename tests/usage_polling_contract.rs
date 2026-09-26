@@ -53,6 +53,20 @@
 //!   caller even when a cached reading exists — only the auth path degrades
 //!   to stale data.
 //!
+//! Timeout coverage (claudego-0840eab5), the one failure class transport
+//! errors cannot represent — the endpoint that accepts the connection and
+//! never answers. ureq does not time out response reads on its own, so before
+//! the request timeout these scenarios blocked `poll()` — and with it the
+//! governor's whole observe cycle — forever:
+//!
+//! - A hung usage endpoint surfaces as `ApiRequestFailed` within the
+//!   configured request timeout instead of blocking.
+//! - A hung token-refresh endpoint burns both retry attempts within the
+//!   timeout and then degrades to the cached reading (stale fallback), like
+//!   any other refresh failure.
+//! - A response that is merely slow but inside the timeout still succeeds,
+//!   so the bound cannot silently tighten below real-world latency.
+//!
 //! A local mockito server stands in for the two endpoints;
 //! [`Poller::with_endpoints`] / [`Poller::with_refresh_retry_delay`] point the
 //! poller at it. All tests serialize on one lock because the refresh-failure
@@ -163,6 +177,44 @@ fn dead_endpoint_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A localhost URL whose listener is bound and held but never answered: the
+/// kernel completes the TCP handshake into the accept backlog, the client
+/// writes its request, and no response ever comes — a deterministic black
+/// hole. Distinct from [`dead_endpoint_url`] (connection refused): this is
+/// the hang the request timeout exists to bound, and without it a poll
+/// against this URL blocks forever. The listener is returned so the caller
+/// keeps the port open for the test's duration; dropping it would turn the
+/// hang back into a refusal.
+fn hung_endpoint() -> (String, std::net::TcpListener) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    (format!("http://127.0.0.1:{port}"), listener)
+}
+
+/// A one-shot HTTP endpoint that answers with a valid 200 carrying `body`,
+/// but only after `delay` (mockito 1.x cannot delay responses). Complement
+/// to [`hung_endpoint`]: pins that a merely slow response inside the request
+/// timeout is still a normal success. The serving thread owns the listener,
+/// so the URL is all the caller needs.
+fn slow_endpoint(delay: Duration, body: String) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let (mut stream, _) = listener.accept().expect("accept the one connection");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf); // the request head; contents irrelevant
+        std::thread::sleep(delay);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).ok();
+    });
     format!("http://127.0.0.1:{port}")
 }
 
@@ -1516,4 +1568,134 @@ fn usage_endpoint_failure_does_not_fall_back_to_stale_data() {
     let msg = err.to_string();
     assert!(msg.contains("429"), "error must surface the status: {msg}");
     usage_limited.assert();
+}
+
+// ---------------------------------------------------------------------------
+// Timeouts (claudego-0840eab5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hung_usage_endpoint_fails_within_the_request_timeout() {
+    let _guard = lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+    let (hung, _listener) = hung_endpoint();
+
+    // The production bound is 30s; the test shortens it to 300ms so the
+    // scenario fails in milliseconds. Before the request timeout existed,
+    // this call blocked forever — that is the regression being pinned.
+    let mut poller = Poller::with_credentials_path(Some(creds))
+        .expect("a valid credentials path should build a poller")
+        .with_endpoints(hung.clone(), hung)
+        .with_refresh_retry_delay(Duration::ZERO)
+        .with_request_timeout(Duration::from_millis(300));
+
+    let started = std::time::Instant::now();
+    let err = poller
+        .poll()
+        .expect_err("a hung endpoint must time out, not block forever");
+    let elapsed = started.elapsed();
+
+    // A timeout is a transport failure: the same ApiRequestFailed variant a
+    // refused connection produces.
+    assert!(
+        matches!(
+            err.downcast_ref::<PollerError>(),
+            Some(PollerError::ApiRequestFailed(_))
+        ),
+        "expected ApiRequestFailed from the timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the timeout must fire promptly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn hung_token_refresh_degrades_to_stale_within_the_request_timeout() {
+    let _guard = lock();
+    let mut server = mockito::Server::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+    let usage = server
+        .mock("GET", "/api/oauth/usage")
+        .with_status(200)
+        .with_body(documented_usage_body())
+        .create();
+
+    // Poll #1: a good reading to seed the cache.
+    let mut poller = contract_poller(&creds, &server.url());
+    let fresh = poller.poll().expect("first poll must succeed");
+    usage.assert();
+    assert!(!fresh.stale);
+
+    // The token then expires and the refresh endpoint black-holes. Both
+    // refresh attempts (initial + one retry) must fail within the shortened
+    // timeout, and the poll must degrade to the cached reading — the auth
+    // path's stale fallback — rather than wedging the cycle on the hang.
+    write_credentials(
+        dir.path(),
+        "expiring-access-token",
+        "expiring-refresh-token",
+        expiring_soon_expiry_ms(),
+    );
+    let (hung, _listener) = hung_endpoint();
+    poller = poller
+        .with_endpoints(server.url(), hung)
+        .with_request_timeout(Duration::from_millis(300));
+
+    let started = std::time::Instant::now();
+    let stale = poller
+        .poll()
+        .expect("a hung refresh must degrade to cached data");
+    let elapsed = started.elapsed();
+
+    assert!(stale.stale, "the served reading must be marked stale");
+    assert_eq!(stale.five_hour_utilization, fresh.five_hour_utilization);
+    assert_eq!(stale.timestamp, fresh.timestamp);
+    // Two refresh attempts at 300ms each plus overhead; before the request
+    // timeout this hung forever on the first attempt.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the stale fallback must stay bounded by the timeout, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn slow_response_within_the_timeout_still_succeeds() {
+    let _guard = lock();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = write_credentials(
+        dir.path(),
+        "access-token-1",
+        "refresh-token-1",
+        far_future_expiry_ms(),
+    );
+
+    // A response that arrives inside the timeout is a normal success — the
+    // bound exists for hangs, not for latency. If the default is ever
+    // tightened below real-world latency, this is the test that breaks.
+    let slow = slow_endpoint(Duration::from_millis(100), documented_usage_body());
+
+    let mut poller = Poller::with_credentials_path(Some(creds))
+        .expect("a valid credentials path should build a poller")
+        .with_endpoints(slow, dead_endpoint_url())
+        .with_refresh_retry_delay(Duration::ZERO)
+        .with_request_timeout(Duration::from_millis(300));
+    let data = poller
+        .poll()
+        .expect("a response inside the timeout must succeed");
+
+    assert!(!data.stale);
+    assert_eq!(data.five_hour_utilization, 14.0);
 }

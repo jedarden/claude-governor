@@ -18,6 +18,10 @@
 //!   token-healthy (`token_refresh_failing` stays false: the OAuth token is
 //!   not the problem), and a fleet already converged onto the last good
 //!   reading's target does not grow.
+//! - **Hung endpoint (request timeout)** — the same class as a transport
+//!   error once the poller's request timeout (claudego-0840eab5) bounds it:
+//!   the poll fails instead of blocking the observe cycle forever, the last
+//!   good reading is retained, and the converged fleet does not grow.
 //! - **Credential loss** — the auth path degrades to the cached reading with
 //!   `stale=true`, flags `token_refresh_failing`, and likewise cannot grow a
 //!   converged fleet.
@@ -27,6 +31,16 @@
 //!   headroom. The defense under test: a window with no parseable reset
 //!   timestamp is data-absent, and data-absent windows cannot bind the
 //!   scaling decision.
+//!
+//! On top of the failure classes, one **fixture-driven off-peak scenario**
+//! closes the seam this suite's failure scenarios sit next to: the raw
+//! multi-window `/api/oauth/usage` body is polled by the real `Poller` and
+//! fed through the real observe cycle with an active promotion, pinning the
+//! promotion-aware capacity walk end to end — effective hours boosted 2x for
+//! the window the promotion's `applies_to` lists, raw wall-clock for the
+//! windows it does not. (The hand-built-`UsageData` promotion matrix lives in
+//! `offpeak_promotion_window_forecasting.rs`; nothing there exercises a raw
+//! API body through the real poller.)
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -34,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, TimeZone, Utc};
 use tempfile::TempDir;
 
 use claude_governor::config::{
@@ -42,6 +56,7 @@ use claude_governor::config::{
 };
 use claude_governor::governor::{run_act_cycle, run_observe_cycle, CyclePaths, ScalingDecision};
 use claude_governor::poller::Poller;
+use claude_governor::schedule::Promotion;
 use claude_governor::state::{self, GovernorState};
 
 /// Tests here mutate process-global environment (PATH, CGOV_DECISIONS_PATH);
@@ -229,6 +244,27 @@ fn dead_endpoint_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A bound-but-never-answered listener: the kernel completes the TCP
+/// handshake into the accept backlog, the client writes its request, and no
+/// response ever comes. Distinct from [`dead_endpoint_url`] (refused): this
+/// is the hang the poller's request timeout exists to bound — without that
+/// timeout a poll against this URL blocks the observe cycle forever. The
+/// listener lives in the guard; dropping it would close the port and turn
+/// the hang back into a refusal.
+struct HungEndpoint {
+    url: String,
+    _listener: std::net::TcpListener,
+}
+
+fn hung_endpoint() -> HungEndpoint {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    HungEndpoint {
+        url: format!("http://127.0.0.1:{port}"),
+        _listener: listener,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cycle driver: real poller → real observe → real act, at a fixed instant
 // ---------------------------------------------------------------------------
@@ -299,6 +335,10 @@ fn mock_usage_once(server: &mut mockito::Server, body: &str) -> mockito::Mock {
 enum Failure {
     /// The usage endpoint is unreachable: connection refused.
     Transport,
+    /// The usage endpoint accepts the connection and never answers; the
+    /// poller's request timeout (shortened for the test) is what lets the
+    /// poll fail at all.
+    Timeout,
     /// The documented 429 self-rate-limit response.
     RateLimit,
     /// A 200 whose body is not JSON.
@@ -308,23 +348,32 @@ enum Failure {
 impl Failure {
     /// Build the poller for the failing cycle and register whatever mock the
     /// failure class needs. Transport rewires the usage endpoint to a
-    /// guaranteed-closed port instead, so there is no mock to satisfy.
+    /// guaranteed-closed port instead, so there is no mock to satisfy;
+    /// Timeout rewires it to a never-answered one and returns the keepalive
+    /// guard the caller must hold (dropping the listener would turn the hang
+    /// back into a refusal).
     fn arm(
         &self,
         creds: &str,
         server_url: &str,
         server: &mut mockito::Server,
-    ) -> (Poller, Option<mockito::Mock>) {
+    ) -> (Poller, Option<mockito::Mock>, Option<HungEndpoint>) {
         match self {
             Failure::Transport => {
                 let poller =
                     poller_with_endpoints(creds, &dead_endpoint_url(), &format!("{server_url}/v1/oauth/token"));
-                (poller, None)
+                (poller, None, None)
+            }
+            Failure::Timeout => {
+                let hung = hung_endpoint();
+                let poller = poller_with_endpoints(creds, &hung.url, &format!("{server_url}/v1/oauth/token"))
+                    .with_request_timeout(std::time::Duration::from_millis(300));
+                (poller, None, Some(hung))
             }
             Failure::RateLimit => {
                 let poller = poller_with_endpoints(creds, server_url, &format!("{server_url}/v1/oauth/token"));
                 let mock = rate_limited_mock(server);
-                (poller, Some(mock))
+                (poller, Some(mock), None)
             }
             Failure::Malformed => {
                 let poller = poller_with_endpoints(creds, server_url, &format!("{server_url}/v1/oauth/token"));
@@ -334,7 +383,7 @@ impl Failure {
                     .with_body("{not json")
                     .expect(1)
                     .create();
-                (poller, Some(mock))
+                (poller, Some(mock), None)
             }
         }
     }
@@ -408,7 +457,7 @@ fn assert_failed_poll_cannot_grow_a_converged_fleet(failure: Failure) {
     );
 
     // Phase 2: the usage poll breaks; the fleet must not grow on it.
-    let (mut poller, mock) = failure.arm(&creds, &server_url, &mut server);
+    let (mut poller, mock, _hung) = failure.arm(&creds, &server_url, &mut server);
     let cycle = drive_cycle(&mut poller, &dir, &agents, &config, now);
     if let Some(mock) = mock {
         mock.assert();
@@ -436,7 +485,7 @@ fn assert_failed_poll_cannot_grow_a_converged_fleet(failure: Failure) {
     // path keys on must stay down.
     assert_eq!(
         cycle.state.token_refresh_failing, false,
-        "transport/429/parse failures are not token failures"
+        "transport/timeout/429/parse failures are not token failures"
     );
 }
 
@@ -453,6 +502,17 @@ fn rate_limited_poll_cannot_grow_a_converged_fleet() {
 #[test]
 fn malformed_poll_cannot_grow_a_converged_fleet() {
     assert_failed_poll_cannot_grow_a_converged_fleet(Failure::Malformed);
+}
+
+/// The hung-endpoint class: before the poller's request timeout this did not
+/// fail the poll at all — it blocked the observe cycle thread forever, which
+/// is the one failure mode no fleet policy can absorb. With the timeout
+/// bounding it (shortened to 300ms for the test), it must behave exactly
+/// like every other API-side failure: no growth, reading retained verbatim,
+/// token classified healthy.
+#[test]
+fn timed_out_poll_cannot_grow_a_converged_fleet() {
+    assert_failed_poll_cannot_grow_a_converged_fleet(Failure::Timeout);
 }
 
 /// Credential loss is the one failure class the poller absorbs: the cached
@@ -579,5 +639,118 @@ fn empty_usage_response_is_data_absent_and_cannot_move_a_converged_fleet() {
     assert!(
         !cycle.state.token_refresh_failing,
         "a parseable 200 is not a token failure"
+    );
+}
+
+/// The off-peak fixture: a raw multi-window `/api/oauth/usage` body, polled
+/// by the real `Poller` (mockito standing in for the endpoint) and fed
+/// through the real observe cycle with an active promotion. The promotion
+/// semantics themselves are pinned exhaustively in
+/// `offpeak_promotion_window_forecasting.rs` — against a `FakePoller`
+/// returning hand-built `UsageData`, so nothing there proves a raw API body
+/// survives the real parse-then-walk path. Here the promotion lists only
+/// `five_hour` in `applies_to`, and the pinned property is the per-window
+/// split: the listed window's effective hours are boosted 2x its wall-clock
+/// remainder, the unlisted windows stay at raw wall-clock — computed from
+/// the resets_at strings exactly as the API sent them.
+#[test]
+fn offpeak_fixture_boosts_effective_hours_only_for_applies_to_windows() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = TempDir::new().unwrap();
+    let creds = write_credentials(&dir);
+    let mut server = mockito::Server::new();
+    let server_url = server.url();
+
+    let agents = agent_map();
+    let config = pricing_config(&agents);
+
+    // Saturday 2026-03-14 16:00 UTC = Saturday 12:00 ET (EDT): a weekend
+    // instant is off-peak by definition, so no peak-boundary reasoning can
+    // leak into the expected multipliers.
+    let now = Utc.with_ymd_and_hms(2026, 3, 14, 16, 0, 0).unwrap();
+
+    // Active across the whole instant (start inclusive, end exclusive), and
+    // scoped to exactly one window: the boost must follow the LISTING, not
+    // the promotion's mere presence.
+    let promo = Promotion {
+        name: "march-weekend".to_string(),
+        start_date: "2026-03-13".to_string(),
+        end_date: "2026-03-16".to_string(),
+        peak_start_hour_et: 8,
+        peak_end_hour_et: 14,
+        offpeak_multiplier: 2.0,
+        applies_to: vec!["five_hour".to_string()],
+    };
+
+    // The raw fixture: all three windows present with distinct utilizations,
+    // five_hour resetting 2h out (boosted -> 4.0 effective hours), the other
+    // two resetting 90h out (unboosted -> 90.0). Fixed across cycles, as the
+    // real API reports one timestamp per window period.
+    let five_hour_reset = (now + ChronoDuration::hours(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let weekly_reset = (now + ChronoDuration::hours(90)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let body = format!(
+        r#"{{"five_hour": {{"utilization": 40.0, "resets_at": "{five_hour_reset}"}},
+            "seven_day": {{"utilization": 30.0, "resets_at": "{weekly_reset}"}},
+            "limits": [{{"kind": "weekly_scoped", "percent": 50,
+                         "resets_at": "{weekly_reset}",
+                         "scope": {{"model": {{"id": "claude-fable-5", "display_name": "Fable"}}}},
+                         "is_active": true}}]}}"#
+    );
+
+    let mock = mock_usage_once(&mut server, &body);
+    let mut poller =
+        poller_with_endpoints(&creds, &server_url, &format!("{server_url}/v1/oauth/token"));
+    let state_path = dir.path().join("governor-state.json");
+    let paths = CyclePaths::under(dir.path());
+    run_observe_cycle(
+        &mut poller,
+        &state_path,
+        &paths,
+        &config.alerts,
+        &agents,
+        &[promo],
+        &config,
+        now,
+    )
+    .expect("the observe cycle should complete");
+    mock.assert();
+
+    let state = state::load_state(&state_path).unwrap();
+
+    // The raw body parsed through the real poller into state, verbatim.
+    assert_eq!(state.usage.five_hour_pct, 40.0);
+    assert_eq!(state.usage.all_models_pct, 30.0);
+    assert_eq!(state.usage.weekly_scoped_pct, 50.0);
+    assert!(!state.usage.stale, "a parseable 200 must not be misflagged as stale");
+
+    // Fixture sanity: off-peak, promotion in force.
+    assert!(
+        !state.schedule.is_peak_hour,
+        "the weekend instant must read off-peak"
+    );
+    assert!(
+        state.schedule.is_promo_active,
+        "the promotion must read active at the fixture instant"
+    );
+
+    // The capacity walk, per window: listed window boosted 2x, unlisted
+    // windows at raw wall-clock. (The burn-rate-side promo_multiplier_*
+    // fields are empirically gated and pinned by the off-peak promotion
+    // suite; the capacity walk is declared-config-driven, which is what a
+    // raw API fixture exercises.)
+    let eff_five_hour = state.schedule.effective_hours_remaining_five_hour;
+    assert!(
+        (eff_five_hour - 4.0).abs() < 1e-6,
+        "five_hour (listed) must be 2h wall-clock x 2.0 = 4.0 effective hours, got {eff_five_hour}"
+    );
+    let eff_seven_day = state.schedule.effective_hours_remaining_seven_day;
+    assert!(
+        (eff_seven_day - 90.0).abs() < 1e-6,
+        "seven_day (unlisted) must stay at 90.0 raw wall-clock hours, got {eff_seven_day}"
+    );
+    let eff_weekly = state.schedule.effective_hours_remaining_weekly_scoped;
+    assert!(
+        (eff_weekly - 90.0).abs() < 1e-6,
+        "weekly_scoped (unlisted) must stay at 90.0 raw wall-clock hours, got {eff_weekly}"
     );
 }
