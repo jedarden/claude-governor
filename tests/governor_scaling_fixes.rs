@@ -14,6 +14,15 @@
 //! 4. `apply_underutilization_sprint` actually being wired into the act cycle
 //!    (it was defined but never called)
 //!    (`underutilization_sprint_wired_into_act_cycle_regression`).
+//! 5. `apply_underutilization_sprint`'s pool-level eligibility gates — §4
+//!    boosts "an eligible subscription pool", so a non-subscription pool is
+//!    never sprint-boosted
+//!    (`sprint_eligible_pools_are_subscription_only_regression`), and a pool
+//!    with no more queued work than running workers — or with no readable
+//!    backlog signal at all — is never boosted
+//!    (`sprint_suppressed_without_backlog_regression`). The window-level
+//!    gates (under-used, resets soon, no cutoff risk, safe mode) are pinned
+//!    by the sprint tests in `src/alerts.rs`'s `mod tests`.
 //!
 //! The act-cycle tests drive `run_act_cycle` with `dry_run = false`, because
 //! both the reconcile arm and the launch arms are skipped entirely in dry-run
@@ -23,11 +32,13 @@
 //! audit log into the temp dir. Every test that swaps the environment holds
 //! `ENV_LOCK` for its whole body so the swaps cannot race.
 //!
-//! Regression property (mutation-checked at HEAD 2c02a55): reverting each fix
-//! in `governor.rs` — floor pass disabled, NoChange reconcile loops disabled,
-//! `Some(0)` re-held at `current_total`, sprint call unwired — flips exactly the
-//! corresponding test to failure on the assertion that names the fix, so these
-//! four tests pin the four CLAUDE.md §4 bullets one-to-one.
+//! Regression property (mutation-checked at HEAD 2c02a55, extended at HEAD for
+//! the two pool-gate tests): reverting each fix in `governor.rs` — floor pass
+//! disabled, NoChange reconcile loops disabled, `Some(0)` re-held at
+//! `current_total`, sprint call unwired, the sprint's subscription gate
+//! dropped, the sprint's backlog gate dropped — flips exactly the
+//! corresponding test to failure on the assertion that names the fix, so
+//! these tests pin the CLAUDE.md §4 bullets one-to-one.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -495,5 +506,153 @@ fn underutilization_sprint_wired_into_act_cycle_regression() {
     assert!(
         tags.iter().all(|t| t == "gen"),
         "all sprint launches go to the eligible pool"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix 4 (pool gates) — apply_underutilization_sprint eligibility is
+// subscription-only and backlog-gated
+// ---------------------------------------------------------------------------
+
+/// The same fleet, window and backlog as
+/// [`underutilization_sprint_wired_into_act_cycle_regression`] except
+/// `subscription: false`. §4's sprint boosts "an eligible subscription pool",
+/// and `apply_underutilization_sprint` skips `!cfg.subscription` before any
+/// window or backlog check — so the only lifter the cycle has must not lift
+/// this fleet, and no worker may launch.
+#[test]
+fn sprint_eligible_pools_are_subscription_only_regression() {
+    let env = TempDir::new().expect("temp dir");
+    let bin_dir = env.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("bin dir");
+
+    // Census: nothing running. Fake `bf` reports one ready bead so a pool
+    // whose subscription gate regressed away has backlog to justify a boost
+    // with — without it, the regressed path would suppress itself and the
+    // test would pass vacuously. Forecast: under-used (20%), resets soon
+    // (1.5h < the 2h default), no cutoff risk, no safe count — base target 0.
+    let sessions = env.path().join("sessions.txt");
+    std::fs::write(&sessions, "").expect("sessions fixture");
+    install_fake_tmux(&bin_dir, &sessions, &env.path().join("tmux-calls.log"));
+    install_fake_bf(&bin_dir);
+    install_launch_stub(&bin_dir);
+    let launch_log = env.path().join("launches.log");
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "gen".to_string(),
+        agent_config(
+            &launch_cmd_for(&bin_dir, env.path(), "gen", &launch_log, "claude-sonnet"),
+            "cgovtest-gen-*",
+            &env.path().join("hb-gen"),
+            0,
+            4,
+            false, // not a subscription pool — the only delta from the wiring test
+        ),
+    );
+
+    let state = seeded_state(20.0, 1.5, None);
+    let state_path = env.path().join("governor-state.json");
+    state::save_state(&state, &state_path).expect("seed state");
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    activate_env(&bin_dir, &env.path().join("decisions.jsonl"));
+
+    let decision = run_real_act_cycle(&state_path, &agents, &priced_governor_config());
+
+    assert_eq!(
+        decision,
+        ScalingDecision::NoChange,
+        "a non-subscription pool must never be sprint-boosted — with the base \
+         target 0 the fleet stays parked; pre-fix (subscription gate dropped) \
+         the cycle returned ScaleUp(4) here"
+    );
+    assert!(
+        launch_tags(&launch_log).is_empty(),
+        "no worker may launch off a non-subscription pool's eligibility"
+    );
+}
+
+/// The sprint's backlog gate: a subscription pool with no more queued work
+/// than running workers is not boosted. Phase 1 pins zero ready beads; phase
+/// 2 pins the documented error direction — `count_ready_beads` maps every
+/// `bf` failure to 0, so "a missing backlog signal must only ever *suppress*
+/// a sprint, never cause one". Each phase re-seeds the state file because the
+/// act cycle persists its act-owned subtree on the way out.
+#[test]
+fn sprint_suppressed_without_backlog_regression() {
+    let env = TempDir::new().expect("temp dir");
+    let bin_dir = env.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("bin dir");
+
+    // Census: nothing running, so current = 0 everywhere. `bf` is installed
+    // per phase below. Forecast identical to the wiring test's except for the
+    // backlog: under-used, resets soon, no cutoff risk, base target 0 — the
+    // sprint is the ONLY thing that could lift this fleet.
+    let sessions = env.path().join("sessions.txt");
+    std::fs::write(&sessions, "").expect("sessions fixture");
+    install_fake_tmux(&bin_dir, &sessions, &env.path().join("tmux-calls.log"));
+    // Phase 1: `bf` succeeds but reports zero ready beads.
+    write_executable(&bin_dir, "bf", "exit 0");
+    install_launch_stub(&bin_dir);
+    let launch_log = env.path().join("launches.log");
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "gen".to_string(),
+        agent_config(
+            &launch_cmd_for(&bin_dir, env.path(), "gen", &launch_log, "claude-sonnet"),
+            "cgovtest-gen-*",
+            &env.path().join("hb-gen"),
+            0,
+            4,    // what the sprint WOULD boost to
+            true, // subscription — eligible but for the backlog gate
+        ),
+    );
+
+    let state_path = env.path().join("governor-state.json");
+    state::save_state(&seeded_state(20.0, 1.5, None), &state_path).expect("seed state");
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    activate_env(&bin_dir, &env.path().join("decisions.jsonl"));
+
+    let decision = run_real_act_cycle(&state_path, &agents, &priced_governor_config());
+
+    assert_eq!(
+        decision,
+        ScalingDecision::NoChange,
+        "no backlog means nothing for extra runners to do — the sprint must \
+         not fire; pre-fix (backlog gate dropped) the cycle returned \
+         ScaleUp(4) here"
+    );
+    assert!(
+        launch_tags(&launch_log).is_empty(),
+        "no worker may launch without backlog to feed it"
+    );
+
+    // Phase 2: `bf` fails outright. A missing backlog signal maps to 0, so
+    // the fleet must stay parked here too — the failure direction must not
+    // invent a sprint.
+    write_executable(&bin_dir, "bf", "exit 1");
+    // Phase 1 asserted the log is absent, so there is nothing to clear — but
+    // drop it if a regressed phase 1 ever created one, so phase 2's
+    // emptiness assertion is its own.
+    let _ = std::fs::remove_file(&launch_log);
+    state::save_state(&seeded_state(20.0, 1.5, None), &state_path).expect("re-seed state");
+
+    let decision = run_real_act_cycle(&state_path, &agents, &priced_governor_config());
+
+    assert_eq!(
+        decision,
+        ScalingDecision::NoChange,
+        "a failed backlog probe must suppress the sprint, never cause one"
+    );
+    assert!(
+        launch_tags(&launch_log).is_empty(),
+        "a failed backlog probe must launch nothing"
     );
 }
