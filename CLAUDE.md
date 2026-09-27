@@ -168,6 +168,14 @@ hostname times out. Each host needs its own `claude-print` binary + adapters + c
 These fixes prevent cgov from choking on `null`/`Inf` from the API/state or
 treating configured agents as fungible.
 
+Every bullet in this section has named test coverage: the four `governor.rs`
+fixes in `tests/governor_scaling_fixes.rs` (including the sprint's
+subscription-only and backlog pool gates), the window-level sprint gates in
+`src/alerts.rs`'s `mod tests`, the retired-reference load rejection in
+`src/config.rs`'s `mod tests` and `tests/retired_component_surface_sweep.rs`,
+and the two null-tolerance bullets in `tests/null_tolerance_fixture_test.rs`
+plus `tests/usage_polling_contract.rs` (`null_windows_are_treated_as_non_binding`).
+
 - **poller.rs** — `UsageResponse` windows are `Option`; a `null` window (the API
   legitimately returns one, e.g. no separate sonnet limit) no longer crashes the
   whole poll and starves the governor of capacity data.
