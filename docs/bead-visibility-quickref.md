@@ -42,8 +42,9 @@ scripts/verify-pluck-config.sh
 
 It verifies the backend binding, the active config path, the resolved default
 workspace, the bead-rs store layout, the CLI output contract, and the live
-`strands.pluck` values, and exits non-zero on any mismatch. The rest of this
-page summarizes what it reports.
+`strands.pluck` values, and exits non-zero on any mismatch. Its `--self-test`
+mode statically pins that inventory against the script's own check sections;
+the rest of this page summarizes what it reports.
 
 ## Workspace rule
 

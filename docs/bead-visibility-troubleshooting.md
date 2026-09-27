@@ -24,6 +24,13 @@ output rather than from memory:
 scripts/verify-pluck-config.sh
 ```
 
+The script pins itself against that claim too: `--self-test` statically
+re-derives its check inventory from its own text and exits non-zero if a
+numbered check section is dropped, renamed or added without matching the
+six-part list above (anything beyond the six must stay note-or-pass only).
+`tests/pluck_config_selftest_test.rs` drills that mode and pins the
+inventory against this page.
+
 ## The visibility contract
 
 Bead visibility is a pipeline, not one filter:
