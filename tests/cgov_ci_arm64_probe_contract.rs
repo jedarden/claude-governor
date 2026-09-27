@@ -515,9 +515,12 @@ fn cgov_ci_gate_refuses_a_probe_that_ran_and_failed() {
         "the validator ran, so its output must have been tee'd for the gate:\n{out}"
     );
 
-    // PASS-specificity, made load-bearing: the failure lines name the very
-    // probe text the gate greps for, so a gate weakened to a bare match
-    // would accept this run. The `^PASS: ` anchor is what refuses it.
+    // PASS-specificity: the failure lines name the very probe text the gate
+    // greps for. In THIS replay the validator's own non-zero exit — through
+    // the gate's `pipefail` — refuses before the grep loop even runs, so
+    // this test alone does not pin the anchor. That the anchor is
+    // independently sufficient against exactly this collision is the next
+    // test's subject.
     let log = fs::read_to_string(sb.root().join("cgov-arm64-verify.log"))
         .expect("read the tee'd verify log");
     assert!(
@@ -533,6 +536,77 @@ fn cgov_ci_gate_refuses_a_probe_that_ran_and_failed() {
             naive_probe_mention(&log, probe),
             "the {probe} FAIL line must name the probe text — that collision is \
              exactly what the PASS anchor exists to defeat:\n{log}"
+        );
+    }
+}
+
+#[test]
+fn the_pass_anchor_alone_refuses_a_fail_line_naming_the_probe() {
+    // No x86_64-host guard: nothing executes a guest here. The validator is
+    // a stub, so the replay exercises only the gate's own shell — the
+    // presence guard against the emulator double, the pipe, and the grep
+    // loop.
+    let sb = WorkflowSandbox::new();
+    install_arm64_artifact(&sb, 0);
+    sb.install_fake_emulator(0);
+
+    // The drift shape the anchor exists for: a future validator that
+    // observes a probe failing under the emulator, reports it with the
+    // exact FAIL line the shipped validator emits — and downgrades it to
+    // exit 0. The pipe then cannot fail, and the grep loop is the only
+    // refuser left between this artifact and publication.
+    write_executable(
+        &sb.root().join("scripts/verify-release-static.sh"),
+        br#"#!/usr/bin/env bash
+# Test double: real FAIL lines, exit 0 - the downgrade shape.
+printf 'FAIL: %s: %s %sin env -i, empty cwd, empty PATH: exit=%s output=%.200q\n' \
+  cgov-linux-arm64 --version 'under qemu-aarch64-static ' 3 \
+  'fake-qemu: simulated failure of cgov-linux-arm64 --version'
+printf 'FAIL: %s: %s %sin env -i, empty cwd, empty PATH: exit=%s output=%.200q\n' \
+  cgov-linux-arm64 --help 'under qemu-aarch64-static ' 3 \
+  'fake-qemu: simulated failure of cgov-linux-arm64 --help'
+exit 0
+"#,
+    );
+
+    let (code, out, log_exists) = sb.run_gate(&sb.tools_with_qemu());
+    assert_eq!(
+        code, 1,
+        "a FAIL line naming the probe text must not satisfy the gate even \
+         from an exit-0 validator:\n{out}"
+    );
+    assert!(
+        log_exists,
+        "the pipe succeeded (exit 0), so the log must have been tee'd:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "FAIL: arm64 artifact was not executed under qemu-aarch64-static for --version — refusing to publish an unexecuted artifact"
+        ),
+        "the refusal must be the grep loop's own message, not the presence \
+         guard's and not the pipe's:\n{out}"
+    );
+
+    // The precondition that makes the anchor load-bearing: the log's only
+    // mention of the probe text is the FAIL line, which a naive (unanchored)
+    // gate would match. If this assertion ever fails, the anchor has stopped
+    // being the deciding layer and this test no longer pins anything.
+    let log = fs::read_to_string(sb.root().join("cgov-arm64-verify.log"))
+        .expect("read the tee'd verify log");
+    assert!(
+        log.contains("exit=3"),
+        "the stub must report the failed run the way the real validator \
+         does:\n{log}"
+    );
+    for probe in ["--version", "--help"] {
+        assert!(
+            !workflow_probe_passed(&log, probe),
+            "a FAIL verdict is not a PASS verdict:\n{log}"
+        );
+        assert!(
+            naive_probe_mention(&log, probe),
+            "the anchored gate's refusal is only load-bearing if the naive \
+             form would have matched this log:\n{log}"
         );
     }
 }
