@@ -912,6 +912,23 @@ impl GovernorConfig {
         Ok(config)
     }
 
+    /// Render the `cgov config` display for a configuration loaded from
+    /// `path` (claudego-62bd7180).
+    ///
+    /// This is the whole `cgov config` contract (CLAUDE.md §1): the first
+    /// line names the file that was actually loaded — the live machine path,
+    /// never the seed template — and the body is the full serialized
+    /// configuration, every daemon key included, so the operator sees exactly
+    /// what the daemon is running. `run_config_command` prints this string
+    /// verbatim; `tests/config_render_contract_test.rs` pins it.
+    pub fn render_config_display(path: &Path, config: &GovernorConfig) -> Result<String> {
+        Ok(format!(
+            "Config file: {}\n\n{}",
+            path.display(),
+            serde_yaml::to_string(config)?
+        ))
+    }
+
     /// Get the default config paths to try
     fn config_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();

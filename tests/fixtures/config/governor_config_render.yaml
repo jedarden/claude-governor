@@ -1,0 +1,40 @@
+# Fixture for tests/config_render_contract_test.rs (claudego-62bd7180).
+#
+# Every daemon key carries a distinctive value so a render that silently
+# substitutes a default — or drops the key — fails the value-faithfulness
+# assertions. The file must stay free of retired-component markers
+# (polish / generator-pool / generator_pool): GovernorConfig::load_from_path
+# rejects those before any render happens.
+
+pricing:
+  models:
+    fixture-model:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.3
+
+daemon:
+  loop_interval_secs: 271
+  hysteresis_band: 1.75
+  max_scale_up_per_cycle: 4
+  max_scale_down_per_cycle: 2
+  progressive_scaling: true
+  min_scale_interval_secs: 97
+  target_ceiling: 82.5
+  mode: tmux
+  pre_scale_minutes: 44
+  log_max_bytes: 12345678
+  log_backup_count: 6
+  windows:
+    five_hour:
+      target_utilization: 0.71
+
+agents:
+  fixture-agent:
+    launch_cmd: "needle run --agent fixture-agent --workspace /home/coding/claude-governor"
+    session_pattern: "needle-fixture-*"
+    heartbeat_dir: "~/.needle/state/heartbeats"
+    min_workers: 1
+    max_workers: 3

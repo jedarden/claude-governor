@@ -1010,9 +1010,12 @@ fn run_config_command(edit: bool) -> Result<()> {
         }
 
         let config = GovernorConfig::load_from_path(&config_path)?;
-        let output = serde_yaml::to_string(&config)?;
-        println!("Config file: {}\n", config_path.display());
-        println!("{}", output);
+        // The render lives in the library so the contract test drives the
+        // exact bytes this command prints (claudego-62bd7180).
+        print!(
+            "{}\n",
+            GovernorConfig::render_config_display(&config_path, &config)?
+        );
         Ok(())
     }
 }
