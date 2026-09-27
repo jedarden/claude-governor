@@ -21,8 +21,21 @@
 //!
 //! Scope: presence and ordering of the two lines. Verifying the numbers they
 //! carry against the fixture inputs is a separate bead.
+//!
+//! The reconcile summary line is pinned here too (claudego-6f000c99): CLAUDE.md
+//! §3 documents triaging the daemon with `journalctl --user -u
+//! claude-governor -n 30 | grep reconcile`, so every cycle — every decision,
+//! live or dry-run — must emit at least one line containing "reconcile" that
+//! names the capacity decision and the per-pool start/stop actions. The
+//! reconcile scenarios seed the act half's own input state and drive
+//! [`run_act_cycle`] directly rather than going through [`run_governor_cycle`]:
+//! the observe half recomputes the capacity forecast from collector data a test
+//! does not have, and ADR-002 turns a missing forecast into a hold, which would
+//! make every decision NoChange and the contract untestable.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -30,12 +43,32 @@ use claude_governor::config::{
     AgentConfig, AlertConfig, CompositeRiskConfig, ConeScalingConfig, DaemonConfig, GovernorConfig,
     PricingConfig, SprintConfig,
 };
-use claude_governor::governor::{run_governor_cycle, CyclePaths};
+use claude_governor::governor::{run_act_cycle, run_governor_cycle, CyclePaths, ScalingDecision};
 use claude_governor::poller::{UsageData, UsagePoller};
 use claude_governor::schedule::Promotion;
 use claude_governor::snapshot_fixtures::snapshot_pair_5h;
-use claude_governor::state::PrevUsageSnapshot;
+use claude_governor::state::{self, PrevUsageSnapshot};
 use tempfile::TempDir;
+
+struct ActEnvGuard {
+    path: String,
+    decisions: Option<String>,
+    ledger_logs: Option<String>,
+}
+
+impl Drop for ActEnvGuard {
+    fn drop(&mut self) {
+        std::env::set_var("PATH", &self.path);
+        match &self.decisions {
+            Some(value) => std::env::set_var("CGOV_DECISIONS_PATH", value),
+            None => std::env::remove_var("CGOV_DECISIONS_PATH"),
+        }
+        match &self.ledger_logs {
+            Some(value) => std::env::set_var("CGOV_LEDGER_LOGS_DIR", value),
+            None => std::env::remove_var("CGOV_LEDGER_LOGS_DIR"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Log capture
@@ -60,6 +93,13 @@ impl log::Log for TestLogger {
 }
 
 static TEST_LOGGER: TestLogger = TestLogger;
+
+/// Serializes whole test bodies against the shared captured-log buffer and the
+/// process environment. Tests in one binary share a process and run in
+/// threads, so records from two tests can interleave in the buffer; the
+/// reconcile test additionally swaps PATH / CGOV_DECISIONS_PATH /
+/// CGOV_LEDGER_LOGS_DIR. Both tests must hold this for their whole body.
+static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn init_logger() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -108,6 +148,92 @@ fn logs_containing_since(from: usize, pattern: &str) -> Vec<(log::Level, String)
         .filter(|(_, msg)| msg.contains(pattern))
         .cloned()
         .collect()
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write test executable");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("make test executable runnable");
+}
+
+fn fake_act_environment(dir: &TempDir, sessions: &str) -> (ActEnvGuard, PathBuf) {
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("create fake-bin directory");
+    let sessions_path = dir.path().join("sessions");
+    std::fs::write(&sessions_path, sessions).expect("seed fake tmux sessions");
+    let decisions_path = dir.path().join("decisions.jsonl");
+    let ledger_logs = dir.path().join("ledger-logs");
+    std::fs::create_dir(&ledger_logs).expect("create fake ledger log directory");
+
+    let tmux = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  list-sessions) cat '{sessions}';;\n  *) exit 0;;\nesac\n",
+        sessions = sessions_path.display()
+    );
+    write_executable(&bin.join("tmux"), &tmux);
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let old_decisions = std::env::var("CGOV_DECISIONS_PATH").ok();
+    let old_ledger_logs = std::env::var("CGOV_LEDGER_LOGS_DIR").ok();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+    std::env::set_var("CGOV_DECISIONS_PATH", &decisions_path);
+    std::env::set_var("CGOV_LEDGER_LOGS_DIR", &ledger_logs);
+
+    (
+        ActEnvGuard {
+            path: old_path,
+            decisions: old_decisions,
+            ledger_logs: old_ledger_logs,
+        },
+        sessions_path,
+    )
+}
+
+fn act_agent(name: &str, heartbeat_dir: &Path) -> AgentConfig {
+    serde_json::from_value(serde_json::json!({
+        "launch_cmd": "launch-stub",
+        "session_pattern": format!("{name}-*"),
+        "heartbeat_dir": heartbeat_dir,
+        "min_workers": 0,
+        "max_workers": 4,
+        "subscription": false,
+    }))
+    .expect("valid act-cycle test agent")
+}
+
+fn act_config(agents: &HashMap<String, AgentConfig>) -> GovernorConfig {
+    GovernorConfig {
+        pricing: PricingConfig {
+            models: HashMap::new(),
+        },
+        sprint: SprintConfig::default(),
+        daemon: DaemonConfig::default(),
+        alerts: AlertConfig {
+            enabled: false,
+            ..AlertConfig::default()
+        },
+        composite_risk: CompositeRiskConfig::default(),
+        cone_scaling: ConeScalingConfig::default(),
+        agents: agents.clone(),
+        credentials_path: None,
+    }
+}
+
+fn forecast_for_target(target: u32) -> state::CapacityForecast {
+    let window = state::WindowForecast {
+        current_utilization: 10.0,
+        hours_remaining: 100.0,
+        safe_worker_count: Some(target),
+        safe_worker_count_p75: Some(target),
+        binding: true,
+        ..state::WindowForecast::default()
+    };
+    state::CapacityForecast {
+        five_hour: window.clone(),
+        seven_day: window.clone(),
+        weekly_scoped: window,
+        binding_window: "five_hour".to_string(),
+        ..state::CapacityForecast::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +370,7 @@ fn drive_cycle(poller: &mut FakePoller, state_path: &std::path::Path) -> anyhow:
 /// splitting it would let two tests interleave records in the shared buffer.
 #[test]
 fn two_cycles_emit_the_delta_log_lines() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_logger();
 
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -318,5 +445,113 @@ fn two_cycles_emit_the_delta_log_lines() {
     assert_eq!(
         poller.polls, 2,
         "each cycle should have polled exactly once"
+    );
+}
+
+/// The operator's `journalctl ... | grep reconcile` workflow must expose the
+/// decision and the pool-level moves for every dry-run act cycle. Use the real
+/// act path with a fake tmux census so the two cycles exercise opposite moves:
+/// a planned start followed by a planned stop.
+#[test]
+fn dry_run_reconcile_lines_name_decision_and_pool_actions() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_logger();
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let (_act_env, sessions_path) = fake_act_environment(&temp_dir, "pool-1\n");
+    let state_path = temp_dir.path().join("governor-state.json");
+    let heartbeat_dir = temp_dir.path().join("heartbeats");
+    let mut agents = HashMap::new();
+    agents.insert("pool".to_string(), act_agent("pool", &heartbeat_dir));
+    let config = act_config(&agents);
+    let alerts = AlertConfig {
+        enabled: false,
+        ..AlertConfig::default()
+    };
+
+    let mut state = state::GovernorState::new();
+    state.capacity_forecast = forecast_for_target(3);
+    state::save_state(&state, &state_path).expect("seed scale-up state");
+
+    let cycle1_start = log_len();
+    let decision = run_act_cycle(
+        &state_path,
+        true,
+        0.0,
+        2,
+        2,
+        90.0,
+        &alerts,
+        &agents,
+        0,
+        &[],
+        &CompositeRiskConfig::default(),
+        &ConeScalingConfig::default(),
+        &config,
+        Utc::now(),
+    )
+    .expect("scale-up dry-run cycle should complete");
+    assert_eq!(decision, ScalingDecision::ScaleUp(2));
+
+    let cycle1_lines = logs_containing_since(cycle1_start, "reconcile:");
+    assert_eq!(
+        cycle1_lines.len(),
+        1,
+        "each cycle must emit exactly one reconcile summary: {cycle1_lines:?}"
+    );
+    assert!(
+        cycle1_lines[0].1.contains("decision=ScaleUp(2)"),
+        "summary must identify the capacity decision: {}",
+        cycle1_lines[0].1
+    );
+    assert!(
+        cycle1_lines[0].1.contains("pools: pool start 2 (1 -> 3)"),
+        "summary must identify the planned per-pool start: {}",
+        cycle1_lines[0].1
+    );
+
+    // Change only the fake census and forecast: the next dry-run cycle sees
+    // three workers and a target of one, so its summary must name the stop.
+    std::fs::write(&sessions_path, "pool-1\npool-2\npool-3\n")
+        .expect("seed fake scale-down census");
+    let mut state = state::load_state(&state_path).expect("reload scale-up state");
+    state.capacity_forecast = forecast_for_target(1);
+    state::save_state(&state, &state_path).expect("seed scale-down state");
+
+    let cycle2_start = log_len();
+    let decision = run_act_cycle(
+        &state_path,
+        true,
+        0.0,
+        2,
+        2,
+        90.0,
+        &alerts,
+        &agents,
+        0,
+        &[],
+        &CompositeRiskConfig::default(),
+        &ConeScalingConfig::default(),
+        &config,
+        Utc::now(),
+    )
+    .expect("scale-down dry-run cycle should complete");
+    assert_eq!(decision, ScalingDecision::ScaleDown(2));
+
+    let cycle2_lines = logs_containing_since(cycle2_start, "reconcile:");
+    assert_eq!(
+        cycle2_lines.len(),
+        1,
+        "each cycle must emit exactly one reconcile summary: {cycle2_lines:?}"
+    );
+    assert!(
+        cycle2_lines[0].1.contains("decision=ScaleDown(2)"),
+        "summary must identify the capacity decision: {}",
+        cycle2_lines[0].1
+    );
+    assert!(
+        cycle2_lines[0].1.contains("pools: pool stop 2 (3 -> 1)"),
+        "summary must identify the planned per-pool stop: {}",
+        cycle2_lines[0].1
     );
 }

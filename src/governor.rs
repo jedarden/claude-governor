@@ -7604,6 +7604,14 @@ pub fn run_act_cycle(
     let mut actual_launched: u32 = 0;
     let mut actual_removed: u32 = 0;
     let mut allocation_reconciled = false;
+    // Per-pool start/stop moves, as rendered for the cycle's reconcile summary
+    // line (below). CLAUDE.md §3 documents triaging the daemon with
+    // `journalctl --user -u claude-governor -n 30 | grep reconcile`, so every
+    // cycle must emit at least one line containing "reconcile" that names the
+    // capacity decision and the per-pool actions — in dry-run too, where the
+    // executor never runs and the moves are the planned ones. Filled by each
+    // execution arm; "none" when the cycle took no pool-level action.
+    let mut pool_actions: Vec<String> = Vec::new();
     match &decision {
         ScalingDecision::NoChange => {
             // The aggregate total is unchanged, but the per-agent allocation can
@@ -7644,6 +7652,13 @@ pub fn run_act_cycle(
                                 false,
                             );
                             reconciled = true;
+                            pool_actions.push(format!(
+                                "{} stop {} ({} -> {})",
+                                agent_name,
+                                current - target_count,
+                                current,
+                                target_count
+                            ));
                             log::info!(
                                 "[governor] reconcile: {} {} -> {} workers",
                                 agent_name,
@@ -7661,6 +7676,13 @@ pub fn run_act_cycle(
                         if target_count > current {
                             worker::scale_up(target_count - current, &worker_config.1, false);
                             reconciled = true;
+                            pool_actions.push(format!(
+                                "{} start {} ({} -> {})",
+                                agent_name,
+                                target_count - current,
+                                current,
+                                target_count
+                            ));
                             log::info!(
                                 "[governor] reconcile: {} {} -> {} workers",
                                 agent_name,
@@ -7685,35 +7707,29 @@ pub fn run_act_cycle(
         }
         ScalingDecision::ScaleUp(n) => {
             log::info!("[governor] scaling up by {} workers", n);
+            // The distribution is computed in both modes: the executor consumes
+            // it live, and the dry-run summary line reports the same moves as
+            // planned (nothing is launched under dry_run).
+            let cutoff_risk = match state.capacity_forecast.binding_window.as_str() {
+                WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+                WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+                _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
+            };
+            let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+            for (name, ws) in &state.workers {
+                current_workers_map.insert(name.clone(), ws.current);
+            }
+            let new_total = current_total.saturating_add(*n);
+            let target_distribution = distribute_workers_by_cost_priority(
+                agents,
+                &current_workers_map,
+                new_total,
+                &state.burn_rate.by_model,
+                pricing_config,
+                cutoff_risk,
+                &state.capacity_forecast,
+            );
             if !dry_run {
-                // Determine cutoff_risk from binding window
-                let binding_window = &state.capacity_forecast.binding_window;
-                let cutoff_risk = match binding_window.as_str() {
-                    WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
-                    WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-                    _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
-                };
-
-                // Build current workers map
-                let mut current_workers_map: HashMap<String, u32> = HashMap::new();
-                for (name, ws) in &state.workers {
-                    current_workers_map.insert(name.clone(), ws.current);
-                }
-
-                // Calculate new target total
-                let new_total = current_total.saturating_add(*n);
-
-                // Distribute workers by cost priority
-                let target_distribution = distribute_workers_by_cost_priority(
-                    agents,
-                    &current_workers_map,
-                    new_total,
-                    &state.burn_rate.by_model,
-                    pricing_config,
-                    cutoff_risk,
-                    &state.capacity_forecast,
-                );
-
                 // Scale up each agent individually based on distribution
                 let mut total_launched = 0;
                 for (agent_name, &target_count) in &target_distribution {
@@ -7725,6 +7741,15 @@ pub fn run_act_cycle(
                             let to_add = target_count - current;
                             let launched = worker::scale_up(to_add, &worker_config.1, false);
                             total_launched += launched;
+                            if launched > 0 {
+                                pool_actions.push(format!(
+                                    "{} start {} ({} -> {})",
+                                    agent_name,
+                                    launched,
+                                    current,
+                                    current + launched as u32
+                                ));
+                            }
                             log::info!(
                                 "[governor] scaled up {} agent: {} -> {} workers (launched {})",
                                 agent_name,
@@ -7738,43 +7763,49 @@ pub fn run_act_cycle(
                 log::info!("[governor] total workers launched: {}", total_launched);
                 actual_launched = total_launched as u32;
             } else {
+                for (agent_name, &target_count) in &target_distribution {
+                    let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                    if target_count > current {
+                        pool_actions.push(format!(
+                            "{} start {} ({} -> {})",
+                            agent_name,
+                            target_count - current,
+                            current,
+                            target_count
+                        ));
+                    }
+                }
                 log::info!("[governor] DRY RUN: would scale up by {}", n);
             }
         }
         ScalingDecision::ScaleDown(n) => {
             log::info!("[governor] gracefully scaling down by {} workers", n);
+            // Same both-modes distribution as the ScaleUp arm above: executed
+            // live, reported as planned moves in dry-run.
+            let cutoff_risk = match state.capacity_forecast.binding_window.as_str() {
+                WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
+                WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
+                _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
+            };
+            let mut current_workers_map: HashMap<String, u32> = HashMap::new();
+            for (name, ws) in &state.workers {
+                current_workers_map.insert(name.clone(), ws.current);
+            }
+            let new_total = current_total.saturating_sub(*n);
+            // Distribute workers by cost priority (highest cost first when scaling down),
+            // reordered by worst verified-closure yield per dollar first when the ledger
+            // has evidence (claudego-f80857a2)
+            let target_distribution = distribute_workers_by_ledger_yield(
+                agents,
+                &current_workers_map,
+                new_total,
+                &state.burn_rate.by_model,
+                pricing_config,
+                cutoff_risk,
+                &state.capacity_forecast,
+                ledger_yields.as_ref(),
+            );
             if !dry_run {
-                // Determine cutoff_risk from binding window
-                let binding_window = &state.capacity_forecast.binding_window;
-                let cutoff_risk = match binding_window.as_str() {
-                    WINDOW_FIVE_HOUR => state.capacity_forecast.five_hour.cutoff_risk,
-                    WINDOW_SEVEN_DAY => state.capacity_forecast.seven_day.cutoff_risk,
-                    _ => state.capacity_forecast.weekly_scoped.cutoff_risk,
-                };
-
-                // Build current workers map
-                let mut current_workers_map: HashMap<String, u32> = HashMap::new();
-                for (name, ws) in &state.workers {
-                    current_workers_map.insert(name.clone(), ws.current);
-                }
-
-                // Calculate new target total
-                let new_total = current_total.saturating_sub(*n);
-
-                // Distribute workers by cost priority (highest cost first when scaling down),
-                // reordered by worst verified-closure yield per dollar first when the ledger
-                // has evidence (claudego-f80857a2)
-                let target_distribution = distribute_workers_by_ledger_yield(
-                    agents,
-                    &current_workers_map,
-                    new_total,
-                    &state.burn_rate.by_model,
-                    pricing_config,
-                    cutoff_risk,
-                    &state.capacity_forecast,
-                    ledger_yields.as_ref(),
-                );
-
                 // Scale down each agent individually based on distribution
                 let mut total_graceful = 0;
                 let mut total_forced = 0;
@@ -7789,6 +7820,16 @@ pub fn run_act_cycle(
                                 worker::scale_down_graceful(to_remove, &worker_config.1, false);
                             total_graceful += result.graceful;
                             total_forced += result.force_killed;
+                            let removed = result.graceful + result.force_killed;
+                            if removed > 0 {
+                                pool_actions.push(format!(
+                                    "{} stop {} ({} -> {})",
+                                    agent_name,
+                                    removed,
+                                    current,
+                                    current - removed as u32
+                                ));
+                            }
                             log::info!(
                                 "[governor] scaled down {} agent: {} -> {} workers (removed: {}, graceful={}, forced={})",
                                 agent_name,
@@ -7808,6 +7849,18 @@ pub fn run_act_cycle(
                 );
                 actual_removed = (total_graceful + total_forced) as u32;
             } else {
+                for (agent_name, &target_count) in &target_distribution {
+                    let current = *current_workers_map.get(agent_name).unwrap_or(&0);
+                    if target_count < current {
+                        pool_actions.push(format!(
+                            "{} stop {} ({} -> {})",
+                            agent_name,
+                            current - target_count,
+                            current,
+                            target_count
+                        ));
+                    }
+                }
                 log::info!("[governor] DRY RUN: would scale down by {}", n);
             }
         }
@@ -7824,6 +7877,18 @@ pub fn run_act_cycle(
                 "[governor] EMERGENCY BRAKE (source={}): scaling all to 0",
                 decision_source
             );
+            // Per-pool record for the summary line: every pool holding live
+            // workers goes to 0. Snapshotted before the live branch resets
+            // ws.current to zero.
+            let brake_stops: Vec<(String, u32)> = state
+                .workers
+                .iter()
+                .filter(|(_, ws)| ws.current > 0)
+                .map(|(name, ws)| (name.clone(), ws.current))
+                .collect();
+            for (name, current) in &brake_stops {
+                pool_actions.push(format!("{} stop {} ({} -> 0)", name, current, current));
+            }
             if !dry_run {
                 // Kill all workers immediately across all agents
                 for session in &all_sessions {
@@ -7847,6 +7912,37 @@ pub fn run_act_cycle(
             }
         }
     }
+
+    // The cycle's one greppable summary. CLAUDE.md §3 documents triaging the
+    // daemon with `journalctl --user -u claude-governor -n 30 | grep
+    // reconcile`, so every cycle — every decision, live or dry-run — must emit
+    // at least one line containing "reconcile" naming the decision and the
+    // per-pool start/stop actions. Under dry_run the actions are the planned
+    // moves (the executor never ran) and started/stopped stay 0; live they are
+    // the executor's actual counts, which may undershoot the decision (pool at
+    // max, launcher failure). Sorted so the pools read in a stable order
+    // regardless of HashMap iteration.
+    pool_actions.sort();
+    let planned_end = match &decision {
+        ScalingDecision::ScaleUp(n) => current_total.saturating_add(*n),
+        ScalingDecision::ScaleDown(n) => current_total.saturating_sub(*n),
+        ScalingDecision::EmergencyBrake => 0,
+        ScalingDecision::NoChange => current_total,
+    };
+    log::info!(
+        "[governor] reconcile: decision={:?} fleet {} -> {} (dry_run={}, started {}, stopped {}) pools: {}",
+        decision,
+        current_total,
+        planned_end,
+        dry_run,
+        actual_launched,
+        actual_removed,
+        if pool_actions.is_empty() {
+            "none".to_string()
+        } else {
+            pool_actions.join(", ")
+        }
+    );
 
     // 6b. Record the decision in the JSONL audit log that `cgov explain` reads.
     //
