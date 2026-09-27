@@ -23,6 +23,12 @@
 //! * network failures — an unreachable release server, a 500 on the artifact,
 //!   a 500 on the sidecar — → refusal with nothing written (claudego-8bf03a00;
 //!   the 404 shapes are covered alongside the sidecar cases below);
+//! * an incomplete download — a 200 whose body stops mid-transfer, short of
+//!   its own Content-Length — fails at the fetch itself (curl's partial-file
+//!   error), never reaches the checksum gate, and writes nothing: the
+//!   truncated bytes land only in the installer's trap-cleaned temp dir, so
+//!   an existing install survives untouched and a fresh host never gains an
+//!   install dir (claudego-a710dc46);
 //! * a missing sidecar (404) → refusal with the same fresh-host atomicity:
 //!   the sidecar fetch fails before the verification gate that guards
 //!   `mkdir -p`, so the install dir never comes into existence
@@ -39,10 +45,14 @@
 //! mock server; every other byte of the executed script is the committed one.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use mockito::Mock;
 use tempfile::TempDir;
@@ -863,4 +873,130 @@ fn bare_version_is_normalized_to_the_release_tag() {
         "installer must report the normalized tag:\n{out}"
     );
     assert_installed_binary(&install_dir, &bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Incomplete downloads (claudego-a710dc46)
+// ---------------------------------------------------------------------------
+
+/// Retires the truncating listener's thread on drop, so a panicking assert
+/// never leaks a polling thread for the rest of the test process.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A release origin that answers every GET with a 200 promising
+/// `claimed_total` bytes but writing only `prefix` before closing the
+/// connection — the truncated-transfer shape behind every interrupted
+/// install (dropped Wi-Fi, killed proxy, dying CDN edge). mockito cannot
+/// express this — its bodies always satisfy their own Content-Length — so
+/// this is a raw `std::net` listener. curl fails such a transfer itself
+/// (exit 18, "partial file"), and the installer must turn that into the
+/// same fail-closed refusal as any other download error.
+fn spawn_truncating_release_server(
+    claimed_total: usize,
+    prefix: &'static [u8],
+) -> (String, StopOnDrop) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let url = format!("http://{}", listener.local_addr().expect("listener address"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        while !stop_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // The tests below pin a CGOV_VERSION, which skips
+                    // install.sh's best-effort redirect probe — every
+                    // connection arriving here is an artifact GET, and the
+                    // truncated response is served for any path.
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Length: {claimed_total}\r\n\
+                         Content-Type: application/octet-stream\r\n\
+                         Connection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(prefix);
+                    let _ = stream.flush();
+                    // No terminating bytes: dropping the socket ends the
+                    // transfer far short of the promised Content-Length.
+                    drop(stream);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, StopOnDrop(stop))
+}
+
+#[test]
+fn incomplete_download_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let _artifact = release_artifact_name();
+    let prefix: &'static [u8] = b"#!/bin/sh\necho \"cgov 0.0.0-trunca";
+    let (base, _stop) = spawn_truncating_release_server(prefix.len() + 4096, prefix);
+
+    let script = materialize_installer(sandbox.path(), &base);
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(
+        &script,
+        &sandbox_home(&sandbox),
+        &install_dir,
+        // The pin only skips the best-effort redirect probe; the truncating
+        // server ignores paths entirely, so the tag value is arbitrary.
+        &[("CGOV_VERSION", "v9.9.9-truncated")],
+    );
+    assert!(
+        !ok,
+        "a download truncated mid-body must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Download failed"),
+        "a truncated transfer must die at the fetch, with the fetch's own \
+         refusal:\n{out}"
+    );
+    assert!(
+        !out.contains("Checksum OK"),
+        "partial bytes must never reach the verification gate, let alone \
+         pass it:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+}
+
+#[test]
+fn incomplete_download_never_creates_a_fresh_install_dir() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let _artifact = release_artifact_name();
+    let prefix: &'static [u8] = b"#!/bin/sh\necho \"cgov 0.0.0-trunca";
+    let (base, _stop) = spawn_truncating_release_server(prefix.len() + 4096, prefix);
+
+    let script = materialize_installer(sandbox.path(), &base);
+    let install_dir = fresh_install_dir(&sandbox);
+    let (ok, out) = run_installer(
+        &script,
+        &sandbox_home(&sandbox),
+        &install_dir,
+        &[("CGOV_VERSION", "v9.9.9-truncated")],
+    );
+    assert!(!ok, "a truncated download must fail the install:\n{out}");
+    assert!(
+        out.contains("Download failed"),
+        "refusal must identify the failed download:\n{out}"
+    );
+    // The partial artifact lands only in the installer's own WORK_DIR, which
+    // the EXIT trap removes; the install dir sits behind both the checksum
+    // gate and `mkdir -p`, so a truncated transfer must leave a virgin host
+    // with no install dir at all.
+    assert!(
+        !install_dir.exists(),
+        "a truncated download on a fresh install must not create the install dir"
+    );
 }
