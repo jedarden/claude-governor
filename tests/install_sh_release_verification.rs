@@ -43,7 +43,15 @@
 //! * a sidecar truncated mid-transfer — the artifact leg served whole so the
 //!   run's only defect is the partial sidecar — dies at the fetch itself,
 //!   with the same pre-gate refusal as a missing sidecar and the same
-//!   preserved install dir (claudego-e2960c5d).
+//!   preserved install dir (claudego-e2960c5d);
+//! * the whole sidecar matrix is exercised for *every* architecture mapping
+//!   install.sh accepts, not only the build host's: a `uname` shim at the
+//!   front of PATH drives each arm of the platform case statement — x86_64
+//!   and amd64 to cgov-linux-amd64, aarch64 and arm64 to cgov-linux-arm64 —
+//!   through the successful, mismatched, missing (404) and unavailable (500)
+//!   sidecar states; every refusal leaves a seeded installation
+//!   byte-for-byte intact, and on a fresh host the verification gate still
+//!   precedes `mkdir -p` for each mapped artifact (claudego-abbfb9d6).
 //!
 //! The script is embedded with `include_str!` at compile time, following the
 //! repo's gate pattern (tests/adapter_var_sync.rs): the tested text cannot
@@ -744,19 +752,45 @@ fn sidecar_for_a_different_artifact_refuses_and_preserves_existing_install() {
     assert_hit_once(sidecar_mock);
 }
 
+/// A release origin that accepts every connection and closes it without
+/// writing a single byte — no status line, no headers, nothing. curl fails
+/// such a transfer immediately with "Empty reply from server", which is the
+/// fetch-layer refusal the unreachable-server test pins, and the port stays
+/// bound for the whole test so no parallel test's server can re-take it and
+/// answer in its place (the previous bind-then-drop form was racy exactly
+/// there: once the suite grew enough servers, the dropped port was recycled
+/// by a concurrent fixture and the "dead" origin started speaking for
+/// another test).
+fn spawn_silent_release_server() -> (String, StopOnDrop) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let url = format!("http://{}", listener.local_addr().expect("listener address"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        while !stop_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                // Close on sight: curl gets EOF before any response bytes
+                // and aborts the transfer on its own.
+                Ok((stream, _)) => drop(stream),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, StopOnDrop(stop))
+}
+
 #[test]
 fn unreachable_release_server_refuses_and_creates_nothing() {
     let sandbox = TempDir::new().expect("sandbox");
     let _artifact = release_artifact_name();
 
-    // The purest network failure: bind a port, capture the URL, then drop the
-    // server so curl hits connection-refused — not an HTTP error status. If a
-    // foreign service somehow re-took the ephemeral port and answered 200 with
-    // garbage, the test still holds: the run fails and nothing is written.
-    let dead_base = {
-        let server = mockito::Server::new();
-        server.url()
-    };
+    // The purest network failure: every connection dies before a single
+    // response byte — not an HTTP error status.
+    let (dead_base, _stop) = spawn_silent_release_server();
 
     let script = materialize_installer(sandbox.path(), &dead_base);
     let install_dir = fresh_install_dir(&sandbox);
@@ -1242,4 +1276,295 @@ fn truncated_sidecar_download_refuses_and_preserves_existing_install() {
          verification gate, let alone pass it:\n{out}"
     );
     assert_install_dir_unchanged(&install_dir);
+}
+
+// ---------------------------------------------------------------------------
+// The sidecar matrix for every architecture mapping (claudego-abbfb9d6)
+// ---------------------------------------------------------------------------
+
+/// Every `uname -m` value install.sh's platform case statement accepts, paired
+/// with the release artifact each must map to. The four entries cover all four
+/// arms: the canonical machine names and both aliases.
+fn arch_matrix() -> [(&'static str, &'static str); 4] {
+    [
+        ("x86_64", "cgov-linux-amd64"),
+        ("amd64", "cgov-linux-amd64"),
+        ("aarch64", "cgov-linux-arm64"),
+        ("arm64", "cgov-linux-arm64"),
+    ]
+}
+
+/// Absolute path to the host's real `uname`, so the shim can delegate anything
+/// beyond the two invocations install.sh actually makes. Resolved at runtime —
+/// the binary's location differs between distributions (stock Linux puts it at
+/// /usr/bin/uname; NixOS at /run/current-system/sw/bin/uname) and the close
+/// gate re-runs these tests wherever the extraction lands.
+fn real_uname() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("uname");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("no uname anywhere on PATH; cannot build the architecture shim");
+}
+
+/// Writes a `uname` executable into `dir` that answers install.sh's two
+/// questions — `-s` with `Linux`, `-m` with `machine` — and delegates anything
+/// else to the real binary, so a mapping bug cannot hide behind a shim that
+/// answers questions the script does not ask. Front-loading `dir` on PATH is
+/// the only way to drive the non-native arms of the platform case statement on
+/// a single host: install.sh reads the running kernel's arch straight from
+/// uname, and with the shim in place every other byte of the executed script
+/// is still the shipped one.
+fn install_uname_shim(dir: &Path, machine: &str) {
+    let real = real_uname().display().to_string();
+    assert!(
+        !real.contains('\''),
+        "uname path {real} is not single-quote-safe; escape it in the shim"
+    );
+    let shim = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  -s) echo Linux ;;\n  -m) echo {machine} ;;\n\
+         \x20 *) exec '{real}' \"$@\" ;;\nesac\n"
+    );
+    fs::write(dir.join("uname"), shim).expect("write uname shim");
+    fs::set_permissions(dir.join("uname"), fs::Permissions::from_mode(0o755))
+        .expect("chmod uname shim");
+}
+
+/// Prepares one matrix case: a per-case directory holding the `uname` shim,
+/// plus the PATH override that puts that directory first while leaving every
+/// other resolution untouched. The caller materializes the installer into the
+/// returned directory once its case server exists, and passes the env pairs to
+/// `run_installer`.
+fn stage_arch_case(sandbox: &TempDir, machine: &str) -> (PathBuf, Vec<(String, String)>) {
+    let case_dir = sandbox.path().join(format!("case-{machine}"));
+    fs::create_dir_all(&case_dir).expect("create per-architecture case dir");
+    install_uname_shim(&case_dir, machine);
+    let path_override = (
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            case_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    (case_dir, vec![path_override])
+}
+
+#[test]
+fn published_sidecar_verifies_for_every_architecture_mapping() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let bytes = artifact_bytes();
+    let digest = sha256_hex(&bytes);
+
+    for (machine, artifact) in arch_matrix() {
+        let (case_dir, env) = stage_arch_case(&sandbox, machine);
+        let mut server = mockito::Server::new();
+        let script = materialize_installer(&case_dir, &server.url());
+
+        let (artifact_mock, sidecar_mock) = serve_release(
+            &mut server,
+            "/releases/latest/download",
+            artifact,
+            &bytes,
+            Some(sidecar_bytes(&digest, artifact)),
+        );
+
+        let install_dir = fresh_install_dir(&sandbox);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &env_refs);
+        assert!(
+            ok,
+            "a genuine published sidecar must install for uname -m {machine}:\n{out}"
+        );
+        assert!(
+            out.contains("Checksum OK (published sidecar)"),
+            "uname -m {machine}: verification must credit the published sidecar:\n{out}"
+        );
+        // The mapping, not just the outcome: the download must have gone to
+        // the arch-specific route — including the alias arms, which must
+        // resolve to the same artifact as their canonical spelling.
+        artifact_mock.assert();
+        assert_hit_once(sidecar_mock);
+        assert_installed_binary(&install_dir, &bytes);
+    }
+}
+
+#[test]
+fn mismatched_sidecar_refuses_for_every_architecture_mapping() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let bytes = artifact_bytes();
+
+    for (machine, artifact) in arch_matrix() {
+        let (case_dir, env) = stage_arch_case(&sandbox, machine);
+        let mut server = mockito::Server::new();
+        let script = materialize_installer(&case_dir, &server.url());
+
+        let (artifact_mock, sidecar_mock) = serve_release(
+            &mut server,
+            "/releases/latest/download",
+            artifact,
+            &bytes,
+            Some(sidecar_bytes(&sha256_hex(b"tampered payload"), artifact)),
+        );
+
+        let install_dir = existing_install_dir(&sandbox);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &env_refs);
+        assert!(
+            !ok,
+            "a mismatched sidecar must fail the install for uname -m {machine}:\n{out}"
+        );
+        assert!(
+            out.contains("Checksum verification FAILED"),
+            "uname -m {machine}: refusal must name the checksum failure:\n{out}"
+        );
+        assert_install_dir_unchanged(&install_dir);
+        // Both legs were fetched and verified — the refusal came from the
+        // comparison of real bytes, not a short-circuit.
+        artifact_mock.assert();
+        assert_hit_once(sidecar_mock);
+    }
+}
+
+#[test]
+fn missing_sidecar_refuses_for_every_architecture_mapping() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let bytes = artifact_bytes();
+
+    for (machine, artifact) in arch_matrix() {
+        let (case_dir, env) = stage_arch_case(&sandbox, machine);
+        let mut server = mockito::Server::new();
+        let script = materialize_installer(&case_dir, &server.url());
+
+        let artifact_mock = server
+            .mock(
+                "GET",
+                format!("/releases/latest/download/{artifact}").as_str(),
+            )
+            .with_status(200)
+            .with_body(bytes.clone())
+            .expect(1)
+            .create();
+        let sidecar_mock = server
+            .mock(
+                "GET",
+                format!("/releases/latest/download/{artifact}.sha256").as_str(),
+            )
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let install_dir = existing_install_dir(&sandbox);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &env_refs);
+        assert!(
+            !ok,
+            "a missing sidecar must fail the install for uname -m {machine}:\n{out}"
+        );
+        assert!(
+            out.contains("Digest sidecar download failed"),
+            "uname -m {machine}: refusal must identify the missing sidecar:\n{out}"
+        );
+        assert_install_dir_unchanged(&install_dir);
+        artifact_mock.assert();
+        sidecar_mock.assert();
+    }
+}
+
+#[test]
+fn unavailable_sidecar_refuses_for_every_architecture_mapping() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let bytes = artifact_bytes();
+
+    for (machine, artifact) in arch_matrix() {
+        let (case_dir, env) = stage_arch_case(&sandbox, machine);
+        let mut server = mockito::Server::new();
+        let script = materialize_installer(&case_dir, &server.url());
+
+        // The artifact serves fine; its sidecar is there but broken (500).
+        // "Unavailable" must refuse exactly like "missing" — never install
+        // "while we have the bytes" — for every mapping arm alike.
+        let artifact_mock = server
+            .mock(
+                "GET",
+                format!("/releases/latest/download/{artifact}").as_str(),
+            )
+            .with_status(200)
+            .with_body(bytes.clone())
+            .expect(1)
+            .create();
+        let sidecar_mock = server
+            .mock(
+                "GET",
+                format!("/releases/latest/download/{artifact}.sha256").as_str(),
+            )
+            .with_status(500)
+            .expect(1)
+            .create();
+
+        let install_dir = existing_install_dir(&sandbox);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &env_refs);
+        assert!(
+            !ok,
+            "a 500ing sidecar must fail the install for uname -m {machine}:\n{out}"
+        );
+        assert!(
+            out.contains("Digest sidecar download failed"),
+            "uname -m {machine}: refusal must identify the failed sidecar download:\n{out}"
+        );
+        assert_install_dir_unchanged(&install_dir);
+        artifact_mock.assert();
+        sidecar_mock.assert();
+    }
+}
+
+/// Install-happens-only-after-validation, per mapping arm: on a fresh host a
+/// sidecar that fails *at the verification gate* (served whole, wrong digest)
+/// must leave the install dir un-created — `mkdir -p` sits after the gate in
+/// install.sh. The fetch-stage refusals (missing/500) die one step earlier and
+/// share this gate's position; their fresh-host behavior is pinned for the
+/// native mapping by the dedicated tests above, and nothing between the gate
+/// and `mkdir -p` branches on the architecture.
+#[test]
+fn failed_verification_never_creates_a_fresh_install_dir_for_any_mapping() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let bytes = artifact_bytes();
+
+    for (machine, artifact) in arch_matrix() {
+        let (case_dir, env) = stage_arch_case(&sandbox, machine);
+        let mut server = mockito::Server::new();
+        let script = materialize_installer(&case_dir, &server.url());
+
+        let (artifact_mock, sidecar_mock) = serve_release(
+            &mut server,
+            "/releases/latest/download",
+            artifact,
+            &bytes,
+            Some(sidecar_bytes(&sha256_hex(b"tampered payload"), artifact)),
+        );
+
+        let install_dir = fresh_install_dir(&sandbox);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &env_refs);
+        assert!(
+            !ok,
+            "a mismatched sidecar must fail the install for uname -m {machine}:\n{out}"
+        );
+        assert!(
+            !install_dir.exists(),
+            "uname -m {machine}: failed verification on a fresh install must \
+             not create the install dir"
+        );
+        artifact_mock.assert();
+        assert_hit_once(sidecar_mock);
+    }
 }
