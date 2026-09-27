@@ -2161,6 +2161,88 @@ fn check_claude_print_adapters_in(dir: &std::path::Path, live_dispatch: bool) ->
     }
 }
 
+/// Check that this host's deployed claude-print surface is byte-identical to
+/// the canonical deployment this cgov build ships.
+///
+/// [`check_claude_print_adapters`] proves the installed templates satisfy the
+/// static contract, but it cannot see a template hand-edited on this host
+/// into a *different* compliant shape, an install that predates a rule later
+/// added to the canonical templates, or a canonical adapter deleted outright —
+/// exactly how a second host drifts from the primary, and exactly the kind of
+/// drift that historically surfaced as a dispatch failure instead of a
+/// diagnosis. This check compares the installed `claude-print-*.yaml` files
+/// byte-for-byte against the templates embedded in this binary at build time
+/// and verifies every absolute claude-print path the canonical templates call
+/// exists and is executable here. Run it on the second host after any
+/// adapter/pin change lands in the repo (see
+/// `docs/notes/second-host-provisioning.md` for the runbook).
+fn check_claude_print_parity_in(dir: &std::path::Path, binary_paths: &[String]) -> CheckResult {
+    // Not provisioned is a different state from drifted: a host with no
+    // claude-print adapters has nothing to compare, and the pass/fail verdict
+    // would be vacuous — warn, matching check_claude_print_adapters.
+    let installed_count = match crate::adapter_verify::load_installed_adapters(dir) {
+        Ok(adapters) => adapters.len(),
+        Err(e) => {
+            return CheckResult::warn(
+                "claude_print_parity",
+                format!("cannot inventory {} ({})", dir.display(), e),
+                "Provision this host: deploy/install-claude-print-adapters.sh \
+                 — see docs/notes/second-host-provisioning.md",
+            )
+        }
+    };
+    if installed_count == 0 {
+        return CheckResult::warn(
+            "claude_print_parity",
+            format!("no claude-print-*.yaml installed in {} — parity is vacuous", dir.display()),
+            "Provision this host: deploy/install-claude-print-adapters.sh \
+             — see docs/notes/second-host-provisioning.md",
+        );
+    }
+
+    match crate::adapter_verify::host_parity_drift(dir, binary_paths) {
+        Ok(drift) if drift.is_empty() => CheckResult::pass(
+            "claude_print_parity",
+            format!(
+                "{} installed adapter(s) byte-identical to this build's canonical \
+                 templates; dispatch path(s) present: {}",
+                installed_count,
+                binary_paths.join(", ")
+            ),
+        ),
+        Ok(drift) => CheckResult::fail(
+            "claude_print_parity",
+            format!(
+                "this host's deployment diverged from the canonical surface this cgov \
+                 build carries: {}",
+                drift
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            "Re-run deploy/install-claude-print-adapters.sh from a checkout at this \
+             cgov build's commit — do not hand-edit the live templates back into \
+             shape. If the installer's fresh install still reports drift, this cgov \
+             binary is older than the repo's templates: rebuild/reinstall cgov so \
+             its embedded canonical copies match. Runbook: \
+             docs/notes/second-host-provisioning.md",
+        ),
+        Err(e) => CheckResult::warn(
+            "claude_print_parity",
+            format!("cannot compare against the canonical adapters ({})", e),
+            "Fix the read error on the installed adapter files, then re-run cgov doctor",
+        ),
+    }
+}
+
+fn check_claude_print_parity() -> CheckResult {
+    check_claude_print_parity_in(
+        &crate::adapter_verify::default_adapters_dir(),
+        &crate::adapter_verify::canonical_binary_paths(),
+    )
+}
+
 /// Check subscription session presence - verify cli-entrypoint JSONL sessions exist
 ///
 /// This check ensures that subscription-flagged agents are actually using subscription
@@ -2351,6 +2433,7 @@ pub fn run_doctor_with_options(options: DoctorOptions) -> DoctorReport {
         check_claude_binary_installed(),
         check_claude_print_installed(),
         check_claude_print_adapters(options.live_dispatch),
+        check_claude_print_parity(),
         check_subscription_session_presence(),
     ];
 
@@ -3162,6 +3245,137 @@ agents:
         assert!(
             result.message.contains("live exit-0"),
             "msg: {}",
+            result.message
+        );
+    }
+
+    // -- claude_print_parity ----------------------------------------------------
+
+    /// A fake dispatch binary inside the sandbox, standing in for the
+    /// absolute claude-print path the canonical templates call.
+    fn stub_binary(dir: &std::path::Path) -> String {
+        let bin = dir.join("claude-print");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        bin.display().to_string()
+    }
+
+    #[test]
+    fn parity_check_passes_a_host_installed_from_this_builds_templates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("adapters")).unwrap();
+        for (filename, bytes) in crate::adapter_verify::CANONICAL_ADAPTERS {
+            fs::write(tmp.path().join("adapters").join(filename), bytes).unwrap();
+        }
+
+        let result = check_claude_print_parity_in(
+            &tmp.path().join("adapters"),
+            &[stub_binary(tmp.path())],
+        );
+
+        assert_eq!(result.status, CheckStatus::Pass, "msg: {}", result.message);
+        assert!(result.message.contains("byte-identical"), "msg: {}", result.message);
+    }
+
+    #[test]
+    fn parity_check_warns_on_an_absent_or_empty_adapters_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let absent = check_claude_print_parity_in(&tmp.path().join("absent"), &[]);
+        assert_eq!(absent.status, CheckStatus::Warn, "msg: {}", absent.message);
+        assert!(
+            absent.remediation.as_deref().unwrap().contains("install-claude-print-adapters.sh"),
+            "not-provisioned remediation names the installer: {:?}",
+            absent.remediation
+        );
+
+        fs::create_dir(tmp.path().join("empty")).unwrap();
+        let empty = check_claude_print_parity_in(&tmp.path().join("empty"), &[]);
+        assert_eq!(empty.status, CheckStatus::Warn, "msg: {}", empty.message);
+    }
+
+    #[test]
+    fn parity_check_fails_a_hand_edited_installed_template() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("adapters")).unwrap();
+        for (filename, bytes) in crate::adapter_verify::CANONICAL_ADAPTERS {
+            fs::write(tmp.path().join("adapters").join(filename), bytes).unwrap();
+        }
+        let (edited, canonical) = crate::adapter_verify::CANONICAL_ADAPTERS[1];
+        fs::write(
+            tmp.path().join("adapters").join(edited),
+            format!("{canonical}\n# local tweak\n"),
+        )
+        .unwrap();
+
+        let result = check_claude_print_parity_in(
+            &tmp.path().join("adapters"),
+            &[stub_binary(tmp.path())],
+        );
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains(edited) && result.message.contains("canonical"),
+            "the failure must name the drifted file: {}",
+            result.message
+        );
+        let remediation = result.remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("install-claude-print-adapters.sh")
+                && remediation.contains("do not hand-edit"),
+            "remediation routes through the installer, not hand-editing: {:?}",
+            remediation
+        );
+        assert!(
+            remediation.contains("docs/notes/second-host-provisioning.md"),
+            "remediation names the runbook: {:?}",
+            remediation
+        );
+    }
+
+    #[test]
+    fn parity_check_fails_a_missing_canonical_adapter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("adapters")).unwrap();
+        // Only one of the canonical pair installed — an install older than
+        // the repo, or a deletion.
+        let (only, bytes) = crate::adapter_verify::CANONICAL_ADAPTERS[0];
+        fs::write(tmp.path().join("adapters").join(only), bytes).unwrap();
+
+        let result = check_claude_print_parity_in(
+            &tmp.path().join("adapters"),
+            &[stub_binary(tmp.path())],
+        );
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("claude-print-opus.yaml is not installed")
+                || result.message.contains("claude-print-fable.yaml is not installed"),
+            "the failure must name the missing canonical adapter: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn parity_check_fails_when_the_dispatch_binary_path_is_gone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("adapters")).unwrap();
+        for (filename, bytes) in crate::adapter_verify::CANONICAL_ADAPTERS {
+            fs::write(tmp.path().join("adapters").join(filename), bytes).unwrap();
+        }
+
+        let result = check_claude_print_parity_in(
+            &tmp.path().join("adapters"),
+            &["/nonexistent-cgov-parity/claude-print".to_string()],
+        );
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("exit 127"),
+            "the exit-127 signature must be named: {}",
             result.message
         );
     }

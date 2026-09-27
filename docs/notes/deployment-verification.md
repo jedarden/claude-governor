@@ -135,6 +135,7 @@ scope-limited exception noted:
 | `pricing_coverage` | recent usage on unpriced models | add the named model(s) to `pricing.models` (figures are then auto-resolved, rounded up until exact entries exist) |
 | `disk_space` | ≥95% used on the state dir (WARN 80–95%) | free space before the DB is at risk |
 | `claude_print_adapters` | env-scrub static check or live dispatch fails | re-run `deploy/install-claude-print-adapters.sh` |
+| `claude_print_parity` | installed adapters diverge from the canonical templates this cgov build carries, or the dispatch path went missing | re-run `deploy/install-claude-print-adapters.sh` from a checkout at this build's commit; if a fresh install still reports drift, cgov is older than the repo — rebuild it (second-host runbook: `second-host-provisioning.md`) |
 | `prediction_accuracy` | median error ≥10% with 5+ scored | check for unusual usage patterns; safe mode may activate |
 | `burn_rate_samples` | <3 samples **and** uptime ≥30 min | only a failure outside the warm-up window — see step 0 |
 | `oauth_token` | credential file unreadable/unparseable | re-auth; collector/daemon will recover. Expiring-soon is only a WARN (auto-refresh) |
@@ -153,6 +154,7 @@ These WARNs are the system working as designed. Record them, don't chase them:
 | Check | Warns when | Why acceptable |
 |---|---|---|
 | `act_running` | act paused (`cgov start act` not run) | Explicit safety posture: scaling/alerting stay gated until trusted. Observe keeps forecasting while paused |
+| `claude_print_parity` | no claude-print adapters installed on this host | Not provisioned, not drifted — the parity verdict is vacuous until `deploy/install-claude-print-adapters.sh` runs (`second-host-provisioning.md`) |
 | `alert_fp_telemetry` | <6 tracked alert types at 100 samples with <5% FP | Re-enablement bar for `alerts.auto_bead`; fills only while observe runs. 0% FP on everything is the *good* direction |
 | `log_file` | log not yet created | Created on first daemon run; harmless pre-first-run |
 | `disk_space` | 80–95% used | Advisory; act at ≥95% instead |

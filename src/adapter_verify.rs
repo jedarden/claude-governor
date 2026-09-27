@@ -125,6 +125,30 @@ pub const ADAPTER_TIMEOUT_PINS: &[(&str, u64)] = &[
     ("claude-print-opus", 1200),
 ];
 
+/// The canonical adapter templates this build ships, embedded at compile
+/// time as `(filename, bytes)` pairs from `deploy/needle-adapters/`.
+///
+/// `cgov doctor`'s parity check compares the adapters installed on whatever
+/// host it runs on against these bytes, so drift on a second host — a
+/// hand-edited template under `~/.config/needle/adapters/`, or an install
+/// older than the repo's latest rule change — fails doctor there instead of
+/// surfacing as a dispatch failure (see
+/// `docs/notes/second-host-provisioning.md`). Cargo tracks include_str!
+/// files as rebuild inputs, so a template edit rebuilds every binary that
+/// carries it and the comparison is always against the exact surface this
+/// binary was built from — the same embedded-not-read rule the drift gates
+/// below follow for the same shared-close-gate-cache reason.
+pub const CANONICAL_ADAPTERS: &[(&str, &str)] = &[
+    (
+        "claude-print-fable.yaml",
+        include_str!("../deploy/needle-adapters/claude-print-fable.yaml"),
+    ),
+    (
+        "claude-print-opus.yaml",
+        include_str!("../deploy/needle-adapters/claude-print-opus.yaml"),
+    ),
+];
+
 /// Upper bound on the live probe. A trivial prompt normally finishes in well
 /// under a minute; the cap only bites on a hung dispatch, which is exactly
 /// the failure this probe exists to surface.
@@ -206,6 +230,149 @@ pub fn load_installed_adapters(dir: &Path) -> Result<Vec<InstalledAdapter>, Stri
         adapters.push(InstalledAdapter { path, adapter });
     }
     Ok(adapters)
+}
+
+// ---------------------------------------------------------------------------
+// Host parity — installed surface vs the canonical deployment this build ships
+// ---------------------------------------------------------------------------
+
+/// One drift finding between a host's installed claude-print surface and the
+/// canonical deployment the running cgov build embeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParityDrift {
+    /// A canonical adapter has no installed counterpart on this host.
+    MissingAdapter {
+        filename: String,
+    },
+    /// The installed adapter's bytes differ from the canonical template — a
+    /// hand-edit under the live adapters directory, or an install older or
+    /// newer than this cgov build.
+    DivergedAdapter {
+        filename: String,
+        installed_bytes: usize,
+        canonical_bytes: usize,
+    },
+    /// An absolute claude-print path the canonical templates call is absent
+    /// or not executable on this host — every dispatch through it dies at
+    /// exit 127 while `needle test-agent` still reports READY.
+    BinaryPathMissing {
+        path: String,
+    },
+}
+
+impl std::fmt::Display for ParityDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParityDrift::MissingAdapter { filename } => {
+                write!(f, "{filename} is not installed")
+            }
+            ParityDrift::DivergedAdapter {
+                filename,
+                installed_bytes,
+                canonical_bytes,
+            } => write!(
+                f,
+                "{filename} differs from the canonical template \
+                 ({installed_bytes} bytes installed vs {canonical_bytes} canonical)"
+            ),
+            ParityDrift::BinaryPathMissing { path } => write!(
+                f,
+                "{path} is missing or not executable — dispatch through it dies at exit 127"
+            ),
+        }
+    }
+}
+
+/// The absolute claude-print paths one template calls: whitespace-delimited
+/// tokens starting with `/` and ending in `/claude-print`, the installer's
+/// own `grep -ho '/[^ ]*/claude-print'` rule. The templates call the binary
+/// by absolute path on purpose (NEEDLE's dispatch shell PATH is not the
+/// interactive shell's), and the installer is what establishes that path —
+/// normally a symlink to the real binary — so a host where the path is gone
+/// is a host where dispatch dies at exit 127. The bare `claude-print` tokens
+/// (`agent_cli`, `version_command`) do not start with `/` and never match.
+fn absolute_binary_paths_in(template: &str) -> Vec<String> {
+    template
+        .split_whitespace()
+        .filter(|t| t.starts_with('/') && t.ends_with("/claude-print"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The absolute claude-print paths the canonical templates call, deduplicated
+/// in first-seen order.
+pub fn canonical_binary_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    for (_, template) in CANONICAL_ADAPTERS {
+        for path in absolute_binary_paths_in(template) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// Is `path` an existing, executable file?
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    }
+}
+
+/// Compare a host's installed claude-print surface against the canonical
+/// deployment the running build embeds: every canonical adapter must be
+/// installed byte-identical, and every absolute binary path the canonical
+/// templates call must exist and be executable here.
+///
+/// `Err` only when a file that should be comparable cannot be read at all
+/// (e.g. permissions) — the caller reports that separately from drift. A
+/// missing directory or a missing adapter is drift, not an error: an empty
+/// directory comes back as every canonical adapter missing.
+pub fn host_parity_drift(
+    dir: &Path,
+    binary_paths: &[String],
+) -> Result<Vec<ParityDrift>, String> {
+    let mut drift = Vec::new();
+
+    for (filename, canonical) in CANONICAL_ADAPTERS {
+        let installed_path = dir.join(filename);
+        match fs::read(&installed_path) {
+            Ok(installed) => {
+                if installed != canonical.as_bytes() {
+                    drift.push(ParityDrift::DivergedAdapter {
+                        filename: (*filename).to_string(),
+                        installed_bytes: installed.len(),
+                        canonical_bytes: canonical.len(),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                drift.push(ParityDrift::MissingAdapter {
+                    filename: (*filename).to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(format!("cannot read {}: {}", installed_path.display(), e));
+            }
+        }
+    }
+
+    for path in binary_paths {
+        if !is_executable_file(Path::new(path)) {
+            drift.push(ParityDrift::BinaryPathMissing { path: path.clone() });
+        }
+    }
+
+    Ok(drift)
 }
 
 /// Which documented failure class a required variable belongs to.
@@ -741,6 +908,186 @@ mod tests {
             ADAPTER_TIMEOUT_PINS.len(),
             "an adapter was added without a timeout_secs pin, or a pin lost its adapter"
         );
+    }
+
+    // -- host parity (CANONICAL_ADAPTERS / host_parity_drift) -----------------
+
+    /// The embedded canonical adapters are the committed template bytes under
+    /// their installed filenames — the parity check compares live installs
+    /// against exactly what the repo ships.
+    #[test]
+    fn canonical_adapters_carry_the_committed_template_bytes() {
+        let canonical: std::collections::BTreeMap<&str, &str> =
+            CANONICAL_ADAPTERS.iter().copied().collect();
+        assert_eq!(
+            canonical.get("claude-print-opus.yaml").copied(),
+            Some(ADAPTER_OPUS_YAML)
+        );
+        assert_eq!(
+            canonical.get("claude-print-fable.yaml").copied(),
+            Some(ADAPTER_FABLE_YAML)
+        );
+    }
+
+    /// The embedded bytes must survive the production loader and pass every
+    /// static contract gate — a canonical template that cannot be loaded or
+    /// is itself non-compliant would make parity impossible (every host would
+    /// either match a broken canonical or drift from a good install).
+    #[test]
+    fn canonical_adapters_load_and_pass_the_static_contract() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        for (filename, bytes) in CANONICAL_ADAPTERS {
+            std::fs::write(tmp.path().join(filename), bytes).expect("write canonical adapter");
+        }
+        let adapters = load_installed_adapters(tmp.path()).expect("canonical adapters must load");
+        assert_eq!(adapters.len(), CANONICAL_ADAPTERS.len());
+        for adapter in &adapters {
+            assert!(
+                missing_scrub_vars(&adapter.adapter.invoke_template).is_empty(),
+                "{} stops unsetting required vars",
+                adapter.adapter.name
+            );
+            assert!(
+                missing_invoke_flags(&adapter.adapter.invoke_template).is_empty(),
+                "{} drops required invoke flags",
+                adapter.adapter.name
+            );
+            assert_eq!(
+                timeout_violation(&adapter.adapter.name, adapter.adapter.timeout_secs),
+                None,
+                "{} violates its timeout pin",
+                adapter.adapter.name
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_binary_paths_extracts_only_absolute_dispatch_paths() {
+        // Both committed templates call the same absolute path; the bare
+        // `claude-print` tokens (agent_cli, version_command) never match.
+        assert_eq!(
+            canonical_binary_paths(),
+            vec!["/home/coding/.local/bin/claude-print".to_string()]
+        );
+        // A path in the middle of the template counts; a relative one and a
+        // path not ending in /claude-print do not.
+        let found = absolute_binary_paths_in(
+            "x /opt/cp/claude-print --flag /usr/bin/other claude-print /rel/claude-print/x",
+        );
+        assert_eq!(found, vec!["/opt/cp/claude-print".to_string()]);
+    }
+
+    fn install_canonical(dir: &Path) {
+        for (filename, bytes) in CANONICAL_ADAPTERS {
+            std::fs::write(dir.join(filename), bytes).expect("write adapter");
+        }
+    }
+
+    #[test]
+    fn parity_passes_a_byte_identical_host_with_the_binary_path_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("adapters");
+        std::fs::create_dir(&dir).unwrap();
+        install_canonical(&dir);
+
+        let bin = tmp.path().join("claude-print");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+
+        let drift = host_parity_drift(&dir, &[bin.display().to_string()])
+            .expect("readable install must not err");
+        assert!(
+            drift.is_empty(),
+            "byte-identical host must carry no drift: {drift:?}"
+        );
+    }
+
+    #[test]
+    fn parity_reports_a_diverged_installed_template_with_both_byte_counts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("adapters");
+        std::fs::create_dir(&dir).unwrap();
+        install_canonical(&dir);
+        // The hand-edit shape: someone touched the live template on this host.
+        let (filename, canonical) = CANONICAL_ADAPTERS[1];
+        std::fs::write(dir.join(filename), format!("{canonical}\n# local edit\n")).unwrap();
+
+        let drift = host_parity_drift(&dir, &[]).expect("readable install must not err");
+        assert_eq!(
+            drift,
+            vec![ParityDrift::DivergedAdapter {
+                filename: filename.to_string(),
+                installed_bytes: canonical.len() + "\n# local edit\n".len(),
+                canonical_bytes: canonical.len(),
+            }]
+        );
+        let rendered = drift[0].to_string();
+        assert!(rendered.contains("differs from the canonical template"), "{rendered}");
+        assert!(rendered.contains(filename), "{rendered}");
+    }
+
+    #[test]
+    fn parity_reports_a_missing_canonical_adapter_and_a_missing_dir_as_drift() {
+        // An adapters dir without one of the canonical pair (an install older
+        // than the repo, or a hand deletion) is drift, not an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("adapters");
+        std::fs::create_dir(&dir).unwrap();
+        let (only, bytes) = CANONICAL_ADAPTERS[0];
+        std::fs::write(dir.join(only), bytes).unwrap();
+
+        let drift = host_parity_drift(&dir, &[]).expect("readable install must not err");
+        assert_eq!(
+            drift,
+            vec![ParityDrift::MissingAdapter {
+                filename: "claude-print-opus.yaml".to_string(),
+            }]
+        );
+
+        // A host that was never provisioned has no adapters dir at all: still
+        // drift (every canonical adapter missing), not an error — the caller
+        // distinguishes not-provisioned from drifted by inventorying first.
+        let absent = tmp.path().join("no-such-dir");
+        let drift = host_parity_drift(&absent, &[]).expect("missing dir is drift, not an error");
+        assert_eq!(drift.len(), CANONICAL_ADAPTERS.len());
+        assert!(drift
+            .iter()
+            .all(|d| matches!(d, ParityDrift::MissingAdapter { .. })));
+    }
+
+    #[test]
+    fn parity_fails_the_missing_dispatch_binary_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("adapters");
+        std::fs::create_dir(&dir).unwrap();
+        install_canonical(&dir);
+
+        let drift = host_parity_drift(&dir, &["/nonexistent-cgov-parity/claude-print".to_string()])
+            .expect("readable install must not err");
+        assert_eq!(
+            drift,
+            vec![ParityDrift::BinaryPathMissing {
+                path: "/nonexistent-cgov-parity/claude-print".to_string(),
+            }]
+        );
+        assert!(
+            drift[0].to_string().contains("exit 127"),
+            "the finding must name the dispatch failure it causes: {}",
+            drift[0]
+        );
+    }
+
+    #[test]
+    fn parity_errs_when_an_installed_file_cannot_be_read_at_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A regular file where the adapters directory should be: every
+        // canonical path is unreadable (ENOTDIR) — that is an error to
+        // report, not drift.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "file").unwrap();
+
+        let err = host_parity_drift(&blocker, &[]).expect_err("unreadable install must err");
+        assert!(err.contains("cannot read"), "err: {err}");
     }
 
     #[test]

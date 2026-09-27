@@ -159,7 +159,10 @@ Expected on a healthy start: the daemon reports a capacity decision, reconciles
 each configured pool toward its target, and starts or stops workers as needed.
 
 **Lab note:** the second host is reachable at the Tailscale IP `100.81.129.38`; the
-hostname times out. Each host needs its own `claude-print` binary + adapters + creds.
+hostname times out. Each host needs its own `claude-print` binary + adapters + creds
+— provisioning runbook: `docs/notes/second-host-provisioning.md`. `cgov doctor`'s
+`claude_print_parity` check fails on a host whose installed adapters or dispatch
+path have drifted from the canonical surface its own build carries.
 
 ---
 
