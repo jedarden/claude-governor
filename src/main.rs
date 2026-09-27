@@ -882,40 +882,38 @@ fn run_scale_command(
     // reverted by a concurrent cycle save (state::merge_act_owned copies
     // manual_override only when the act cycle itself changed it;
     // merge_observe_owned never touches it).
-    let (record, bounds, safe_mode_was_active) = state::with_state_lock(
-        &state_path,
-        || -> anyhow::Result<_> {
-        let mut state = state::load_state(&state_path)?;
-        let bounds = validate_scale_count(&state, count)?;
-        let safe_mode_was_active = state.safe_mode.active;
+    let (record, bounds, safe_mode_was_active) =
+        state::with_state_lock(&state_path, || -> anyhow::Result<_> {
+            let mut state = state::load_state(&state_path)?;
+            let bounds = validate_scale_count(&state, count)?;
+            let safe_mode_was_active = state.safe_mode.active;
 
-        // Safe mode does not block the write — while the emergency brake is
-        // engaged it wins over the pin regardless — but the operator must
-        // know the pin will not take effect until it clears.
-        if safe_mode_was_active {
-            log::warn!("[governor] WARN: manual scale override during safe mode");
+            // Safe mode does not block the write — while the emergency brake is
+            // engaged it wins over the pin regardless — but the operator must
+            // know the pin will not take effect until it clears.
+            if safe_mode_was_active {
+                log::warn!("[governor] WARN: manual scale override during safe mode");
 
-            // Also write directly to log file for persistence (with rotation support)
-            let config = GovernorConfig::load()?;
-            let log_line = format!(
-                "{} [governor] WARN: manual scale override during safe mode\n",
-                Utc::now().to_rfc3339()
-            );
-            let _ = append_to_governor_log(&log_line, &config);
-        }
+                // Also write directly to log file for persistence (with rotation support)
+                let config = GovernorConfig::load()?;
+                let log_line = format!(
+                    "{} [governor] WARN: manual scale override during safe mode\n",
+                    Utc::now().to_rfc3339()
+                );
+                let _ = append_to_governor_log(&log_line, &config);
+            }
 
-        let record = manual_override_record(count, ttl_hours, Utc::now());
-        if !dry_run {
-            state.manual_override = Some(record.clone());
-            // updated_at is deliberately NOT bumped: it tracks when the
-            // observe pipeline last ran (doctor's freshness checks and the
-            // quota controller measure it), and a CLI write must not make
-            // stale observations look fresh.
-            state::save_state(&state, &state_path)?;
-        }
-        Ok((record, bounds, safe_mode_was_active))
-        },
-    )?;
+            let record = manual_override_record(count, ttl_hours, Utc::now());
+            if !dry_run {
+                state.manual_override = Some(record.clone());
+                // updated_at is deliberately NOT bumped: it tracks when the
+                // observe pipeline last ran (doctor's freshness checks and the
+                // quota controller measure it), and a CLI write must not make
+                // stale observations look fresh.
+                state::save_state(&state, &state_path)?;
+            }
+            Ok((record, bounds, safe_mode_was_active))
+        })?;
 
     let expiry_text = match record.expires_at {
         Some(e) => format!("binding until {}", e.to_rfc3339()),
@@ -985,14 +983,9 @@ fn run_logs_command(follow: bool, lines: usize) -> Result<()> {
 }
 
 fn run_config_command(edit: bool) -> Result<()> {
-    // Find the config file path
-    let config_path = if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg_config).join("claude-governor/governor.yaml")
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".config/claude-governor/governor.yaml")
-    } else {
-        PathBuf::from("config/governor.yaml")
-    };
+    // Resolve and load through the same precedence path as every daemon
+    // command, so the displayed path is the file actually in use.
+    let (config_path, config) = GovernorConfig::load_with_path()?;
 
     if edit {
         // Open in editor
@@ -1004,12 +997,6 @@ fn run_config_command(edit: bool) -> Result<()> {
         }
         Ok(())
     } else {
-        // Print active config
-        if !config_path.exists() {
-            anyhow::bail!("Config file not found: {}", config_path.display());
-        }
-
-        let config = GovernorConfig::load_from_path(&config_path)?;
         // The render lives in the library so the contract test drives the
         // exact bytes this command prints (claudego-62bd7180).
         print!(
@@ -2615,11 +2602,11 @@ mod tests {
 
         let win = claude_governor::burn_rate::generate_window_forecast_with_exogenous(
             "five_hour",
-            0.0, // fleet rate: zero workers running
+            0.0,  // fleet rate: zero workers running
             41.0, // utilization as the operator's session left it
             90.0,
             4.0,
-            0.0,  // no per-worker rate to size with at zero workers
+            0.0, // no per-worker rate to size with at zero workers
             0.0,
             claude_governor::state::EstimateQuality::Calibrated,
             13.0, // measured exogenous baseline
@@ -2674,8 +2661,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&format_forecast_json(&state)).unwrap();
         assert_eq!(
-            parsed["five_hour"]["exogenous_pct_per_hour"],
-            0.0,
+            parsed["five_hour"]["exogenous_pct_per_hour"], 0.0,
             "fresh state serializes 0.0, never null/NaN"
         );
     }
@@ -3479,9 +3465,11 @@ mod tests {
         );
 
         for (target, half, result) in results {
-            let err =
-                result.expect_err(&format!("restart {target} must fail loudly, not succeed"));
-            assert!(err.to_string().contains(half), "must name the half it tried: {err}");
+            let err = result.expect_err(&format!("restart {target} must fail loudly, not succeed"));
+            assert!(
+                err.to_string().contains(half),
+                "must name the half it tried: {err}"
+            );
             assert!(
                 err.to_string().contains(COMBINED_SERVICE),
                 "must point at the unit that really runs the daemon: {err}"
@@ -3526,7 +3514,10 @@ mod tests {
         let now = Utc::now();
         let rec = manual_override_record(4, governor::MANUAL_OVERRIDE_DEFAULT_TTL_HOURS, now);
 
-        assert_eq!(rec.target, 4, "the requested count is stored raw (pre-clamp)");
+        assert_eq!(
+            rec.target, 4,
+            "the requested count is stored raw (pre-clamp)"
+        );
         assert_eq!(rec.source, "cli");
         assert_eq!(
             rec.expires_at,

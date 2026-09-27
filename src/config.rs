@@ -873,18 +873,28 @@ impl GovernorConfig {
     /// 2. `~/.config/claude-governor/governor.yaml`
     /// 3. `./config/governor.yaml` (for development)
     pub fn load() -> Result<Self> {
+        Self::load_with_path().map(|(_, config)| config)
+    }
+
+    /// Load configuration and return the path that supplied it.
+    ///
+    /// Keeping path resolution next to loading prevents CLI surfaces from
+    /// displaying a preferred path while actually running a lower-precedence
+    /// fallback. If no config exists, the checked-in seed is copied to the
+    /// highest-precedence path before it is loaded.
+    pub fn load_with_path() -> Result<(PathBuf, Self)> {
         let paths = Self::config_paths();
 
         for path in &paths {
             if path.exists() {
-                return Self::load_from_path(path);
+                return Ok((path.clone(), Self::load_from_path(path)?));
             }
         }
 
         // If no config found, try to create default in the first location
         let first_path = &paths[0];
         Self::create_default_config(first_path)?;
-        Self::load_from_path(first_path)
+        Ok((first_path.clone(), Self::load_from_path(first_path)?))
     }
 
     /// Load configuration from a specific path
@@ -1946,7 +1956,9 @@ agents:
             "{violations:?}"
         );
         assert!(
-            violations.iter().any(|v| v.contains("generator-pool-fable")),
+            violations
+                .iter()
+                .any(|v| v.contains("generator-pool-fable")),
             "{violations:?}"
         );
 
