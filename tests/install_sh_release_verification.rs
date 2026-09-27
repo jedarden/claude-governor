@@ -32,7 +32,18 @@
 //! * a missing sidecar (404) → refusal with the same fresh-host atomicity:
 //!   the sidecar fetch fails before the verification gate that guards
 //!   `mkdir -p`, so the install dir never comes into existence
-//!   (claudego-8bb2b383).
+//!   (claudego-8bb2b383);
+//! * a corrupt download whose bytes arrive complete but altered — the
+//!   artifact transfer satisfies its own Content-Length and carries flipped
+//!   bits, so nothing at the HTTP layer looks wrong — is caught by both
+//!   verification branches: a genuine published sidecar fails `sha256sum -c`,
+//!   and an honest `CGOV_SHA256` pin (the digest the release actually
+//!   published) fails the comparison; either refusal leaves an existing
+//!   install byte-for-byte intact (claudego-e2960c5d);
+//! * a sidecar truncated mid-transfer — the artifact leg served whole so the
+//!   run's only defect is the partial sidecar — dies at the fetch itself,
+//!   with the same pre-gate refusal as a missing sidecar and the same
+//!   preserved install dir (claudego-e2960c5d).
 //!
 //! The script is embedded with `include_str!` at compile time, following the
 //! repo's gate pattern (tests/adapter_var_sync.rs): the tested text cannot
@@ -45,7 +56,7 @@
 //! mock server; every other byte of the executed script is the committed one.
 
 use std::fs;
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -999,4 +1010,236 @@ fn incomplete_download_never_creates_a_fresh_install_dir() {
         !install_dir.exists(),
         "a truncated download on a fresh install must not create the install dir"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Corrupt transfers and partial sidecars (claudego-e2960c5d)
+// ---------------------------------------------------------------------------
+
+/// Reads one HTTP request line (`GET <path> HTTP/1.1`) from a fresh
+/// connection so a handler can branch on the requested path. Returns None if
+/// the peer hung up before a complete line arrived — the caller then falls
+/// back to the artifact response.
+fn read_request_path(stream: &mut std::net::TcpStream) -> Option<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.len() < 8192 {
+        match stream.read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            Err(_) => return None,
+        }
+    }
+    let line = String::from_utf8_lossy(&line);
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(method), Some(path)) if method == "GET" => Some(path.to_string()),
+        _ => None,
+    }
+}
+
+/// Writes one complete 200 response: headers promising exactly `body.len()`
+/// bytes, then the body, then the socket close.
+fn write_full_response(stream: &mut std::net::TcpStream, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: {}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+/// A release origin that serves the artifact leg whole but truncates the
+/// sidecar transfer: the sidecar GET is answered with a 200 promising 32
+/// bytes more than it sends, then the socket closes — curl fails the
+/// transfer itself (exit 18, partial file). mockito cannot express a body
+/// that breaks its own Content-Length, and the artifact must arrive intact
+/// so the run's only defect is the partial sidecar (claudego-e2960c5d).
+/// The tests using this pin a CGOV_VERSION, which skips install.sh's
+/// best-effort redirect probe, so every connection is one of the two GETs.
+fn spawn_partial_sidecar_release_server(artifact: Vec<u8>, sidecar: Vec<u8>) -> (String, StopOnDrop) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let url = format!("http://{}", listener.local_addr().expect("listener address"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        while !stop_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // accept() on a nonblocking listener hands back a
+                    // nonblocking stream; the request read below needs it
+                    // blocking.
+                    stream.set_nonblocking(false).expect("blocking connection");
+                    let wants_sidecar = read_request_path(&mut stream)
+                        .map_or(false, |path| path.ends_with(".sha256"));
+                    if wants_sidecar {
+                        // Promise 32 bytes more than the sidecar carries,
+                        // send exactly the sidecar, then close: the promised
+                        // Content-Length is never satisfied and curl fails
+                        // the transfer itself (exit 18, partial file).
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Length: {}\r\n\
+                             Content-Type: application/octet-stream\r\n\
+                             Connection: close\r\n\r\n",
+                            sidecar.len() + 32
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&sidecar);
+                        let _ = stream.flush();
+                    } else {
+                        write_full_response(&mut stream, &artifact);
+                    }
+                    drop(stream);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, StopOnDrop(stop))
+}
+
+/// A download whose bytes arrive complete but wrong: the transfer satisfies
+/// its own Content-Length and the HTTP layer looks perfectly healthy — only
+/// the digest can tell. The mirror publishes the digest of the true
+/// artifact while serving flipped bits, the exact shape of a corrupting
+/// proxy or a swapped mirror object.
+#[test]
+fn corrupted_artifact_with_genuine_sidecar_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+    let mut corrupted = bytes.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0x01;
+    assert_ne!(corrupted, bytes, "the corruption must alter the bytes");
+
+    let mut server = mockito::Server::new();
+    let (artifact_mock, sidecar_mock) = serve_release(
+        &mut server,
+        "/releases/latest/download",
+        &artifact,
+        &corrupted,
+        Some(sidecar_bytes(&sha256_hex(&bytes), &artifact)),
+    );
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(&script, &sandbox_home(&sandbox), &install_dir, &[]);
+    assert!(!ok, "a corrupted download must fail the install:\n{out}");
+    assert!(
+        out.contains("Checksum verification FAILED"),
+        "refusal must name the checksum failure:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    assert_hit_once(sidecar_mock);
+}
+
+/// The pinned-digest twin of the corruption above: the caller's
+/// `CGOV_SHA256` is honest — the digest the release actually published —
+/// and it is the *download* that lies. The comparison must still catch it,
+/// and the refusal must still write nothing (claudego-e2960c5d).
+#[test]
+fn corrupt_download_under_a_correct_digest_pin_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+    let mut corrupted = bytes.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0x01;
+    assert_ne!(corrupted, bytes, "the corruption must alter the bytes");
+
+    let mut server = mockito::Server::new();
+    let (artifact_mock, _never_sidecar) = serve_release(
+        &mut server,
+        "/releases/download/v0.1.1",
+        &artifact,
+        &corrupted,
+        None,
+    );
+    let unused_sidecar = server
+        .mock(
+            "GET",
+            format!("/releases/download/v0.1.1/{artifact}.sha256").as_str(),
+        )
+        .with_status(404)
+        .expect(0) // assert() below enforces: never fetched
+        .create();
+
+    let script = materialize_installer(sandbox.path(), &server.url());
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(
+        &script,
+        &sandbox_home(&sandbox),
+        &install_dir,
+        &[
+            ("CGOV_VERSION", "v0.1.1"),
+            ("CGOV_SHA256", &sha256_hex(&bytes)),
+        ],
+    );
+    assert!(
+        !ok,
+        "a corrupted download must fail even an honest digest pin:\n{out}"
+    );
+    assert!(
+        out.contains("Checksum MISMATCH"),
+        "refusal must name the digest mismatch:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
+    artifact_mock.assert();
+    unused_sidecar.assert();
+}
+
+/// A sidecar truncated mid-transfer: the artifact leg is served whole and
+/// honest, so the run's only defect is the partial digest file. The failure
+/// belongs to the fetch, not the checksum gate — the same pre-gate refusal
+/// shape as a missing or 500ing sidecar — and the install dir must survive
+/// untouched (claudego-e2960c5d).
+#[test]
+fn truncated_sidecar_download_refuses_and_preserves_existing_install() {
+    let sandbox = TempDir::new().expect("sandbox");
+    let artifact = release_artifact_name();
+    let bytes = artifact_bytes();
+    let sidecar = sidecar_bytes(&sha256_hex(&bytes), &artifact);
+    let (base, _stop) = spawn_partial_sidecar_release_server(bytes.clone(), sidecar);
+
+    let script = materialize_installer(sandbox.path(), &base);
+    let install_dir = existing_install_dir(&sandbox);
+    let (ok, out) = run_installer(
+        &script,
+        &sandbox_home(&sandbox),
+        &install_dir,
+        // The pin only skips the best-effort redirect probe; the raw server
+        // branches on the request path, so the tag value is arbitrary.
+        &[("CGOV_VERSION", "v9.9.9-partial-sidecar")],
+    );
+    assert!(
+        !ok,
+        "a sidecar truncated mid-transfer must fail the install:\n{out}"
+    );
+    assert!(
+        out.contains("Digest sidecar download failed"),
+        "a partial sidecar must die at the fetch, with the fetch's own \
+         refusal:\n{out}"
+    );
+    assert!(
+        !out.contains("Checksum OK"),
+        "a sidecar that never finished arriving must never reach the \
+         verification gate, let alone pass it:\n{out}"
+    );
+    assert_install_dir_unchanged(&install_dir);
 }
