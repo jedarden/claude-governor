@@ -11,6 +11,15 @@ Every command is safe to run against a live deployment: doctor and status are
 read-only diagnostics; `systemctl --user status`/`is-active`/`is-enabled` and
 `journalctl` are read-only.
 
+This procedure is pinned, not just written:
+`cargo test --test deployment_verification_contract` extracts every `cgov`
+invocation below and parses it against the real binary, pins the step-1
+systemd units against the unit files the repo ships, and checks every doctor
+id in the criteria tables against a live `cgov doctor --json` inventory. A
+command edited here without the matching CLI change fails that test — the
+same self-test treatment `scripts/verify-pluck-config.sh --self-test` gives
+its own check inventory.
+
 ## Topology you are verifying
 
 The daemon is a systemd **user** service. Depending on how recently the host
