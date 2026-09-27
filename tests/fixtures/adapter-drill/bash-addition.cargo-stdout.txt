@@ -1,0 +1,17 @@
+
+running 1 test
+test adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants ... FAILED
+
+failures:
+
+---- adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants stdout ----
+
+thread 'adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants' (<TID>) panicked at src/adapter_verify.rs:1040:13:
+RULE3_IDE_VARS in deploy/install-claude-print-adapters.sh diverges from IDE_ENV_VARS in src/adapter_verify.rs — the bash list is missing [] and carries unlisted ["VSCODE_DRILL_PROBE"]. Update both copies together; the installer's own sync check fails the install on the same drift.
+
+
+failures:
+    adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; <FILTERED> filtered out; finished in <DURATION>s
+

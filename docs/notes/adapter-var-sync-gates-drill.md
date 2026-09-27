@@ -19,9 +19,11 @@ still detects drift. That file is no longer passive: since 79d01bc
 `four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies`
 applies all four mutations to isolated copies on every `cargo test` and
 drives both real gates against the pinned signatures (see "Automated drill"
-below). The manual procedure recorded here is that automation's evidence
-trail, and its fallback when you need the verbatim gate output or are
-debugging the automation itself.
+below) — and since claudego-f1e8183a (2026-09-26) byte-compares each gate's
+full output against captured fixtures, so the wording below can no longer
+silently rot (see "Byte-exact fixture comparison"). The manual procedure
+recorded here is that automation's evidence trail, and its fallback when
+you are debugging the automation itself.
 
 This drill applied four single-sided mutations to a `git archive HEAD`
 extraction in a fresh temp dir (never mutate-and-revert the shared checkout)
@@ -71,10 +73,31 @@ asserts the components each signature below is built from: the gate fails;
 the cargo output names the sync test, the drifted list pair and the
 variable; the installer prints `Install incomplete.` and `variable-list
 drift` naming the pair, the variable, and the correct `diff` direction
-(`<` for Mutations 1 and 4, `>` for Mutations 2 and 3). It does not diff
-the output byte-for-byte against the transcripts below — those remain the
-verbatim evidence. A green run on 2026-09-25 confirmed every asserted
-component for all four mutations against the committed state.
+(`<` for Mutations 1 and 4, `>` for Mutations 2 and 3). Since
+claudego-f1e8183a it goes further and diffs byte-for-byte — see below. A
+green run on 2026-09-25 confirmed every asserted component for all four
+mutations against the committed state.
+
+**Byte-exact fixture comparison (2026-09-26).** The residual gap that the
+component assertions left — nothing diffed the gate output itself, so a
+reworded diagnostic or a swapped `diff` direction that still failed would
+have passed the drill — had already bitten once: the M1 rust-side
+collateral list recorded here had to be corrected after the fact (three
+collateral checks, not one), and byte-exact comparison would have caught
+the recorded signature being wrong at capture time. The drill now captures
+each mutation's full cargo-test stdout and full installer transcript into
+`tests/fixtures/adapter-drill/` (eight files, `<mutation>.{cargo-stdout,installer}.txt`,
+embedded with `include_str!`) and asserts the normalized run output equals
+its fixture exactly. Only toolchain-authored noise is normalized away: the
+drill copy's temp path (`<COPY>`), the panic thread id (`<TID>`), libtest's
+filtered-out count and duration (`<FILTERED>`/`<DURATION>`), and the
+`RUST_BACKTRACE` note. Everything a gate printed — message text, panic
+location (which shifts ±1 line under the Rust-side mutations, so the
+fixtures also pin those), the `diff` direction, the installer collateral
+verdicts, and the exit codes (101 panic, 1 `Install incomplete.`) — is
+pinned; wording or format drift in either gate's diagnostics is now a test
+failure. If new wording is intended, recapture the fixture; the assert
+message says so.
 
 **Coverage differences from the manual drill** (deliberate, not drift):
 
@@ -98,6 +121,12 @@ component for all four mutations against the committed state.
   automation asserts the marker per mutation, so a gate regression that
   swaps the `diff` arguments — flipping every direction while still failing
   — now fails a test.
+- **The verbatim output is machine-pinned, not transcript-only.** Until
+  claudego-f1e8183a the transcripts below were the only source of exact
+  gate output; the fixtures under `tests/fixtures/adapter-drill/` are now
+  the machine-checked copies of the same runs, and this document is their
+  human-readable record. The two can drift apart only if a gate's output
+  changes — which the drill fails on — and are then updated together.
 
 The sandbox sensitivity pins (`clean_tree_sync_gate_passes`,
 `sync_gate_flags_an_extra_bash_variable`,
@@ -234,7 +263,8 @@ assertion `left == right` failed: ANTHROPIC_SMALL_FAST_MODEL is not an element o
 - **Both gates are set comparisons** (`sort -u` / `BTreeSet`): element order
   and duplicates never trip them; only real membership differences do.
 - **Exit codes are unambiguous**: 101 (panic) for anything under
-  `cargo test`, 1 with `Install incomplete.` for the installer. A
+  `cargo test`, 1 with `Install incomplete.` for the installer — both now
+  asserted per mutation by the drill. A
   mutation that changes nothing (the drill's first M4 attempt — a sed that
   greedy-matched to a no-op) leaves every gate green, so a silent drill run
   means the mutation never landed, not that a gate is blind.

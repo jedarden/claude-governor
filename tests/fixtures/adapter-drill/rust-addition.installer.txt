@@ -1,0 +1,22 @@
+[0;32mclaude-print adapter installer[0m
+==============================
+  installed claude-print-fable.yaml -> <COPY>/home/.config/needle/adapters/
+  installed claude-print-opus.yaml -> <COPY>/home/.config/needle/adapters/
+  source binary: <COPY>/home/.cargo/bin/claude-print
+  [1;33mlinked[0m <COPY>/adapter-bin/claude-print -> <COPY>/home/.cargo/bin/claude-print
+
+Verifying:
+  [0;32m✓[0m <COPY>/adapter-bin/claude-print — claude-print-drill
+
+Variable-list and invoke-contract sync check (installer arrays vs src/adapter_verify.rs):
+  [0;31m✗ variable-list drift: RULE3_IDE_VARS (this script) vs IDE_ENV_VARS (src/adapter_verify.rs)[0m
+      4d3
+      < VSCODE_DRILL_PROBE
+  [0;32m✓[0m REQUIRED_INVOKE_FLAGS and ADAPTER_TIMEOUT_PINS match the Rust constants
+
+Static template contract (scrub rules 3/5, invoke flags, timeout_secs pins):
+  [0;32m✓[0m claude-print-fable unsets all rule-3 and rule-5 variables, carries every required invoke flag, pins timeout_secs at 600s
+  [0;32m✓[0m claude-print-opus unsets all rule-3 and rule-5 variables, carries every required invoke flag, pins timeout_secs at 1200s
+
+Live dispatch probe: skipped (--skip-live); static checks only.
+[0;31mInstall incomplete.[0m

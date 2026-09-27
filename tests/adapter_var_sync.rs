@@ -24,7 +24,14 @@
 //!   drift report;
 //! * one removed variable fails the gate the same way;
 //! * the four-way drill runs both real gates against isolated Rust-side and
-//!   Bash-side additions/removals and checks their diagnostics.
+//!   Bash-side additions/removals and checks their diagnostics — and, since
+//!   claudego-f1e8183a, byte-compares each gate's full output against a
+//!   captured fixture (`tests/fixtures/adapter-drill/`), so wording, format
+//!   and direction drift in the diagnostics themselves fails the drill. Only
+//!   toolchain-authored noise is normalized away: the drill copy's path, the
+//!   panic thread id, libtest's filtered-out count and run duration, and the
+//!   RUST_BACKTRACE note. Everything a gate printed byte-for-byte — message
+//!   text, `diff` direction, `Install incomplete.` exit path — is pinned.
 //!
 //! The invoke-contract mirror (`REQUIRED_INVOKE_FLAGS` /
 //! `ADAPTER_TIMEOUT_PINS`, enforced by `check_flag_and_timeout_sync` and the
@@ -401,6 +408,57 @@ impl DrillMutation {
         }
     }
 
+    /// The byte-exact fixture of the cargo gate's captured stdout for this
+    /// mutation, plus its path for failure messages. Captured from a
+    /// `git archive HEAD` extraction on 2026-09-26 (claudego-f1e8183a) with
+    /// the nondeterministic tokens replaced by the placeholders
+    /// `normalize_for_fixture` reconstructs; embedded at compile time so a
+    /// stale shared target dir cannot swap them (see INSTALLER_SH).
+    fn cargo_fixture(self) -> (&'static str, &'static str) {
+        match self {
+            Self::RustAddition => (
+                include_str!("fixtures/adapter-drill/rust-addition.cargo-stdout.txt"),
+                "tests/fixtures/adapter-drill/rust-addition.cargo-stdout.txt",
+            ),
+            Self::RustRemoval => (
+                include_str!("fixtures/adapter-drill/rust-removal.cargo-stdout.txt"),
+                "tests/fixtures/adapter-drill/rust-removal.cargo-stdout.txt",
+            ),
+            Self::BashAddition => (
+                include_str!("fixtures/adapter-drill/bash-addition.cargo-stdout.txt"),
+                "tests/fixtures/adapter-drill/bash-addition.cargo-stdout.txt",
+            ),
+            Self::BashRemoval => (
+                include_str!("fixtures/adapter-drill/bash-removal.cargo-stdout.txt"),
+                "tests/fixtures/adapter-drill/bash-removal.cargo-stdout.txt",
+            ),
+        }
+    }
+
+    /// The byte-exact fixture of the installer's full output for this
+    /// mutation — every line from the banner through `Install incomplete.`
+    /// — plus its path for failure messages.
+    fn installer_fixture(self) -> (&'static str, &'static str) {
+        match self {
+            Self::RustAddition => (
+                include_str!("fixtures/adapter-drill/rust-addition.installer.txt"),
+                "tests/fixtures/adapter-drill/rust-addition.installer.txt",
+            ),
+            Self::RustRemoval => (
+                include_str!("fixtures/adapter-drill/rust-removal.installer.txt"),
+                "tests/fixtures/adapter-drill/rust-removal.installer.txt",
+            ),
+            Self::BashAddition => (
+                include_str!("fixtures/adapter-drill/bash-addition.installer.txt"),
+                "tests/fixtures/adapter-drill/bash-addition.installer.txt",
+            ),
+            Self::BashRemoval => (
+                include_str!("fixtures/adapter-drill/bash-removal.installer.txt"),
+                "tests/fixtures/adapter-drill/bash-removal.installer.txt",
+            ),
+        }
+    }
+
     fn all() -> [Self; 4] {
         [
             Self::RustAddition,
@@ -560,17 +618,44 @@ fn write_drill_copy(
     }
 }
 
-fn command_text(output: std::process::Output) -> (bool, String) {
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    (output.status.success(), text)
+/// What one real gate run produced. `combined` (stdout then stderr) is what
+/// the drill's component assertions have always matched against; the
+/// byte-exact fixture comparison pins `stdout` alone — the cargo gate's
+/// diagnostic is entirely on stdout (libtest replays the captured panic
+/// there), while stderr is cargo/toolchain framing (Compiling/Finished/
+/// Running lines whose paths, durations and hash suffixes belong to the
+/// build environment, not to the gate) — plus the exit code, which both
+/// gates document as part of their contract (101 panic, 1 `Install
+/// incomplete.`).
+struct GateRun {
+    ok: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl GateRun {
+    fn combined(&self) -> String {
+        let mut text = self.stdout.clone();
+        text.push_str(&self.stderr);
+        text
+    }
+}
+
+fn gate_run(output: std::process::Output) -> GateRun {
+    GateRun {
+        ok: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
 /// Sequence number for per-leg isolated target dirs (unique within this
 /// test process; combined with the pid for uniqueness across processes).
 static DRILL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn run_cargo_gate(root: &Path, test_name: &str) -> (bool, String) {
+fn run_cargo_gate(root: &Path, test_name: &str) -> GateRun {
     // The cargo wrapper forces CARGO_TARGET_DIR to the repo-wide
     // /build/<repo> for every drill copy — the copies are not git repos, so
     // the wrapper maps them by package name — and concurrent drill legs then
@@ -582,8 +667,7 @@ fn run_cargo_gate(root: &Path, test_name: &str) -> (bool, String) {
     // (no wrapper env), the copy's own target/ is already per-copy.
     let isolated = std::env::var("CARGO_TARGET_DIR").ok().map(|shared| {
         let n = DRILL_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(shared)
-            .join(format!("adapter-drill-{}-{}", std::process::id(), n));
+        let dir = PathBuf::from(shared).join(format!("adapter-drill-{}-{}", std::process::id(), n));
         fs::create_dir_all(&dir).expect("create isolated drill target dir");
         dir
     });
@@ -600,10 +684,10 @@ fn run_cargo_gate(root: &Path, test_name: &str) -> (bool, String) {
     if let Some(dir) = isolated {
         let _ = fs::remove_dir_all(dir);
     }
-    command_text(output)
+    gate_run(output)
 }
 
-fn run_cargo_sync_gate(root: &Path) -> (bool, String) {
+fn run_cargo_sync_gate(root: &Path) -> GateRun {
     run_cargo_gate(
         root,
         "adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants",
@@ -627,7 +711,7 @@ fn make_fake_claude_print(home: &Path) -> PathBuf {
     binary
 }
 
-fn run_installer_sync_gate(root: &Path) -> (bool, String) {
+fn run_installer_sync_gate(root: &Path) -> GateRun {
     let home = root.join("home");
     let fake_binary = make_fake_claude_print(&home);
     let inherited_path = std::env::var("PATH").unwrap_or_default();
@@ -650,7 +734,114 @@ fn run_installer_sync_gate(root: &Path) -> (bool, String) {
                 e
             )
         });
-    command_text(output)
+    gate_run(output)
+}
+
+/// The rustc-authored note closing a panic block — present only when
+/// `RUST_BACKTRACE` is unset, so a gate runner debugging with it set would
+/// otherwise see the fixture fail over toolchain framing, never gate text.
+const BACKTRACE_NOTE_LINE: &str =
+    "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+
+/// Reduce one gate's output to what the fixture pins: everything the gate
+/// itself printed stays byte-for-byte; only tokens authored by the harness
+/// or the toolchain are replaced with the fixture's placeholders:
+///
+/// * the drill copy's root path → `<COPY>` (it is a fresh temp dir per run
+///   and appears wherever the sandboxed `$HOME` and `REPO_DIR` are echoed);
+/// * the panic thread id → `<TID>` (rustc formats it as
+///   `' (<digits>) panicked at'`; older toolchains omit it — neither is
+///   gate-authored, so both canonicalize to the fixture's form);
+/// * libtest's filtered-out count → `<FILTERED>` (it moves every time a
+///   lib unit test is added) and the run duration → `<DURATION>`.
+fn normalize_for_fixture(text: &str, copy_root: &Path) -> String {
+    let root = copy_root.to_str().expect("drill copy root is valid UTF-8");
+    let text = text.replace(root, "<COPY>");
+    let text = text.replace(BACKTRACE_NOTE_LINE, "");
+    let text = canonicalize_thread_id(&text);
+    normalize_libtest_summary(&text)
+}
+
+/// Canonicalize the panic thread id out of the `thread '<name>' … panicked
+/// at` line, mirroring the fixture capture. Only that line carries the
+/// ` panicked at ` marker.
+fn canonicalize_thread_id(text: &str) -> String {
+    let Some(at) = text.find(" panicked at ") else {
+        return text.to_string();
+    };
+    let head = &text[..at];
+    let Some(quote) = head.rfind('\'') else {
+        return text.to_string();
+    };
+    let between = &head[quote + 1..];
+    let is_tid = between.is_empty()
+        || (between.len() > 3
+            && between.starts_with(" (")
+            && between.ends_with(')')
+            && between[2..between.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_digit()));
+    if is_tid {
+        // `text[at..]` already begins with ` panicked at `.
+        format!("{}' (<TID>){}", &head[..quote], &text[at..])
+    } else {
+        text.to_string()
+    }
+}
+
+/// Replace the two run-varying numbers of libtest's summary line
+/// (`; 989 filtered out; finished in 0.00s`) with the fixture's
+/// placeholders. The surrounding wording stays pinned — a libtest format
+/// change is a fixture bump, not silent acceptance.
+fn normalize_libtest_summary(text: &str) -> String {
+    const MARKER: &str = " filtered out; finished in ";
+    let Some(marker_at) = text.find(MARKER) else {
+        return text.to_string();
+    };
+    let bytes = text.as_bytes();
+    let mut start = marker_at;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    let mut end = marker_at + MARKER.len();
+    while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+        end += 1;
+    }
+    format!(
+        "{}<FILTERED> filtered out; finished in <DURATION>{}",
+        &text[..start],
+        &text[end..]
+    )
+}
+
+/// The first byte-level difference between the fixture and the actual
+/// normalized output, for the assert message. `lines()` may hide a
+/// trailing-newline difference, so the line counts are checked too.
+fn first_difference(expected: &str, actual: &str) -> String {
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    for (i, (expected_line, actual_line)) in
+        expected_lines.iter().zip(actual_lines.iter()).enumerate()
+    {
+        if expected_line != actual_line {
+            return format!(
+                "first differing line {}:\n  fixture: {}\n  actual:  {}",
+                i + 1,
+                expected_line,
+                actual_line
+            );
+        }
+    }
+    if expected_lines.len() != actual_lines.len() {
+        format!(
+            "line counts differ: fixture has {}, actual has {}",
+            expected_lines.len(),
+            actual_lines.len()
+        )
+    } else {
+        "lines compare equal but bytes differ (line-ending or invisible-character drift)"
+            .to_string()
+    }
 }
 
 #[test]
@@ -659,13 +850,14 @@ fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
         let temp = TempDir::new().unwrap();
         write_drill_copy(temp.path(), Some(mutation), AdapterMutation::Committed);
 
-        let (cargo_ok, cargo_output) = run_cargo_sync_gate(temp.path());
+        let cargo = run_cargo_sync_gate(temp.path());
         assert!(
-            !cargo_ok,
+            !cargo.ok,
             "{} cargo gate unexpectedly passed:\n{}",
             mutation.label(),
-            cargo_output
+            cargo.combined()
         );
+        let cargo_output = cargo.combined();
         assert!(
             cargo_output.contains("installer_bash_variable_lists_match_the_rust_constants"),
             "{} cargo output did not identify the synchronization test:\n{}",
@@ -685,14 +877,39 @@ fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
             mutation.variable(),
             cargo_output
         );
+        assert_eq!(
+            cargo.code,
+            Some(101),
+            "{} cargo gate exited with {:?}, not the documented panic code 101:\n{}",
+            mutation.label(),
+            cargo.code,
+            cargo_output
+        );
 
-        let (installer_ok, installer_output) = run_installer_sync_gate(temp.path());
+        // Byte-exact gate diagnostic: everything libtest put on stdout is
+        // the gate's panic block plus its framing, so wording, location or
+        // format drift fails here. Compare against the fixture after
+        // normalizing the toolchain-authored tokens.
+        let (cargo_expected, cargo_fixture_path) = mutation.cargo_fixture();
+        let cargo_actual = normalize_for_fixture(&cargo.stdout, temp.path());
+        assert_eq!(
+            cargo_actual,
+            cargo_expected,
+            "{} cargo gate output drifted from the pinned fixture {} — if the new \
+             wording is intended, recapture the fixture; {}",
+            mutation.label(),
+            cargo_fixture_path,
+            first_difference(cargo_expected, &cargo_actual)
+        );
+
+        let installer = run_installer_sync_gate(temp.path());
         assert!(
-            !installer_ok,
+            !installer.ok,
             "{} installer gate unexpectedly passed:\n{}",
             mutation.label(),
-            installer_output
+            installer.combined()
         );
+        let installer_output = installer.combined();
         assert!(
             installer_output.contains("Install incomplete."),
             "{} installer output omitted the failing-install diagnostic:\n{}",
@@ -717,6 +934,32 @@ fn four_way_adapter_drift_drill_runs_both_real_gates_in_isolated_copies() {
             "{} installer diagnostic omitted the expected diff direction:\n{}",
             mutation.label(),
             installer_output
+        );
+        assert_eq!(
+            installer.code,
+            Some(1),
+            "{} installer exited with {:?}, not the documented `Install incomplete.` \
+             exit code 1:\n{}",
+            mutation.label(),
+            installer.code,
+            installer_output
+        );
+
+        // Byte-exact installer transcript: the whole run output — banner,
+        // install/link lines, drift report with its `diff` direction,
+        // static-template verdicts, probe-skip notice and the
+        // `Install incomplete.` exit path — is gate-authored, so the
+        // fixture pins every byte of it, not just the drift report.
+        let (installer_expected, installer_fixture_path) = mutation.installer_fixture();
+        let installer_actual = normalize_for_fixture(&installer.stdout, temp.path());
+        assert_eq!(
+            installer_actual,
+            installer_expected,
+            "{} installer output drifted from the pinned fixture {} — if the new \
+             wording is intended, recapture the fixture; {}",
+            mutation.label(),
+            installer_fixture_path,
+            first_difference(installer_expected, &installer_actual)
         );
     }
 }
@@ -744,13 +987,14 @@ fn invoke_contract_drills_fire_both_real_gates_in_isolated_copies() {
         let temp = TempDir::new().unwrap();
         write_drill_copy(temp.path(), None, adapter_mutation);
 
-        let (cargo_ok, cargo_output) = run_cargo_gate(temp.path(), lib_test);
+        let cargo = run_cargo_gate(temp.path(), lib_test);
         assert!(
-            !cargo_ok,
+            !cargo.ok,
             "{} cargo gate unexpectedly passed:\n{}",
             adapter_mutation.label(),
-            cargo_output
+            cargo.combined()
         );
+        let cargo_output = cargo.combined();
         assert!(
             cargo_output.contains(lib_test),
             "{} cargo output did not identify the per-template gate:\n{}",
@@ -765,13 +1009,14 @@ fn invoke_contract_drills_fire_both_real_gates_in_isolated_copies() {
             cargo_output
         );
 
-        let (installer_ok, installer_output) = run_installer_sync_gate(temp.path());
+        let installer = run_installer_sync_gate(temp.path());
         assert!(
-            !installer_ok,
+            !installer.ok,
             "{} installer gate unexpectedly passed:\n{}",
             adapter_mutation.label(),
-            installer_output
+            installer.combined()
         );
+        let installer_output = installer.combined();
         assert!(
             installer_output.contains("Install incomplete."),
             "{} installer output omitted the failing-install diagnostic:\n{}",
