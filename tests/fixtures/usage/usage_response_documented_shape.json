@@ -1,0 +1,46 @@
+{
+  "five_hour": {
+    "utilization": 14.0,
+    "resets_at": "2026-03-18T13:59:59.918852+00:00"
+  },
+  "seven_day": {
+    "utilization": 82.0,
+    "resets_at": "2026-03-20T03:00:00.918880+00:00"
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": {
+    "utilization": 72.0,
+    "resets_at": "2026-03-20T03:59:59.918891+00:00"
+  },
+  "seven_day_cowork": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "default",
+      "percent": 14,
+      "severity": "low",
+      "resets_at": "2026-03-18T13:59:59Z",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 79,
+      "resets_at": "2026-03-20T03:59:59Z",
+      "scope": {
+        "model": {
+          "id": "claude-fable-5",
+          "display_name": "Fable"
+        }
+      },
+      "is_active": true
+    }
+  ]
+}

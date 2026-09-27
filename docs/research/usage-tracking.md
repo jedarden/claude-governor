@@ -72,6 +72,14 @@ The `anthropic-beta: oauth-2025-04-20` header is mandatory — requests without 
 }
 ```
 
+Top-level windows may also carry an optional `is_active` bool with the same
+semantics as `limits[]` below: **only `false` is meaningful** — the window's
+limit is structurally inactive — while an absent or `null` field is treated
+as active. cgov parses it (`UsageWindow.is_active`), and the governor's
+structural-inactivity predicate consumes an explicit `false` as an
+instantaneous exclusion from binding-window candidacy
+(`governor.rs::is_structurally_inactive`).
+
 ### Field Mapping to `/status` UI Labels
 
 | API Field | UI Label |
@@ -87,6 +95,11 @@ The `anthropic-beta: oauth-2025-04-20` header is mandatory — requests without 
 - `utilization`: float, 0–100, representing percentage used
 - `resets_at`: ISO 8601 datetime string with timezone offset
 - Fields are `null` when not applicable for the current plan
+- `resets_at` may carry any ISO 8601 UTC offset, not only `+00:00`/`Z` (e.g.
+  `+05:30`); cgov normalizes to the UTC instant before computing hours
+  remaining, so the same instant in different offsets yields identical
+  `hours_remaining` (the wire string is preserved verbatim alongside the
+  derivation)
 
 ### The generic `limits[]` array
 
@@ -115,7 +128,8 @@ Alongside the legacy top-level windows, the response carries a generic
 | `scope.model.id` / `scope.model.display_name` | string, optional | which model a model-scoped cap applies to |
 | `is_active` | bool, optional | **only `false` means structurally inactive**; absent or `null` is treated as active |
 
-Contract rules, pinned by `tests/usage_polling_contract.rs`:
+Contract rules, pinned by `tests/usage_polling_contract.rs` and the committed
+fixture corpus (`tests/usage_contract_fixture_matrix.rs`, §10 below):
 
 - **Additive tolerance.** cgov parses `limits[]` alongside the legacy windows.
   Absent and `null` fields inside an entry are tolerated (per-field serde
@@ -384,3 +398,22 @@ of `{}` leaves every window data-absent, so no window binds — the phantom
 headroom nor shed a converged fleet on a fake zero-risk forecast. The
 `binding_window` in the persisted forecast is empty in that state, which is
 the observable signature of "the API told us nothing usable this cycle".
+
+### Committed fixture corpus
+
+`tests/usage_contract_fixture_matrix.rs` drives the wire contract from
+committed fixture files (`include_str!`, the `null_tolerance_fixture_test.rs`
+convention), each with a guard test so editing away the case it pins fails
+loudly instead of passing vacuously:
+
+| Fixture | Clause it pins |
+|---|---|
+| `usage_response_documented_shape.json` | the §2 response structure verbatim — known windows, the unknown-to-cgov sibling fields (`seven_day_sonnet`, `extra_usage`, …), and the generic `limits[]` array all parse from one realistic body |
+| `usage_response_inactive_and_unknown_limits.json` | `is_active: false` at window and entry level parses and round-trips (only `false` means structurally inactive; absent/null is active), and an unknown `kind` is tolerated without disturbing `weekly_scoped` resolution |
+| `usage_response_non_utc_reset_offsets.json` | the same reset instant at `+05:30` and `Z` yields identical `hours_remaining` — offsets normalize to UTC before any time math |
+| `usage_response_null_window.json` | a null window is non-binding (consumed by `tests/null_tolerance_fixture_test.rs`) |
+
+Authentication, HTTP-error, rate-limit, and retry behavior are behavioral,
+not representational — they stay pinned by the mockito suite
+(`tests/usage_polling_contract.rs`) per §10, which no static fixture can
+express.

@@ -1,0 +1,38 @@
+{
+  "five_hour": {
+    "utilization": 22.5,
+    "resets_at": "2026-03-18T13:59:59Z",
+    "is_active": false
+  },
+  "seven_day": {
+    "utilization": 64.0,
+    "resets_at": "2026-03-20T03:00:00Z",
+    "is_active": true
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "percent": 22,
+      "resets_at": "2026-03-18T13:59:59Z",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_capacity_v3",
+      "percent": 55,
+      "resets_at": "2026-03-20T03:00:00Z",
+      "scope": null
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 79,
+      "resets_at": "2026-03-20T03:59:59Z",
+      "scope": {
+        "model": {
+          "id": "claude-fable-5",
+          "display_name": "Fable"
+        }
+      }
+    }
+  ]
+}
