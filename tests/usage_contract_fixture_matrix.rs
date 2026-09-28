@@ -23,6 +23,25 @@
 //!   reset instant expressed at `+05:30` and `Z`; `hours_remaining` must be
 //!   computed from the normalized UTC instant, so the two forms agree.
 //!   Every existing test used only `+00:00`/`Z` shapes.
+//!
+//! Response-condition classes (claudego-6d535c0a) — the §10 fixture corpus is
+//! the committed home for the four wire-condition classes the usage API
+//! produces. successful → `usage_response_documented_shape.json`; expired →
+//! `usage_response_non_utc_reset_offsets.json` (its fixed instants are months
+//! in the past, so the parse must yield long-negative hours, not an error);
+//! incomplete and invalid are pinned by the fixtures below:
+//!
+//! - `fixtures/usage/usage_response_incomplete.json` — a plan-shaped body in
+//!   which every scoped/op window is `null` and the generic `limits[]` array
+//!   is absent outright: the named windows parse through, the absent ones
+//!   default, and the whole poll still succeeds.
+//! - `fixtures/usage/usage_response_invalid_wrong_typed_utilization.json` and
+//!   `fixtures/usage/usage_response_invalid_missing_required_field.json` —
+//!   the two invalid-body clauses: `utilization` present but wrong-typed, and
+//!   a present window with `utilization` absent outright. Both fail the
+//!   `UsageResponse` parse; `fetch_usage` wraps the same serde error as
+//!   `PollerError::ParseError` (that end-to-end hop is the mockito suite's,
+//!   tests/usage_polling_contract.rs).
 
 use chrono::{DateTime, Utc};
 
@@ -34,6 +53,11 @@ const INACTIVE_AND_UNKNOWN_JSON: &str =
     include_str!("fixtures/usage/usage_response_inactive_and_unknown_limits.json");
 const NON_UTC_OFFSETS_JSON: &str =
     include_str!("fixtures/usage/usage_response_non_utc_reset_offsets.json");
+const INCOMPLETE_JSON: &str = include_str!("fixtures/usage/usage_response_incomplete.json");
+const INVALID_WRONG_TYPED_JSON: &str =
+    include_str!("fixtures/usage/usage_response_invalid_wrong_typed_utilization.json");
+const INVALID_MISSING_FIELD_JSON: &str =
+    include_str!("fixtures/usage/usage_response_invalid_missing_required_field.json");
 
 /// Guard that each fixture still carries the case it exists for. If a fixture
 /// is edited to drop its pinned clause, these must fail loudly rather than
@@ -213,5 +237,115 @@ fn non_utc_reset_offsets_normalize_to_identical_hours_remaining() {
     assert!(
         offset_hours < -4000.0,
         "the fixed past instant must read as long-expired, got {offset_hours}"
+    );
+}
+
+/// Guard that the incomplete/invalid fixtures still carry the clauses they
+/// exist for — same convention as [`fixtures_still_contain_the_clauses_they_pin`].
+#[test]
+fn incomplete_and_invalid_fixtures_still_contain_the_clauses_they_pin() {
+    // Incomplete: scoped/op windows null, the generic limits[] array absent
+    // outright (not merely empty — the array key itself must be missing).
+    assert!(
+        INCOMPLETE_JSON.contains(r#""weekly_scoped": null"#),
+        "incomplete fixture must carry a null weekly_scoped window"
+    );
+    assert!(
+        INCOMPLETE_JSON.contains(r#""seven_day_opus": null"#),
+        "incomplete fixture must carry a null seven_day_opus window"
+    );
+    assert!(
+        !INCOMPLETE_JSON.contains("\"limits\""),
+        "incomplete fixture must omit the limits[] key outright"
+    );
+
+    // Invalid #1: utilization present but wrong-typed.
+    assert!(
+        INVALID_WRONG_TYPED_JSON.contains(r#""utilization": "high""#),
+        "wrong-typed fixture must carry a string utilization"
+    );
+
+    // Invalid #2: a present window whose utilization key is absent outright.
+    assert!(
+        INVALID_MISSING_FIELD_JSON.contains("\"resets_at\""),
+        "missing-field fixture must keep resets_at so it isolates the one absent field"
+    );
+    assert!(
+        !INVALID_MISSING_FIELD_JSON.contains("utilization"),
+        "missing-field fixture must omit utilization outright — that absence is the pinned clause"
+    );
+}
+
+/// An incomplete response — named windows present, every scoped/op window
+/// `null`, and the generic `limits[]` array absent outright — parses, and the
+/// parse shows precisely which data arrived: the named windows verbatim,
+/// everything else absent (poll() turns an absent `limits` into an empty set
+/// and a null window into the non-binding defaults).
+#[test]
+fn incomplete_fixture_parses_named_windows_and_defaults_the_rest() {
+    let resp: UsageResponse =
+        serde_json::from_str(INCOMPLETE_JSON).expect("an incomplete response must still parse");
+
+    // The named windows flow through verbatim…
+    let five_hour = resp.five_hour.as_ref().expect("five_hour present");
+    assert_eq!(five_hour.utilization, 61.5);
+    assert_eq!(five_hour.resets_at, "2026-03-18T13:59:59.918852+00:00");
+    let seven_day = resp.seven_day.as_ref().expect("seven_day present");
+    assert_eq!(seven_day.utilization, 12.0);
+
+    // …while every scoped/op window is null → None, not a parse failure.
+    assert!(resp.weekly_scoped.is_none());
+    assert!(resp.limits.is_none(), "absent limits[] parses as None");
+
+    // With no limits[] entry anywhere, no model-scoped weekly cap can resolve:
+    // the reading is usable but weekly_scoped stays non-binding.
+    let data = UsageData {
+        weekly_scoped_utilization: 0.0,
+        weekly_scoped_resets_at: String::new(),
+        weekly_scoped_hours_remaining: 0.0,
+        weekly_scoped_model: None,
+        seven_day_utilization: seven_day.utilization,
+        seven_day_resets_at: seven_day.resets_at.clone(),
+        seven_day_hours_remaining: 0.0,
+        five_hour_utilization: five_hour.utilization,
+        five_hour_resets_at: five_hour.resets_at.clone(),
+        five_hour_hours_remaining: 0.0,
+        limits: Vec::new(), // poll(): usage.limits.unwrap_or_default()
+        timestamp: Utc::now(),
+        stale: false,
+    };
+    assert!(data.scoped_weekly().is_none());
+    assert!(data.weekly_scoped_model.is_none());
+}
+
+/// The invalid-body fixtures are the committed tripwires for the parse-failure
+/// boundary. Both must FAIL the `UsageResponse` parse, and the missing-field
+/// error must name the absent field (the diagnosability the poller's
+/// `ParseError` log relies on). The missing-`utilization` case is the
+/// dangerous direction: a future `#[serde(default)]` on `UsageWindow::
+/// utilization` would silently read absence as 0% — manufactured headroom the
+/// scaling decision could act on — and this fixture fails that build.
+#[test]
+fn invalid_fixtures_fail_the_parse_missing_field_error_names_the_field() {
+    // Wrong-typed utilization: a string where the float belongs. (serde's
+    // type-mismatch message does not carry the field name, so only the
+    // failure itself is asserted — the variant wrapping is pinned
+    // end-to-end by wrong_typed_window_field_fails_the_poll in the mockito
+    // suite.)
+    let wrong_typed = serde_json::from_str::<UsageResponse>(INVALID_WRONG_TYPED_JSON);
+    let err = wrong_typed.expect_err("a string utilization must fail the parse");
+    assert!(
+        err.to_string().contains("invalid type"),
+        "expected a type-mismatch error, got: {err}"
+    );
+
+    // Missing utilization on a present window: serde defaults apply only to
+    // absent optional keys, and `utilization` has no default — absence is a
+    // hard failure whose message names the field.
+    let missing = serde_json::from_str::<UsageResponse>(INVALID_MISSING_FIELD_JSON);
+    let err = missing.expect_err("a present window without utilization must fail the parse");
+    assert!(
+        err.to_string().contains("utilization"),
+        "the error must name the missing field so the log is diagnosable: {err}"
     );
 }

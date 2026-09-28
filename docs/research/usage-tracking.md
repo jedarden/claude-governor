@@ -410,10 +410,20 @@ loudly instead of passing vacuously:
 |---|---|
 | `usage_response_documented_shape.json` | the §2 response structure verbatim — known windows, the unknown-to-cgov sibling fields (`seven_day_sonnet`, `extra_usage`, …), and the generic `limits[]` array all parse from one realistic body |
 | `usage_response_inactive_and_unknown_limits.json` | `is_active: false` at window and entry level parses and round-trips (only `false` means structurally inactive; absent/null is active), and an unknown `kind` is tolerated without disturbing `weekly_scoped` resolution |
-| `usage_response_non_utc_reset_offsets.json` | the same reset instant at `+05:30` and `Z` yields identical `hours_remaining` — offsets normalize to UTC before any time math |
+| `usage_response_non_utc_reset_offsets.json` | the same reset instant at `+05:30` and `Z` yields identical `hours_remaining` — offsets normalize to UTC before any time math; the fixed instants are months in the past, so this fixture also pins the **expired-response** class (long-past `resets_at` parses and yields long-negative hours, never an error) |
 | `usage_response_null_window.json` | a null window is non-binding (consumed by `tests/null_tolerance_fixture_test.rs`) |
+| `usage_response_incomplete.json` | the **incomplete-response** class: named windows present, every scoped/op window `null`, and the `limits[]` array absent outright — the named windows flow verbatim, the absent ones default, and the poll still succeeds |
+| `usage_response_invalid_wrong_typed_utilization.json` | the **invalid-response** class, wrong-typed clause: `utilization` present as a string fails the `UsageResponse` parse |
+| `usage_response_invalid_missing_required_field.json` | the **invalid-response** class, missing-field clause: a present window with `utilization` absent outright fails the parse with an error naming the field — the tripwire against a future `#[serde(default)]` on `utilization`, which would silently read absence as 0% manufactured headroom |
+
+Together these cover the four wire-condition classes the usage API produces:
+successful (`documented_shape`), expired (`non_utc_reset_offsets`), incomplete
+(`incomplete`), and invalid (the two `invalid_*` fixtures).
 
 Authentication, HTTP-error, rate-limit, and retry behavior are behavioral,
 not representational — they stay pinned by the mockito suite
 (`tests/usage_polling_contract.rs`) per §10, which no static fixture can
-express.
+express. The invalid fixtures assert the parse failure at the
+`UsageResponse` layer; `fetch_usage` wraps that same serde error as
+`PollerError::ParseError`, and the end-to-end hop is what the mockito suite
+already pins.
