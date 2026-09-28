@@ -103,6 +103,7 @@ const LIB_SOURCES: &[(&str, &str)] = &[
     ("src/narrator.rs", include_str!("../src/narrator.rs")),
     ("src/poller.rs", include_str!("../src/poller.rs")),
     ("src/pricing.rs", include_str!("../src/pricing.rs")),
+    ("src/retention.rs", include_str!("../src/retention.rs")),
     ("src/schedule.rs", include_str!("../src/schedule.rs")),
     ("src/simulator.rs", include_str!("../src/simulator.rs")),
     (

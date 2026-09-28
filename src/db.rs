@@ -23,6 +23,11 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
 
 /// Create all tables, indexes, and views for the token history mirror.
 pub fn create_schema(conn: &Connection) -> Result<()> {
+    // Incremental auto-vacuum so retention pruning (claudego-aea80db7) can
+    // hand freed pages back to the filesystem incrementally. Takes effect at
+    // creation on a fresh database; on an existing database this is a no-op
+    // until reclaim_space() converts it with a one-time full VACUUM.
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
     // Table i: instance records
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS i (
@@ -408,6 +413,52 @@ pub fn rebuild_from_jsonl(jsonl_path: &Path, db_path: &Path) -> Result<usize> {
     tx.commit()?;
 
     Ok(count)
+}
+
+/// Delete mirror rows older than `cutoff` (claudego-aea80db7).
+///
+/// Rows are matched on the same record `ts` the JSONL rotation partitions on,
+/// compared through `julianday()` so any RFC3339 spelling compares
+/// chronologically. A row whose `ts` is missing or unparseable yields NULL
+/// from `julianday()` and therefore never matches — nothing undatable is ever
+/// deleted. Call [`reclaim_space`] afterwards to hand the freed pages back.
+/// Returns rows deleted from `(i, f, w)`.
+pub fn prune_before(conn: &Connection, cutoff: DateTime<Utc>) -> Result<(usize, usize, usize)> {
+    let cutoff = cutoff.to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
+    let di = tx.execute(
+        "DELETE FROM i WHERE julianday(ts) < julianday(?1)",
+        params![&cutoff],
+    )?;
+    let df = tx.execute(
+        "DELETE FROM f WHERE julianday(ts) < julianday(?1)",
+        params![&cutoff],
+    )?;
+    let dw = tx.execute(
+        "DELETE FROM w WHERE julianday(ts) < julianday(?1)",
+        params![&cutoff],
+    )?;
+    tx.commit()?;
+    Ok((di, df, dw))
+}
+
+/// Reclaim the pages [`prune_before`] freed.
+///
+/// Databases already in incremental auto-vacuum mode (every database created
+/// after claudego-aea80db7) just drop their free list. Legacy databases —
+/// including the live mirror this shipped against — are converted in place:
+/// flipping `auto_vacuum` only takes effect across a full `VACUUM`, which
+/// then also reclaims everything in one pass. Returns how the space was
+/// reclaimed, for the rotation log.
+pub fn reclaim_space(conn: &Connection) -> Result<&'static str> {
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode == 2 {
+        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+        Ok("incremental")
+    } else {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        Ok("full vacuum (auto_vacuum converted to incremental)")
+    }
 }
 
 /// Query the last N window records from the database.

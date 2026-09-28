@@ -1396,6 +1396,10 @@ pub fn run_collection_pass_with_engine(
     let cursor_path = &paths.cursor_path;
     let session_base = &paths.session_base;
 
+    // Bound the history files before appending to them (claudego-aea80db7):
+    // at most one rotation per day, marker-checked, never fails the pass.
+    crate::retention::maybe_rotate(history_path, db_path);
+
     let config = pricing_engine.config();
 
     // Collect all configured model names
@@ -1650,6 +1654,11 @@ fn ctrlc_handler(running: Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<
 /// Creates the file (and parent directories) if they don't exist.
 /// All records are serialised into a single buffer and written with one
 /// `write_all` call to prevent partial-line writes.
+///
+/// Holds the history rotation's advisory lock while writing
+/// (claudego-aea80db7): an append therefore lands entirely before rotation's
+/// scan or entirely after its atomic rename, never into the file that rename
+/// replaces.
 pub fn append_jsonl(path: &Path, records: &[serde_json::Value]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -1669,6 +1678,8 @@ pub fn append_jsonl(path: &Path, records: &[serde_json::Value]) -> Result<()> {
         buf.push('\n');
     }
 
+    let _lock = crate::retention::HistoryLock::acquire(path)
+        .map_err(|e| CollectorError::Io(io::Error::other(e.to_string())))?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(buf.as_bytes())?;
 

@@ -20,6 +20,9 @@ pub mod ledger_yield;
 pub mod narrator;
 pub mod poller;
 pub mod pricing;
+/// Bounded token-history: windowed JSONL, monthly archives, pruned mirror
+/// (claudego-aea80db7).
+pub mod retention;
 pub mod schedule;
 pub mod simulator;
 pub mod snapshot_fixtures;

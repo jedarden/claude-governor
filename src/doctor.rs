@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -1741,9 +1741,13 @@ fn check_promotion_dates() -> CheckResult {
 
 /// Check JSONL/DB row count sync
 fn check_jsonl_db_sync() -> CheckResult {
-    let jsonl_path = default_jsonl_path();
-    let db_path = default_db_path();
+    check_jsonl_db_sync_at(&default_jsonl_path(), &default_db_path())
+}
 
+/// [`check_jsonl_db_sync`] against explicit paths, so retention rotation
+/// (claudego-aea80db7) can be tested against a fixture instead of the live
+/// history.
+fn check_jsonl_db_sync_at(jsonl_path: &Path, db_path: &Path) -> CheckResult {
     if !jsonl_path.exists() && !db_path.exists() {
         return CheckResult::warn(
             "jsonl_db_sync",
@@ -2488,6 +2492,47 @@ pub fn format_doctor_json(report: &DoctorReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retention rotation (claudego-aea80db7) keeps the JSONL and its mirror
+    /// in lockstep, so the doctor's sync check must keep passing on a history
+    /// that has just been windowed and archived.
+    #[test]
+    fn jsonl_db_sync_passes_after_retention_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jsonl = tmp.path().join("token-history.jsonl");
+        let db = tmp.path().join("token-history.db");
+
+        let mut records = Vec::new();
+        for i in 0..220 {
+            let ts = if i < 200 {
+                (Utc::now() - chrono::Duration::days(100 + i)).to_rfc3339()
+            } else {
+                (Utc::now() - chrono::Duration::hours(i - 200)).to_rfc3339()
+            };
+            records.push(serde_json::json!({
+                "r": "i", "ts": ts, "t0": ts, "t1": ts,
+                "sess": "s", "sid": "s", "model": "m",
+                "pk": 0, "hr_et": 0, "dow": 0, "total-usd": 1.0,
+            }));
+        }
+        let body = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&jsonl, body + "\n").unwrap();
+        crate::db::rebuild_from_jsonl(&jsonl, &db).unwrap();
+
+        crate::retention::rotate_history(&jsonl, &db, Utc::now()).unwrap();
+
+        let result = check_jsonl_db_sync_at(&jsonl, &db);
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "doctor must still validate a rotated history: {:?}",
+            result
+        );
+    }
 
     // -- retired_component_refs -------------------------------------------------
 
