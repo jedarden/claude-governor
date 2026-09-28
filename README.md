@@ -265,32 +265,44 @@ The governor's state file lives under the config directory, **not** under
 
 ## Configuration
 
-The governor reads configuration from `~/.config/claude-governor/governor.yaml`:
+The governor reads configuration from `~/.config/claude-governor/governor.yaml`
+(the repo's `config/governor.yaml` is only the seed template copied on first
+run). A minimal working example:
 
 ```yaml
 agents:
   sonnet:
-    launch_cmd: needle run --agent=claude-anthropic-sonnet --workspace={workspace} --force
-    session_pattern: needle-claude-anthropic-sonnet-*
+    launch_cmd: "needle run --agent claude-anthropic-sonnet --identifier cgov-sonnet-{id}"
+    session_pattern: "needle-claude-anthropic-sonnet-cgov-sonnet-*"
     heartbeat_dir: ~/.needle/state/heartbeats
-    workspace: /path/to/project
+    min_workers: 0
+    max_workers: 8
 
-polling:
-  interval_seconds: 300
-  usage_api_url: https://api.anthropic.com/api/oauth/usage
+daemon:
+  loop_interval_secs: 300
+  target_ceiling: 90.0
+  windows:
+    five_hour:
+      target_utilization: 0.85
 
 pricing:
-  claude-sonnet-4-6:
-    input_per_mtok: 3.0
-    output_per_mtok: 15.0
-    cache_write_5m_per_mtok: 3.75
-    cache_write_1h_per_mtok: 6.0
-    cache_read_per_mtok: 0.3
+  models:
+    claude-sonnet-4-6:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_write_5m_per_mtok: 3.75
+      cache_write_1h_per_mtok: 6.0
+      cache_read_per_mtok: 0.3
 ```
 
 Configuration is validated before the governor starts. Retired component keys
 and pool references are rejected instead of being silently ignored; `cgov
 doctor` reports the same condition as a failed check.
+
+The complete schema reference — every key, default, validation rule,
+environment override, and migration behaviour — is
+[docs/configuration-reference.md](docs/configuration-reference.md), kept
+in sync with the binary by `tests/config_docs_contract_test.rs`.
 
 ## Usage
 
