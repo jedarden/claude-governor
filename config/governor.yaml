@@ -225,6 +225,7 @@ agents:
 daemon:
   pre_scale_minutes: 30             # Look-ahead for multiplier transitions (0 = disabled)
   loop_interval_secs: 300           # Polling interval in seconds (5 min)
+  adaptive_act_interval: false      # Shorten act sleeps to 1/3 while gap > 5; observation stays at loop_interval_secs
   hysteresis_band: 1.0              # Scaling hysteresis band
   max_scale_up_per_cycle: 1         # Max workers to scale up per cycle
   max_scale_down_per_cycle: 1       # Max workers to scale down per cycle

@@ -65,6 +65,7 @@ sprint:
   pace_blocks: 6
 daemon:
   loop_interval_secs: 120
+  adaptive_act_interval: true
   hysteresis_band: 2.0
   max_scale_up_per_cycle: 2
   max_scale_down_per_cycle: 2

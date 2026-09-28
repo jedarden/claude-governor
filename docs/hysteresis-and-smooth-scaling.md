@@ -175,17 +175,29 @@ The band must never create a gap at which the fleet stops converging. With integ
 
 A target jittering ±1 around the fleet produces no churn: the first deficit closes (fleet at 6, say), after which a target of 5 sits inside the down-band and holds. Churn requires the target itself to swing by more than the band — the same condition the symmetric band required.
 
-## Remaining Improvements (Not Implemented)
+## Remaining Improvements
 
-Option C remains open and is tracked as a bead. It was serialized behind the now-completed Option B implementation because both touch `src/governor.rs`, `src/config.rs`, and this test file.
+Option C was serialized behind the now-completed Option B implementation
+because both touch `src/governor.rs`, `src/config.rs`, and this test file.
 
 ### Option B: Exponential Decay — implemented in [claudego-b9195f5a]
 
 Set `exponential_decay_scaling: true` to close 30% of the remaining gap per cycle, rounded up to a whole worker. The effective cap is `min(ceil(0.30 * gap), configured cap, gap)`, so the configured cap remains the hard bound and a cycle never overshoots the target. This gives a smooth asymptotic approach while preserving the binary behavior when the knob is disabled. It takes precedence over `progressive_scaling` if both are enabled.
 
-### Option C: Adaptive Timing — [claudego-71a82180]
+### Option C: Adaptive Timing — implemented in [claudego-71a82180]
 
-Shorten the polling interval while far from target (e.g. 1/3 interval when gap > 5). Faster convergence without touching per-cycle limits. Not implemented — the 300s loop interval is also the burn-rate sampling granularity (see `DaemonConfig::loop_interval_secs`), so the design must keep observation/sampling on the fixed cadence or explicitly test the changed semantics.
+Set `adaptive_act_interval: true` to shorten only the act sleep to one-third
+of `loop_interval_secs` while the absolute target gap is greater than 5
+workers. The interval switch has hysteresis: fast mode is entered above gap 5
+and returns to the base cadence at gap 3 or below. This avoids flapping when a
+forecast moves around the entry threshold and does not change per-cycle scale
+limits.
+
+The observation half remains on the fixed `loop_interval_secs` cadence in both
+the split daemons and the legacy combined daemon. That fixed cadence continues
+to define burn-rate sample spacing, calibration timing, and collector cursor
+advancement; adaptive timing is act-only and therefore cannot silently turn a
+five-minute sample into a shorter sample.
 
 ## Configuration Examples
 
@@ -203,6 +215,7 @@ daemon:
   max_scale_down_per_cycle: 1
   progressive_scaling: false
   exponential_decay_scaling: false
+  adaptive_act_interval: false
   loop_interval_secs: 300  # 5 minutes
 ```
 
@@ -225,6 +238,7 @@ daemon:
   max_scale_up_per_cycle: 3      # hard upper bound for decay
   max_scale_down_per_cycle: 3
   exponential_decay_scaling: true # close ceil(30% of gap), never past target
+  adaptive_act_interval: true      # act sleeps are 1/3 while gap > 5; observe stays fixed
   loop_interval_secs: 300
 ```
 
@@ -236,6 +250,7 @@ daemon:
 - Convergence to target (`test_smooth_scale_up_sequence` — the 5→10 table ends at 10; `test_scale_up_converges_from_one_short` — the regression in one line)
 - Down-side damping (`test_hysteresis_scale_down_within_band`, `test_smooth_scale_down_sequence`)
 - Progressive caps: tiers, gap clamp, disabled cap (`test_progressive_scale_cap_tiers_and_clamps`), convergence speed (`test_progressive_scaling_converges_faster_and_exactly`)
+- Adaptive act timing: fast interval beyond the gap threshold, base interval at/inside target, interval-switch hysteresis, disabled-by-default behavior, and a fixed observation/sampling cadence (`test_adaptive_timing_shortens_beyond_gap`, `test_adaptive_timing_returns_to_base_at_target`, `test_adaptive_timing_switch_has_hysteresis`, `test_adaptive_timing_keeps_observation_cadence_fixed`)
 - Exponential-decay caps: ceiling/fraction closure, no overshoot, configured-cap bound, disabled binary behavior, and faster large-gap convergence (`test_decay_scale_cap_closes_a_fraction_with_ceiling`, `test_decay_scale_cap_never_exceeds_configured_cap_or_gap`, `test_decay_scaling_closes_fraction_of_gap_each_cycle`, `test_decay_scaling_converges_faster_than_binary_for_large_gap`)
 - Anti-oscillation under jitter (`test_hysteresis_prevents_oscillation`)
 - Emergency brake override (`test_emergency_brake_bypasses_hysteresis`)

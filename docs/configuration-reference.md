@@ -172,6 +172,7 @@ chosen.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `loop_interval_secs` | integer | `300` | Cycle length in seconds. 300 is the *minimum useful* value, not an enforced floor: the usage API percentages don't move visibly faster, and shorter intervals zero out the deltas the burn-rate EMA learns from |
+| `adaptive_act_interval` | bool | `false` | Shorten only act sleeps to one-third while the target gap is above 5 workers; observation, burn-rate sampling, and collector cursor advancement remain on `loop_interval_secs` (fast mode exits at gap ≤ 3) |
 | `hysteresis_band` | number | `1.0` | Scale-down damping band (workers). Deficits of any size close immediately; see `docs/hysteresis-and-smooth-scaling.md` |
 | `max_scale_up_per_cycle` | integer | `1` | Max workers added per cycle |
 | `max_scale_down_per_cycle` | integer | `1` | Max workers removed per cycle |
@@ -274,6 +275,7 @@ cone_scaling
 cone_scaling.narrow_threshold
 credentials_path
 daemon
+daemon.adaptive_act_interval
 daemon.hysteresis_band
 daemon.log_backup_count
 daemon.log_max_bytes
@@ -335,6 +337,7 @@ sprint:
 agents: {}
 daemon:
   loop_interval_secs: 300
+  adaptive_act_interval: false
   hysteresis_band: 1.0
   max_scale_up_per_cycle: 1
   max_scale_down_per_cycle: 1

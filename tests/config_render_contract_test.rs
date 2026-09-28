@@ -35,8 +35,9 @@ const FIXTURE_FILE_NAME: &str = "governor-render-fixture.yaml";
 /// block all present this same surface. Pinned in full — a key may only be
 /// added or removed here together with `DaemonConfig`, the template, and the
 /// docs.
-const PINNED_DAEMON_KEYS: [&str; 13] = [
+const PINNED_DAEMON_KEYS: [&str; 14] = [
     "loop_interval_secs",
+    "adaptive_act_interval",
     "hysteresis_band",
     "max_scale_up_per_cycle",
     "max_scale_down_per_cycle",
@@ -169,6 +170,7 @@ fn render_carries_every_documented_daemon_key_with_its_loaded_value() {
     let daemon = rendered_daemon_section(&display);
 
     assert_fixture_value(&daemon, "loop_interval_secs", &Value::from(271));
+    assert_fixture_value(&daemon, "adaptive_act_interval", &Value::from(true));
     assert_fixture_value(&daemon, "hysteresis_band", &Value::from(1.75));
     assert_fixture_value(&daemon, "max_scale_up_per_cycle", &Value::from(4));
     assert_fixture_value(&daemon, "max_scale_down_per_cycle", &Value::from(2));

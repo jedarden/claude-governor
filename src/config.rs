@@ -243,6 +243,16 @@ pub struct DaemonConfig {
     #[serde(default = "default_loop_interval_secs")]
     pub loop_interval_secs: u64,
 
+    /// Adapt the act daemon's sleep interval to the current target gap
+    /// (default: false).
+    ///
+    /// When enabled, the act half polls more frequently while the fleet is
+    /// far from its target. Observation remains on `loop_interval_secs` so
+    /// burn-rate samples, calibration, and collector cursor advancement keep
+    /// their configured cadence.
+    #[serde(default)]
+    pub adaptive_act_interval: bool,
+
     /// Hysteresis band for scaling decisions (default: 1.0)
     /// Scaling only occurs when target differs from current by more than this
     #[serde(default = "default_hysteresis_band")]
@@ -360,6 +370,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             loop_interval_secs: default_loop_interval_secs(), // 300
+            adaptive_act_interval: false,
             hysteresis_band: default_hysteresis_band(),
             max_scale_up_per_cycle: default_max_scale_up_per_cycle(),
             max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
@@ -1112,6 +1123,7 @@ pricing:
 "#;
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.daemon.loop_interval_secs, 300);
+        assert!(!config.daemon.adaptive_act_interval);
         assert!((config.daemon.hysteresis_band - 1.0).abs() < 1e-9);
         assert_eq!(config.daemon.max_scale_up_per_cycle, 1);
         assert_eq!(config.daemon.max_scale_down_per_cycle, 1);
@@ -1127,6 +1139,7 @@ pricing:
   models: {}
 daemon:
   loop_interval_secs: 120
+  adaptive_act_interval: true
   hysteresis_band: 2.0
   max_scale_up_per_cycle: 2
   max_scale_down_per_cycle: 2
@@ -1136,6 +1149,7 @@ daemon:
 "#;
         let config: GovernorConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.daemon.loop_interval_secs, 120);
+        assert!(config.daemon.adaptive_act_interval);
         assert!((config.daemon.hysteresis_band - 2.0).abs() < 1e-9);
         assert_eq!(config.daemon.max_scale_up_per_cycle, 2);
         assert_eq!(config.daemon.max_scale_down_per_cycle, 2);

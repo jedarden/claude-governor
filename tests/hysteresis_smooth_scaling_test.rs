@@ -12,8 +12,8 @@
 
 use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig, DaemonConfig};
 use claude_governor::governor::{
-    apply_scaling, compute_target_workers, decay_scale_cap, progressive_scale_cap, ScalingDecision,
-    DEFAULT_SCALE_DECAY_FRACTION,
+    adaptive_act_interval_secs, apply_scaling, compute_target_workers, decay_scale_cap,
+    progressive_scale_cap, DaemonCadence, ScalingDecision, DEFAULT_SCALE_DECAY_FRACTION,
 };
 use claude_governor::state;
 
@@ -803,31 +803,63 @@ fn test_exponential_approach_concept() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_adaptive_timing_concept() {
-    // Conceptual test for adaptive polling interval
-    // This documents expected behavior for faster convergence
+fn test_adaptive_timing_shortens_beyond_gap() {
+    let (interval, shortened) = adaptive_act_interval_secs(300, 6, true, false);
 
-    let current = 5;
-    let target = 15;
-    let base_interval_secs = 300; // 5 minutes
+    assert_eq!(interval, 100, "gap > 5 uses one-third of the base interval");
+    assert!(shortened, "gap > 5 enters fast act mode");
+}
 
-    let gap = (target - current) as f64;
+#[test]
+fn test_adaptive_timing_returns_to_base_at_target() {
+    let (at_target, shortened) = adaptive_act_interval_secs(300, 0, true, true);
+    assert_eq!(at_target, 300);
+    assert!(!shortened, "at target returns to the base act cadence");
 
-    // Large gap (> 5): use 1/3 interval = 1.67 minutes
-    // Medium gap (> 3): use 1/2 interval = 2.5 minutes
-    // Small gap (<= 3): use full interval = 5 minutes
+    let (inside_target, shortened) = adaptive_act_interval_secs(300, 2, true, true);
+    assert_eq!(inside_target, 300);
+    assert!(!shortened, "a small remaining gap uses the base cadence");
+}
 
-    let expected_interval = if gap > 5.0 {
-        base_interval_secs / 3
-    } else if gap > 3.0 {
-        base_interval_secs / 2
-    } else {
-        base_interval_secs
-    };
+#[test]
+fn test_adaptive_timing_switch_has_hysteresis() {
+    let (entered, shortened) = adaptive_act_interval_secs(300, 6, true, false);
+    assert_eq!(entered, 100);
+    assert!(shortened);
 
-    assert_eq!(
-        expected_interval,
-        100, // 300 / 3
-        "Large gap should use faster polling interval"
+    let (held, shortened) = adaptive_act_interval_secs(300, 4, true, true);
+    assert_eq!(held, 100, "gap 4 stays fast after entering above gap 5");
+    assert!(shortened);
+
+    let (exited, shortened) = adaptive_act_interval_secs(300, 3, true, true);
+    assert_eq!(exited, 300, "fast mode exits at the lower threshold");
+    assert!(!shortened);
+
+    let (not_reentered, shortened) = adaptive_act_interval_secs(300, 5, true, false);
+    assert_eq!(not_reentered, 300, "gap 5 does not re-enter fast mode");
+    assert!(!shortened);
+}
+
+#[test]
+fn test_adaptive_timing_keeps_observation_cadence_fixed() {
+    let mut cadence = DaemonCadence::new(300, true, 6);
+    assert_eq!(cadence.observation_interval_secs(), 300);
+    assert_eq!(cadence.act_interval_secs(), 100);
+
+    cadence.update_after_act(6);
+    assert_eq!(cadence.observation_interval_secs(), 300);
+    assert_eq!(cadence.act_interval_secs(), 100);
+
+    cadence.update_after_act(0);
+    assert_eq!(cadence.observation_interval_secs(), 300);
+    assert_eq!(cadence.act_interval_secs(), 300);
+
+    let defaults = DaemonConfig::default();
+    assert!(
+        !defaults.adaptive_act_interval,
+        "adaptive act timing is opt-in"
     );
+    let (disabled, shortened) = adaptive_act_interval_secs(300, 100, false, false);
+    assert_eq!(disabled, 300);
+    assert!(!shortened);
 }

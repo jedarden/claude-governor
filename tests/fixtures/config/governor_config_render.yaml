@@ -17,6 +17,7 @@ pricing:
 
 daemon:
   loop_interval_secs: 271
+  adaptive_act_interval: true
   hysteresis_band: 1.75
   max_scale_up_per_cycle: 4
   max_scale_down_per_cycle: 2

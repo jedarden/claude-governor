@@ -1100,7 +1100,7 @@ mod governor_state_tests {
 // ---------------------------------------------------------------------------
 
 /// Result of a scaling decision in one cycle
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalingDecision {
     /// No change needed (within hysteresis band or already at target)
     NoChange,
@@ -1113,6 +1113,104 @@ pub enum ScalingDecision {
     /// 98% threshold); a computed target of 0 without one travels as
     /// [`ScalingDecision::ScaleDown`] instead.
     EmergencyBrake,
+}
+
+/// The parts of an act cycle needed by a daemon scheduler after the cycle has
+/// persisted its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActCycleResult {
+    pub decision: ScalingDecision,
+    pub current_total: u32,
+    pub effective_target: u32,
+}
+
+impl ActCycleResult {
+    /// Absolute distance between the live fleet and the target this cycle
+    /// selected. The scheduler uses this rather than the per-cycle move so a
+    /// capped decision still gets a fast cadence while a large gap remains.
+    pub fn gap(&self) -> u32 {
+        self.current_total.abs_diff(self.effective_target)
+    }
+}
+
+/// Gap thresholds for the adaptive act cadence. Fast mode enters only beyond
+/// the upper threshold and stays active until the gap reaches the lower one;
+/// that dead band prevents a forecast oscillating around the entry threshold
+/// from changing the sleep interval every cycle.
+pub const ADAPTIVE_ACT_GAP_ENTER_THRESHOLD: u32 = 5;
+pub const ADAPTIVE_ACT_GAP_EXIT_THRESHOLD: u32 = 3;
+pub const ADAPTIVE_ACT_INTERVAL_DIVISOR: u64 = 3;
+
+/// Select the next act sleep interval and remember whether fast mode is active.
+///
+/// Observation is deliberately not part of this helper: callers use the
+/// configured base interval for observation and collector/burn-rate sampling.
+/// The returned boolean is the state to pass back on the next act cycle.
+pub fn adaptive_act_interval_secs(
+    base_interval_secs: u64,
+    gap: u32,
+    enabled: bool,
+    previously_shortened: bool,
+) -> (u64, bool) {
+    let base = base_interval_secs.max(1);
+    if !enabled {
+        return (base, false);
+    }
+
+    let shortened = if previously_shortened {
+        gap > ADAPTIVE_ACT_GAP_EXIT_THRESHOLD
+    } else {
+        gap > ADAPTIVE_ACT_GAP_ENTER_THRESHOLD
+    };
+    let interval = if shortened {
+        (base / ADAPTIVE_ACT_INTERVAL_DIVISOR).max(1)
+    } else {
+        base
+    };
+    (interval, shortened)
+}
+
+/// Independent daemon cadences. The observation cadence is always the base
+/// loop interval; only the act cadence can be shortened by the opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonCadence {
+    observation_interval_secs: u64,
+    act_interval_secs: u64,
+    act_interval_shortened: bool,
+    adaptive_act_interval: bool,
+}
+
+impl DaemonCadence {
+    pub fn new(base_interval_secs: u64, adaptive_act_interval: bool, gap: u32) -> Self {
+        let base = base_interval_secs.max(1);
+        let (act_interval_secs, act_interval_shortened) =
+            adaptive_act_interval_secs(base, gap, adaptive_act_interval, false);
+        Self {
+            observation_interval_secs: base,
+            act_interval_secs,
+            act_interval_shortened,
+            adaptive_act_interval,
+        }
+    }
+
+    pub fn observation_interval_secs(&self) -> u64 {
+        self.observation_interval_secs
+    }
+
+    pub fn act_interval_secs(&self) -> u64 {
+        self.act_interval_secs
+    }
+
+    pub fn update_after_act(&mut self, gap: u32) {
+        let (act_interval_secs, act_interval_shortened) = adaptive_act_interval_secs(
+            self.observation_interval_secs,
+            gap,
+            self.adaptive_act_interval,
+            self.act_interval_shortened,
+        );
+        self.act_interval_secs = act_interval_secs;
+        self.act_interval_shortened = act_interval_shortened;
+    }
 }
 
 /// Resolve safe_worker_count to a concrete target, with an explicit fallback when
@@ -7364,6 +7462,44 @@ pub fn run_act_cycle(
     pricing_config: &crate::config::GovernorConfig,
     now: DateTime<Utc>,
 ) -> anyhow::Result<ScalingDecision> {
+    run_act_cycle_with_result(
+        state_path,
+        dry_run,
+        hysteresis_band,
+        max_up_per_cycle,
+        max_down_per_cycle,
+        target_ceiling,
+        alert_config,
+        agents,
+        pre_scale_minutes,
+        promotions,
+        composite_risk_config,
+        cone_scaling_config,
+        pricing_config,
+        now,
+    )
+    .map(|result| result.decision)
+}
+
+/// Run one act cycle and return the target gap used to choose the next act
+/// cadence. [`run_act_cycle`] remains the compatibility wrapper for callers
+/// that only need the scaling decision.
+pub fn run_act_cycle_with_result(
+    state_path: &Path,
+    dry_run: bool,
+    hysteresis_band: f64,
+    max_up_per_cycle: u32,
+    max_down_per_cycle: u32,
+    target_ceiling: f64,
+    alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
+    pre_scale_minutes: u64,
+    promotions: &[Promotion],
+    composite_risk_config: &CompositeRiskConfig,
+    cone_scaling_config: &ConeScalingConfig,
+    pricing_config: &crate::config::GovernorConfig,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ActCycleResult> {
     log::info!("[governor] === act cycle start at {} ===", now.to_rfc3339());
 
     // 1. Load state fresh: the observe half of this cycle just persisted it.
@@ -8315,7 +8451,11 @@ pub fn run_act_cycle(
         "[governor] === act cycle complete (decision: {:?}) ===",
         decision
     );
-    Ok(decision)
+    Ok(ActCycleResult {
+        decision,
+        current_total,
+        effective_target,
+    })
 }
 
 /// Run a single observation cycle (poll, forecast, calibrate, write state)
@@ -8406,7 +8546,10 @@ pub fn run_observe(
 
 /// Run the governor daemon (infinite loop with graceful shutdown on SIGINT/SIGTERM)
 ///
-/// Executes `run_governor_cycle` every `loop_interval` seconds.
+/// Executes observation at the fixed `loop_interval` cadence and runs the act
+/// half at either that cadence or the opt-in gap-adaptive cadence. Keeping the
+/// two schedules separate is important: the observation interval is also the
+/// burn-rate sample and collector cursor cadence.
 /// Sets up signal handlers for graceful shutdown via ctrlc crate.
 pub fn run_daemon(
     state_path: &Path,
@@ -8416,6 +8559,7 @@ pub fn run_daemon(
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
     target_ceiling: f64,
+    adaptive_act_interval: bool,
     alert_config: &AlertConfig,
     agents: &std::collections::HashMap<String, AgentConfig>,
     pre_scale_minutes: u64,
@@ -8434,9 +8578,10 @@ pub fn run_daemon(
     .map_err(|e| anyhow::anyhow!("Failed to set signal handler: {}", e))?;
 
     log::info!(
-        "[governor] daemon started (dry_run={}, interval={}s, hysteresis={:.1}, ceiling={:.0}%)",
+        "[governor] daemon started (dry_run={}, interval={}s, adaptive_act_interval={}, hysteresis={:.1}, ceiling={:.0}%)",
         dry_run,
         loop_interval,
+        adaptive_act_interval,
         hysteresis_band,
         target_ceiling
     );
@@ -8454,13 +8599,26 @@ pub fn run_daemon(
     // calibration accuracy log) — resolved once, shared by all cycles.
     let cycle_paths = CyclePaths::default();
 
-    // Initial cycle
-    if let Err(e) = run_governor_cycle(
+    // Initial observation and act cycle. They are separate here, as they are
+    // in the ADR-001 split daemons, so later act cycles can run faster without
+    // changing the observation/sampling cadence.
+    if let Err(e) = run_observe_cycle_with_target_ceiling(
         &mut poller,
         state_path,
         &cycle_paths,
+        alert_config,
+        agents,
+        promotions,
+        pricing_config,
+        target_ceiling,
+        Utc::now(),
+    ) {
+        log::error!("[governor] initial observe cycle failed: {}", e);
+    }
+
+    let initial_act = run_act_cycle_with_result(
+        state_path,
         dry_run,
-        loop_interval,
         hysteresis_band,
         max_up_per_cycle,
         max_down_per_cycle,
@@ -8472,13 +8630,24 @@ pub fn run_daemon(
         composite_risk_config,
         cone_scaling_config,
         pricing_config,
-    ) {
-        log::error!("[governor] initial cycle failed: {}", e);
-    }
+        Utc::now(),
+    );
+    let initial_gap = match &initial_act {
+        Ok(result) => result.gap(),
+        Err(e) => {
+            log::error!("[governor] initial act cycle failed: {}", e);
+            0
+        }
+    };
+    let mut cadence = DaemonCadence::new(loop_interval, adaptive_act_interval, initial_gap);
+    let mut observe_remaining = cadence.observation_interval_secs();
+    let mut act_remaining = cadence.act_interval_secs();
 
     while running.load(Ordering::SeqCst) {
-        // Sleep for loop interval, checking shutdown every second
-        for _ in 0..loop_interval {
+        // Sleep until the next half is due. Observation always counts down
+        // from the base interval; only act_remaining may be shortened.
+        let sleep_secs = observe_remaining.min(act_remaining);
+        for _ in 0..sleep_secs {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
@@ -8489,26 +8658,47 @@ pub fn run_daemon(
             break;
         }
 
-        if let Err(e) = run_governor_cycle(
-            &mut poller,
-            state_path,
-            &cycle_paths,
-            dry_run,
-            loop_interval,
-            hysteresis_band,
-            max_up_per_cycle,
-            max_down_per_cycle,
-            target_ceiling,
-            alert_config,
-            agents,
-            pre_scale_minutes,
-            promotions,
-            composite_risk_config,
-            cone_scaling_config,
-            pricing_config,
-        ) {
-            log::error!("[governor] cycle failed: {}", e);
-            // Continue running despite cycle failures
+        observe_remaining -= sleep_secs;
+        act_remaining -= sleep_secs;
+
+        if observe_remaining == 0 {
+            if let Err(e) = run_observe_cycle_with_target_ceiling(
+                &mut poller,
+                state_path,
+                &cycle_paths,
+                alert_config,
+                agents,
+                promotions,
+                pricing_config,
+                target_ceiling,
+                Utc::now(),
+            ) {
+                log::error!("[governor] observe cycle failed: {}", e);
+            }
+            observe_remaining = cadence.observation_interval_secs();
+        }
+
+        if act_remaining == 0 {
+            match run_act_cycle_with_result(
+                state_path,
+                dry_run,
+                hysteresis_band,
+                max_up_per_cycle,
+                max_down_per_cycle,
+                target_ceiling,
+                alert_config,
+                agents,
+                pre_scale_minutes,
+                promotions,
+                composite_risk_config,
+                cone_scaling_config,
+                pricing_config,
+                Utc::now(),
+            ) {
+                Ok(result) => cadence.update_after_act(result.gap()),
+                Err(e) => log::error!("[governor] act cycle failed: {}", e),
+            }
+            act_remaining = cadence.act_interval_secs();
         }
     }
 
@@ -8592,6 +8782,7 @@ pub fn run_act_daemon(
     state_path: &Path,
     dry_run: bool,
     interval: u64,
+    adaptive_act_interval: bool,
     hysteresis_band: f64,
     max_up_per_cycle: u32,
     max_down_per_cycle: u32,
@@ -8614,15 +8805,18 @@ pub fn run_act_daemon(
     .map_err(|e| anyhow::anyhow!("Failed to set signal handler: {}", e))?;
 
     log::info!(
-        "[act] daemon started (dry_run={}, interval={}s, hysteresis={:.1}, ceiling={:.0}%)",
+        "[act] daemon started (dry_run={}, interval={}s, adaptive_act_interval={}, hysteresis={:.1}, ceiling={:.0}%)",
         dry_run,
         interval,
+        adaptive_act_interval,
         hysteresis_band,
         target_ceiling
     );
 
+    let mut cadence = DaemonCadence::new(interval, adaptive_act_interval, 0);
+
     loop {
-        if let Err(e) = run_act_cycle(
+        match run_act_cycle_with_result(
             state_path,
             dry_run,
             hysteresis_band,
@@ -8638,12 +8832,14 @@ pub fn run_act_daemon(
             pricing_config,
             Utc::now(),
         ) {
-            log::error!("[act] cycle failed: {}", e);
-            // Continue running despite cycle failures
+            Ok(result) => cadence.update_after_act(result.gap()),
+            Err(e) => log::error!("[act] cycle failed: {}", e),
         }
 
-        // Sleep for the interval, checking shutdown every second
-        for _ in 0..interval {
+        // Only the act cadence is adaptive. The separate observe daemon owns
+        // the fixed sampling interval, so this cannot change burn-rate input
+        // granularity or collector cursor cadence.
+        for _ in 0..cadence.act_interval_secs() {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
