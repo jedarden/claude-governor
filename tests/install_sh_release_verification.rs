@@ -51,7 +51,10 @@
 //!   through the successful, mismatched, missing (404) and unavailable (500)
 //!   sidecar states; every refusal leaves a seeded installation
 //!   byte-for-byte intact, and on a fresh host the verification gate still
-//!   precedes `mkdir -p` for each mapped artifact (claudego-abbfb9d6).
+//!   precedes `mkdir -p` for each mapped artifact (claudego-abbfb9d6);
+//! * a successful install writes exactly one file — the verified binary
+//!   itself: the install dir holds no sidecar copy, no duplicate of the
+//!   artifact, no temp residue beside it (claudego-5ff779a1).
 //!
 //! The script is embedded with `include_str!` at compile time, following the
 //! repo's gate pattern (tests/adapter_var_sync.rs): the tested text cannot
@@ -338,6 +341,23 @@ fn assert_installed_binary(install_dir: &Path, artifact: &[u8]) {
     assert!(
         String::from_utf8_lossy(&version.stdout).contains("cgov 0.0.0-sandbox"),
         "installed binary produced wrong --version output"
+    );
+    // "Installs only the verified artifact": the successful install dir holds
+    // exactly the one binary — no copy of the .sha256 sidecar, no duplicate
+    // of the artifact under its release name, no temp residue beside it
+    // (claudego-5ff779a1). Every caller here installs into a fresh dir, so
+    // exclusivity is exactly one entry.
+    let mut entries = fs::read_dir(install_dir)
+        .expect("read install dir after a successful install")
+        .map(|entry| entry.expect("read installed entry").file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("cgov")],
+        "a successful install must write only the verified artifact — the \
+         install dir must not gain a sidecar copy, an artifact duplicate, \
+         or temp residue"
     );
 }
 
