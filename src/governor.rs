@@ -13235,6 +13235,78 @@ mod tests {
         );
     }
 
+    /// Table-driven companion to the end-to-end manual override coverage:
+    /// bypassing hysteresis changes only the down-side hold decision; the
+    /// configured caps and the graceful zero-target arm still apply.
+    #[test]
+    fn manual_override_scaling_policy_table() {
+        struct Row {
+            name: &'static str,
+            target: u32,
+            current: u32,
+            max_up: u32,
+            max_down: u32,
+            expected: ScalingDecision,
+        }
+
+        let rows = [
+            Row {
+                name: "inside_computed_down_band_is_actionable_when_pinned",
+                target: 3,
+                current: 5,
+                max_up: 3,
+                max_down: 2,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            Row {
+                name: "large_down_gap_still_honours_cap",
+                target: 0,
+                current: 5,
+                max_up: 3,
+                max_down: 2,
+                expected: ScalingDecision::ScaleDown(2),
+            },
+            Row {
+                name: "upward_pin_honours_up_cap",
+                target: 10,
+                current: 5,
+                max_up: 2,
+                max_down: 2,
+                expected: ScalingDecision::ScaleUp(2),
+            },
+            Row {
+                name: "small_upward_pin_moves_full_gap",
+                target: 6,
+                current: 5,
+                max_up: 3,
+                max_down: 2,
+                expected: ScalingDecision::ScaleUp(1),
+            },
+            Row {
+                name: "manual_zero_is_graceful_not_emergency",
+                target: 0,
+                current: 1,
+                max_up: 3,
+                max_down: 2,
+                expected: ScalingDecision::ScaleDown(1),
+            },
+            Row {
+                name: "at_target_holds",
+                target: 4,
+                current: 4,
+                max_up: 3,
+                max_down: 2,
+                expected: ScalingDecision::NoChange,
+            },
+        ];
+
+        for row in rows {
+            let actual =
+                apply_manual_override_scaling(row.target, row.current, row.max_up, row.max_down);
+            assert_eq!(actual, row.expected, "manual override row `{}`", row.name);
+        }
+    }
+
     /// Per-cycle caps under `daemon.progressive_scaling` (claudego-44b1f4f5,
     /// table added claudego-11c4439e): `progressive_scale_cap` widens the base
     /// cap with the remaining gap — 3x beyond a gap of 5, 2x beyond 3, 1x
