@@ -27,6 +27,12 @@
 //!   seeded store, while the identical command from a cwd above it meets
 //!   the barrier instead — the workspace-not-absolute starvation root cause
 //!   (docs/research/pluck-filter-root-cause.md), now as assertions.
+//! - **ready-frontier gates and checkpoint publication** — the raw bead-rs
+//!   frontier requires open, unassigned, unblocked beads with no unfinished
+//!   `blocks` dependency; Pluck's label exclusion remains an exact,
+//!   case-sensitive post-filter, so `documentation` is inert while `human`
+//!   is excluded and `Human` survives. A suppressed auto-flush is then made
+//!   durable by the explicit `bead sync flush-only` command.
 //!
 //! Supersedes three dead diagnostic tests replaced by asserting versions
 //! (they printed analysis and never asserted, read the live shared store,
@@ -42,7 +48,7 @@
 //! Division of labor: `bead_rs_contract_test.rs` owns the version pins and
 //! the store / JSONL / dependency contract; `pluck_db_test.rs` owns the
 //! adapter's query construction and label exclusion. This file adds only
-//! the three behaviors above and deliberately re-runs no version pin — it
+//! the behaviors above and deliberately re-runs no version pin — it
 //! rides the same `bead` binary that file pins (0.2.6; behaviors here
 //! observed live against it, 2026-09-27).
 //!
@@ -180,6 +186,46 @@ impl FrontierWorkspace {
     /// Ready IDs from the frontier, in output order.
     fn ready_ids(&self) -> Vec<String> {
         jsonl_ids(&bead_ok(&self.path, RENDERED_COMMAND))
+    }
+
+    /// Full objects from the raw bead-rs ready frontier. Label exclusion is
+    /// deliberately not performed by `bead list --ready`; it is Pluck's
+    /// exact-match post-filter over these objects.
+    fn ready_beads(&self) -> Vec<Value> {
+        bead_ok(&self.path, RENDERED_COMMAND)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("ready stdout must be JSONL, got {line:?}: {e}"))
+            })
+            .collect()
+    }
+
+    /// Create a mutation while deliberately suppressing the automatic
+    /// checkpoint publication, leaving `sync status` with a dirty frontier
+    /// for the explicit flush assertion below.
+    fn create_without_auto_flush(&self, title: &str, labels: &[&str]) -> String {
+        let mut args = vec!["--no-auto-flush", "create", "--title", title];
+        for label in labels {
+            args.push("--label");
+            args.push(label);
+        }
+        bead_ok(&self.path, &args)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .expect("bead create must print the new issue ID")
+            .to_string()
+    }
+
+    /// Machine-readable checkpoint freshness, which is the durable commit
+    /// gate bead-rs exposes after a mutation.
+    fn checkpoint_status(&self) -> Value {
+        let output = bead_ok(&self.path, &["sync", "status", "--format", "json"]);
+        serde_json::from_str(output.trim())
+            .expect("bead sync status --format json must emit one JSON object")
     }
 
     /// One bead's full JSON object (`bead show ID --json` is an array —
@@ -386,5 +432,169 @@ fn the_rendered_invocation_resolves_the_workspace_by_absolute_path() {
     assert!(
         !jsonl_ids(&stdout).contains(&id),
         "the barrier-root invocation must never serve the seeded workspace's beads, got: {stdout}"
+    );
+}
+
+/// The raw bead-rs frontier owns state, assignment, manual-block, and
+/// unfinished-dependency readiness. Pluck then applies exact label exclusion
+/// to that raw JSONL; labels are not a positive readiness requirement.
+#[test]
+fn the_ready_frontier_requires_all_gates_and_uses_exact_label_exclusion() {
+    const EXCLUDED_LABELS: &[&str] = &["deferred", "human", "blocked", "escalation", "alert"];
+
+    let ws = FrontierWorkspace::new();
+    let clean = ws.create("all frontier gates pass", &[]);
+    let documentation = ws.create("documentation label is inert", &["documentation"]);
+    let exact_excluded = ws.create("exact excluded label", &["human"]);
+    let case_variant = ws.create("case variant is not excluded", &["Human"]);
+    let glob_shaped = ws.create("glob-shaped label is not excluded", &["hum*"]);
+    let assigned = ws.create("assigned open is not ready", &[]);
+    let in_progress = ws.create("in-progress is not ready", &[]);
+    let manually_blocked = ws.create("manual block is not ready", &[]);
+    let blocker = ws.create("unfinished dependency blocker", &[]);
+    let dependency_blocked = ws.create("unfinished dependency is not ready", &[]);
+    let documentation_in_progress =
+        ws.create("documentation does not override status", &["documentation"]);
+
+    bead_ok(
+        &ws.path,
+        &["update", &assigned, "--assignee", "frontier-worker"],
+    );
+    bead_ok(
+        &ws.path,
+        &["update", &in_progress, "--status", "in_progress"],
+    );
+    bead_ok(
+        &ws.path,
+        &["update", &manually_blocked, "--status", "blocked"],
+    );
+    bead_ok(
+        &ws.path,
+        &[
+            "update",
+            &documentation_in_progress,
+            "--status",
+            "in_progress",
+        ],
+    );
+    bead_ok(&ws.path, &["dep", "add", &dependency_blocked, &blocker]);
+
+    let raw_beads = ws.ready_beads();
+    let raw_ids: Vec<String> = raw_beads
+        .iter()
+        .map(|bead| {
+            bead["id"]
+                .as_str()
+                .expect("every ready bead must carry an id")
+                .to_string()
+        })
+        .collect();
+
+    // These are the raw bead-rs gates. Labels do not make a bead ready or
+    // unready: the documentation bead is present, while the documentation
+    // bead with an in-progress status is absent.
+    for ready in [
+        &clean,
+        &documentation,
+        &exact_excluded,
+        &case_variant,
+        &glob_shaped,
+    ] {
+        assert!(
+            raw_ids.contains(ready),
+            "an open, unassigned, unblocked bead with no unfinished blocks dependency must be raw-ready: {ready}"
+        );
+    }
+    for held in [
+        &assigned,
+        &in_progress,
+        &manually_blocked,
+        &dependency_blocked,
+        &documentation_in_progress,
+    ] {
+        assert!(
+            !raw_ids.contains(held),
+            "a bead failing a readiness gate must not be raw-ready: {held}"
+        );
+    }
+
+    // This is the adapter-side Pluck rule: an exact excluded label drops a
+    // raw-ready bead, but case variants and wildcard-looking literals remain.
+    let pluck_ids: Vec<String> = raw_beads
+        .into_iter()
+        .filter(|bead| {
+            !bead["labels"].as_array().is_some_and(|labels| {
+                labels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|label| EXCLUDED_LABELS.contains(&label))
+            })
+        })
+        .map(|bead| {
+            bead["id"]
+                .as_str()
+                .expect("every ready bead must carry an id")
+                .to_string()
+        })
+        .collect();
+
+    assert!(
+        !pluck_ids.contains(&exact_excluded),
+        "the exact excluded label must be filtered by Pluck"
+    );
+    for survives in [&clean, &documentation, &case_variant, &glob_shaped] {
+        assert!(
+            pluck_ids.contains(survives),
+            "non-excluded labels must survive Pluck's exact matching: {survives}"
+        );
+    }
+}
+
+/// Checkpoint publication is part of the bead-rs mutation contract: a
+/// mutation suppressed with `--no-auto-flush` is not commit-ready until an
+/// explicit `sync flush-only` covers its live sequence.
+#[test]
+fn explicit_checkpoint_flush_publishes_suppressed_mutations() {
+    let ws = FrontierWorkspace::new();
+    let mutation = ws.create_without_auto_flush("checkpoint mutation", &[]);
+
+    let dirty = ws.checkpoint_status();
+    assert_eq!(
+        dirty["dirty"], true,
+        "the suppressed mutation must dirty the checkpoint"
+    );
+    assert_eq!(dirty["relationship"], "behind");
+    assert_eq!(dirty["ready_to_commit"], false);
+    assert!(
+        dirty["live_sequence"].as_u64() > dirty["covered_sequence"].as_u64(),
+        "the live event sequence must be ahead of the checkpoint after suppression"
+    );
+
+    bead_ok(&ws.path, &["sync", "flush-only"]);
+
+    let clean = ws.checkpoint_status();
+    assert_eq!(
+        clean["dirty"], false,
+        "flush-only must clear checkpoint dirtiness"
+    );
+    assert_eq!(clean["relationship"], "aligned");
+    assert_eq!(clean["ready_to_commit"], true);
+    assert_eq!(
+        clean["live_sequence"], clean["covered_sequence"],
+        "the flushed checkpoint must cover every live mutation"
+    );
+
+    let root_path = clean["root_path"]
+        .as_str()
+        .expect("checkpoint status must report the active root path");
+    assert!(
+        ws.path.join(".beads/checkpoint").join(root_path).is_file(),
+        "the status root must point to a published checkpoint object"
+    );
+    let forensic = fs::read_to_string(ws.path.join(".beads/checkpoint/forensic.jsonl"))
+        .expect("flush-only must publish the forensic checkpoint view");
+    assert!(
+        forensic.contains(&mutation),
+        "the published checkpoint must contain the mutation {mutation}"
     );
 }
