@@ -55,10 +55,11 @@ impl PinnedContract {
     /// exclusion set below is `DEFAULT_EXCLUDE_LABELS` in NEEDLE
     /// `src/strand/pluck.rs` at this version).
     ///
-    /// 0.6.16 → 0.6.17 (claudego-13dc4929, 2026-09-26): re-verified from the
-    /// deployed binary's exact release commit (13d0e2e, the v0.6.17 bump) —
-    /// `DEFAULT_EXCLUDE_LABELS` is still the same five labels.
-    const NEEDLE: &'static str = "0.6.17";
+    /// 0.6.17 → 0.6.26 (claudego-643e8336, 2026-09-28): re-verified from
+    /// the deployed binary's exact release commit (e7f600b8, the v0.6.26
+    /// bump) — `DEFAULT_EXCLUDE_LABELS` is still the same five labels and
+    /// the focused CLI contract remains green.
+    const NEEDLE: &'static str = "0.6.26";
 
     /// `bead --version` this contract was verified against (store layout,
     /// JSONL shapes, dep/readiness semantics).
@@ -66,7 +67,7 @@ impl PinnedContract {
 
     /// The built-in exclusion set PluckStrand substitutes when the configured
     /// `exclude_labels` is empty or omitted — this deployment's live case
-    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.17
+    /// (`strands.pluck.exclude_labels: []`). Needle 0.6.26
     /// `DEFAULT_EXCLUDE_LABELS`, `src/strand/pluck.rs`. A non-empty
     /// configured list *replaces* this set rather than merging with it.
     ///

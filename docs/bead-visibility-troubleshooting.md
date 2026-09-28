@@ -47,8 +47,8 @@ resolved workspace
 
 The current target workspace is `/home/coding/claude-governor`. The active
 global Pluck configuration is `/home/coding/.config/needle/config.yaml`
-(verified 2026-09-25, needle 0.6.14; default set re-verified unchanged at
-needle 0.6.17, 2026-09-26):
+(verified 2026-09-28, needle 0.6.26; default set re-verified unchanged at
+needle 0.6.26, pinned by `tests/bead_rs_contract_test.rs`):
 
 ```yaml
 workspace:
@@ -97,7 +97,7 @@ label, including punctuation and case. A generated label such as
 failure-count ordering and split logic instead.
 
 When the configured list is empty or omitted, PluckStrand substitutes NEEDLE's
-built-in default set. As of needle 0.6.17 that set is
+built-in default set. As of needle 0.6.26 that set is
 (`DEFAULT_EXCLUDE_LABELS`, `src/strand/pluck.rs`):
 
 ```text

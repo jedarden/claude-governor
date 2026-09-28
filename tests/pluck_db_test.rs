@@ -39,8 +39,8 @@ const PLUCK_STATE: &str = "open";
 /// The exclusion set this deployment's Pluck strand effectively applies: the
 /// live config carries `exclude_labels: []`, so PluckStrand substitutes
 /// NEEDLE's built-in default set — `DEFAULT_EXCLUDE_LABELS` in NEEDLE
-/// `src/strand/pluck.rs`, re-verified unchanged at needle 0.6.16 (2026-09-26;
-/// previously 0.6.14). Pinned independently by
+/// `src/strand/pluck.rs`, re-verified unchanged at needle 0.6.26 (2026-09-28;
+/// previously 0.6.17). Pinned independently by
 /// `tests/bead_rs_contract_test.rs` (label set + version tripwires); the two
 /// constants must not drift apart. `starvation-alert` is deliberately NOT in
 /// this list: it is a deployment-specific label from earlier needle versions'
