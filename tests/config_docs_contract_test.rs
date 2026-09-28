@@ -69,6 +69,7 @@ daemon:
   max_scale_up_per_cycle: 2
   max_scale_down_per_cycle: 2
   progressive_scaling: true
+  exponential_decay_scaling: true
   min_scale_interval_secs: 30
   target_ceiling: 85.0
   mode: tmux

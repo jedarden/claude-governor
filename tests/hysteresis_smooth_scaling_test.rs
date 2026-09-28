@@ -4,15 +4,16 @@
 //! - Hysteresis band behavior (asymmetric: damps scale-down only, edge cases)
 //! - Convergence: every deficit closes — the fleet reaches target, never
 //!   stranding one worker short (claudego-44b1f4f5)
-//! - Large gap scaling (progressive per-cycle caps via `progressive_scale_cap`)
+//! - Large gap scaling (progressive and exponential-decay per-cycle caps)
 //! - Smooth scaling transitions (no oscillation)
 //! - Exponential approach convergence
 //! - Adaptive timing scenarios
 //! - Emergency brake override of hysteresis
 
-use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig};
+use claude_governor::config::{CompositeRiskConfig, ConeScalingConfig, DaemonConfig};
 use claude_governor::governor::{
-    apply_scaling, compute_target_workers, progressive_scale_cap, ScalingDecision,
+    apply_scaling, compute_target_workers, decay_scale_cap, progressive_scale_cap, ScalingDecision,
+    DEFAULT_SCALE_DECAY_FRACTION,
 };
 use claude_governor::state;
 
@@ -338,6 +339,118 @@ fn test_progressive_scaling_converges_faster_and_exactly() {
         current, target,
         "Progressive scaling must end exactly at target"
     );
+}
+
+#[test]
+fn test_decay_scale_cap_closes_a_fraction_with_ceiling() {
+    // The default decay fraction is 30%, rounded up so a non-zero gap always
+    // gets a useful integer-sized correction.
+    assert!((DEFAULT_SCALE_DECAY_FRACTION - 0.30).abs() < f64::EPSILON);
+    assert_eq!(decay_scale_cap(10, 10), 3, "30% of 10");
+    assert_eq!(decay_scale_cap(10, 11), 4, "ceil(30% of 11)");
+    assert_eq!(decay_scale_cap(10, 1), 1, "the gap clamps the cap");
+    assert_eq!(decay_scale_cap(0, 10), 0, "a disabled cap stays disabled");
+    assert_eq!(decay_scale_cap(10, 0), 0, "a zero gap needs no movement");
+}
+
+#[test]
+fn test_decay_scale_cap_never_exceeds_configured_cap_or_gap() {
+    for configured_cap in 0..=8 {
+        for gap in 0..=40 {
+            let effective = decay_scale_cap(configured_cap, gap);
+            assert!(
+                effective <= configured_cap,
+                "decay cap {} exceeded configured cap {} for gap {}",
+                effective,
+                configured_cap,
+                gap
+            );
+            assert!(
+                effective <= gap,
+                "decay cap {} overshot gap {} with configured cap {}",
+                effective,
+                gap,
+                configured_cap
+            );
+        }
+    }
+}
+
+#[test]
+fn test_decay_scaling_closes_fraction_of_gap_each_cycle() {
+    let target = 20;
+    let mut current = 5;
+    let mut steps = Vec::new();
+
+    while current < target {
+        let gap = target - current;
+        let step = decay_scale_cap(10, gap);
+        assert!(step > 0, "a non-zero gap must make progress");
+        assert!(
+            step >= ((gap as f64 * DEFAULT_SCALE_DECAY_FRACTION).ceil() as u32),
+            "step {} did not close the configured fraction of gap {}",
+            step,
+            gap
+        );
+        assert!(
+            current + step <= target,
+            "decay must never overshoot target"
+        );
+        steps.push(step);
+        current += step;
+    }
+
+    assert_eq!(current, target);
+    assert_eq!(steps, vec![5, 3, 3, 2, 1, 1]);
+}
+
+#[test]
+fn test_decay_scaling_converges_faster_than_binary_for_large_gap() {
+    let target = 50;
+
+    let mut binary_current = 5;
+    let mut binary_cycles = 0;
+    while binary_current < target {
+        let decision = apply_scaling(target, binary_current, 1.0, 1, 1, false);
+        let ScalingDecision::ScaleUp(step) = decision else {
+            panic!("binary scaling should keep moving toward the target");
+        };
+        binary_current += step;
+        binary_cycles += 1;
+    }
+
+    let mut decay_current = 5;
+    let mut decay_cycles = 0;
+    while decay_current < target {
+        let gap = target - decay_current;
+        let cap = decay_scale_cap(3, gap);
+        let decision = apply_scaling(target, decay_current, 1.0, cap, cap, false);
+        let ScalingDecision::ScaleUp(step) = decision else {
+            panic!("decay scaling should keep moving toward the target");
+        };
+        assert!(decay_current + step <= target);
+        decay_current += step;
+        decay_cycles += 1;
+    }
+
+    assert_eq!(decay_current, target);
+    assert!(
+        decay_cycles < binary_cycles,
+        "decay should converge faster than binary scaling ({} vs {} cycles)",
+        decay_cycles,
+        binary_cycles
+    );
+}
+
+#[test]
+fn test_disabled_decay_knob_keeps_binary_caps() {
+    let daemon = DaemonConfig::default();
+    assert!(!daemon.exponential_decay_scaling);
+
+    // With decay disabled, the ordinary decision path still receives the
+    // configured binary cap rather than a fraction-of-gap cap.
+    let decision = apply_scaling(20, 5, 1.0, 1, 1, false);
+    assert_eq!(decision, ScalingDecision::ScaleUp(1));
 }
 
 // ---------------------------------------------------------------------------

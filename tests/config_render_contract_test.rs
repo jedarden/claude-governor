@@ -35,12 +35,13 @@ const FIXTURE_FILE_NAME: &str = "governor-render-fixture.yaml";
 /// block all present this same surface. Pinned in full — a key may only be
 /// added or removed here together with `DaemonConfig`, the template, and the
 /// docs.
-const PINNED_DAEMON_KEYS: [&str; 12] = [
+const PINNED_DAEMON_KEYS: [&str; 13] = [
     "loop_interval_secs",
     "hysteresis_band",
     "max_scale_up_per_cycle",
     "max_scale_down_per_cycle",
     "progressive_scaling",
+    "exponential_decay_scaling",
     "min_scale_interval_secs",
     "target_ceiling",
     "mode",
@@ -172,6 +173,7 @@ fn render_carries_every_documented_daemon_key_with_its_loaded_value() {
     assert_fixture_value(&daemon, "max_scale_up_per_cycle", &Value::from(4));
     assert_fixture_value(&daemon, "max_scale_down_per_cycle", &Value::from(2));
     assert_fixture_value(&daemon, "progressive_scaling", &Value::from(true));
+    assert_fixture_value(&daemon, "exponential_decay_scaling", &Value::from(true));
     assert_fixture_value(&daemon, "min_scale_interval_secs", &Value::from(97));
     assert_fixture_value(&daemon, "target_ceiling", &Value::from(82.5));
     assert_fixture_value(&daemon, "mode", &Value::from("tmux"));

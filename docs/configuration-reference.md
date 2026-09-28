@@ -176,6 +176,7 @@ chosen.
 | `max_scale_up_per_cycle` | integer | `1` | Max workers added per cycle |
 | `max_scale_down_per_cycle` | integer | `1` | Max workers removed per cycle |
 | `progressive_scaling` | bool | `false` | Widen the per-cycle caps with the remaining gap: 3x when gap > 5, 2x when gap > 3, always clamped to the gap |
+| `exponential_decay_scaling` | bool | `false` | Close 30% of the remaining gap per cycle (rounded up), bounded by the configured cap and the gap; takes precedence over `progressive_scaling` |
 | `min_scale_interval_secs` | integer | `60` | Minimum seconds between scale operations |
 | `target_ceiling` | number | `90.0` | Global target utilization ceiling, percent (0–100). The fallback for any window without an override |
 | `mode` | `auto` \| `systemd` \| `tmux` | `auto` | Worker-launch mode; `auto` picks systemd when available |
@@ -279,6 +280,7 @@ daemon.log_max_bytes
 daemon.loop_interval_secs
 daemon.max_scale_down_per_cycle
 daemon.max_scale_up_per_cycle
+daemon.exponential_decay_scaling
 daemon.min_scale_interval_secs
 daemon.mode
 daemon.pre_scale_minutes
@@ -337,6 +339,7 @@ daemon:
   max_scale_up_per_cycle: 1
   max_scale_down_per_cycle: 1
   progressive_scaling: false
+  exponential_decay_scaling: false
   min_scale_interval_secs: 60
   target_ceiling: 90.0
   mode: auto

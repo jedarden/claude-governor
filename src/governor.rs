@@ -5610,6 +5610,33 @@ pub fn progressive_scale_cap(max_per_cycle: u32, gap: u32) -> u32 {
     max_per_cycle.saturating_mul(factor).min(gap)
 }
 
+/// Fraction of the remaining gap closed by exponential-decay scaling.
+pub const DEFAULT_SCALE_DECAY_FRACTION: f64 = 0.30;
+
+/// Calculate a hard-bounded exponential-decay cap for one scaling cycle.
+///
+/// The cap closes a fixed fraction of the remaining gap, rounded up so every
+/// non-zero gap makes progress, while the configured cap remains the hard
+/// upper bound. The gap clamp prevents overshooting the target. A zero cap or
+/// gap produces no movement.
+pub fn fractional_scale_cap(max_per_cycle: u32, gap: u32, fraction: f64) -> u32 {
+    if max_per_cycle == 0 || gap == 0 || !fraction.is_finite() || fraction <= 0.0 {
+        return 0;
+    }
+
+    let fraction_cap = (gap as f64 * fraction).ceil();
+    if fraction_cap >= u32::MAX as f64 {
+        return max_per_cycle.min(gap);
+    }
+
+    max_per_cycle.min(fraction_cap as u32).min(gap)
+}
+
+/// Calculate the configured 30%-decay cap for one scaling cycle.
+pub fn decay_scale_cap(max_per_cycle: u32, gap: u32) -> u32 {
+    fractional_scale_cap(max_per_cycle, gap, DEFAULT_SCALE_DECAY_FRACTION)
+}
+
 // ---------------------------------------------------------------------------
 // Pre-scale logic
 // ---------------------------------------------------------------------------
@@ -6414,9 +6441,7 @@ pub fn run_observe_cycle(
                         // sample authority before reading `samples` below — the
                         // first fresh delta then overwrites it wholesale
                         // (claudego-ddd93cee).
-                        if let Some(evicted) =
-                            resume_fleet_ema_after_idle(&mut state.burn_rate)
-                        {
+                        if let Some(evicted) = resume_fleet_ema_after_idle(&mut state.burn_rate) {
                             log::info!(
                                 "[governor] fleet resumed from idle: evicting {} stale EMA \
                                  samples persisted from the previous active period — sizing \
@@ -7552,20 +7577,28 @@ pub fn run_act_cycle(
     // 5. Apply scaling decision
     //
     // Progressive scaling (daemon.progressive_scaling) widens the per-cycle
-    // caps with the remaining gap, so a large correction doesn't crawl one
-    // worker per 5-minute cycle. The configured caps still bound every move
-    // and the gap clamp in progressive_scale_cap means the decision never
-    // overshoots the target. The decision log below records these effective
-    // caps, not the configured base rate.
+    // caps with the remaining gap, while exponential decay closes a fixed
+    // fraction of the gap without ever widening the configured caps. Decay
+    // takes precedence if both opt-ins are enabled. Both modes clamp to the
+    // gap so the decision never overshoots the target. The decision log below
+    // records these effective caps, not the configured base rate.
     let gap = effective_target.abs_diff(current_total);
-    let (eff_max_up, eff_max_down) = if pricing_config.daemon.progressive_scaling {
-        (
-            progressive_scale_cap(max_up_per_cycle, gap),
-            progressive_scale_cap(max_down_per_cycle, gap),
-        )
-    } else {
-        (max_up_per_cycle, max_down_per_cycle)
-    };
+    let (eff_max_up, eff_max_down, scaling_cap_mode) =
+        if pricing_config.daemon.exponential_decay_scaling {
+            (
+                decay_scale_cap(max_up_per_cycle, gap),
+                decay_scale_cap(max_down_per_cycle, gap),
+                "exponential_decay",
+            )
+        } else if pricing_config.daemon.progressive_scaling {
+            (
+                progressive_scale_cap(max_up_per_cycle, gap),
+                progressive_scale_cap(max_down_per_cycle, gap),
+                "progressive",
+            )
+        } else {
+            (max_up_per_cycle, max_down_per_cycle, "binary")
+        };
     let decision = if manual_override_applied {
         apply_manual_override_scaling(effective_target, current_total, eff_max_up, eff_max_down)
     } else {
@@ -7987,16 +8020,16 @@ pub fn run_act_cycle(
                 effective_target, current_total
             ),
             ScalingDecision::ScaleUp(_) => format!(
-                "target {} > current {} (deficits are never band-damped)",
-                effective_target, current_total
+                "target {} > current {} (deficits are never band-damped; effective cap {} workers, mode {})",
+                effective_target, current_total, eff_max_up, scaling_cap_mode
             ),
             ScalingDecision::ScaleDown(_) if manual_override_applied => format!(
                 "manual override target {} < current {} (hysteresis bypassed)",
                 effective_target, current_total
             ),
             ScalingDecision::ScaleDown(_) => format!(
-                "target {} < current {} beyond hysteresis {:.0}",
-                effective_target, current_total, effective_hysteresis
+                "target {} < current {} beyond hysteresis {:.0} (effective cap {} workers, mode {})",
+                effective_target, current_total, effective_hysteresis, eff_max_down, scaling_cap_mode
             ),
             ScalingDecision::EmergencyBrake => {
                 // This arm only fires on a real window at/above the threshold;
@@ -8039,6 +8072,13 @@ pub fn run_act_cycle(
             "max_up_per_cycle": eff_max_up,
             "max_down_per_cycle": eff_max_down,
             "progressive_scaling": pricing_config.daemon.progressive_scaling,
+            "exponential_decay_scaling": pricing_config.daemon.exponential_decay_scaling,
+            "scaling_cap_mode": scaling_cap_mode,
+            "scaling_decay_fraction": if pricing_config.daemon.exponential_decay_scaling {
+                Some(DEFAULT_SCALE_DECAY_FRACTION)
+            } else {
+                None
+            },
             "actual_launched": actual_launched,
             "actual_removed": actual_removed,
             "allocation_reconciled": allocation_reconciled,
@@ -10827,14 +10867,13 @@ mod tests {
 
         assert_eq!(
             resolution,
-            ManualOverrideResolution::Applied {
-                applied_target: 4
-            },
+            ManualOverrideResolution::Applied { applied_target: 4 },
             "override must bind at the aggregate envelope max — the identical \
              bound the computed target clamps against — not the raw request"
         );
         assert_eq!(
-            state.manual_override.expect("stored").target, 9,
+            state.manual_override.expect("stored").target,
+            9,
             "the stored target must stay raw (pre-clamp)"
         );
     }
@@ -10845,19 +10884,13 @@ mod tests {
         // the pin was set: the envelope max becomes 8 and the pin binds there
         // without anyone re-running cgov scale.
         let mut state = override_state(9, Some(Utc::now() + chrono::Duration::hours(1)));
-        state
-            .workers
-            .get_mut("opus")
-            .expect("opus pool")
-            .max = 8;
+        state.workers.get_mut("opus").expect("opus pool").max = 8;
 
         let resolution = resolve_manual_override(&mut state, Utc::now());
 
         assert_eq!(
             resolution,
-            ManualOverrideResolution::Applied {
-                applied_target: 8
-            },
+            ManualOverrideResolution::Applied { applied_target: 8 },
             "raising an agent's max_workers must un-clamp the stored raw pin"
         );
         assert_eq!(state.manual_override.expect("stored").target, 9);
@@ -10869,13 +10902,12 @@ mod tests {
 
         // Well past any plausible session: no expires_at means --clear, not
         // the clock, ends it.
-        let resolution = resolve_manual_override(&mut state, Utc::now() + chrono::Duration::days(30));
+        let resolution =
+            resolve_manual_override(&mut state, Utc::now() + chrono::Duration::days(30));
 
         assert_eq!(
             resolution,
-            ManualOverrideResolution::Applied {
-                applied_target: 3
-            }
+            ManualOverrideResolution::Applied { applied_target: 3 }
         );
         assert!(state.manual_override.is_some(), "must stay stored");
     }
@@ -10930,9 +10962,7 @@ mod tests {
 
         assert_eq!(
             resolution,
-            ManualOverrideResolution::Applied {
-                applied_target: 1
-            },
+            ManualOverrideResolution::Applied { applied_target: 1 },
             "a pin below the aggregate floor binds at the floor"
         );
     }

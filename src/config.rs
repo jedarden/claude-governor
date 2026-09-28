@@ -268,6 +268,16 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub progressive_scaling: bool,
 
+    /// Exponential-decay scaling: close a fixed fraction of the remaining
+    /// gap on each cycle (default: false).
+    ///
+    /// Unlike progressive scaling, decay never widens the configured
+    /// per-cycle caps. The effective cap is the smaller of the configured cap
+    /// and the ceiling of 30% of the remaining gap, clamped to the gap itself.
+    /// If both scaling modes are enabled, exponential decay takes precedence.
+    #[serde(default, alias = "decay_scaling")]
+    pub exponential_decay_scaling: bool,
+
     /// Minimum time between scale operations in seconds (default: 60)
     #[serde(default = "default_min_scale_interval_secs")]
     pub min_scale_interval_secs: u64,
@@ -354,6 +364,7 @@ impl Default for DaemonConfig {
             max_scale_up_per_cycle: default_max_scale_up_per_cycle(),
             max_scale_down_per_cycle: default_max_scale_down_per_cycle(),
             progressive_scaling: false,
+            exponential_decay_scaling: false,
             min_scale_interval_secs: default_min_scale_interval_secs(),
             target_ceiling: default_target_ceiling(),
             mode: DaemonMode::Auto,
@@ -1087,6 +1098,7 @@ pricing:
         assert!((config.daemon.hysteresis_band - 1.0).abs() < 1e-9);
         assert_eq!(config.daemon.max_scale_up_per_cycle, 1);
         assert_eq!(config.daemon.max_scale_down_per_cycle, 1);
+        assert!(!config.daemon.exponential_decay_scaling);
         assert_eq!(config.daemon.min_scale_interval_secs, 60);
         assert!((config.daemon.target_ceiling - 90.0).abs() < 1e-9);
     }
@@ -1101,6 +1113,7 @@ daemon:
   hysteresis_band: 2.0
   max_scale_up_per_cycle: 2
   max_scale_down_per_cycle: 2
+  exponential_decay_scaling: true
   min_scale_interval_secs: 30
   target_ceiling: 85.0
 "#;
@@ -1109,6 +1122,7 @@ daemon:
         assert!((config.daemon.hysteresis_band - 2.0).abs() < 1e-9);
         assert_eq!(config.daemon.max_scale_up_per_cycle, 2);
         assert_eq!(config.daemon.max_scale_down_per_cycle, 2);
+        assert!(config.daemon.exponential_decay_scaling);
         assert_eq!(config.daemon.min_scale_interval_secs, 30);
         assert!((config.daemon.target_ceiling - 85.0).abs() < 1e-9);
     }

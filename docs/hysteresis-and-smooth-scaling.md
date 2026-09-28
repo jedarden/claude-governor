@@ -77,6 +77,7 @@ daemon:
   max_scale_up_per_cycle: 1     # Maximum workers to add per cycle
   max_scale_down_per_cycle: 1   # Maximum workers to remove per cycle
   progressive_scaling: false    # Widen per-cycle caps with the gap (see below)
+  exponential_decay_scaling: false # Close 30% of the remaining gap per cycle
   min_scale_interval_secs: 60   # Minimum time between scale operations
   loop_interval_secs: 300       # 5-minute polling cycle
 ```
@@ -116,7 +117,7 @@ The target worker count is computed from:
 
 ### Scaling Rate Limits
 
-Per-cycle rate limiting is binary by default (1 worker up, 1 down per 5-minute cycle), or **progressive** when `progressive_scaling: true` (see below).
+Per-cycle rate limiting is binary by default (1 worker up, 1 down per 5-minute cycle), **progressive** when `progressive_scaling: true`, or **exponential-decay** when `exponential_decay_scaling: true` (see below). If both opt-ins are true, exponential decay takes precedence.
 
 ### Example: Large Scale-Up (converges)
 
@@ -176,11 +177,11 @@ A target jittering ±1 around the fleet produces no churn: the first deficit clo
 
 ## Remaining Improvements (Not Implemented)
 
-Both open items are tracked as beads. They are serialized (`claudego-71a82180` blocked by `claudego-b9195f5a`) because both touch `src/governor.rs` and `src/config.rs` and extend the same test file.
+Option C remains open and is tracked as a bead. It was serialized behind the now-completed Option B implementation because both touch `src/governor.rs`, `src/config.rs`, and this test file.
 
-### Option B: Exponential Decay — [claudego-b9195f5a]
+### Option B: Exponential Decay — implemented in [claudego-b9195f5a]
 
-Close a fixed fraction of the remaining gap per cycle (e.g. 30%), for a smooth asymptotic approach. The progressive tier function already approximates this for large gaps; true exponential scaling remains a proposal.
+Set `exponential_decay_scaling: true` to close 30% of the remaining gap per cycle, rounded up to a whole worker. The effective cap is `min(ceil(0.30 * gap), configured cap, gap)`, so the configured cap remains the hard bound and a cycle never overshoots the target. This gives a smooth asymptotic approach while preserving the binary behavior when the knob is disabled. It takes precedence over `progressive_scaling` if both are enabled.
 
 ### Option C: Adaptive Timing — [claudego-71a82180]
 
@@ -201,6 +202,7 @@ daemon:
   max_scale_up_per_cycle: 1
   max_scale_down_per_cycle: 1
   progressive_scaling: false
+  exponential_decay_scaling: false
   loop_interval_secs: 300  # 5 minutes
 ```
 
@@ -215,6 +217,17 @@ daemon:
   loop_interval_secs: 300
 ```
 
+### Exponential-Decay Scaling
+
+```yaml
+daemon:
+  hysteresis_band: 1.0
+  max_scale_up_per_cycle: 3      # hard upper bound for decay
+  max_scale_down_per_cycle: 3
+  exponential_decay_scaling: true # close ceil(30% of gap), never past target
+  loop_interval_secs: 300
+```
+
 ## Testing Strategy
 
 **Test file**: `tests/hysteresis_smooth_scaling_test.rs` — the unit/integration floor:
@@ -223,6 +236,7 @@ daemon:
 - Convergence to target (`test_smooth_scale_up_sequence` — the 5→10 table ends at 10; `test_scale_up_converges_from_one_short` — the regression in one line)
 - Down-side damping (`test_hysteresis_scale_down_within_band`, `test_smooth_scale_down_sequence`)
 - Progressive caps: tiers, gap clamp, disabled cap (`test_progressive_scale_cap_tiers_and_clamps`), convergence speed (`test_progressive_scaling_converges_faster_and_exactly`)
+- Exponential-decay caps: ceiling/fraction closure, no overshoot, configured-cap bound, disabled binary behavior, and faster large-gap convergence (`test_decay_scale_cap_closes_a_fraction_with_ceiling`, `test_decay_scale_cap_never_exceeds_configured_cap_or_gap`, `test_decay_scaling_closes_fraction_of_gap_each_cycle`, `test_decay_scaling_converges_faster_than_binary_for_large_gap`)
 - Anti-oscillation under jitter (`test_hysteresis_prevents_oscillation`)
 - Emergency brake override (`test_emergency_brake_bypasses_hysteresis`)
 - Per-cycle caps, binary rate limits both directions (`test_rate_limit_scale_up`, `test_rate_limit_scale_down`, `test_rate_limit_no_limit_when_delta_small`) and a large gap still landing exactly on target (`test_large_gap_binary_scaling`)
@@ -285,8 +299,8 @@ let new_count = (current as i32 + scale_delta)
 
 ## References
 
-- **Source code**: `src/governor.rs` (`apply_scaling`, `progressive_scale_cap`, `run_act_cycle` step 5)
-- **Configuration**: live `~/.config/claude-governor/governor.yaml` (machine-specific; verify with `cgov config`), seeded from the checked-in template `config/governor.yaml` (`daemon.progressive_scaling`); loader: `src/config.rs` (`DaemonConfig`, `GovernorConfig::config_paths`)
+- **Source code**: `src/governor.rs` (`apply_scaling`, `progressive_scale_cap`, `decay_scale_cap`, `run_act_cycle` step 5)
+- **Configuration**: live `~/.config/claude-governor/governor.yaml` (machine-specific; verify with `cgov config`), seeded from the checked-in template `config/governor.yaml` (`daemon.progressive_scaling`, `daemon.exponential_decay_scaling`); loader: `src/config.rs` (`DaemonConfig`, `GovernorConfig::config_paths`)
 - **Tests**: `tests/hysteresis_smooth_scaling_test.rs`, `tests/explain_decisions_test.rs`, `tests/governor_cycle_snapshot_test.rs`; the CLAUDE.md §4 guarantee layer — `tests/governor_scaling_fixes.rs` (one named test per §4 fix), `tests/scaling_invariants_test.rs` (one enumerative test per invariant), `tests/emergency_brake_distinction_test.rs` (brake threshold and computed-zero classification), and the `#[cfg(test)]` module in `src/governor.rs` (see the table above)
 - **Related modules**: `src/burn_rate.rs`, `src/worker.rs`, `src/calibrator.rs`
 
@@ -300,3 +314,4 @@ let new_count = (current as i32 + scale_delta)
 - **2026-09-25** (claudego-3648483e): Resolved the canonical config-path reference. This doc previously headed its tuning keys with `config/governor.yaml` as if that were the configuration; that file is the checked-in seed template (`include_str!`-baked in `src/config.rs`), while the live machine config (`~/.config/claude-governor/governor.yaml`) is authoritative and drifts from the template by design. The Configuration block now names both roles and points live-value verification at `cgov config`; CLAUDE.md §1 says the same.
 - **2026-09-26** (claudego-e76bcced): Linked the CLAUDE.md §4 allocation-guarantee test layer into this doc. The four §4 guarantees were already pinned (one regression test per fix in `tests/governor_scaling_fixes.rs`, one enumerative test per invariant in `tests/scaling_invariants_test.rs`, the 98%-threshold boundary in `tests/emergency_brake_distinction_test.rs`, unit boundaries in `src/governor.rs`) — the Testing Strategy section now maps each guarantee to its pins so the doc↔test linkage is bidirectional, and the References list names the three suites. CLAUDE.md §4's `safe_worker_count_or_max` bullet now notes the function's current name, `safe_worker_count_or_hold`.
 - **2026-09-28** (claudego-ce4b0151): Completed the Testing Strategy map for the remaining policy areas — the per-cycle cap tests, the computed-zero-without-brake pins, and the manual pin bypass (claudego-11c4439e) were all already pinned but unnamed here. Audit confirmed no policy gap: every behaviour this document describes has a named, passing test.
+- **2026-09-28** (claudego-b9195f5a): Implemented Option B's opt-in exponential-decay cap. Each cycle closes `ceil(30% × gap)` subject to the configured cap and remaining gap; the decision log records the effective cap and selected mode.
