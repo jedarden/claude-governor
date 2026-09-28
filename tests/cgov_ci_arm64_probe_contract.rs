@@ -378,6 +378,42 @@ fn install_arm64_artifact(sb: &WorkflowSandbox, exit_code: u8) -> PathBuf {
     artifact
 }
 
+/// A validator double that reports exactly one probe as PASSED under the
+/// emulator and says whatever `other` says about the second probe: a
+/// real-shaped FAIL verdict (`Some(probe)` — the probe ran under the
+/// emulator and failed), or nothing at all (`None` — the probe was never
+/// reported). It exits 0 either way, the downgrade shape: the pipe cannot
+/// refuse, so the gate's both-probe grep loop is the only refuser left
+/// between this log and publication — precisely the layer the single-pass
+/// tests below exist to pin. The shipped validator can only fail or skip
+/// both probes at once (one guest, one loop over both probes), so a mixed
+/// verdict is only reachable through a double.
+fn install_single_pass_validator(sb: &WorkflowSandbox, passed: &str, other: Option<&str>) {
+    let env_tail = "under qemu-aarch64-static in env -i, empty cwd, empty PATH";
+    let mut lines = vec![format!(
+        "PASS: cgov-linux-arm64: {passed} {env_tail} (exit 0: cgov 0.1.x-arm64-contract)"
+    )];
+    if let Some(failed) = other {
+        lines.push(format!(
+            "FAIL: cgov-linux-arm64: {failed} {env_tail}: \
+             exit=3 output=\"fake-qemu: simulated failure of cgov-linux-arm64 {failed}\""
+        ));
+    }
+    let mut script = String::from(
+        "#!/usr/bin/env bash\n# Test double: exactly one PASS verdict, exit 0 — the downgrade shape.\n\
+         cat <<'SINGLE_PASS_EOL'\n",
+    );
+    for line in &lines {
+        script.push_str(line);
+        script.push('\n');
+    }
+    script.push_str("SINGLE_PASS_EOL\nexit 0\n");
+    write_executable(
+        &sb.root().join("scripts/verify-release-static.sh"),
+        script.as_bytes(),
+    );
+}
+
 #[test]
 fn both_probes_passing_under_qemu_satisfy_the_cgov_ci_gate() {
     if !require_x86_64_host("both_probes_passing_under_qemu_satisfy_the_cgov_ci_gate") {
@@ -607,6 +643,147 @@ exit 0
             naive_probe_mention(&log, probe),
             "the anchored gate's refusal is only load-bearing if the naive \
              form would have matched this log:\n{log}"
+        );
+    }
+}
+
+#[test]
+fn cgov_ci_gate_refuses_when_one_probe_failed_even_if_the_other_passed() {
+    // No x86_64-host guard: nothing executes a guest here — the validator
+    // is a stub, so the replay exercises only the gate's own shell: the
+    // presence guard against the emulator double, the pipe, and the grep
+    // loop.
+    //
+    // The asymmetric half of the README's promise ("refuses to publish
+    // unless the --version and --help probes BOTH ran"): a probe that ran
+    // under the emulator and failed must refuse even though its sibling
+    // passed. Every refusal above is symmetric — both probes skip or both
+    // fail together — because the real validator runs both probes over one
+    // guest and can only fail as a pair. The mixed verdict arrives via the
+    // downgrade double: one PASS verdict, one real-shaped FAIL with exit=3,
+    // validator exits 0. The pipe cannot refuse, so this pins the loop's
+    // per-probe independence directly: weaken the loop from both-probes to
+    // any-probe (a single unanchored grep over either probe) and this
+    // artifact ships.
+    for (passed, failed) in [("--version", "--help"), ("--help", "--version")] {
+        let sb = WorkflowSandbox::new();
+        install_arm64_artifact(&sb, 0);
+        sb.install_fake_emulator(0);
+        install_single_pass_validator(&sb, passed, Some(failed));
+
+        let (code, out, log_exists) = sb.run_gate(&sb.tools_with_qemu());
+        assert_eq!(
+            code, 1,
+            "one failed probe must refuse the release even with the other \
+             passing:\n{out}"
+        );
+        assert!(
+            log_exists,
+            "the pipe succeeded (exit 0), so the log must have been tee'd:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "FAIL: arm64 artifact was not executed under \
+                 qemu-aarch64-static for {failed} — refusing to publish an \
+                 unexecuted artifact"
+            )),
+            "the refusal must name the failed probe:\n{out}"
+        );
+        assert!(
+            !out.contains(&format!(
+                "for {passed} — refusing to publish an unexecuted artifact"
+            )),
+            "the passing {passed} probe must never be named by a \
+             refusal:\n{out}"
+        );
+
+        // The load-bearing precondition, the same one the anchor test pins:
+        // the log DOES carry a PASS verdict for the passing probe, so a
+        // gate weakened from both-probes to any-probe would match it and
+        // publish. If this ever fails, this test has stopped pinning the
+        // both-required semantics.
+        let log = fs::read_to_string(sb.root().join("cgov-arm64-verify.log"))
+            .expect("read the tee'd verify log");
+        assert!(
+            workflow_probe_passed(&log, passed),
+            "precondition: an any-of gate would have matched this log's \
+             {passed} PASS verdict:\n{log}"
+        );
+        assert!(
+            !workflow_probe_passed(&log, failed),
+            "a failed {failed} probe must produce no PASS verdict:\n{log}"
+        );
+        assert!(
+            naive_probe_mention(&log, failed),
+            "the {failed} FAIL line must name the probe text — that collision \
+             is exactly what the PASS anchor exists to defeat:\n{log}"
+        );
+    }
+}
+
+#[test]
+fn cgov_ci_gate_refuses_when_one_probe_was_never_reported_even_if_the_other_passed() {
+    // The did-not-run half of "either probe did not run or failed": the
+    // validator double reports one PASS verdict and says nothing at all
+    // about the second probe — no FAIL line, no skip note, no mention. The
+    // README's promise is that cgov-ci publishes only after BOTH probes ran
+    // under the emulator, so silence about a probe is refusal, not benefit
+    // of the doubt. This is the drift shape of a validator that loses a
+    // probe from its loop: the refusing layer must still be the gate, and
+    // the refusal must name the probe that never spoke.
+    for (passed, unreported) in [("--version", "--help"), ("--help", "--version")] {
+        let sb = WorkflowSandbox::new();
+        install_arm64_artifact(&sb, 0);
+        sb.install_fake_emulator(0);
+        install_single_pass_validator(&sb, passed, None);
+
+        let (code, out, log_exists) = sb.run_gate(&sb.tools_with_qemu());
+        assert_eq!(
+            code, 1,
+            "an unreported probe must refuse the release even with the other \
+             passing:\n{out}"
+        );
+        assert!(
+            log_exists,
+            "the pipe succeeded (exit 0), so the log must have been tee'd:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "FAIL: arm64 artifact was not executed under \
+                 qemu-aarch64-static for {unreported} — refusing to publish \
+                 an unexecuted artifact"
+            )),
+            "the refusal must name the probe that was never reported:\n{out}"
+        );
+        assert!(
+            !out.contains(&format!(
+                "for {passed} — refusing to publish an unexecuted artifact"
+            )),
+            "the passing {passed} probe must never be named by a \
+             refusal:\n{out}"
+        );
+
+        // Same load-bearing precondition as the failed-sibling test: the
+        // single PASS verdict is present, so an any-of gate would publish.
+        // And with the probe wholly absent from the log, the gate must
+        // refuse on absence itself — there is not even a FAIL line to
+        // anchor against.
+        let log = fs::read_to_string(sb.root().join("cgov-arm64-verify.log"))
+            .expect("read the tee'd verify log");
+        assert!(
+            workflow_probe_passed(&log, passed),
+            "precondition: an any-of gate would have matched this log's \
+             {passed} PASS verdict:\n{log}"
+        );
+        assert!(
+            !workflow_probe_passed(&log, unreported),
+            "an unreported {unreported} probe must produce no PASS \
+             verdict:\n{log}"
+        );
+        assert!(
+            !naive_probe_mention(&log, unreported),
+            "the unreported probe must not be mentioned at all — the gate \
+             must refuse on absence, not on a FAIL line:\n{log}"
         );
     }
 }
