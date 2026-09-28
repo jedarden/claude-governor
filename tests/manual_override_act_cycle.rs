@@ -49,6 +49,10 @@ fn fake_environment(dir: &TempDir, sessions: &str) -> (EnvGuard, PathBuf, PathBu
     write_executable(&bin.join("tmux"), &tmux);
     write_executable(&bin.join("bf"), "#!/bin/sh\necho 'bf-fake0001 ready'\n");
     write_executable(&bin.join("launch-stub"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10%'\n",
+    );
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let old_decisions = std::env::var("CGOV_DECISIONS_PATH").ok();

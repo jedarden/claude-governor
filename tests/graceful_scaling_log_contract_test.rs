@@ -165,6 +165,16 @@ fn install_launch_stub(bin_dir: &Path) {
     write_executable(bin_dir, "launch-stub", "echo \"$3\" >> \"$4\"");
 }
 
+/// Keep the production disk guard deterministic; its threshold is covered by
+/// the worker unit tests, while this harness asserts scaling log behavior.
+fn install_low_disk_df(bin_dir: &Path) {
+    write_executable(
+        bin_dir,
+        "df",
+        "printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10% /'",
+    );
+}
+
 fn launch_cmd_for(bin_dir: &Path, env: &Path, log: &Path) -> String {
     format!(
         "{} --workspace {} log-scaled {}",
@@ -291,6 +301,7 @@ fn harness() -> Harness {
     install_fake_tmux(&bin_dir, &sessions_file, &calls_log, &stopped_file);
     install_quiet_bf(&bin_dir);
     install_launch_stub(&bin_dir);
+    install_low_disk_df(&bin_dir);
 
     std::env::set_var(
         "PATH",

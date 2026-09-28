@@ -145,6 +145,17 @@ fn install_launch_stub(bin_dir: &Path) {
     write_executable(bin_dir, "launch-stub", "echo \"$3\" >> \"$4\"");
 }
 
+/// The worker executor checks the filesystem before launching. Keep that
+/// production guard deterministic here: this harness tests scaling behavior,
+/// while the guard's boundary is covered by `src/worker.rs` unit tests.
+fn install_low_disk_df(bin_dir: &Path) {
+    write_executable(
+        bin_dir,
+        "df",
+        "printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10% /'",
+    );
+}
+
 fn launch_cmd_for(bin_dir: &Path, env: &Path, log: &Path) -> String {
     format!(
         "{} --workspace {} idle-scaled {}",
@@ -288,6 +299,7 @@ fn harness() -> Harness {
     install_fake_tmux(&bin_dir, &sessions_file, &calls_log, &stopped_file);
     install_quiet_bf(&bin_dir);
     install_launch_stub(&bin_dir);
+    install_low_disk_df(&bin_dir);
 
     let orig = ORIG_PATH.get_or_init(|| std::env::var("PATH").unwrap_or_default());
     std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), orig));
@@ -626,11 +638,7 @@ fn mixed_active_and_idle_scale_down_is_capped_idle_only_and_recorded() {
     assert_eq!(second, ScalingDecision::ScaleDown(1));
     assert_eq!(
         signalled(&h.calls_log),
-        sorted(&[
-            "cgidle-idle-old",
-            "cgidle-idle-new",
-            "cgidle-idle-youngest"
-        ]),
+        sorted(&["cgidle-idle-old", "cgidle-idle-new", "cgidle-idle-youngest"]),
         "both cycles remove only idle workers and never signal active workers"
     );
     assert!(killed(&h.calls_log).is_empty());
@@ -644,7 +652,10 @@ fn mixed_active_and_idle_scale_down_is_capped_idle_only_and_recorded() {
         pool.current, 3,
         "the second cycle census saw three live sessions"
     );
-    assert_eq!(pool.target, 2, "state records the bounded scale-down target");
+    assert_eq!(
+        pool.target, 2,
+        "state records the bounded scale-down target"
+    );
 
     // The decision log records both bounded requests and their actual graceful
     // outcomes, making the idle-only scale-down auditable by cgov explain.
@@ -652,11 +663,9 @@ fn mixed_active_and_idle_scale_down_is_capped_idle_only_and_recorded() {
     let decisions = read_last_decisions_from_path(2, &decisions_path)
         .expect("read scale-down decision audit log");
     assert_eq!(decisions.len(), 2);
-    assert!(
-        decisions
-            .iter()
-            .all(|entry| entry.action == ScaleAction::ScaleDown)
-    );
+    assert!(decisions
+        .iter()
+        .all(|entry| entry.action == ScaleAction::ScaleDown));
     assert_eq!((decisions[0].from, decisions[0].to), (3, 2));
     assert_eq!((decisions[1].from, decisions[1].to), (5, 3));
     assert_eq!(
@@ -1154,7 +1163,13 @@ fn ledger_pool_config(
         env.display(),
         launch_log.display()
     );
-    affinity_agent_config(launch_cmd, &format!("{session_prefix}-*"), hb_dir, 8, &["five_hour"])
+    affinity_agent_config(
+        launch_cmd,
+        &format!("{session_prefix}-*"),
+        hb_dir,
+        8,
+        &["five_hour"],
+    )
 }
 
 /// The exhaustion-shed forecast: five_hour binds at `safe`, the other two
@@ -1299,14 +1314,19 @@ fn ledger_shed_follows_worst_yield_per_dollar_through_the_live_cycle() {
     assert_eq!(
         signalled(&h.calls_log),
         sorted(&[
-            "shd-none-w1", "shd-none-w2", // proven waste sheds first
-            "shd-cheap-w1", "shd-cheap-w2", // worst yield per dollar next
-            "shd-mid-w1", "shd-mid-w2", // then middling yield
+            "shd-none-w1",
+            "shd-none-w2", // proven waste sheds first
+            "shd-cheap-w1",
+            "shd-cheap-w2", // worst yield per dollar next
+            "shd-mid-w1",
+            "shd-mid-w2", // then middling yield
         ]),
         "the shed follows worst verified-closure yield per dollar: none, cheap, mid"
     );
     assert!(
-        !signalled(&h.calls_log).iter().any(|s| s.starts_with("shd-exp")),
+        !signalled(&h.calls_log)
+            .iter()
+            .any(|s| s.starts_with("shd-exp")),
         "the best-yield pool keeps both workers although it is the most \
          expensive pool — the cost order would have shed it first"
     );
@@ -1328,9 +1348,12 @@ fn ledger_shed_follows_worst_yield_per_dollar_through_the_live_cycle() {
 fn without_ledger_evidence_the_live_shed_is_todays_cost_order() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let expected_cost_order = sorted(&[
-        "shd-exp-w1", "shd-exp-w2", // most expensive sheds first
-        "shd-none-w1", "shd-none-w2", // then $20
-        "shd-mid-w1", "shd-mid-w2", // then $15; cheap ($5) survives
+        "shd-exp-w1",
+        "shd-exp-w2", // most expensive sheds first
+        "shd-none-w1",
+        "shd-none-w2", // then $20
+        "shd-mid-w1",
+        "shd-mid-w2", // then $15; cheap ($5) survives
     ]);
 
     // Shape one: the ledger directory exists but carries no in-window rows —
@@ -1352,7 +1375,9 @@ fn without_ledger_evidence_the_live_shed_is_todays_cost_order() {
         "no ledger evidence: the shed is exactly the pre-ledger cost-per-hour order"
     );
     assert!(
-        !signalled(&h.calls_log).iter().any(|s| s.starts_with("shd-cheap")),
+        !signalled(&h.calls_log)
+            .iter()
+            .any(|s| s.starts_with("shd-cheap")),
         "the cheap pool survives although the ledger would have shed it first"
     );
     assert!(killed(&h.calls_log).is_empty());

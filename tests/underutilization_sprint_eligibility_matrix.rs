@@ -469,6 +469,13 @@ fn run_scenario(label: &str, scenario: Scenario) -> Outcome {
     // Launch stub: appends the pool tag once per worker actually launched.
     let launch_log = env.path().join("launches.log");
     write_executable(&bin_dir, "launch-stub", "echo \"$3\" >> \"$4\"");
+    // The live executor checks disk before launch; keep this harness focused on
+    // sprint eligibility rather than inheriting the host's filesystem usage.
+    write_executable(
+        &bin_dir,
+        "df",
+        "printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10% /'",
+    );
 
     let mut agents = HashMap::new();
     agents.insert(

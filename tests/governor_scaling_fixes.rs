@@ -119,6 +119,16 @@ fn install_launch_stub(bin_dir: &Path) {
     write_executable(bin_dir, "launch-stub", "echo \"$3\" >> \"$4\"");
 }
 
+/// Keep live executor tests independent of the host filesystem. The worker
+/// module's disk-guard threshold itself is covered by its unit tests.
+fn install_low_disk_df(bin_dir: &Path) {
+    write_executable(
+        bin_dir,
+        "df",
+        "printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10% /'",
+    );
+}
+
 fn launch_cmd_for(bin_dir: &Path, workspace: &Path, tag: &str, log: &Path, model: &str) -> String {
     format!(
         "{} --workspace {} {} {} --agent {}",
@@ -141,6 +151,7 @@ fn launch_tags(log: &Path) -> Vec<String> {
 /// Point subprocess resolution at this test's fakes and keep the audit log
 /// out of the operator's home. Caller must hold [`ENV_LOCK`].
 fn activate_env(bin_dir: &Path, decisions_path: &Path) {
+    install_low_disk_df(bin_dir);
     let orig = ORIG_PATH.get_or_init(|| std::env::var("PATH").unwrap_or_default());
     std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), orig));
     std::env::set_var("CGOV_DECISIONS_PATH", decisions_path);

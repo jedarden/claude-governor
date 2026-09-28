@@ -60,7 +60,11 @@ impl Drop for EnvGuard {
 /// sessions file is the tmux census: one session name per line, matched
 /// against each agent's `session_pattern`. `ready_beads` is what the fake
 /// `bf ready` prints — the backlog signal the underutilization sprint needs.
-fn fake_environment(dir: &TempDir, sessions: &str, ready_beads: &str) -> (EnvGuard, PathBuf, PathBuf) {
+fn fake_environment(
+    dir: &TempDir,
+    sessions: &str,
+    ready_beads: &str,
+) -> (EnvGuard, PathBuf, PathBuf) {
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let sessions_path = dir.path().join("sessions");
@@ -77,6 +81,10 @@ fn fake_environment(dir: &TempDir, sessions: &str, ready_beads: &str) -> (EnvGua
         &format!("#!/bin/sh\ncat <<'BFEOD'\n{ready_beads}BFEOD\n"),
     );
     write_executable(&bin.join("launch-stub"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture 100 10 90 10%'\n",
+    );
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let old_decisions = std::env::var("CGOV_DECISIONS_PATH").ok();
@@ -269,11 +277,8 @@ fn march_2026_promo() -> Promotion {
 fn sprint_that_would_fire_is_suppressed_by_an_active_pin() {
     let _lock = take_lock();
     let dir = TempDir::new().unwrap();
-    let (_env, _sessions, _decisions) = fake_environment(
-        &dir,
-        "pool-1\n",
-        "bf-fake0001 ready\nbf-fake0002 ready\n",
-    );
+    let (_env, _sessions, _decisions) =
+        fake_environment(&dir, "pool-1\n", "bf-fake0001 ready\nbf-fake0002 ready\n");
 
     let mut agents = HashMap::new();
     // Subscription + workspace + fake backlog of 2 > 1 running: sprint-eligible.
@@ -331,8 +336,11 @@ fn sprint_that_would_fire_is_suppressed_by_an_active_pin() {
 fn pre_scale_ramp_is_suppressed_by_an_active_pin() {
     let _lock = take_lock();
     let dir = TempDir::new().unwrap();
-    let (_env, _sessions, _decisions) =
-        fake_environment(&dir, "pool-1\npool-2\npool-3\npool-4\n", "bf-fake0001 ready\n");
+    let (_env, _sessions, _decisions) = fake_environment(
+        &dir,
+        "pool-1\npool-2\npool-3\npool-4\n",
+        "bf-fake0001 ready\n",
+    );
 
     // Non-subscription pool: the sprint path stays out of the picture, so the
     // only computed-target modifier in play is the pre-scale ramp.
@@ -381,7 +389,8 @@ fn pre_scale_ramp_is_suppressed_by_an_active_pin() {
 fn clearing_the_pin_restores_computed_targets_on_the_next_cycle() {
     let _lock = take_lock();
     let dir = TempDir::new().unwrap();
-    let (_env, sessions_path, _decisions) = fake_environment(&dir, "pool-1\n", "bf-fake0001 ready\n");
+    let (_env, sessions_path, _decisions) =
+        fake_environment(&dir, "pool-1\n", "bf-fake0001 ready\n");
 
     let mut agents = HashMap::new();
     agents.insert("pool".to_string(), agent("pool", 0, 8, false, None));
