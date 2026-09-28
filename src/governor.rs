@@ -5946,7 +5946,7 @@ pub fn run_governor_cycle(
     let now = Utc::now();
     log::info!("[governor] === cycle start at {} ===", now.to_rfc3339());
 
-    run_observe_cycle(
+    run_observe_cycle_with_target_ceiling(
         poller,
         state_path,
         paths,
@@ -5954,6 +5954,7 @@ pub fn run_governor_cycle(
         agents,
         promotions,
         pricing_config,
+        target_ceiling,
         now,
     )?;
 
@@ -6007,6 +6008,36 @@ pub fn run_observe_cycle(
     agents: &std::collections::HashMap<String, AgentConfig>,
     promotions: &[Promotion],
     pricing_config: &crate::config::GovernorConfig,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    run_observe_cycle_with_target_ceiling(
+        poller,
+        state_path,
+        paths,
+        alert_config,
+        agents,
+        promotions,
+        pricing_config,
+        pricing_config.daemon.target_ceiling,
+        now,
+    )
+}
+
+/// Run the observation half with an explicit global target-ceiling fallback.
+///
+/// The public [`run_observe_cycle`] wrapper preserves the library API for
+/// callers that use the config-file value. The combined daemon calls this
+/// variant so a process-level `--ceiling` override is applied consistently to
+/// both the forecast written by observe and the target consumed by act.
+pub fn run_observe_cycle_with_target_ceiling(
+    poller: &mut impl UsagePoller,
+    state_path: &Path,
+    paths: &CyclePaths,
+    alert_config: &AlertConfig,
+    agents: &std::collections::HashMap<String, AgentConfig>,
+    promotions: &[Promotion],
+    pricing_config: &crate::config::GovernorConfig,
+    target_ceiling: f64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     log::info!(
@@ -6930,7 +6961,9 @@ pub fn run_observe_cycle(
         let fleet_pct_hr = fleet_pct_per_hour.get(*window).copied().unwrap_or(0.0);
 
         // Get the base target ceiling for this specific window (from config override or global default)
-        let base_target_ceiling = pricing_config.daemon.get_target_ceiling_for_window(window);
+        let base_target_ceiling = pricing_config
+            .daemon
+            .get_target_ceiling_for_window_with_fallback(window, target_ceiling);
 
         // Apply safe mode reduction if active (per-window)
         let effective_target_ceiling = if state.safe_mode.active {
@@ -7447,8 +7480,10 @@ pub fn run_act_cycle(
     let binding_effective_ceiling = {
         let base = pricing_config
             .daemon
-            .get_target_ceiling_for_window(&state.capacity_forecast.binding_window);
-        let base = if base > 0.0 { base } else { target_ceiling };
+            .get_target_ceiling_for_window_with_fallback(
+                &state.capacity_forecast.binding_window,
+                target_ceiling,
+            );
         if state.safe_mode.active {
             (base - SAFE_MODE_CEILING_REDUCTION).max(50.0)
         } else {

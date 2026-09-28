@@ -406,14 +406,31 @@ impl DaemonConfig {
     /// assert_eq!(config.get_target_ceiling_for_window("seven_day"), 90.0);
     /// ```
     pub fn get_target_ceiling_for_window(&self, window_name: &str) -> f64 {
+        self.get_target_ceiling_for_window_with_fallback(window_name, self.target_ceiling)
+    }
+
+    /// Get the target ceiling for a window, using `fallback` when the window
+    /// has no positive override.
+    ///
+    /// The daemon's `--ceiling` flag supplies this fallback at process
+    /// startup. A positive per-window value remains authoritative, so a CLI
+    /// override cannot weaken a deliberate window-specific reserve.
+    pub fn get_target_ceiling_for_window_with_fallback(
+        &self,
+        window_name: &str,
+        fallback: f64,
+    ) -> f64 {
         if let Some(window_config) = self.windows.get(window_name) {
-            if let Some(utilization) = window_config.target_utilization {
+            if let Some(utilization) = window_config
+                .target_utilization
+                .filter(|utilization| *utilization > 0.0)
+            {
                 // Convert from 0-1 range to 0-100 percentage
                 return utilization * 100.0;
             }
         }
-        // Fall back to global default
-        self.target_ceiling
+        // Fall back to the global config value or the CLI-supplied value.
+        fallback
     }
 }
 
