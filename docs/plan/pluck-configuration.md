@@ -85,6 +85,49 @@ returned 7 ready candidates. The difference is expected: bead-rs removes
 assigned, manually blocked, and unfinished dependency-blocked issues before
 Pluck receives them.
 
+## Weave queue-state premises are a separate path
+
+Do not use the Pluck query above to infer what a Weave premise has seen. The
+two strands share a store, but they do not share the query:
+
+1. `FleetWeaveStrand` opens each Explore target with `discover_default`.
+2. `WeaveStrand::evaluate_internal` calls `store.list_all()` to build the
+   existing-bead context and title de-duplication set.
+3. The bead-rs adapter implements `list_all` as:
+
+   ```text
+   bead list --json --limit 999999
+   ```
+
+   This is intentionally an unfiltered inventory. The `BeadStore` contract
+   defines it as “ALL beads”; it is not the ready frontier and does not mean
+   open beads.
+
+The Weave formatter currently labels that inventory `Current Open Beads`
+without filtering `Bead.status`. Consequently, closed records—including
+rehydrated flood records—can be presented to the creator as open queue
+premises. The low-water generation gate does not correct this: it calls
+`store.ready()` only to decide whether generation may run, while the Weave
+prompt still receives the separate `list_all()` result. Changing
+`strands.pluck.exclude_labels` or the Pluck invocation cannot fix this
+misclassification.
+
+Until a NEEDLE release filters Weave's inventory before formatting and
+de-duplication, verify every Weave queue-count premise from the target
+workspace with the status-filtered command below. `bead list --json` is JSONL,
+so use `jq -s` when counting its records:
+
+```bash
+cd /path/to/target-workspace
+bead list --status open --json --limit 999999 | jq -s 'length'
+bead list --ready --json --limit 999999 | jq -s 'length'
+```
+
+The first command is the authoritative open count; the second is the
+dispatchable Pluck frontier. A Weave premise that reports the unfiltered
+`list_all` population as open is stale evidence and must be reconciled against
+these commands before dispatching cleanup work.
+
 ## Complete `exclude_labels` inventory
 
 ### Active target configuration
