@@ -6,7 +6,7 @@ failures:
 
 ---- adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants stdout ----
 
-thread 'adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants' (<TID>) panicked at src/adapter_verify.rs:1039:13:
+thread 'adapter_verify::tests::installer_bash_variable_lists_match_the_rust_constants' (<TID>) panicked at src/adapter_verify.rs:<LINE>:13:
 RULE3_IDE_VARS in deploy/install-claude-print-adapters.sh diverges from IDE_ENV_VARS in src/adapter_verify.rs — the bash list is missing [] and carries unlisted ["VSCODE_CWD"]. Update both copies together; the installer's own sync check fails the install on the same drift.
 
 

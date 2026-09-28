@@ -29,8 +29,9 @@
 //!   captured fixture (`tests/fixtures/adapter-drill/`), so wording, format
 //!   and direction drift in the diagnostics themselves fails the drill. Only
 //!   toolchain-authored noise is normalized away: the drill copy's path, the
-//!   panic thread id, libtest's filtered-out count and run duration, and the
-//!   RUST_BACKTRACE note. Everything a gate printed byte-for-byte — message
+//!   panic thread id and source line, libtest's filtered-out count and run
+//!   duration, and the RUST_BACKTRACE note. Everything a gate printed
+//!   byte-for-byte — message
 //!   text, `diff` direction, `Install incomplete.` exit path — is pinned.
 //!
 //! The invoke-contract mirror (`REQUIRED_INVOKE_FLAGS` /
@@ -752,6 +753,8 @@ const BACKTRACE_NOTE_LINE: &str =
 /// * the panic thread id → `<TID>` (rustc formats it as
 ///   `' (<digits>) panicked at'`; older toolchains omit it — neither is
 ///   gate-authored, so both canonicalize to the fixture's form);
+/// * the `src/adapter_verify.rs` panic line → `<LINE>` (source additions move
+///   the assertion without changing the gate's diagnostic);
 /// * libtest's filtered-out count → `<FILTERED>` (it moves every time a
 ///   lib unit test is added) and the run duration → `<DURATION>`.
 fn normalize_for_fixture(text: &str, copy_root: &Path) -> String {
@@ -759,6 +762,7 @@ fn normalize_for_fixture(text: &str, copy_root: &Path) -> String {
     let text = text.replace(root, "<COPY>");
     let text = text.replace(BACKTRACE_NOTE_LINE, "");
     let text = canonicalize_thread_id(&text);
+    let text = canonicalize_panic_source_line(&text);
     normalize_libtest_summary(&text)
 }
 
@@ -789,6 +793,28 @@ fn canonicalize_thread_id(text: &str) -> String {
     }
 }
 
+/// Canonicalize the Rust source line in the panic header. The four-way drill
+/// deliberately compiles an isolated copy of `src/adapter_verify.rs`, and
+/// unrelated checks can be inserted above the sync assertion. The assertion's
+/// message is the contract; its source line is compiler framing, just like
+/// the panic thread id.
+fn canonicalize_panic_source_line(text: &str) -> String {
+    const MARKER: &str = " panicked at src/adapter_verify.rs:";
+    let Some(marker_at) = text.find(MARKER) else {
+        return text.to_string();
+    };
+    let line_start = marker_at + MARKER.len();
+    let bytes = text.as_bytes();
+    let mut line_end = line_start;
+    while line_end < bytes.len() && bytes[line_end].is_ascii_digit() {
+        line_end += 1;
+    }
+    if line_end == line_start || !text[line_end..].starts_with(':') {
+        return text.to_string();
+    }
+    format!("{}<LINE>{}", &text[..line_start], &text[line_end..])
+}
+
 /// Replace the two run-varying numbers of libtest's summary line
 /// (`; 989 filtered out; finished in 0.00s`) with the fixture's
 /// placeholders. The surrounding wording stays pinned — a libtest format
@@ -812,6 +838,21 @@ fn normalize_libtest_summary(text: &str) -> String {
         &text[..start],
         &text[end..]
     )
+}
+
+#[test]
+fn fixture_normalization_ignores_only_moving_panic_location_metadata() {
+    let copy = Path::new("<COPY>");
+    let first = normalize_for_fixture(
+        "thread 'gate' (1) panicked at src/adapter_verify.rs:1040:13:\n",
+        copy,
+    );
+    let second = normalize_for_fixture(
+        "thread 'gate' (999) panicked at src/adapter_verify.rs:1388:13:\n",
+        copy,
+    );
+    assert_eq!(first, second);
+    assert!(first.contains("src/adapter_verify.rs:<LINE>:13:"));
 }
 
 /// The first byte-level difference between the fixture and the actual

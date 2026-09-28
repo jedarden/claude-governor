@@ -89,15 +89,14 @@ each mutation's full cargo-test stdout and full installer transcript into
 `tests/fixtures/adapter-drill/` (eight files, `<mutation>.{cargo-stdout,installer}.txt`,
 embedded with `include_str!`) and asserts the normalized run output equals
 its fixture exactly. Only toolchain-authored noise is normalized away: the
-drill copy's temp path (`<COPY>`), the panic thread id (`<TID>`), libtest's
-filtered-out count and duration (`<FILTERED>`/`<DURATION>`), and the
-`RUST_BACKTRACE` note. Everything a gate printed — message text, panic
-location (which shifts ±1 line under the Rust-side mutations, so the
-fixtures also pin those), the `diff` direction, the installer collateral
-verdicts, and the exit codes (101 panic, 1 `Install incomplete.`) — is
-pinned; wording or format drift in either gate's diagnostics is now a test
-failure. If new wording is intended, recapture the fixture; the assert
-message says so.
+drill copy's temp path (`<COPY>`), the panic thread id (`<TID>`), the
+`src/adapter_verify.rs` panic source line (`<LINE>`), libtest's filtered-out
+count and duration (`<FILTERED>`/`<DURATION>`), and the `RUST_BACKTRACE` note.
+Everything a gate printed — message text, the panic location's file and
+column, the `diff` direction, the installer collateral verdicts, and the exit
+codes (101 panic, 1 `Install incomplete.`) — is pinned; wording or format
+drift in either gate's diagnostics is now a test failure. If new wording is
+intended, recapture the fixture; the assert message says so.
 
 **Coverage differences from the manual drill** (deliberate, not drift):
 
